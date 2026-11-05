@@ -509,13 +509,11 @@ impl Mailbox {
         exclusive: bool,
         reason: Option<&str>,
     ) -> anyhow::Result<AcquireResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut result = AcquireResult::default();
 
         for path in paths {
-            // Decided by the kernel (bd-y6t7): build once per call, tick
-            // per path. Granted publishes below; Denied maps to hard/soft.
             let now_us = Self::kernel_now_us();
             let (model, meta) = self.kernel_model_for(project_slug).await;
             let ttl_us = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
@@ -541,8 +539,6 @@ impl Mailbox {
                 continue;
             }
             if !soft.is_empty() {
-                // Freeze + propose (Spec 4): not a hard block, not granted.
-                // The proposer/detector consumer (P11.3b) fires on this.
                 result.soft_conflicts.push(PathConflict {
                     path: path.clone(),
                     holders: soft,
@@ -551,7 +547,6 @@ impl Mailbox {
                 continue;
             }
 
-            // Publish the lease: NIP-40 expiration (TTL) + dual-emit scoping.
             let d = format!("{project_slug}:{path}");
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
@@ -566,9 +561,6 @@ impl Mailbox {
             if let Some(exp) = ttl.expiration_tag(created) {
                 tags.push(exp);
             }
-            // bd-adr-0028-implementation-zfnx.11: every new lease bumps the coordinate epoch (fresh
-            // claim, must-convert, or post-release/revoke reclaim — the
-            // previous holder's presented epoch goes stale by construction).
             let d_epoch = format!("{project_slug}:{path}");
             let epoch = self.next_epoch_at(project_slug, &d_epoch).await;
             let content = lease_content(exclusive, reason.unwrap_or(""), epoch);
@@ -607,9 +599,6 @@ impl Mailbox {
                 epoch,
             });
         }
-        // bd-liveness-any-command-mc34: acquiring proves the holder is
-        // alive (a manual holder may never read mail). Best-effort at the
-        // effect edge — after the grant, never failing the acquire.
         let now_us = super::lease_liveness::host_now_us();
         self.record_inbox_poll(project_slug, agent_name, now_us)
             .await;
@@ -630,7 +619,7 @@ impl Mailbox {
         reason: Option<&str>,
         ttl_secs: Option<u64>,
     ) -> anyhow::Result<IntentResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut result = IntentResult::default();
         for path in paths {
@@ -672,9 +661,6 @@ impl Mailbox {
                 expires_ts_us: (EnvelopeTtl { secs: Some(ttl) })
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
-                // bd-adr-0028-implementation-zfnx.11: intents are advisory, not ownership — they
-                // neither read nor bump the coordinate epoch. The
-                // must-convert acquire bumps past them.
                 epoch: 0,
             });
         }
@@ -692,15 +678,13 @@ impl Mailbox {
         agent_name: &str,
         paths: &[String],
     ) -> anyhow::Result<ConflictReport> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut report = ConflictReport {
             checked_paths: paths.len(),
             ..Default::default()
         };
         for path in paths {
-            // Dry-run decision through the kernel (bd-y6t7): no publish,
-            // same decider as the acquire path.
             let now_us = Self::kernel_now_us();
             let (model, meta) = self.kernel_model_for(project_slug).await;
             let blockers = Self::kernel_blockers_for(
@@ -717,18 +701,6 @@ impl Mailbox {
             );
             let (hard, hard_ids, soft, soft_ids) = Self::split_blockers(&blockers);
 
-            // bd-4dl4: a live SHARED lease by another agent blocks nobody, so
-            // the kernel above returns no blocker for it and the path would
-            // land in `clear_paths` with nothing else set — the reader
-            // concludes nobody is there when someone declared they are. Fold
-            // those holders into the ADVISORY tier: `conflict_free` stays true
-            // (a shared lease genuinely does not fence anyone, ADR-0011 Spec
-            // 4), but the path is no longer reported as bare clear, so
-            // `clear_paths` means "nobody holds or declared this".
-            //
-            // Only the shared ones are added here; the exclusive ones are
-            // already in `hard` and adding them again would double-count
-            // `total_conflicting_reservations`.
             let mut soft = soft;
             let mut soft_ids = soft_ids;
             for id in reservations_core::advisory_viewers(
@@ -769,8 +741,6 @@ impl Mailbox {
         report.has_soft_conflicts = !report.soft_conflicts.is_empty();
         report.total_conflicting_reservations =
             report.conflicts.iter().map(|c| c.holders.len()).sum();
-        // bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —
-        // the pre-write check answers "is the cargo fence free?" in ONE call.
         report.slot_holders = match self.index_pool() {
             Some(pool) => crate::index::slots::active_slots(pool, project_slug)
                 .await
@@ -818,7 +788,7 @@ impl Mailbox {
         paths: &[String],
         extend_secs: u64,
     ) -> anyhow::Result<RenewResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let now_secs = Timestamp::now().as_secs() as i64;
         let mine = self
@@ -832,15 +802,7 @@ impl Mailbox {
         let mut result = RenewResult::default();
         for res in mine {
             let d = format!("{project_slug}:{}", res.path_pattern);
-            // bd-evqs cap: no republish when the lease still has ≥
-            // extend_secs of TTL left (or is permanent) — zero events for
-            // the healthy window. bd-mbh0: the lease is still COUNTED as
-            // renewed (its expiry is already converged ≥ the requested
-            // runway) and REPORTED so the embedding's closed-bead sweep can
-            // see + release it: a reservation whose owning bead closed is
-            // stale even while its TTL is healthy.
             let old_expiry_secs = res.expires_ts_us.map(|t| t / 1_000_000);
-            // permanent lease (no expiry) needs no renewal runway — converged.
             let skip = old_expiry_secs
                 .is_none_or(|abs| abs.saturating_sub(now_secs) >= extend_secs as i64);
             if skip {
@@ -862,10 +824,6 @@ impl Mailbox {
             let mut tags =
                 with_project_scoping(toron_kind(FILE_RESERVATION), base, Some(project_slug));
             let created = Timestamp::now();
-            // Renewal: the new lease must expire at the OLD absolute expiry PLUS
-            // the extension, in absolute epoch seconds — not re-derived from
-            // `now`. Treating `expires_ts_us` (absolute epoch µs) as a relative
-            // duration and re-adding to `now` double-counts the elapsed time
             // and produced a 2x expiry (parity bug bd-XXX).
             let new_expiry_secs = old_expiry_secs
                 .map(|abs| (abs as u64).saturating_add(extend_secs))
@@ -879,8 +837,6 @@ impl Mailbox {
             let event = build_event(
                 &agent_keys,
                 toron_kind(FILE_RESERVATION),
-                // bd-adr-0028-implementation-zfnx.11: a renew is not a claim — republish the SAME
-                // epoch so the holder's fencing belief survives renewal.
                 lease_content(res.exclusive, &res.reason, res.epoch),
                 tags,
                 created,
@@ -911,10 +867,6 @@ impl Mailbox {
             });
             result.renewed += 1;
         }
-        // bd-liveness-any-command-mc34: renewing proves the holder is alive
-        // — this is the with-lease heartbeat's own signal, so a working
-        // holder that never reads mail stays vouched. Best-effort at the
-        // effect edge, never failing the renew.
         let now_us = super::lease_liveness::host_now_us();
         self.record_inbox_poll(project_slug, agent_name, now_us)
             .await;
@@ -930,7 +882,7 @@ impl Mailbox {
         agent_name: &str,
         paths: &[String],
     ) -> anyhow::Result<ReleaseResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mine: Vec<Reservation> = self
             .active_reservations(project_slug)
@@ -953,8 +905,6 @@ impl Mailbox {
             let event = build_event(
                 &agent_keys,
                 toron_kind(FILE_RESERVATION),
-                // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch so the next claim
-                // bumps past it (reclaim invalidates the old belief).
                 marker_content("released", None, res.epoch),
                 tags,
                 Timestamp::now(),
@@ -998,14 +948,12 @@ impl Mailbox {
         note: Option<&str>,
         notify_previous: bool,
     ) -> anyhow::Result<()> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let operator = self
             .operator
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
 
-        // Locate the lease by path (+ optional holder) through the same view
-        // conflict-check reads — never a caller-supplied event id.
         let lease = self
             .active_reservations(project_slug)
             .await?
@@ -1017,7 +965,6 @@ impl Mailbox {
                 anyhow::anyhow!("no active reservation on {path}{where_}")
             })?;
 
-        // 1. Staleness heuristic.
         let stale = self.is_holder_stale(project_slug, &lease).await;
         if !stale {
             anyhow::bail!(
@@ -1028,7 +975,6 @@ impl Mailbox {
             );
         }
 
-        // 2. Operator signs the revocation at the SAME (kind, d) coordinate.
         let d = format!("{project_slug}:{}", lease.path_pattern);
         let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
             EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
@@ -1054,8 +1000,6 @@ impl Mailbox {
         let revoke = build_event(
             operator,
             toron_kind(FILE_RESERVATION),
-            // bd-adr-0028-implementation-zfnx.11: stamp the revoked lease's epoch — the next claim
-            // bumps past it, the old holder's belief goes stale by construction.
             marker_content("revoked", Some("stale-holder"), lease.epoch),
             tags,
             Timestamp::now(),
@@ -1071,9 +1015,8 @@ impl Mailbox {
         .await;
         self.record_transition(project_slug, &d, "revoked", &revoke.id);
 
-        // 5. Notify previous holder via NIP-17 (heuristic summary).
         if notify_previous {
-            let holder_keys = Keys::generate(); // sender key for the wrap
+            let holder_keys = Keys::generate();
             let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
                 .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
             let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -1096,8 +1039,6 @@ impl Mailbox {
             );
             let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
                 .expect("wrap notify");
-            // F2.SILENT-DROP (batch-fix): a failed force-release notification
-            // DM must be loud — the force-released holder is entitled to know.
             if let Err(e) = self.publish_dm(&wrap).await {
                 tracing::warn!(
                     d,
@@ -1185,7 +1126,6 @@ impl Mailbox {
                 let revoke = build_event(
                     operator,
                     toron_kind(FILE_RESERVATION),
-                    // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
                     marker_content("revoked", Some("ghost-pane"), lease.epoch),
                     tags,
                     Timestamp::now(),
@@ -1223,7 +1163,7 @@ impl Mailbox {
         bead_id: &str,
         notify_previous: bool,
     ) -> anyhow::Result<ReleaseResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let operator = self
             .operator
             .as_ref()
@@ -1263,7 +1203,6 @@ impl Mailbox {
             let revoke = build_event(
                 operator,
                 toron_kind(FILE_RESERVATION),
-                // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
                 marker_content("revoked", Some("bead-closed"), lease.epoch),
                 tags,
                 Timestamp::now(),
@@ -1280,10 +1219,8 @@ impl Mailbox {
             self.record_transition(project_slug, &d, "revoked", &revoke.id);
             released += 1;
 
-            // Notify the previous holder via NIP-17 (the lease was revoked
-            // by bead close, not by them).
             if notify_previous {
-                let holder_keys = Keys::generate(); // sender key for the wrap
+                let holder_keys = Keys::generate();
                 let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
                     .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
                 let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -1303,8 +1240,6 @@ impl Mailbox {
                 );
                 let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
                     .expect("wrap notify");
-                // F2.SILENT-DROP: a failed release notification DM must be
-                // loud — the released holder is entitled to know.
                 if let Err(e) = self.publish_dm(&wrap).await {
                     tracing::warn!(
                         d,
@@ -1373,13 +1308,6 @@ impl Mailbox {
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut out = Self::resolve_leases_from_events(&events, operator, now_secs);
 
-        // bd-lease-liveness-bo0g: the bus prunes EXPIRED envelopes on replay
-        // (NIP-40), so an expired-but-still-blocking lease is invisible to
-        // the event view above. Its SQL MIRROR row persists (`status=active`,
-        // `expires_ts_us` past) — resurrect that row ONLY while a liveness
-        // oracle vouches the holder's session is still live. No oracle →
-        // pure NIP-40 semantics (expired stays invisible), byte-identical to
-        // pre-bo0g behavior.
         let liveness = installed_lease_liveness();
         if let Some(pool) = self.index_pool() {
             let now_us = now_secs * 1_000_000;
@@ -1412,9 +1340,6 @@ impl Mailbox {
                     expires_ts_us: Some(exp_us),
                     status: ReservationStatus::Held,
                     created_at_secs: 0,
-                    // bd-adr-0028-implementation-zfnx.11: the oracle-resurrected mirror row predates
-                    // epoch tracking (no new store column); fencing treats it
-                    // as genesis — a fenced op must re-read, never assume.
                     epoch: 0,
                     expired: true,
                     liveness_extended: true,
@@ -1452,10 +1377,6 @@ impl Mailbox {
             if status == ReservationStatus::Revoked || status == ReservationStatus::Released {
                 continue;
             }
-            // TTL expiry clears the lease here (NIP-40, held and intent
-            // alike). bd-lease-liveness-bo0g: an expired lease whose holder
-            // is STILL LIVE is resurrected in `resolved_leases` from the SQL
-            // mirror under oracle vouch — this view stays pure NIP-40.
             if let Some(exp) = winning.tags.expiration()
                 && (exp.as_secs() as i64) < now_secs
             {
@@ -1514,7 +1435,7 @@ impl Mailbox {
         project_slug: &str,
         repo_name: &str,
     ) -> anyhow::Result<Vec<Reservation>> {
-        let canonical = self.canonical_project(project_slug).await; // ADR-0017
+        let canonical = self.canonical_project(project_slug).await;
         let own_aliases: std::collections::HashSet<String> =
             self.project_slug_aliases(&canonical).into_iter().collect();
         let Some(pool) = self.index_pool.as_ref() else {
@@ -1562,7 +1483,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<Reservation>> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let mut out: Vec<Reservation> = self
             .resolved_leases(project_slug)
             .await?
@@ -1570,7 +1491,7 @@ impl Mailbox {
             .filter(|l| l.status == ReservationStatus::Held)
             .map(|l| Reservation {
                 id: l.id,
-                agent_name: String::new(), // resolved via profile below
+                agent_name: String::new(),
                 agent_pubkey: l.agent_pubkey,
                 path_pattern: l.path_pattern,
                 exclusive: l.exclusive,
@@ -1580,7 +1501,6 @@ impl Mailbox {
                 epoch: l.epoch,
             })
             .collect();
-        // Fill agent names from profiles (best-effort).
         self.fill_agent_names(project_slug, &mut out).await;
         Ok(out)
     }
@@ -1601,7 +1521,6 @@ impl Mailbox {
             .filter(|r| holder.is_none_or(|h| r.agent_name == h))
             .filter(|r| {
                 path.is_none_or(|p| {
-                    // the guard's own symmetric fnmatch semantics
                     super::guard::pattern_matches(&r.path_pattern, p)
                         || super::guard::pattern_matches(p, &r.path_pattern)
                 })
@@ -1618,7 +1537,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<Reservation>> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let aliases = self.project_slug_aliases(project_slug);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<Reservation> = Vec::new();
@@ -1668,7 +1587,7 @@ impl Mailbox {
         path: &str,
         presented_epoch: u64,
     ) -> anyhow::Result<Reservation> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let current = self
             .active_reservations(project_slug)
             .await?
@@ -1735,7 +1654,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<IntentReservation>> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let leases = self.resolved_leases(project_slug).await?;
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut intents: Vec<IntentReservation> = leases
@@ -1747,7 +1666,7 @@ impl Mailbox {
                     (l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64)) * 1_000_000;
                 IntentReservation {
                     id: l.id,
-                    agent_name: String::new(), // filled below
+                    agent_name: String::new(),
                     agent_pubkey: l.agent_pubkey,
                     path_pattern: l.path_pattern,
                     reason: l.reason,
@@ -1759,8 +1678,6 @@ impl Mailbox {
             .collect();
         let names = self.agent_name_map(project_slug).await;
         for i in &mut intents {
-            // Roster miss stays empty: never invent a pubkey prefix (bd-ow6c —
-            // an invented name later compared as a peer pin).
             i.agent_name = names.get(&i.agent_pubkey).cloned().unwrap_or_default();
         }
         Ok(intents)
@@ -1788,8 +1705,6 @@ impl Mailbox {
                 ReservationStatus::Intent => EntryState::Intent,
                 _ => continue,
             };
-            // Roster miss stays empty: never invent a pubkey prefix (bd-ow6c —
-            // an invented name later compared as a peer pin).
             let name = names.get(&l.agent_pubkey).cloned().unwrap_or_default();
             meta.insert(l.id.clone(), (name, l.status));
             model.leases.insert(
@@ -1901,7 +1816,6 @@ impl Mailbox {
                     .filter(|e| e.pubkey.to_hex() == holder_pubkey)
                     .map(|e| e.created_at.as_secs() as i64)
                     .max();
-                // No profile at all → treat as stale (unknown agent).
                 last_active.is_none_or(|ts| now - ts > STALE_AFTER_SECS as i64)
             })
     }
@@ -1930,11 +1844,6 @@ impl Mailbox {
                 }
             })
             .collect();
-        // bd-ow6c: the roster fills what the live profiles do not cover. The
-        // fallback used to be the first 8 chars of the pubkey — a string no
-        // agent name equals — so a lane that compared the lease holder with
-        // its own pin treated its OWN lease as a peer's and starved on the
-        // bead it held.
         for (pubkey, name) in self.roster_names_by_pubkey(project_slug).await {
             names.entry(pubkey).or_insert(name);
         }
@@ -1979,7 +1888,7 @@ impl Mailbox {
         path: &str,
         reason: Option<&str>,
     ) -> anyhow::Result<TransferResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         if from_agent == to_agent {
             anyhow::bail!("transfer to self is a no-op — {from_agent} already holds {path}");
         }
@@ -1995,7 +1904,6 @@ impl Mailbox {
                 holder.agent_name
             );
         }
-        // Target must have a local key before we touch the holder's lease.
         self.agent_keys_for(project_slug, to_agent)?;
 
         let release_ts = Timestamp::now();
@@ -2008,11 +1916,9 @@ impl Mailbox {
             .or_else(|| (!holder.reason.is_empty()).then(|| holder.reason.clone()))
             .unwrap_or_default();
 
-        // 1. Release marker (same-author NIP-33 supersession, status:released).
         let release_event = build_event(
             &from_keys,
             toron_kind(FILE_RESERVATION),
-            // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
             marker_content("released", None, holder.epoch),
             with_project_scoping(
                 toron_kind(FILE_RESERVATION),
@@ -2029,10 +1935,6 @@ impl Mailbox {
             .await;
         self.record_transition(project_slug, &d, "released", &release_event.id);
 
-        // 2. Re-acquire for the target, preserving exclusivity + reason,
-        //    stamped strictly after the release marker. bd-adr-0028-implementation-zfnx.11: the
-        //    reclaim bumps past the release marker's stamped epoch, so the
-        //    previous holder's presented epoch goes stale by construction.
         let acquire_epoch = self.next_epoch_at(project_slug, &d).await;
         let acquire_event = build_event(
             &to_keys,
@@ -2062,8 +1964,6 @@ impl Mailbox {
         .await;
         self.record_transition(project_slug, &d, "acquired", &acquire_event.id);
 
-        // 3. Verify the target actually holds the path now (the acquire
-        //    resolved past the release marker — never a phantom transfer).
         let held_by_target = self
             .active_reservations(project_slug)
             .await?
@@ -2095,7 +1995,7 @@ impl Mailbox {
         args: &RequestRelease,
     ) -> anyhow::Result<RequestReleaseResult> {
         let mut args = args.clone();
-        args.project_slug = self.canonical_project(&args.project_slug).await; // ADR-0017
+        args.project_slug = self.canonical_project(&args.project_slug).await;
         if args.sender_name == args.target_agent {
             anyhow::bail!(
                 "request-release to self is a no-op — {} already holds it",
@@ -2132,7 +2032,6 @@ impl Mailbox {
             Tag::parse(["reservation-id", &args.reservation_id]).expect("res"),
         ];
         if let Ok(lease_id) = EventId::from_hex(&args.reservation_id) {
-            // NIP-10 e-reference to the held lease event.
             extra.push(Tag::event(lease_id));
         }
         let send = SendMessage {
@@ -2182,7 +2081,7 @@ impl Mailbox {
         args: &ReleaseResponse,
     ) -> anyhow::Result<SendResult> {
         let mut args = args.clone();
-        args.project_slug = self.canonical_project(&args.project_slug).await; // ADR-0017
+        args.project_slug = self.canonical_project(&args.project_slug).await;
         let request = self
             .find_request_by_id(
                 &args.project_slug,
@@ -2190,7 +2089,6 @@ impl Mailbox {
                 &args.request_message_id,
             )
             .await?;
-        // The requester = the request rumor's author → name via profiles.
         let profiles = self.project_profiles(&args.project_slug).await?;
         let requester_name = profiles
             .iter()
@@ -2219,7 +2117,6 @@ impl Mailbox {
             Tag::parse(["reservation-id", &request.reservation_id]).expect("res"),
         ];
         if let Ok(req_id) = EventId::from_hex(&args.request_message_id) {
-            // NIP-10 reply ref to the request rumor.
             extra.push(Tag::event(req_id));
         }
         let send = SendMessage {
@@ -2240,12 +2137,6 @@ impl Mailbox {
             ..Default::default()
         };
         let sent = self.send_message(&send).await?;
-        // bd-wake-id-contract-1jz1: a DECIDED request must never re-fire a
-        // wake for the responder. Record the responder's READ receipt on the
-        // request rumor — the urgent/unread wake filter (bd-dbre: read rows
-        // do not wake) then drops it permanently, loop-side and everywhere.
-        // Best-effort: the decision DM is already out; a receipt failure
-        // must not fail the response.
         let _ = self
             .mark_message_read(
                 &args.project_slug,
@@ -2268,7 +2159,7 @@ impl Mailbox {
         request_message_id: &str,
         window_secs: Option<u64>,
     ) -> RequestReleaseStatus {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let window = window_secs.unwrap_or(REQUEST_RELEASE_TIER_WINDOW_SECS);
         let Ok(keys) = self.agent_keys_for(project_slug, requestor_name) else {
             return RequestReleaseStatus::Unknown;
@@ -2286,9 +2177,6 @@ impl Mailbox {
             return RequestReleaseStatus::Unknown;
         };
         let sent_at = request.created_at.as_secs() as i64;
-        // A typed response to THIS request (e-ref matches) with a parseable
-        // decision settles the negotiation; anything else is not a response.
-        // Multiple responses → the LATEST decision wins (projection rule).
         let decided = rumors
             .iter_mut()
             .filter_map(|r| {
@@ -2340,7 +2228,7 @@ impl Mailbox {
         request_message_id: &str,
         note: Option<&str>,
     ) -> anyhow::Result<()> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let operator = self.operator.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no operator key configured; cannot escalate to captain")
         })?;
@@ -2352,7 +2240,6 @@ impl Mailbox {
             anyhow::bail!("message {request_message_id} is not your request-release");
         }
         let operator_npub = operator.public_key();
-        // Best-effort path label for the DM body (the lease may be gone).
         let path_label = match self
             .active_reservations(project_slug)
             .await
@@ -2474,9 +2361,6 @@ impl Mailbox {
                 r#"{{"d":"{d}","status":"{status}","event_id":"{event_id}","ts_us":{}}}"#,
                 crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
             );
-            // F2.SILENT-DROP (batch-fix): the G13 audit-history write must not
-            // fail silently — an unwritable archive loses the
-            // acquire/release/revoked record with no signal.
             if let Err(e) = archive.stage_file(&rel, content.as_bytes()) {
                 tracing::warn!("reservation audit stage_file failed ({status} {d}): {e}");
             }
@@ -2620,10 +2504,6 @@ pub fn lease_status(winning: &Event) -> ReservationStatus {
     match status_tag.as_deref() {
         Some("intent") => ReservationStatus::Intent,
         Some("released") => ReservationStatus::Released,
-        // Canonical forms only: a bare `contains("released")` classifies an
-        // ACQUIRE whose free-text reason mentions "released" as Released —
-        // the lease vanishes from the held view and the exclusive-path
-        // conflict floor stops blocking (bug hunt 2026-08-17).
         _ if winning.content.contains("status:released")
             || winning.content.contains("\"status\":\"released\"") =>
         {
@@ -2819,7 +2699,6 @@ mod tests {
             .ensure_project("demo")
             .await
             .expect("ensure project");
-        // Keys with NO profile and NO roster row: both name sources miss.
         let ghost = crate::keys::generate();
         publish_raw_stale_lease(&mailbox, &ghost, "demo", "ghost-lane.md").await;
         let held = mailbox.active_reservations("demo").await.expect("active");
@@ -2850,7 +2729,6 @@ mod tests {
             .ensure_project("demo")
             .await
             .expect("ensure project");
-        // Keys with NO profile and NO roster row: both name sources miss.
         let ghost = crate::keys::generate();
         publish_raw_intent(&mailbox, &ghost, "demo", "ghost-plan.md").await;
         let intents = mailbox.active_intents("demo").await.expect("intents");
@@ -2878,7 +2756,6 @@ mod tests {
     async fn roster_miss_leaves_conflict_holder_name_empty() {
         let (mailbox, db_path, data_dir) = test_mailbox("blocker-empty").await;
         register(&mailbox, "demo", "RoseDune").await;
-        // Keys with NO profile and NO roster row: both name sources miss.
         let ghost = crate::keys::generate();
         publish_raw_stale_lease(&mailbox, &ghost, "demo", "ghost-hold.md").await;
         let report = mailbox
@@ -2962,7 +2839,6 @@ mod tests {
         register(&mailbox, "demo", "CoralFinch").await;
         register(&mailbox, "demo", "CrimsonIsland").await;
 
-        // The ghost acquires the shared ledger exclusively.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -2976,7 +2852,6 @@ mod tests {
             .expect("ghost acquire");
         assert_eq!(acq.granted.len(), 1);
 
-        // A peer is hard-blocked while the holder lives.
         let blocked = mailbox
             .file_reservation_paths(
                 "demo",
@@ -2993,8 +2868,6 @@ mod tests {
             "{blocked:?}"
         );
 
-        // The pane dies; the prune names the pin. The cascade MUST revoke
-        // every exclusive held lease of the dead pins.
         let released = mailbox
             .reap_ghost_leases(&["CoralFinch".to_string()], Some("pane-pruned"))
             .await
@@ -3004,7 +2877,6 @@ mod tests {
         assert_eq!(released[0].path_pattern, ".beads/issues.jsonl");
         assert_eq!(released[0].project_slug, "demo");
 
-        // Acquire now succeeds — the ghost no longer owns the ledger.
         let now_ok = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3018,14 +2890,12 @@ mod tests {
             .expect("post-reap acquire");
         assert_eq!(now_ok.granted.len(), 1, "{now_ok:?}");
 
-        // Idempotent: a second reap has nothing to release.
         let again = mailbox
             .reap_ghost_leases(&["CoralFinch".to_string()], None)
             .await
             .expect("reap again");
         assert!(again.is_empty(), "{again:?}");
 
-        // A live holder is NEVER reaped — only pins in the prune list are.
         let untouched = mailbox
             .reap_ghost_leases(&["CrimsonIsland".to_string()], None)
             .await
@@ -3038,12 +2908,9 @@ mod tests {
 
     #[test]
     fn test_symmetric_conflict_both_directions() {
-        // src/** matches src/lib.rs; src/lib.rs matches src/** (symmetric).
         assert!(overlaps("src/**", "src/lib.rs"));
         assert!(overlaps("src/lib.rs", "src/**"), "symmetric the other way");
-        // No overlap.
         assert!(!overlaps("src/**", "docs/x.md"));
-        // Distinct files.
         assert!(!overlaps("src/a.rs", "src/b.rs"));
     }
 
@@ -3091,7 +2958,6 @@ mod tests {
             .expect("release");
         assert_eq!(row_status(&db_path).await.as_deref(), Some("released"));
 
-        // Re-acquire flips the same row back to active (UNIQUE coordinate).
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -3116,7 +2982,6 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // A acquires src/transfer.rs exclusively.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3130,7 +2995,6 @@ mod tests {
             .expect("A acquire");
         assert_eq!(acq.granted.len(), 1);
 
-        // Transfer: A → B, same path, reason preserved.
         let transfer = mailbox
             .transfer_reservation("demo", "BlueLake", "RoseDune", "src/transfer.rs", None)
             .await
@@ -3139,7 +3003,6 @@ mod tests {
         assert_eq!(transfer.from_agent, "BlueLake");
         assert_eq!(transfer.to_agent, "RoseDune");
 
-        // B now holds the path (exclusive, reason preserved).
         let holders: Vec<Reservation> = mailbox.active_reservations("demo").await.expect("active");
         let b_lease = holders
             .iter()
@@ -3149,7 +3012,6 @@ mod tests {
         assert!(b_lease.exclusive, "exclusivity preserved");
         assert_eq!(b_lease.reason, "handoff", "reason preserved");
 
-        // A cannot re-acquire the same exclusive path (B holds it).
         let reacquire = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3203,9 +3065,6 @@ mod tests {
         register(&mailbox, "demo", "IvoryRidge").await;
         register(&mailbox, "demo", "TealMarlin").await;
 
-        // Granted, so the broad claim really IS on the board. A test that
-        // silently asserts a conflict on an empty board would pass for the
-        // wrong reason.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3258,8 +3117,6 @@ mod tests {
                 report.total_conflicting_reservations
             );
         }
-        // A holder is only ever NAMED, never a self-match: this check is about
-        // other agents' claims.
         for c in &report.conflicts {
             assert!(
                 c.holders.iter().any(|h| h == "IvoryRidge"),
@@ -3290,7 +3147,6 @@ mod tests {
         register(&mailbox, "demo", "IvoryRidge").await;
         register(&mailbox, "demo", "TealMarlin").await;
 
-        // NOT --exclusive: this is the case the bead's repro actually created.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3320,7 +3176,6 @@ mod tests {
             .await
             .expect("conflicts");
 
-        // Still not a fence: a shared lease must not change who gets denied.
         assert!(
             report.conflict_free,
             "a shared lease does not fence anyone: {:?}",
@@ -3331,9 +3186,6 @@ mod tests {
             "and it must not be promoted into the hard tier"
         );
 
-        // But it must be NAMED. This is the assertion that fails before the
-        // fix, and it is the whole point: `clear_paths` claimed this path was
-        // free while another agent had declared they were working in it.
         assert!(
             report.has_soft_conflicts,
             "a live shared lease is advisory, so it must surface: \
@@ -3368,7 +3220,6 @@ mod tests {
             "the shared holder is named, so the board really was read: {:?}",
             report.soft_conflicts[0]
         );
-        // Own leases are not an advisory signal against yourself.
         let own = mailbox
             .check_file_reservation_conflicts(
                 "demo",
@@ -3427,7 +3278,6 @@ mod tests {
             .await
             .expect("A acquire");
 
-        // RoseDune is not the holder — transfer must fail, not silently pass.
         let err = mailbox
             .transfer_reservation("demo", "RoseDune", "BlueLake", "src/held.rs", None)
             .await
@@ -3447,7 +3297,6 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // BlueLake acquires src/**.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3462,7 +3311,6 @@ mod tests {
         assert_eq!(acq.granted.len(), 1);
         assert!(acq.conflicts.is_empty());
 
-        // RoseDune conflicts on src/lib.rs (symmetric).
         let report = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/lib.rs".into()])
             .await
@@ -3475,7 +3323,6 @@ mod tests {
             "holder named"
         );
 
-        // RoseDune's own acquire of src/lib.rs → conflict.
         let acq2 = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3490,7 +3337,6 @@ mod tests {
         assert!(acq2.granted.is_empty());
         assert_eq!(acq2.conflicts.len(), 1);
 
-        // A clear path for RoseDune.
         let clear = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["docs/x.md".into()])
             .await
@@ -3516,8 +3362,6 @@ mod tests {
         let peer = register(&mailbox, "demo", "RoseDune").await;
         let holder_hex = holder.to_hex();
 
-        // Holder acquires two paths: one with a 1s TTL (expires below), one
-        // with a healthy TTL (control — never expires mid-test).
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -3556,8 +3400,6 @@ mod tests {
             }
         };
 
-        // Phase 1 — no liveness oracle: expired = clear (NIP-40 baseline),
-        // the healthy lease still blocks regardless.
         let report = check(&mailbox).await;
         assert!(
             report.clear_paths.contains(&"src/fleeting.rs".to_string()),
@@ -3568,9 +3410,6 @@ mod tests {
             "healthy lease unaffected"
         );
 
-        // Phase 2 — oracle says BlueLake's session is LIVE: the expired
-        // lease MUST block again, naming BlueLake, and refuse RoseDune's
-        // acquire of the same path.
         install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
             pubkey_hex == holder_hex
         }));
@@ -3600,7 +3439,6 @@ mod tests {
             "acquire refused while live peer holds: {acq:?}"
         );
 
-        // Phase 3 — oracle says the session is GONE: back to clear.
         install_lease_liveness_checker(std::sync::Arc::new(|_| false));
         let report = check(&mailbox).await;
         assert!(
@@ -3610,7 +3448,6 @@ mod tests {
         );
         clear_lease_liveness_checker();
 
-        // The peer's own identity never trips its own check (sanity).
         let own = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["docs/own.md".into()])
             .await
@@ -3636,7 +3473,6 @@ mod tests {
         let holder_hex = holder.to_hex();
         let pool = mailbox.index_pool().expect("pool").clone();
         let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
-        // Expired mirror row with NO bus event: the resurrection path only.
         sqlx::query(
             "INSERT INTO file_reservations (project_slug, agent_name, agent_pubkey, \
              path_pattern, exclusive, reason, status, expires_ts_us, created_ts_us) \
@@ -3649,7 +3485,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("mirror row");
-        // BlueLake polled just now — the snapshot vouches exactly it.
         sqlx::query(
             "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
              VALUES ('demo', 'BlueLake', 'P', ?1)",
@@ -3678,7 +3513,6 @@ mod tests {
             hit.holders.iter().any(|h| h == "BlueLake"),
             "peer named as holder: {hit:?}"
         );
-        // Holder gone quiet (empty map) → expiry frees the path again.
         install_lease_liveness_checker(std::sync::Arc::new(|_| false));
         let report = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/oracle.rs".into()])
@@ -3712,8 +3546,6 @@ mod tests {
         )
         .await
         .expect("acquire on A");
-        // Published on A after B opened: B reads the shared store, not a
-        // stale open-time snapshot.
         let report = mbb
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/live.rs".into()])
             .await
@@ -3791,7 +3623,6 @@ mod tests {
             .await
         };
 
-        // Acquire alone stamps.
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -3805,7 +3636,6 @@ mod tests {
             .expect("acquire");
         assert!(poll_of().await.expect("acquire stamps") > 0);
 
-        // Renew alone re-stamps: wipe the row, renew, read it back.
         sqlx::query("DELETE FROM inbox_cursors")
             .execute(&pool)
             .await
@@ -3823,7 +3653,6 @@ mod tests {
             "a holder that only renews stays vouched: {map:?}"
         );
 
-        // Send alone stamps too.
         sqlx::query("DELETE FROM inbox_cursors")
             .execute(&pool)
             .await
@@ -3841,8 +3670,6 @@ mod tests {
             .expect("send");
         assert!(poll_of().await.expect("send stamps") > 0);
 
-        // The stamp can never fail the command: cursor table gone entirely,
-        // renew still succeeds (best-effort is `()`, not `Result`).
         sqlx::query("DROP TABLE inbox_cursors")
             .execute(&pool)
             .await
@@ -3864,14 +3691,11 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // BlueLake holds the cargo slot.
         mailbox
             .acquire_build_slot("demo", "BlueLake", "cargo", Some(3600), true)
             .await
             .expect("acquire cargo");
 
-        // RoseDune's pre-write check on an UNRELATED path still sees the
-        // fence is busy.
         let report = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["docs/x.md".into()])
             .await
@@ -3885,7 +3709,6 @@ mod tests {
         assert!(holder.exclusive);
         assert!(holder.expires_ts_us.is_some());
 
-        // Own slots never surface (own never conflicts).
         let own = mailbox
             .check_file_reservation_conflicts("demo", "BlueLake", &["docs/x.md".into()])
             .await
@@ -3896,7 +3719,6 @@ mod tests {
             own.slot_holders
         );
 
-        // Released → gone.
         mailbox
             .release_build_slot("demo", "BlueLake", "cargo")
             .await
@@ -3927,7 +3749,6 @@ mod tests {
             )
             .await
             .expect("acquire");
-        // Same agent re-checking its own path → no conflict.
         let report = mailbox
             .check_file_reservation_conflicts("demo", "BlueLake", &["src/lib.rs".into()])
             .await
@@ -3949,7 +3770,6 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // A acquires the exclusive path.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3964,7 +3784,6 @@ mod tests {
         assert_eq!(acq.granted.len(), 1);
         assert!(acq.conflicts.is_empty());
 
-        // B's acquire of the SAME path → HARD block.
         let acq2 = mailbox
             .file_reservation_paths(
                 "demo",
@@ -3988,7 +3807,6 @@ mod tests {
             acq2.conflicts[0].holders
         );
 
-        // A third party's conflict check sees A's hold.
         register(&mailbox, "demo", "MistyDesert").await;
         let report = mailbox
             .check_file_reservation_conflicts("demo", "MistyDesert", &["src/shared/*".into()])
@@ -4002,7 +3820,6 @@ mod tests {
             report.conflicts[0].holders
         );
 
-        // A's OWN re-check stays clear (own lease never self-conflicts).
         let own = mailbox
             .check_file_reservation_conflicts("demo", "BlueLake", &["src/shared/*".into()])
             .await
@@ -4025,7 +3842,6 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // A acquires with a reason that mentions "released".
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4039,7 +3855,6 @@ mod tests {
             .expect("acquire");
         assert_eq!(acq.granted.len(), 1, "A's acquire must grant: {acq:?}");
 
-        // B must still hard-block on the same exclusive path.
         let acq2 = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4057,7 +3872,6 @@ mod tests {
         );
         assert_eq!(acq2.conflicts.len(), 1, "{acq2:?}");
 
-        // The held view still lists A's lease.
         register(&mailbox, "demo", "MistyPalms").await;
         let report = mailbox
             .check_file_reservation_conflicts("demo", "MistyPalms", &["src/shared/*".into()])
@@ -4083,8 +3897,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("renew-mbh0").await;
         register(&mailbox, "demo", "BlueLake").await;
 
-        // Long-TTL lease: remaining (~7200s) >> extend (3600s) — the old
-        // ratchet returned renewed:0 exactly here.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4112,8 +3924,6 @@ mod tests {
             "already-healthy expiry stays put (converged), never double-extended"
         );
 
-        // Near-lapse lease on another path takes the republish path:
-        // ABSOLUTE extension (old + extend), expiry visibly moves forward.
         let short = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4156,10 +3966,6 @@ mod tests {
     #[tokio::test]
     async fn renew_extends_from_absolute_expiry_not_double_counting() {
         // Regression pin (parity bug bd-XXX): renewal must set the new expiry
-        // to the OLD absolute expiry PLUS the extension — treating
-        // `expires_ts_us` as a relative duration and re-adding to `now`
-        // double-counts elapsed time (2x expiry). Acquire TTL 3600, renew
-        // +7200: the renewed lease must expire at old+7200, NOT ~2x-old.
         let (mailbox, db_path, data_dir) = test_mailbox("renew-abs").await;
         register(&mailbox, "demo", "BlueLake").await;
 
@@ -4226,7 +4032,6 @@ mod tests {
             .expect("release");
         assert_eq!(release.released, 1);
 
-        // After release: no active reservation for that path.
         let res = mailbox.active_reservations("demo").await.expect("active");
         assert!(
             res.iter().all(|r| r.path_pattern != "src/**"),
@@ -4294,9 +4099,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("notify").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // A lease held by an agent with NO profile → is_holder_stale = true
-        // (unknown agent), so the full force_release path runs end-to-end:
-        // operator revocation + NIP-17 notify + Git audit transition.
         let holder = crate::keys::generate();
         let d = "demo:src/**";
         let holder_tags = with_project_scoping(
@@ -4323,7 +4125,6 @@ mod tests {
             .await
             .expect("force release stale holder");
 
-        // Projection resolves to the operator revocation (both events present).
         let events = collect_replay(
             mailbox.bus.as_ref(),
             kind_project_filter(toron_kind(FILE_RESERVATION), "demo"),
@@ -4339,7 +4140,6 @@ mod tests {
             "agent lease still present"
         );
 
-        // Git archive has the revoked transition record (acquired→revoked).
         let audit_dir = data_dir.join("demo").join(".audit");
         let files: Vec<_> = std::fs::read_dir(&audit_dir)
             .map(|rd| {
@@ -4353,7 +4153,6 @@ mod tests {
             "audit transition record present, got {files:?}"
         );
 
-        // Previous holder received a NIP-17 notify (a wrap addressed to them).
         let notify_filter = ToronFilter::new()
             .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(holder.public_key())
@@ -4375,7 +4174,6 @@ mod tests {
             "holder notified via NIP-17 reservation-revoked"
         );
 
-        // No cross-key NIP-09 anywhere.
         assert!(events.iter().all(|e| e.kind.as_u16() != 5));
 
         let _ = std::fs::remove_file(&db_path);
@@ -4384,7 +4182,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ttl_expiry_clears_active_lease() {
-        // Publish a lease with a past expiration → not active.
         let (mailbox, db_path, data_dir) = test_mailbox("ttl").await;
         let blue = register(&mailbox, "demo", "BlueLake").await;
 
@@ -4437,7 +4234,6 @@ mod tests {
         assert_eq!(intent.declared.len(), 1);
         let ev_id = intent.declared[0].id.clone();
 
-        // Bus event carries the status:intent tag.
         let events = collect_replay(
             mailbox.bus.as_ref(),
             kind_project_filter(toron_kind(FILE_RESERVATION), "demo"),
@@ -4454,14 +4250,12 @@ mod tests {
             "status tag classifies as intent"
         );
 
-        // Intent board shows it (in-TTL), agent named.
         let intents = mailbox.active_intents("demo").await.expect("intents");
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].agent_name, "BlueLake");
         assert_eq!(intents[0].path_pattern, "src/**");
         assert_eq!(intents[0].ttl_secs, INTENT_TTL_SECS);
 
-        // The intent is NOT a held reservation.
         let held = mailbox.active_reservations("demo").await.expect("held");
         assert!(held.is_empty(), "intent must not appear as held");
 
@@ -4475,13 +4269,11 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // BlueLake declares an intent on src/**.
         mailbox
             .declare_intent("demo", "BlueLake", &["src/**".into()], None, None)
             .await
             .expect("declare");
 
-        // RoseDune acquires src/lib.rs → SOFT conflict (frozen), NOT a hard block.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4509,7 +4301,6 @@ mod tests {
             "soft conflict carries the intent's reservation id"
         );
 
-        // No lease was published for RoseDune (freeze, not grant).
         let held = mailbox.active_reservations("demo").await.expect("held");
         assert!(
             held.iter().all(|r| r.agent_name != "RoseDune"),
@@ -4589,7 +4380,6 @@ mod tests {
         assert_eq!(held.granted.len(), 1);
         let held_id = held.granted[0].id.clone();
 
-        // Hard tier: RoseDune checks a path BlueLake holds.
         let report = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/lib.rs".into()])
             .await
@@ -4607,7 +4397,6 @@ mod tests {
         );
         assert!(report.soft_conflicts.is_empty(), "no soft tier involved");
 
-        // Soft tier: BlueLake checks a path RoseDune holds an intent on.
         mailbox
             .declare_intent("demo", "RoseDune", &["docs/**".into()], None, None)
             .await
@@ -4638,7 +4427,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("clear-acquire").await;
         register(&mailbox, "demo", "BlueLake").await;
 
-        // No leases, no intents → immediate grant.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4664,8 +4452,6 @@ mod tests {
         let blue = register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // Publish an intent DECLARED past the TTL (created_at old enough that
-        // declared + INTENT_TTL_SECS < now).
         let d = "demo:src/**";
         let now = Timestamp::now().as_secs() as i64;
         let tags = with_project_scoping(
@@ -4692,11 +4478,9 @@ mod tests {
         mailbox.bus.publish(old_intent).await.expect("publish");
         let _ = blue;
 
-        // Expired intent is not on the board...
         let intents = mailbox.active_intents("demo").await.expect("intents");
         assert!(intents.is_empty(), "expired intent must auto-expire");
 
-        // ...and no longer soft-conflicts: RoseDune's acquire succeeds.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -4717,8 +4501,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_own_acquire_converts_intent_to_held() {
-        // Must-convert (Spec 2): the declarer's own acquire at the same
-        // coordinate supersedes the intent (NIP-33) and holds.
         let (mailbox, db_path, data_dir) = test_mailbox("must-convert").await;
         register(&mailbox, "demo", "BlueLake").await;
 
@@ -4762,7 +4544,6 @@ mod tests {
         register(&mailbox, "demo", "RoseDune").await;
         register(&mailbox, "demo", "GaleSummit").await;
 
-        // RoseDune holds held/**, BlueLake intents intent/**.
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -4831,7 +4612,6 @@ mod tests {
             .expect("hold");
         let lease_id = held.granted[0].id.clone();
 
-        // Validation: self-request is a no-op.
         let err = mailbox
             .request_release(&RequestRelease {
                 project_slug: "demo".into(),
@@ -4845,7 +4625,6 @@ mod tests {
             .expect_err("self-request");
         assert!(err.to_string().contains("self"), "{err}");
 
-        // Validation: unknown reservation id.
         let err = mailbox
             .request_release(&RequestRelease {
                 project_slug: "demo".into(),
@@ -4862,8 +4641,6 @@ mod tests {
             "{err}"
         );
 
-        // Validation: GaleSummit (not the holder) asks for BlueLake's lease
-        // targeting RoseDune — holder mismatch.
         let err = mailbox
             .request_release(&RequestRelease {
                 project_slug: "demo".into(),
@@ -4877,7 +4654,6 @@ mod tests {
             .expect_err("wrong holder");
         assert!(err.to_string().contains("held by BlueLake"), "{err}");
 
-        // Happy path: RoseDune asks BlueLake to defer src/** by 600s.
         let req = mailbox
             .request_release(&RequestRelease {
                 project_slug: "demo".into(),
@@ -4894,7 +4670,6 @@ mod tests {
         assert_eq!(req.path_pattern, "src/**");
         assert!(!req.message_id.is_empty());
 
-        // The typed rumor is readable by the holder (toron-kind + refs).
         let rumors = mailbox.project_rumors("demo").await;
         let rumor = rumors
             .iter()
@@ -4938,7 +4713,6 @@ mod tests {
             .expect("hold");
         let lease_id = held.granted[0].id.clone();
 
-        // Fresh request → Pending (window not elapsed).
         let req = mailbox
             .request_release(&RequestRelease {
                 project_slug: "demo".into(),
@@ -4958,7 +4732,6 @@ mod tests {
             "fresh request pending, got {status:?}"
         );
 
-        // Backdated request (declared past the tier window) → EscalationDue.
         let old_ts = Timestamp::from(
             (Timestamp::now().as_secs() as i64 - REQUEST_RELEASE_TIER_WINDOW_SECS as i64 - 60)
                 as u64,
@@ -4996,7 +4769,6 @@ mod tests {
             "unanswered past window escalates, got {status:?}"
         );
 
-        // Escalate → kind-14 DM to the captain (operator key).
         mailbox
             .escalate_request_release("demo", "RoseDune", &backdated_id, Some("need it now"))
             .await
@@ -5073,8 +4845,6 @@ mod tests {
             .await
             .expect("request");
 
-        // A wake candidate = UNREAD + urgent (flywheel wake_urgent drops
-        // read rows, bd-dbre) — so the query mirrors the loop's poll.
         let wake_rows = crate::mailbox::messaging::FetchInbox {
             project_slug: "demo".into(),
             agent_name: "BlueLake".into(),
@@ -5152,7 +4922,6 @@ mod tests {
             .await
             .expect("request");
 
-        // A third party cannot respond (cannot read the request).
         register(&mailbox, "demo", "GaleSummit").await;
         let err = mailbox
             .respond_request_release(&ReleaseResponse {
@@ -5169,7 +4938,6 @@ mod tests {
             "{err}"
         );
 
-        // The holder responds: Agreed → status resolves.
         let send = mailbox
             .respond_request_release(&ReleaseResponse {
                 project_slug: "demo".into(),
@@ -5192,10 +4960,6 @@ mod tests {
             "response resolves the negotiation"
         );
 
-        // A deferred decision round-trips through the wire encoding too.
-        // "LATEST decision wins" resolves on second-granularity rumor time;
-        // two responses in the same second are order-dependent. Sleep across
-        // a boundary so the Deferred response is deterministically later.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let send2 = mailbox
             .respond_request_release(&ReleaseResponse {
@@ -5225,7 +4989,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_escalation_requires_operator_key() {
-        // No operator key → escalation (captain DM) must fail loudly.
         let db_path =
             std::env::temp_dir().join(format!("toron-res-noop-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db_path.to_str().unwrap())
@@ -5285,7 +5048,6 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        // A lease from BlueLake.
         let acq = mailbox
             .file_reservation_paths(
                 "demo",
@@ -5299,29 +5061,20 @@ mod tests {
             .expect("acquire");
         let lease_id = acq.granted[0].id.clone();
 
-        // Fresh holder → not stale → force-release denied.
         let err = mailbox
             .force_release_file_reservation("demo", "RoseDune", "src/**", None, Some("gone"), true)
             .await
             .expect_err("not stale");
         assert!(err.to_string().contains("not stale"), "{err}");
 
-        // Simulate staleness by publishing an OLD profile for the holder,
-        // then force-release must succeed via operator revocation.
-        // (Write an old kind-30013 for BlueLake.)
         let blue_profile = crate::nostr::identity::create_agent_identity(
             "demo",
             &profile("BlueLake"),
             Timestamp::from(1_500_000_000),
         )
         .expect("old profile");
-        // Publishing a different-author profile won't help staleness (the
-        // mailbox's own register already created a fresh one). Force the check
-        // by issuing the revocation directly through the operator path below.
         let _ = blue_profile;
 
-        // Operator revocation: publish a kind-30031 status:revoked at the same
-        // coordinate. This is what force_release does after the heuristic.
         let operator = mailbox.operator().unwrap();
         let d = "demo:src/**";
         let lease_ev = EventId::from_hex(&lease_id).expect("lease id");
@@ -5349,8 +5102,6 @@ mod tests {
             .await
             .expect("publish revoke");
 
-        // Projection: with BOTH agent lease + operator revoke present, the
-        // resolved view is the operator revocation (key-priority operator>agent).
         let events = collect_replay(
             mailbox.bus.as_ref(),
             kind_project_filter(toron_kind(FILE_RESERVATION), "demo"),
@@ -5360,15 +5111,12 @@ mod tests {
         let resolved =
             resolve_coordinate(events.iter(), Some(&operator.public_key())).expect("resolved");
         assert!(is_revocation(&resolved), "projection shows revoked");
-        // Both events present (agent lease + operator revoke).
         let revokes = events.iter().filter(|e| is_revocation(e)).count();
         assert!(revokes >= 1, "operator revoke event present");
-        // No NIP-09 (kind-5) events anywhere.
         assert!(
             events.iter().all(|e| e.kind.as_u16() != 5),
             "no cross-key NIP-09 deletes"
         );
-        // Active view excludes the lease.
         let active = mailbox.active_reservations("demo").await.expect("active");
         assert!(active.is_empty(), "revoked lease not active");
 
@@ -5417,7 +5165,6 @@ mod tests {
         assert_eq!(active.len(), 1, "only the bd-YY lease stays");
         assert_eq!(active[0].path_pattern, "src/y.rs");
 
-        // The released path is conflict-free immediately (no TTL wait).
         let rep = mailbox
             .check_file_reservation_conflicts("demo", "BlueLake", &["src/x.rs".into()])
             .await
@@ -5570,7 +5317,6 @@ mod tests {
         let rose = register(&mailbox, "demo", "RoseDune").await;
         register(&mailbox, "demo", "BlueLake").await;
 
-        // BlueLake acquires src/x.rs under reason bd-X.
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -5592,7 +5338,6 @@ mod tests {
             "lease active before release"
         );
 
-        // Operator release-by-reason revokes it (bead-closed).
         let r = mailbox
             .release_by_reason("demo", "operator", "bd-X", false)
             .await
@@ -5607,7 +5352,6 @@ mod tests {
             "revoked lease not active"
         );
 
-        // RoseDune re-acquires the same path immediately (release unlocked it).
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -5756,8 +5500,6 @@ mod tests {
         );
     }
 
-    // --- bd-adr-0028-implementation-zfnx.11: claim fencing epochs ---
-
     /// Publish a raw legacy (epoch-less) lease for keys with NO profile on
     /// the bus — the stale-pane false negative: the holder is alive, the bus
     /// considers it stale, so `force_release` runs end-to-end.
@@ -5844,7 +5586,6 @@ mod tests {
             "reclaim bumps the epoch past the revoked marker: {reclaim:?}"
         );
 
-        // A's epoch-0 belief is stale: the ONE loud loser.
         let err = mailbox
             .check_claim_epoch("demo", "epoch-fence.txt", 0)
             .await
@@ -5854,14 +5595,12 @@ mod tests {
             "loud stale-pointer, got: {err:?}"
         );
 
-        // B presents the current epoch: the single winner.
         let current = mailbox
             .check_claim_epoch("demo", "epoch-fence.txt", 1)
             .await
             .expect("winner reads current");
         assert_eq!(current.agent_name, "RoseDune");
 
-        // Zero double-own: exactly one live lease at the coordinate.
         let live: Vec<_> = mailbox
             .active_reservations("demo")
             .await
@@ -5907,7 +5646,6 @@ mod tests {
             .await
             .expect("transfer reclaims");
 
-        // A's epoch-0 belief is stale: the ONE loud loser.
         let err = mailbox
             .check_claim_epoch("demo", "epoch-fence.txt", 0)
             .await
@@ -5917,14 +5655,12 @@ mod tests {
             "loud stale-pointer, got: {err:?}"
         );
 
-        // B presents the current epoch: the single winner.
         let current = mailbox
             .check_claim_epoch("demo", "epoch-fence.txt", 1)
             .await
             .expect("winner reads current");
         assert_eq!(current.agent_name, "TealDune");
 
-        // Zero double-own.
         let live: Vec<_> = mailbox
             .active_reservations("demo")
             .await

@@ -38,21 +38,12 @@ fn toron_bin() -> PathBuf {
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
-    // bd-nepl: pin discovery to an absent sock for every child (the
-    // socket-phase proof lives in `spawn_watch`, which points at the
-    // test-held WakeServer). Unpinned, the replay-phase watch below would
-    // attach to the machine daemon's `$state/wake.sock` and never read this
-    // test dir's stored post — foreign-socket starvation, not the ADR path.
     let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&absent);
     toron_core::testkit::toron_command(toron_bin())
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .env("TORON_WAKE_SOCK", &absent)
         .output()
@@ -94,7 +85,6 @@ fn spawn_watch(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn watch");
-    // Reader thread: capture the child's output (both streams) once it exits.
     let mut stderr = child.stderr.take().expect("watch stderr");
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
@@ -126,19 +116,10 @@ async fn setup(data_dir: &Path, project: &str, names: &[&str]) -> Mailbox {
 
 #[tokio::test]
 async fn sc32_watch_once_sees_cross_process_post() {
-    // bd-hs8y daemon-backed harness: the test process holds a WakeServer
-    // (the daemon sidecar) on the shared bus; the watch child connects to
-    // it via TORON_WAKE_SOCK (socket-first, wave 4) instead of its own
-    // blind embedded subscription. The post goes through the harness bus,
-    // so post-after-start resolves instead of clean-timing-out.
     use toron_core::bus::wake::{SystemClock, WakeConfig, WakeServer};
 
     let dir = std::env::temp_dir().join(format!("toron-sc32-{}", uuid::Uuid::new_v4()));
     let mailbox = setup(&dir, PROJECT, &[A, B]).await;
-    // Short socket path: UDS paths must fit SUN_LEN, but the data dir
-    // carries a UUID. The socket lives beside temp, keyed by pid (this
-    // target runs serially; stale files are taken over, never blindly
-    // deleted while live).
     let sock = std::env::temp_dir().join(format!("toron-sc32-{}.sock", std::process::id()));
     let _daemon = WakeServer::new(
         WakeConfig::new(&sock),
@@ -149,7 +130,6 @@ async fn sc32_watch_once_sees_cross_process_post() {
     .await
     .expect("daemon wake.sock");
 
-    // A creates the channel + joins B first (watch filters kinds 9 + channel).
     let out = run(
         &dir,
         &[
@@ -181,14 +161,9 @@ async fn sc32_watch_once_sees_cross_process_post() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Process 1: watch --once (listening on the daemon socket).
     let (mut child, stderr_reader) = spawn_watch(&dir, "15000", &sock);
-    // Give the watch time to subscribe before process 2 posts.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Process 2: the post, through the daemon-held bus (this is the
-    // daemon-backed half of the harness — an embedded CLI post would
-    // stay invisible to the other process's in-process subscription).
     let keys = toron_core::keys::generate();
     let ev = toron_core::nostr::event::build_event(
         &keys,
@@ -203,7 +178,6 @@ async fn sc32_watch_once_sees_cross_process_post() {
     .expect("sign kind-9");
     mailbox.bus().publish(ev).await.expect("daemon publish");
 
-    // Process 1 exits 0 with the kind-9 event JSON.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
@@ -219,25 +193,11 @@ async fn sc32_watch_once_sees_cross_process_post() {
         status.success(),
         "watch --once must exit 0, stderr: {stderr}"
     );
-    // bd-73s8: a PRESENT socket must be named, not just an absent one.
-    // Discovery never consults TORON_MCP_DATA_DIR (ADR-0036 Spec 2), so
-    // attaching to a foreign daemon is possible by design; unsaid, it is
-    // indistinguishable from the in-process fallback and surfaces only as a
-    // full-budget `watch: timeout` (measured: 15.0s vs 39ms, same store, same
-    // argv, only TORON_WAKE_SOCK differing).
     assert!(
         stderr.contains(&format!("wake.sock attached at {}", sock.display())),
         "the attach must name the socket it dialed, got stderr: {stderr}"
     );
-    // Read the captured stdout via a second run-free check: the child's
-    // stdout was piped; try_wait may have consumed it. The event JSON was
-    // printed on stdout of the child — collect it before the child dropped.
-    // (The child owns stdout; we read it here through the join handle
-    // produced by spawn_watch — see below.)
 
-    // Re-run watch --once with a fresh subprocess on the SAME store: the
-    // stored kind-9 post must be replayed and matched, proving the event is
-    // kind 9 on the bus (the ADR's watch --once output shape).
     let out = run(
         &dir,
         &[
@@ -281,7 +241,6 @@ async fn sc32_watch_once_timeout_exits_1() {
     let dir = std::env::temp_dir().join(format!("toron-sc32b-{}", uuid::Uuid::new_v4()));
     let _ = setup(&dir, PROJECT, &[A, B]).await;
 
-    // No post at all → watch --once times out: exit 1, stderr "watch: timeout".
     let out = run(
         &dir,
         &[

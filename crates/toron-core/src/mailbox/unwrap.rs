@@ -281,7 +281,6 @@ impl ProjectionSink for TriggerNotifySink {
     async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool> {
         let written = self.inner.write(mail, local_seq).await?;
         if written {
-            // Best-effort notify; a dropped receiver must not fail projection.
             let _ = self.tx.send(mail.clone());
         }
         Ok(written)
@@ -630,10 +629,6 @@ impl ProjectionSink for ProjectGitProjectionSink {
         }
         let slug = self.slug_for(&mail.recipient.to_hex());
         if slug.is_empty() {
-            // Unregistered recipient — no project archive to write to. The
-            // SQLite leg (composite sink) still indexes it; the archive gap
-            // is healed by `doctor reconstruct` (G11 path 1 needs a project
-            // root, and an unregistered recipient has none by definition).
             return Ok(false);
         }
         let archive = self.archive_for(&slug)?;
@@ -647,14 +642,6 @@ impl ProjectionSink for ProjectGitProjectionSink {
         guard.stage_file(&GitProjectionSink::marker_rel(&id), b"projected")?;
         drop(guard);
 
-        // bd-git-batch-commit-27l0: micro-batching — stage per event, commit
-        // once per flush window. The window closes on the count boundary
-        // (synchronous + fail-fast: a git error propagates exactly like the
-        // per-message commit it replaces) or on the debounce quiet timer
-        // (async tail flush). The rumor id joins `projected` only when the
-        // batch commit lands; a crash or failed commit mid-window loses
-        // nothing — the worktree files are already on disk and re-delivery
-        // re-stages idempotently.
         let mut staged = self.batch.staged_ids.lock();
         let window = staged.entry(slug.clone()).or_default();
         if !window.contains(&id) {
@@ -701,16 +688,10 @@ impl DualProjectionSink {
 #[async_trait::async_trait]
 impl ProjectionSink for DualProjectionSink {
     async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
-        // AND: "projected" means BOTH stores have it. A mail that is in the
-        // archive but missing from the index (sqlite write failed earlier) is
-        // NOT yet projected — a re-delivery re-runs the sqlite leg (git write
-        // is idempotent) and heals the lag.
         Ok(self.git.is_projected(key).await? && self.sqlite.is_projected(key).await?)
     }
 
     async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool> {
-        // Canonical store first: a git failure must NOT leave a "projected"
-        // claim in SQLite while the archive (rebuild source) misses the mail.
         let git_written = self.git.write(mail, local_seq).await?;
         match self.sqlite.write(mail, local_seq).await {
             Ok(w) => Ok(git_written || w),
@@ -855,11 +836,6 @@ impl ProjectionSink for SqliteProjectionSink {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(String::as_str) == Some("ack-required"));
-        // Prefer the literal `thread` tag (free-form AM-style ids); fall
-        // back to the NIP-10 `e` root tag (event-id threads); a HEAD message
-        // (no thread refs) is its own thread — self-thread with its rumor id
-        // so `summarize_thread(head_id)` finds it (AM parity: every message
-        // belongs to a thread, the head IS its own).
         let thread_id = Some(
             tag_text(&mail.rumor, "thread")
                 .or_else(|| tag_text(&mail.rumor, "e"))
@@ -867,23 +843,13 @@ impl ProjectionSink for SqliteProjectionSink {
                 .unwrap_or_else(|| id.clone()),
         );
 
-        // The wrap hides the project (metadata hiding) — resolve it via the
-        // recipient key from the agents-table map built at pipeline time.
         let project_slug = self.project_for(mail);
-        // AM-parity sender naming: resolve the sender pubkey → display name
-        // (hex fallback for unregistered/external senders). `sender_pubkey`
-        // stays the raw hex so sender-filtered search keeps working.
         let sender_pubkey = mail.sender.to_hex();
         let sender_name = self
             .names
             .get(&sender_pubkey)
             .cloned()
             .unwrap_or_else(|| sender_pubkey.clone());
-        // Addressing is read through the canonical projection helper — the
-        // same one `extract_mail` uses. Binding these columns is not cosmetic:
-        // `check_ack_sla_expired` reads `to_list` to find the audience, and an
-        // empty audience means "cannot prove handled", so a missing bind turns
-        // every overdue row into a perpetual wake emitter.
         let (to_list, cc_list) = crate::index::projection::addressing_lists(&mail.rumor.tags);
         let to_list = serde_json::to_string(&to_list)?;
         let cc_list = serde_json::to_string(&cc_list)?;
@@ -1033,9 +999,6 @@ impl UnwrapPipeline {
         if wrap.kind != crate::nostr::Kind::GiftWrap {
             return None;
         }
-        // bd-unwrap-ptag-lazy: the wrap's `p` tag names the recipient npub.
-        // Resolve + decrypt exactly that key — the production path never
-        // scans the keyring.
         if let Some(resolver) = &self.resolver
             && let Some(npub) =
                 tag_value(&wrap.tags, "p").and_then(|v| crate::nostr::PublicKey::parse(v).ok())
@@ -1078,14 +1041,6 @@ impl UnwrapPipeline {
     }
 
     async fn project_inner(&self, wrap: &Event, verify: bool) -> ProjectOutcome {
-        // P3 (bd-p3-schnorr-verify-every-ingest-q0wo): verify the ENVELOPE's
-        // id+signature BEFORE unwrap/projection. The bus verifies on publish,
-        // but direct callers (and partial relay replays) can hand the
-        // pipeline a wrap whose content decrypts while its sig is invalid —
-        // projecting it would archive a non-canonical event. Skipped by
-        // `project_verified` (bd-verify-once-ph7t): the caller already
-        // crossed a verified boundary; the loop path is grep-gated by the
-        // exact-once test.
         if verify && crate::nostr::event::verify_event(wrap).is_err() {
             return ProjectOutcome::NotForUs;
         }
@@ -1094,24 +1049,14 @@ impl UnwrapPipeline {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Idempotency guard 1: the wrap event id itself.
         if !self.seen_wraps.lock().insert(wrap.id.to_hex()) {
             return ProjectOutcome::Duplicate;
         }
 
-        // NIP-40 (ADR-0003 rev6): an expired gift wrap is rejected BEFORE any
-        // unwrap cost or write — never projected to SQLite/Git. The bus
-        // replay filter is not enough: live-published expired wraps bypass it
-        // (probe bd-p0-nip40-ingest-probe-oyaa verdict RED, F2.NIP40).
         if wrap.is_expired() {
             return ProjectOutcome::Expired;
         }
 
-        // F19.NIP09 (batch-fix): NIP-09 kind-5 deletion — the AUTHOR signs a
-        // deletion referencing the target message by `e`-tag. Tombstone the
-        // target row on the index (author-gated: the signer must be the
-        // message's sender_pubkey — enforced inside the sink's tombstone).
-        // Verified canonical above (id+sig).
         if wrap.kind == crate::nostr::Kind::EventDeletion {
             let Some(target) = wrap
                 .tags
@@ -1145,16 +1090,11 @@ impl UnwrapPipeline {
             created_at: gift.rumor.created_at,
         };
 
-        // Idempotency guard 2: (recipient-npub, rumor-id).
         let key = DedupKey::of(&mail.recipient, &mail.rumor_id);
         if self.sink.is_projected(&key).await.unwrap_or(true) {
             return ProjectOutcome::Duplicate;
         }
 
-        // G14: policy gate BEFORE any write. block_all / non-approved
-        // contacts_only mail is dropped pre-index, never reaches Git.
-        // ADR-0004 Ship 5 carve-out: an operator-signed Overseer override
-        // (toron:overseer tag + high/urgent importance) SKIPS the gate.
         let policy = self.policy.policy_for(&mail.recipient);
         let bypass = is_overseer_bypass(&mail, self.operator.as_ref());
         if !bypass
@@ -1166,13 +1106,10 @@ impl UnwrapPipeline {
             return ProjectOutcome::Dropped(policy);
         }
 
-        // G8: ack/read receipts are cached (private NIP-17), not projected as
-        // mail rows — but they ARE recorded for idempotent acknowledgement.
         if is_ack_rumor(&mail.rumor) {
             self.acks.record(&mail.sender, &mail.rumor_id.to_hex());
         }
 
-        // G7: local_seq assigned here (arrival order); the sink persists it.
         let local_seq = self.seen_wraps.lock().len() as u64;
         let written = self.sink.write(&mail, local_seq).await.unwrap_or(false);
         if written {
@@ -1263,7 +1200,6 @@ mod tests {
         let cc = keys();
         let recipient = keys();
 
-        // Same shape `build_visible_rumor` emits: ["p", npub, "", role].
         let rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000),
@@ -1373,7 +1309,6 @@ mod tests {
             ContactPolicy::parse("block_all").expect("block_all"),
             ContactPolicy::BlockAll
         );
-        // Unknown input fails loud, never a silent default (ADR-0035 Spec 6).
         assert!(
             matches!(ContactPolicy::parse("BOGUS"), Err(PolicyError::Unknown(_))),
             "BOGUS policy rejected loudly"
@@ -1388,8 +1323,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_order_by_rumor_time_ignores_envelope() {
-        // Envelope times are randomized by NIP-17 — inverted relative to the
-        // rumor timeline. Sorting MUST follow rumor created_at.
         let sender = keys();
         let recipient = keys();
         let older = wrap_for(&sender, &recipient, 1_700_000_000);
@@ -1399,9 +1332,6 @@ mod tests {
             gift_wrap::unwrap(&recipient, wrap).expect("unwrap").rumor
         };
 
-        // Inputs are deliberately out of rumor order: [later rumor, earlier
-        // rumor]. The envelope created_at is already randomized by NIP-17, so
-        // this is the worst case a projection must survive.
         let mails = vec![
             UnwrappedMail {
                 recipient: recipient.public_key(),
@@ -1509,7 +1439,6 @@ mod tests {
         );
         assert!(!is_ack_rumor(&plain));
 
-        // Missing e tag → not an ack.
         let no_e = build_rumor(
             sender.public_key(),
             Timestamp::now(),
@@ -1563,7 +1492,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_all_drops_before_git_write() {
-        // G14: block_all mail must be dropped BEFORE any Git/archive write.
         let sender = keys();
         let recipient = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
@@ -1576,7 +1504,6 @@ mod tests {
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(outcome, ProjectOutcome::Dropped(ContactPolicy::BlockAll));
 
-        // No message file, no marker, no commit: nothing written.
         let archive = sink.archive.lock();
         assert_eq!(
             archive.commit_count().expect("count"),
@@ -1615,8 +1542,6 @@ mod tests {
 
     #[tokio::test]
     async fn overseer_bypasses_block_all() {
-        // ADR-0004 Ship 5 acceptance: operator-signed overseer msg to a
-        // block_all agent → DELIVERED (not dropped at projection).
         let operator = keys();
         let recipient = keys();
         let wrap = wrap_overseer_for(&operator, &recipient, 1_700_000_000).await;
@@ -1645,8 +1570,6 @@ mod tests {
 
     #[tokio::test]
     async fn non_overseer_blocked() {
-        // ADR-0004 Ship 5 acceptance: an AGENT (non-operator key) sending to a
-        // block_all agent → still dropped. No bypass for non-operator keys.
         let agent = keys();
         let recipient = keys();
         let wrap = wrap_overseer_for(&agent, &recipient, 1_700_000_000).await;
@@ -1654,7 +1577,6 @@ mod tests {
         let root = temp_archive("non-overseer");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
         let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
-        // The operator is a DIFFERENT key than the sender.
         let operator = keys();
         let pipeline = UnwrapPipeline::new(vec![recipient], policy, sink.clone())
             .with_operator(operator.public_key());
@@ -1673,12 +1595,8 @@ mod tests {
 
     #[tokio::test]
     async fn overseer_requires_tag() {
-        // ADR-0004 Ship 5 acceptance: operator-signed msg WITHOUT the
-        // toron:overseer tag → normal policy applies, no bypass. The operator
-        // key alone is not a blanket bypass.
         let operator = keys();
         let recipient = keys();
-        // Same sender, same importance, but NO overseer tag (plain wrap).
         let wrap = wrap_for(&operator, &recipient, 1_700_000_000);
 
         let root = temp_archive("overseer-no-tag");
@@ -1701,7 +1619,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_all_contacts_only_gates() {
-        // contacts_only without an approved contact link → dropped pre-write.
         let sender = keys();
         let recipient = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
@@ -1724,8 +1641,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_delivered_twice_is_single_write() {
-        // Idempotency (beads-review): the same wrap arriving twice (bus
-        // redelivery / federation replay) MUST produce one Git commit.
         let sender = keys();
         let recipient = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
@@ -1841,8 +1756,6 @@ mod tests {
         let sender = keys();
         let recipient = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
-        // Corrupt ONLY the wrap's signature (content untouched → decrypt
-        // still succeeds today).
         let forged = crate::nostr::Event::new(
             wrap.id,
             wrap.pubkey,
@@ -1923,11 +1836,6 @@ mod tests {
 
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
 
-        // Ingress: bus publish verifies once (the trust boundary). The gauge
-        // is process-global, so under parallel tests other publishes can
-        // interleave in this window — the per-event exactly-once guarantee
-        // is pinned by the per-instance assertions below (and the ingress
-        // code path is bd-p3's own test surface).
         let before = VERIFY_EVENT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         bus.publish(wrap.clone()).await.expect("publish");
         let after_publish = VERIFY_EVENT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -1936,10 +1844,6 @@ mod tests {
             "bus publish ingress verifies (>=1; global gauge may see other tests)"
         );
 
-        // Loop path: snapshot replay → project_verified → no re-verify.
-        // run() is a live drain: after the replay burst it waits for future
-        // events, so the timeout is EXPECTED — the projection completed
-        // before the wait, and the counter proves no re-verify happened.
         let sub = bus
             .subscribe(Filter::new().kinds([crate::nostr::Kind::GiftWrap]))
             .await
@@ -1959,7 +1863,6 @@ mod tests {
             "loop path must NOT re-verify (verify-once; the grep-level gate)"
         );
 
-        // Direct-caller contract unchanged: project() still verifies.
         let wrap2 = wrap_for(&sender, &recipient, 1_700_000_100);
         let out = pipeline.project(&wrap2).await;
         assert_eq!(out, ProjectOutcome::Projected, "direct project lands");
@@ -1978,7 +1881,6 @@ mod tests {
 
     #[test]
     fn test_civil_date_layout() {
-        // 2026-01-01T00:00:00Z -> (2026, 1); a mid-year date -> (2026, 8).
         assert_eq!(civil_from_secs(1_767_225_600), (2026, 1));
         assert_eq!(civil_from_secs(1_700_000_000), (2023, 11));
     }
@@ -2022,16 +1924,12 @@ mod tests {
         );
         assert_eq!(pipeline.project(&wrap).await, ProjectOutcome::Projected);
 
-        // NIP-09: the AUTHOR signs a kind-5 deletion referencing the message.
         let delete = crate::nostr::EventBuilder::new(crate::nostr::Kind::EventDeletion, "")
             .tags([crate::nostr::Tag::event(rumor_id)])
             .finalize(&sender)
             .expect("sign kind-5");
         pipeline.project(&delete).await;
 
-        // Contract: the message must be tombstoned (deleted flag), NOT
-        // readable. Pre-fix: the `deleted` column does not exist -> the query
-        // errors -> RED.
         let deleted: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE event_id = ?1 AND deleted = 1")
                 .bind(rumor_id.to_hex())
@@ -2074,7 +1972,6 @@ mod tests {
             wraps.push(wrap);
         }
 
-        // Same wraps → git sink pipeline.
         let git_root = temp_archive("proj-diff-git");
         let git_sink = Arc::new(GitProjectionSink::open(&git_root).expect("git sink"));
         let git_pipeline = UnwrapPipeline::new(
@@ -2082,7 +1979,6 @@ mod tests {
             Arc::new(AutoPolicy),
             git_sink.clone(),
         );
-        // Same wraps → sqlite sink pipeline.
         let sqlite_sink = SqliteProjectionSink::new(pool.clone());
         let sqlite_pipeline = UnwrapPipeline::new(
             vec![recipient.clone()],
@@ -2102,7 +1998,6 @@ mod tests {
             );
         }
 
-        // Projection 1 — bus: replay envelopes, unwrap, order by rumor time.
         let replayed = crate::mailbox::collect_replay(
             bus.as_ref(),
             Filter::new().kinds([crate::nostr::Kind::GiftWrap]),
@@ -2120,7 +2015,6 @@ mod tests {
             .collect();
         bus_rumors.sort_by_key(|(_, ts)| *ts);
 
-        // Projection 2 — git: walk messages/{YYYY}/{MM}/*.json.
         let mut git_rumors: Vec<(String, u64)> = Vec::new();
         let messages = git_root.join("messages");
         let mut stack = vec![messages.clone()];
@@ -2143,7 +2037,6 @@ mod tests {
         }
         git_rumors.sort_by_key(|(_, ts)| *ts);
 
-        // Projection 3 — sqlite: event_id + created_ts_us in G7 order.
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT event_id, created_ts_us FROM messages ORDER BY created_ts_us, local_seq",
         )
@@ -2202,8 +2095,6 @@ mod tests {
             .with_agent_passphrase("fts-coverage-pass");
         mailbox.spawn_unwrap_loop();
 
-        // Path 1 — live projection: a real send through the bus + unwrap
-        // loop lands in messages and the FTS index.
         mailbox
             .register_agent(
                 "demo",
@@ -2242,8 +2133,6 @@ mod tests {
             .await
             .expect("send live");
 
-        // Path 2 — recovery/replay: insert_record (shared by Git rebuild +
-        // bus replay) with its own unique token.
         let writer = IndexWriter::new(pool.clone(), pool.clone());
         insert_record(
             &writer,
@@ -2267,7 +2156,6 @@ mod tests {
         .await
         .expect("insert_record");
 
-        // Both tokens must be findable through the real search surface.
         for token in ["fts-coverage-token-live", "fts-coverage-token-replay"] {
             let mut found = false;
             for _ in 0..200 {
@@ -2330,7 +2218,6 @@ mod tests {
             .expect("count");
         assert_eq!(n, 1, "double write -> one row");
 
-        // is_projected agrees (fresh lookups hit the in-mem set).
         let key = DedupKey::of(&recipient.public_key(), &wrap.id);
         assert!(sink.is_projected(&key).await.expect("is_projected"));
         let _ = std::fs::remove_file(&path);
@@ -2360,7 +2247,6 @@ mod tests {
         assert!(sink_a.write(&mail, 1).await.expect("write"), "first lands");
         assert_eq!(sink_a.projected_count(), 1);
 
-        // "Restart": a brand-new sink instance over the same archive root.
         drop(sink_a);
         let sink_b = GitProjectionSink::open(&root).expect("reopen");
         assert_eq!(sink_b.projected_count(), 0, "fresh in-mem set");
@@ -2405,7 +2291,6 @@ mod tests {
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(outcome, ProjectOutcome::Projected, "mail projected");
 
-        // Archive root is per-project: {data_dir}/demo/messages/{YYYY}/{MM}/*.json
         let messages_root = data_dir.join(slug).join("messages");
         let json_files = walk_json(&messages_root);
         assert_eq!(
@@ -2415,7 +2300,6 @@ mod tests {
             messages_root.display()
         );
 
-        // Dedup: same mail → Duplicate (marker on disk under the project root).
         let outcome2 = pipeline.project(&wrap).await;
         assert_eq!(
             outcome2,
@@ -2484,8 +2368,6 @@ mod tests {
         let projects: HashMap<String, String> =
             HashMap::from([(recipient.public_key().to_hex(), slug.to_string())]);
 
-        // Arm A — per-message projection (window=1: one synchronous commit
-        // per write, the pre-batch behavior).
         let dir_a = std::env::temp_dir().join(format!("toron-batch-a-{}", uuid::Uuid::new_v4()));
         let sink_a = ProjectGitProjectionSink::for_mailbox_with_window(
             dir_a.clone(),
@@ -2499,9 +2381,6 @@ mod tests {
             Arc::new(sink_a),
         );
 
-        // Arm B — batched projection (window=3, 200ms quiet flush; the burst
-        // of N projections completes far inside the quiet window, so the
-        // count boundary closes once and the debounce closes the tail).
         let dir_b = std::env::temp_dir().join(format!("toron-batch-b-{}", uuid::Uuid::new_v4()));
         let sink_b = ProjectGitProjectionSink::for_mailbox_with_window(
             dir_b.clone(),
@@ -2536,10 +2415,8 @@ mod tests {
             );
         }
 
-        // Let the batched arm's debounce tail flush (200ms quiet + margin).
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-        // Acceptance 1a — identical working-tree file set (paths + bytes).
         let files_a = walk_files(&dir_a.join(slug));
         let files_b = walk_files(&dir_b.join(slug));
         assert_eq!(
@@ -2547,8 +2424,6 @@ mod tests {
             "per-message and batched projections must produce identical file trees"
         );
 
-        // Acceptance 1b — commit bound: per-message == N commits; batched
-        // commits <= ceil(N / window).
         let commits_a = archive_commits(&dir_a.join(slug));
         let commits_b = archive_commits(&dir_b.join(slug));
         assert_eq!(
@@ -2587,7 +2462,6 @@ mod tests {
         };
         let key = DedupKey::of(&recipient.public_key(), &mail.rumor_id);
 
-        // ---- case 1: git leg fails -> write Err, nothing projected ----
         let _failing_git = FailSink::new();
         let db = std::env::temp_dir().join(format!("dual-sink-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
@@ -2597,7 +2471,6 @@ mod tests {
         let res = dual.write(&mail, 1).await;
         assert!(res.is_err(), "git failure must fail the whole write");
 
-        // ---- case 2: sqlite leg fails after git ok -> Ok(true), healable ----
         let git_root = temp_archive("dual-git-ok");
         let git_ok: Arc<dyn ProjectionSink> =
             Arc::new(GitProjectionSink::open(&git_root).expect("git sink"));
@@ -2608,13 +2481,10 @@ mod tests {
             written,
             "archive write counts as projected despite index failure"
         );
-        // is_projected = AND: git has it, sqlite (failing) reports not-projected
-        // -> composite reports NOT projected, so a re-delivery heals.
         assert!(
             !dual2.is_projected(&key).await.expect("is_projected"),
             "partial (git-only) projection must read as not-yet-projected"
         );
-        // Heal: swap in the real sqlite sink; re-write; now fully projected.
         let dual3 = DualProjectionSink::new(git_ok.clone(), sqlite.clone());
         let healed = dual3.write(&mail, 1).await.expect("heal write");
         assert!(

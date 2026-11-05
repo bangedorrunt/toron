@@ -53,7 +53,6 @@ pub struct BlobDescriptor {
 /// Extract the sha256 from a Blossom (or any) URL: the **last** 64-char hex
 /// string (BUD-03 client rule). Returns `None` when no 64-hex segment exists.
 pub fn extract_sha256(url: &str) -> Option<String> {
-    // Scan the URL for 64-hex substrings; keep the last occurrence.
     let hex = "0123456789abcdef";
     let bytes: Vec<char> = url.to_lowercase().chars().collect();
     let mut last: Option<String> = None;
@@ -153,8 +152,6 @@ async fn head_blob(
 
 /// Shared BUD-01 GET/HEAD logic.
 async fn serve_blob(state: &BlossomState, sha256: &str, head_only: bool) -> Response {
-    // The path may carry an optional file extension (`.pdf`, `.png`); the hash
-    // is the first 64-hex prefix. Reject malformed paths with 400.
     let hash: String = sha256
         .split('.')
         .next()
@@ -212,7 +209,6 @@ async fn upload(State(state): State<BlossomState>, headers: HeaderMap, body: Byt
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
-    // Optional X-SHA-256: reject on mismatch (BUD-02 409).
     if let Some(x_sha) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
         let actual = sha256_hex(&body);
         if !x_sha.eq_ignore_ascii_case(&actual) {
@@ -402,7 +398,6 @@ mod tests {
         assert_eq!(descriptor["type"], "text/plain");
         assert!(descriptor["url"].as_str().unwrap().contains(&hash));
 
-        // Second PUT (same bytes) → 200 OK, same hash.
         let req2 = Request::builder()
             .method("PUT")
             .uri("/.blossom/upload")
@@ -460,7 +455,6 @@ mod tests {
         )
         .expect("resolves");
         assert_eq!(url, format!("https://cdn.example.com/.blossom/{hash}.pdf"));
-        // Extension mapping.
         assert_eq!(mime_to_ext(Some("image/png")), ".png");
         assert_eq!(mime_to_ext(Some("text/plain")), ".txt");
         assert_eq!(mime_to_ext(None), "");

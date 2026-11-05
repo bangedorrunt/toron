@@ -41,11 +41,6 @@ fn bead_ids(text: &str) -> Vec<String> {
                 i += 1;
             }
             let slug = &text[start..i];
-            // `bd-` on its own, or `bd-` followed by punctuation, is prose
-            // ("the bd- prefix"), not an identifier. The body may open with a
-            // digit: half the short-form ids do (`bd-9z2q`), and a
-            // lowercase-only test would walk straight past the very ids this
-            // gate exists to catch.
             if slug
                 .chars()
                 .nth(3)
@@ -90,9 +85,6 @@ fn strings(node: &Value, path: &str, out: &mut Vec<(String, String)>) {
 fn no_tool_or_resource_description_carries_a_bead_id() {
     let mut found: BTreeSet<String> = BTreeSet::new();
 
-    // The router itself: every tool's description and every field description
-    // in its input/output schema. This is the source the catalog is built
-    // from, so a hit here is a hit in the published file by construction.
     for t in ToolServer::tool_router().list_all() {
         let name = t.name.to_string();
         let mut parts: Vec<(String, String)> = vec![(
@@ -138,15 +130,6 @@ fn no_tool_or_resource_description_carries_a_bead_id() {
 }
 #[test]
 fn the_bead_id_matcher_actually_bites() {
-    // A gate that cannot fail is theater, and this matcher is a hand-written
-    // scanner. Prove it finds the two shapes the ledgers mint, and does not
-    // invent hits from the prose around them.
-    //
-    // The probes are SYNTHETIC ids, not real ones. A real id in this file is
-    // an added `bd-*` token, and the commit-msg guard then obliges the commit
-    // to cite that bead - which would be a false claim of work on a ledger
-    // this change never touched. The matcher recognises a SHAPE; which real
-    // bead it once named is not what is under test.
     assert_eq!(bead_ids("(bd-z9q2)"), vec!["bd-z9q2"]);
     assert_eq!(bead_ids("bd-4t7w.2 G1"), vec!["bd-4t7w"]);
     assert_eq!(

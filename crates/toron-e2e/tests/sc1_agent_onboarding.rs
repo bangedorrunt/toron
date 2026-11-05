@@ -54,7 +54,6 @@ async fn sc1_agent_onboarding() {
         .with_agent_passphrase("toron-dev")
         .with_index_pool(pool);
 
-    // --- Step 2: agent register PiAlpha --program pi --project demo ---
     let profile = AgentProfile {
         name: "PiAlpha".into(),
         program: Some("pi".into()),
@@ -67,12 +66,10 @@ async fn sc1_agent_onboarding() {
         .await
         .expect("register PiAlpha");
 
-    // --- Assert: kind-30013 profile published; name → npub resolves ---
     let whois: WhoIs = mailbox.whois("demo", "PiAlpha").await.expect("whois");
     assert_eq!(whois.npub, first.npub, "whois resolves registered npub");
     assert_eq!(whois.program.as_deref(), Some("pi"));
 
-    // --- Assert: list_agents shows Pi-α ---
     let agents = mailbox
         .list_agents(
             "demo",
@@ -89,7 +86,6 @@ async fn sc1_agent_onboarding() {
         "PiAlpha listed"
     );
 
-    // --- Step 3: Pi-α reserves src/** (kind-30031) ---
     let res = mailbox
         .file_reservation_paths(
             "demo",
@@ -105,7 +101,6 @@ async fn sc1_agent_onboarding() {
     assert_eq!(res.granted.len(), 1);
     assert!(res.granted[0].expires_ts_us.is_some(), "TTL set (NIP-40)");
 
-    // --- Step 4: mail inbox is empty (nothing sent) ---
     let inbox = mailbox
         .fetch_inbox(&FetchInbox {
             project_slug: "demo".into(),
@@ -122,7 +117,6 @@ async fn sc1_agent_onboarding() {
         .expect("fetch inbox");
     assert!(inbox.is_empty(), "no mail yet");
 
-    // --- Assert: re-register is idempotent (same npub, no duplicate) ---
     let again = mailbox
         .register_agent("demo", &profile)
         .await

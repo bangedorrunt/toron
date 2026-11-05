@@ -63,7 +63,6 @@ pub struct Globals {
     #[arg(short, long, global = true)]
     pub output: Option<PathBuf>,
 
-    // --- robot mode (bd-led.8.4): agent-driver global flags (ADR-0003).
     /// Emit a full robot state snapshot (JSON) and exit.
     #[arg(long, global = true)]
     pub robot_snapshot: bool,
@@ -96,7 +95,6 @@ pub enum Command {
     /// Show the effective configuration (flags > env > project > user > system).
     Config(ConfigArgs),
 
-    // --- robot parity surface (bd-led.8.3): the MCP tools as shell-out commands.
     /// Mail: send/reply/inbox/ack/read/search/thread-summarize (MCP parity JSON).
     #[command(subcommand)]
     Mail(MailCommand),
@@ -126,9 +124,6 @@ pub enum Command {
     #[command(subcommand)]
     Agent(AgentCommand),
 
-    // --- two-plane shared surface (ADR-0020 Spec 2): the Nostr plane as CLI.
-    // Plane S (shared rooms, kind 9/7), J (jobs 43001-43006), N (presence
-    // 20001), W (watch/NIP-01 REQ). CLI-first; the MCP cluster stays frozen.
     /// NIP-29 channels: create/join/leave/close/purge/list/members/post/read (39000/39002 + kind 9)
     /// (plane S; lifecycle open -> closed -> purged).
     #[command(subcommand)]
@@ -151,7 +146,6 @@ pub enum Command {
     /// Wait until a receipt appears (subscribe-until-receipt).
     Wait(WaitArgs),
 
-    // --- operator surface (bd-led.8.2): daemon-persona commands.
     /// Deep health checks (hc/git/keys/engine store). --check exits 3 on any failure.
     Doctor(DoctorArgs),
 
@@ -201,8 +195,6 @@ pub enum Command {
     #[command(subcommand)]
     RunState(RunStateCommand),
 
-    // --- comms inbox (ADR-0041): CLI-only verbs over the shared durable
-    // root, behind TORON_COMMS_INBOX. No new MCP tool.
     /// Read your inbox past your cursor (commits cursor + Delivered in one
     /// transaction; --peek commits neither).
     Next(NextArgs),
@@ -501,12 +493,6 @@ pub struct ServeArgs {
     pub mcp_http: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Daemon lifecycle (ops): launchd on macOS, systemd on Linux, pidfile+spawn
-// fallback. `install` writes the autostart unit + the 0600 passphrase file so
-// the secret never lands in the unit file.
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     /// Report daemon state (running/stopped + detection source).
@@ -549,12 +535,6 @@ pub struct DaemonArgs {
     #[command(subcommand)]
     pub cmd: DaemonCommand,
 }
-
-// ---------------------------------------------------------------------------
-// Robot parity surface (bd-led.8.3): the MCP tools as shell-out commands.
-// Noun-verb per ADR. Every command prints the exact `ToJson` shape the
-// matching MCP tool returns (see `robot.rs`).
-// ---------------------------------------------------------------------------
 
 /// Contact policy selector (parity: open|auto|contacts_only|block_all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1447,16 +1427,6 @@ pub struct GuardRecordArgs {
     pub journal: Option<PathBuf>,
 }
 
-// ---------------------------------------------------------------------------
-// Two-plane shared surface (ADR-0020 Spec 2): channel / job / react /
-// presence / watch. CLI-first; MCP cluster stays frozen (40 tools: 38
-// AM-Rust parity + 2 additive).
-//
-// Writes take `--as <canonical-name>` (ADR-0018): the registered agent key
-// signs the event. Unknown `--as` is a usage error (exit 2) — never
-// `Keys::generate()` in a write path. Reads take `--json` for robot mode.
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
     /// Create a channel (idempotent; creator is the first member).
@@ -1859,12 +1829,6 @@ pub struct WaitArgs {
     pub project: String,
 }
 
-// ---------------------------------------------------------------------------
-// Operator surface (bd-led.8.2): doctor/metrics/key/project/relay/backend.
-// Passphrases NEVER arrive via flags — env `TORON_KEY_PASSPHRASE` only (dev
-// default "toron"; production must set the env var).
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// CI-friendly: exit 3 if any check fails (0 if all pass).
@@ -2053,10 +2017,6 @@ impl BenchCaseArg {
     }
 }
 
-// ---------------------------------------------------------------------------
-// bd-flag-vocab-conformance-0hyv: ONE vocabulary, enforced by test.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod flag_conformance_tests {
     use clap::CommandFactory;
@@ -2072,19 +2032,10 @@ mod flag_conformance_tests {
     fn flag_conformance_one_vocabulary_and_required_project() {
         let mut banned: Vec<String> = Vec::new();
         let mut bad_project: Vec<String> = Vec::new();
-        // Explicit waivers (audited): surfaces where --project is a genuine
-        // OPTIONAL filter over ALL projects — never a silent demo routing —
-        // plus bd-1wwc presence publish/list, whose --project defaults from
-        // the TORON_PROJECT pane env and fails LOUDLY when neither flag nor
-        // env is present (no silent default anywhere on that path).
         let waived = [
             "toron doctor reconstruct",
             "toron presence publish",
             "toron presence list",
-            // `toron tui` scopes to a project like presence does: --project
-            // falls back to $TORON_PROJECT (the pane env `agent bootstrap`
-            // stamps) and the command FAILS LOUD when neither is present, so
-            // there is no silent default to route the operator at `demo`.
             "toron tui",
         ];
         let root = Cli::command();
@@ -2142,7 +2093,6 @@ mod flag_conformance_tests {
         use crate::cli::{Cli, Command, ContactCommand};
         use clap::Parser;
 
-        // --clear parses with --project
         let cli = Cli::try_parse_from([
             "toron",
             "contact",
@@ -2161,7 +2111,6 @@ mod flag_conformance_tests {
             _ => panic!("expected contact captain with --clear"),
         }
 
-        // --pin and --clear conflict
         let err = Cli::try_parse_from([
             "toron",
             "contact",
@@ -2179,7 +2128,6 @@ mod flag_conformance_tests {
             "conflict error: {msg}"
         );
 
-        // show (no pin, no clear) still parses
         let cli = Cli::try_parse_from(["toron", "contact", "captain", "--project", "testproj"])
             .expect("parse show");
         match cli.command {

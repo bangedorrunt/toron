@@ -66,10 +66,6 @@ pub async fn canonicalize(pool: Option<&SqlitePool>, slug: &str) -> String {
         return canonical;
     }
     let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-    // bd-rtkx: the alias row is the durable half of the path→slug relation.
-    // Swallowing the write error made the relation silently in-memory: the
-    // canonical slug still came back (the basename derivation stands in), so
-    // the row was simply never there for the read side to expand over.
     if let Err(e) = sqlx::query(
         "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
          VALUES (?1, ?2, ?3) ON CONFLICT (alias) DO NOTHING",
@@ -87,7 +83,6 @@ pub async fn canonicalize(pool: Option<&SqlitePool>, slug: &str) -> String {
             "project alias row NOT persisted — the path→slug relation stays in-memory only"
         );
     }
-    // Re-read: a concurrent canonicalize may have won the race.
     sqlx::query_scalar::<_, String>("SELECT canonical FROM project_aliases WHERE alias = ?1")
         .bind(slug)
         .fetch_one(pool)
@@ -226,15 +221,10 @@ pub async fn reconcile_aliases(pool: &SqlitePool, data_dir: &Path) -> anyhow::Re
             else {
                 continue;
             };
-            // Only real project roots (contain an agents dir), mirroring the
-            // bd-f5tt walk; canonical short-slug roots need no alias.
             if path_form(&slug)
                 && path.join("agents").is_dir()
                 && let Some(short) = short_slug(&slug)
             {
-                // Both spellings fold (mirroring project_slug_aliases):
-                // legacy events/rows may carry the leading-separator
-                // form while the on-disk root is relative.
                 for alias in [slug.clone(), format!("/{slug}")] {
                     let res = sqlx::query(
                         "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
@@ -251,9 +241,6 @@ pub async fn reconcile_aliases(pool: &SqlitePool, data_dir: &Path) -> anyhow::Re
             stack.push(path);
         }
     }
-    // bd-rtkx: the roster's path-form spellings get their alias rows (both
-    // the leading-separator and the relative form — legacy rows carry
-    // either).
     let spellings: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT project_slug FROM agents WHERE project_slug LIKE '%/%' ESCAPE '\\'",
     )
@@ -265,8 +252,6 @@ pub async fn reconcile_aliases(pool: &SqlitePool, data_dir: &Path) -> anyhow::Re
             continue;
         };
         let relative = spelling.trim_start_matches('/').to_string();
-        // Both spellings fold (the legacy rows carry either form): the
-        // leading-separator one and the relative one.
         let forms = if spelling.starts_with('/') {
             vec![spelling.clone(), relative.clone()]
         } else {
@@ -353,7 +338,6 @@ mod tests {
     #[tokio::test]
     async fn first_writer_wins_the_canonical_mapping() {
         let pool = test_pool("first-wins").await;
-        // Two path forms sharing a basename: the first canonicalize wins.
         canonicalize(Some(&pool), "/a/b/toron").await;
         assert_eq!(canonicalize(Some(&pool), "/c/d/toron").await, "toron");
     }
@@ -370,7 +354,6 @@ mod tests {
             set.contains(&"/srv/legacy/toron".to_string()),
             "legacy path-slug rows stay addressable: {set:?}"
         );
-        // Reading via the canonical slug sees every alias too.
         let via_canonical = alias_read_set(Some(&pool), "toron").await;
         assert!(via_canonical.contains(&"/srv/legacy/toron".to_string()));
     }
@@ -425,7 +408,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("legacy path-form roster row");
-        // No alias row: the cache never saw this spelling.
         let cached: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM project_aliases WHERE alias = ?1")
                 .bind(path_slug)
@@ -440,8 +422,6 @@ mod tests {
             "the short key must see the path-form row: {set:?}"
         );
 
-        // A DIFFERENT project that merely ends with the same word is not in
-        // the set — the spelling is matched by its basename, not by a suffix.
         sqlx::query(
             "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
              VALUES (?1, ?2, ?3, 1)",
@@ -500,7 +480,6 @@ mod tests {
                 "the alias table carries {alias} -> toron"
             );
         }
-        // Idempotent: the second run adds nothing.
         assert_eq!(reconcile_aliases(&pool, &data_dir).await.unwrap(), 0);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -508,14 +487,11 @@ mod tests {
     #[test]
     fn project_root_never_escapes_data_dir() {
         let data_dir = std::env::temp_dir().join(format!("toron-proot-{}", uuid::Uuid::new_v4()));
-        // Plain short slug: nested under data_dir.
         assert_eq!(
             project_root(&data_dir, "demo"),
             data_dir.join("demo"),
             "short slug nests under data_dir"
         );
-        // Absolute path-form key (the S10 pollution class: gate tests boot
-        // mailboxes with cwd-derived roots like /Users/.../workspace/s66667).
         let root = project_root(&data_dir, "/Users/bangedorrunt/workspace/s66667");
         assert!(
             root.starts_with(&data_dir),
@@ -523,12 +499,10 @@ mod tests {
             root.display()
         );
         assert_eq!(root, data_dir.join("s66667"));
-        // Relative path-form key without the leading separator.
         assert_eq!(
             project_root(&data_dir, "Users/bangedorrunt/workspace/s66667"),
             data_dir.join("s66667")
         );
-        // Degenerate keys must not escape data_dir either.
         for bad in ["..", ".", "/", "", "../escape"] {
             let root = project_root(&data_dir, bad);
             assert!(
@@ -537,7 +511,6 @@ mod tests {
                 root.display()
             );
         }
-        // Backslashes (windows-style) must not escape either.
         let root = project_root(&data_dir, "..\\escape");
         assert!(
             root.starts_with(&data_dir),

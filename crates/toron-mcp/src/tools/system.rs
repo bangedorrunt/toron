@@ -26,9 +26,6 @@ use super::{ToJson, ToolOutput, ToolServer, generate_agent_name};
 
 #[tool_router(router = system_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // INFRASTRUCTURE (4)
-    // ------------------------------------------------------------------
 
     /// `health_check` (read-only): bus liveness + archive health.
     #[tool(
@@ -67,7 +64,6 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<InstallPrecommitGuardArgs>,
     ) -> ToolOutput {
-        // ADR-0017: canonical project key baked into the hook script.
         let project = self.mailbox.canonical_project(&args.project_key).await;
         match self
             .mailbox
@@ -99,10 +95,6 @@ impl ToolServer {
         }
     }
 
-    // ------------------------------------------------------------------
-    // IDENTITY (6)
-    // ------------------------------------------------------------------
-
     /// `register_agent`: upsert on the existing agent key (or create).
     #[tool(
         name = "register_agent",
@@ -114,8 +106,6 @@ impl ToolServer {
         let name = args.name.clone().unwrap_or_else(generate_agent_name);
         let profile = AgentProfile {
             name: name.clone(),
-            // ADR-0005 P2.2: optional args map into 30013 content fields
-            // (None when the caller omits them — additive).
             program: args.program.clone(),
             model: args.model.clone(),
             task_description: args.task_description.clone(),
@@ -125,8 +115,6 @@ impl ToolServer {
             .mailbox
             .register_agent(&args.project_key, &profile)
             .await;
-        // Additive optional: fold a herdr slug → pin so whois(slug) hits
-        // the same npub. No new MCP tool (ADR-0020 / ADR-0007 C3 names).
         if registered.is_ok()
             && let Some(alias) = args.alias.as_deref().filter(|s| !s.is_empty())
         {
@@ -151,8 +139,6 @@ impl ToolServer {
         let name = args.name_hint.clone().unwrap_or_else(generate_agent_name);
         let profile = AgentProfile {
             name: name.clone(),
-            // ADR-0005 P2.2: optional args map into 30013 content fields
-            // (None when the caller omits them — additive).
             program: args.program.clone(),
             model: args.model.clone(),
             task_description: args.task_description.clone(),
@@ -218,9 +204,6 @@ impl ToolServer {
     ) -> ToolOutput {
         match HcBackend::connect(None) {
             Ok(backend) => {
-                // bd-gc7k: prune dead pins AND release their exclusive
-                // leases in the same call — a dead pin must not own the
-                // ledger. A reap failure never hides the pruned names.
                 let pruned = self.mailbox.cleanup_pane_identities(&backend);
                 match pruned {
                     Ok(names) => {
@@ -265,7 +248,6 @@ impl ToolServer {
     )]
     async fn list_agents(&self, Parameters(args): Parameters<ListAgentsArgs>) -> ToolOutput {
         let opts = ListAgentsOptions {
-            // `u64::try_from` rejects negatives (never wrap to ~1.8e19 days).
             active_within_days: args.active_within_days.and_then(|d| u64::try_from(d).ok()),
         };
         match self.mailbox.list_agents(&args.project_key, opts).await {
@@ -274,10 +256,6 @@ impl ToolServer {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct HealthCheckArgs {

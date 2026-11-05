@@ -20,9 +20,6 @@ use super::{ToolOutput, ToolServer};
 
 #[tool_router(router = contact_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // CONTACTS (4)
-    // ------------------------------------------------------------------
 
     /// `request_contact`: request a contact link (AgentLink, G14).
     #[tool(
@@ -110,10 +107,6 @@ impl ToolServer {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct RequestContactArgs {

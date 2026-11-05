@@ -331,8 +331,6 @@ mod tests {
             project(&G_SUPERVISOR, Role::Captain, 0),
             Err(ProjectError::NotYet { .. })
         ));
-        // Walking End without the pointer check would be an empty allow-list,
-        // which is not the same refusal. The other topologies still project.
         assert!(global_of(Topology::Swarm).is_ok());
     }
 

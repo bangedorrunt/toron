@@ -64,7 +64,7 @@ pub fn parse_canonical_name(name: &str, project_slug: &str) -> Option<(String, u
     }
     let seq: u32 = digits.parse().ok()?;
     if seq < 2 {
-        return None; // seq 1 is suffix-less; `flywheel-toron-oc1` never exists
+        return None;
     }
     Some((role.to_string(), seq))
 }
@@ -138,14 +138,14 @@ pub fn is_adjnoun_pin(name: &str) -> bool {
     for (_, &c) in b.iter().enumerate().skip(1) {
         if c.is_ascii_uppercase() {
             if !saw_lower {
-                return false; // double upper: `DUSTYsparrow`
+                return false;
             }
             words += 1;
             saw_lower = false;
         } else if c.is_ascii_lowercase() {
             saw_lower = true;
         } else {
-            return false; // digit / separator / underscore
+            return false;
         }
     }
     words == 2 && saw_lower
@@ -177,15 +177,10 @@ mod tests {
 
     #[test]
     fn rejects_non_canonical_shapes() {
-        // Wrong project slug embedded in the name.
         assert_eq!(parse_canonical_name("flywheel-other-oc", "toron"), None);
-        // Seq 1 with a digit suffix never exists (builder omits it).
         assert_eq!(parse_canonical_name("flywheel-toron-oc1", "toron"), None);
-        // Empty role.
         assert_eq!(parse_canonical_name("flywheel-toron-", "toron"), None);
-        // Uppercase role.
         assert_eq!(parse_canonical_name("flywheel-toron-OC", "toron"), None);
-        // Not a flywheel name at all.
         assert_eq!(parse_canonical_name("lane-1-bootstrap", "toron"), None);
         assert_eq!(parse_canonical_name("DustySparrow", "toron"), None);
         assert_eq!(parse_canonical_name("assistant", "toron"), None);
@@ -287,10 +282,6 @@ mod tests {
         for name in ["bangedorrunt", "root", "docker", "ubuntu", "wwwdata"] {
             assert!(is_username_class(name), "{name} must be username-class");
         }
-        // NO separators: dashed/underscored names are slug/agent-shaped
-        // (lane-1-bootstrap, my_user) and keep the generic grammar error.
-        // Uppercase (pins), digit-start, empty, and non-alnum are never
-        // username-class.
         for name in [
             "BlueRidge",
             "DustySparrow",

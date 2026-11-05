@@ -1,6 +1,4 @@
 // governed-by: ADR-0031
-// Linux process inspection (bd-nc5d): verbatim move of the linux-gated
-// block out of `serve_lock.rs`. Only compiled on Linux — zero cfg here.
 
 use std::fs;
 

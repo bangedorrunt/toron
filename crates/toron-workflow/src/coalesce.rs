@@ -239,7 +239,6 @@ impl Buffer {
     }
 
     fn push_dedup(&mut self, m: InboundMention) -> bool {
-        // Dedup: identical (parent, spec) already in this buffer → drop.
         let dup = self
             .mentions
             .iter()
@@ -379,22 +378,13 @@ impl MentionCoalescer {
             .buffers
             .entry(assignee.clone())
             .or_insert_with(|| Buffer::new(now_ms));
-        // Open the window on the first mention; subsequent mentions slide the
-        // last_arrival forward (sub-window fast path) but do NOT extend
-        // first_arrival (window is measured from the opening mention).
         if buf.mentions.is_empty() {
             buf.first_arrival_ms = now_ms;
         }
-        // GS-062 TRANSPORT backoff clobber: Transient requeue schedules readiness
-        // by pushing `last_arrival_ms` into the future (ready_at - subwindow). A
-        // concurrent submit must NOT collapse that schedule via `= now_ms`, or
-        // the sub-window fast path fires early under mentions-during-backoff.
-        // Preserve any scheduled-ahead readiness with max(now, existing).
         buf.last_arrival_ms = now_ms.max(buf.last_arrival_ms);
         buf.push_dedup(mention);
 
         if buf.mentions.len() >= self.max_buffer {
-            // Hard cap → flush now (no infinite coalesce).
             let coalesced = self.take_buffer(&assignee).expect("just-inserted buffer");
             return CoalesceDecision::FlushNow(coalesced);
         }
@@ -529,13 +519,7 @@ impl MentionCoalescer {
             RequeueSchedule::Transient => {
                 let attempt = self.retry_attempts(assignee.as_str());
                 if attempt >= REQUEUE_MAX_ATTEMPTS {
-                    // GS-062 Exhausted poison: leaving retry_attempts at MAX
-                    // makes every later Transient Exhaust immediately. Clear so
-                    // a fresh burst (or host clear_retry) can retry again.
                     self.retry_attempts.remove(assignee.as_str());
-                    // T2: park whole coalesced batch on DLQ (not live restore /
-                    // hot-spin; not silent drop). Sibling Buffered mentions in
-                    // the live buffer are untouched.
                     self.dlq.push(DlqEntry {
                         reason: DlqReason::Exhausted,
                         coalesced,
@@ -557,13 +541,11 @@ impl MentionCoalescer {
         let sub = self.subwindow.as_millis() as u64;
         match delay_ms {
             Some(delay) => {
-                // Transient: always apply schedule (empty or merge path).
                 let ready_at = now_ms.saturating_add(delay);
                 buf.first_arrival_ms = ready_at.saturating_sub(win);
                 buf.last_arrival_ms = ready_at.saturating_sub(sub);
             }
             None => {
-                // FreshWindow: only seed timing when buffer was empty.
                 if buf.mentions.is_empty() {
                     buf.first_arrival_ms = now_ms;
                     buf.last_arrival_ms = now_ms;
@@ -603,7 +585,6 @@ impl MentionCoalescer {
         }
         let mentions: Vec<InboundMention> = buf.mentions.drain(..).collect();
         let first_arrival_ms = buf.first_arrival_ms;
-        // Reset the buffer's window so the next mention opens a fresh one.
         buf.first_arrival_ms = 0;
         buf.last_arrival_ms = 0;
         Some(Coalesced {
@@ -667,7 +648,6 @@ mod tests {
             0,
         );
         let batch = c.force_flush("oc").expect("flushed");
-        // InFlight path uses FreshWindow (no budget burn).
         let q = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
         assert!(matches!(q, RequeueOutcome::Queued { .. }), "{q:?}");
         assert_eq!(c.buffered_for("oc"), 1);
@@ -689,7 +669,6 @@ mod tests {
     fn transient_requeue_backoff_and_budget() {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
-        // Attempt 0 → immediate.
         c.submit(m("oc", "e1", "hi"), 0);
         let batch = c.force_flush("oc").expect("flushed");
         let q0 = c.requeue(batch, 1_000, RequeueSchedule::Transient);
@@ -710,7 +689,6 @@ mod tests {
             match q {
                 RequeueOutcome::Queued { delay_ms, attempt } => {
                     assert_eq!(attempt, i + 1);
-                    // Base doubles until cap; jitter may wobble once capped.
                     if last_delay < REQUEUE_BACKOFF_CAP_MS {
                         assert!(
                             delay_ms + 1 >= last_delay,
@@ -749,7 +727,6 @@ mod tests {
             0,
             "Exhausted must clear retry map (no poison for later Transient)"
         );
-        // Fresh burst after Exhausted must be able to Transient again.
         c.submit(m("oc", "e2", "again"), 10_000);
         let batch = c.force_flush("oc").expect("flushed");
         assert!(
@@ -770,10 +747,8 @@ mod tests {
     fn requeue_transient_honors_schedule_on_nonempty_merge() {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
-        // Simulate concurrent submit while publish was awaiting.
         c.submit(m("oc", "concurrent", "new"), 1_000);
         assert_eq!(c.buffered_for("oc"), 1);
-        // Previously published-then-failed burst returns with Transient/immediate.
         let failed = Coalesced {
             assignee: "oc".into(),
             mentions: vec![m("oc", "failed", "retry")],
@@ -785,7 +760,6 @@ mod tests {
             "{q:?}"
         );
         assert_eq!(c.buffered_for("oc"), 2, "merge both mentions");
-        // Must be flush-ready immediately despite non-empty buffer at requeue time.
         let flushed = c.tick(1_000);
         assert_eq!(flushed.len(), 1);
         let parents: Vec<_> = flushed[0]
@@ -801,11 +775,8 @@ mod tests {
     /// NOT collapse `last_arrival_ms` and fire the sub-window early.
     #[test]
     fn submit_during_transient_backoff_does_not_fire_early() {
-        // Subwindow 100ms so attempt-1 Transient backoff (~250ms+) exceeds it
-        // and a clobbering submit would otherwise fire early via subwindow.
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(100), 64);
-        // Burn attempt 0 (immediate) so next Transient has real backoff.
         c.submit(m("oc", "e1", "hi"), 0);
         let batch = c.force_flush("oc").expect("flushed");
         assert!(matches!(
@@ -825,7 +796,6 @@ mod tests {
             }
             other => panic!("expected Queued backoff, got {other:?}"),
         };
-        // Concurrent mention during backoff — must preserve scheduled readiness.
         c.submit(m("oc", "live", "during-backoff"), 2_100);
         assert_eq!(
             c.buffered_for("oc"),
@@ -886,19 +856,16 @@ mod tests {
         let mut c = MentionCoalescer::new(DEFAULT_WINDOW, DEFAULT_SUBWINDOW, DEFAULT_MAX_BUFFER);
         for i in 0..20 {
             let dec = c.submit(m("oc", "evt-a", &format!("mention {i}")), 1_000 + i * 10);
-            // None should cap-flush (20 < 64); all buffer.
             assert!(
                 matches!(dec, CoalesceDecision::Buffered { .. }),
                 "mention {i} should buffer, got {dec:?}"
             );
         }
-        // Force-flush at end of burst → exactly one coalesced batch of 20.
         let flushed = c.force_flush_all();
         assert_eq!(flushed.len(), 1, "one assignee → one batch");
         let batch = &flushed[0];
         assert_eq!(batch.assignee, "oc");
         assert_eq!(batch.count(), 20, "all 20 mentions coalesced");
-        // Ordering preserved (mention 0 first, mention 19 last).
         assert_eq!(batch.mentions[0].spec["text"], "mention 0");
         assert_eq!(batch.mentions[19].spec["text"], "mention 19");
     }
@@ -909,11 +876,8 @@ mod tests {
     fn lone_mention_flushes_at_subwindow_not_full_window() {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
-        // Single mention arrives at t=0.
         c.submit(m("oc", "e1", "hi"), 0);
-        // Before sub-window (t=400): not ready.
         assert_eq!(c.flush_if_ready("oc", 400), FlushOutcome::NotReady);
-        // At sub-window (t=500): flushes (lone-mention fast path).
         let out = c.flush_if_ready("oc", 500);
         assert!(matches!(out, FlushOutcome::Flushed(_)), "sub-window flush");
         if let FlushOutcome::Flushed(batch) = out {
@@ -927,15 +891,10 @@ mod tests {
     fn ongoing_burst_stays_buffered_until_full_window() {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
-        // Mentions arrive every 300ms — faster than the 500ms sub-window, so
-        // the burst is "ongoing" and must NOT flush early.
         for i in 0..5 {
             c.submit(m("oc", "e", &format!("m{i}")), i * 300);
         }
-        // At t=1200 (after 4 sub-windows elapsed since last mention at 1200):
-        // last_arrival=1200, sub-window not yet elapsed → still buffered.
         assert_eq!(c.flush_if_ready("oc", 1_200), FlushOutcome::NotReady);
-        // At t=1700 (500ms after last arrival at 1200): sub-window flushes.
         let out = c.flush_if_ready("oc", 1_700);
         match out {
             FlushOutcome::Flushed(b) => assert_eq!(b.count(), 5),
@@ -949,7 +908,6 @@ mod tests {
         let mut c = MentionCoalescer::new(DEFAULT_WINDOW, DEFAULT_SUBWINDOW, 3);
         let _ = c.submit(m("oc", "e1", "a"), 0);
         let _ = c.submit(m("oc", "e2", "b"), 10);
-        // Third mention hits the cap → FlushNow.
         let dec = c.submit(m("oc", "e3", "c"), 20);
         match dec {
             CoalesceDecision::FlushNow(batch) => {
@@ -958,7 +916,6 @@ mod tests {
             }
             other => panic!("expected FlushNow at cap, got {other:?}"),
         }
-        // Buffer drained after the cap flush.
         assert_eq!(c.buffered_for("oc"), 0);
     }
 
@@ -967,7 +924,7 @@ mod tests {
     fn identical_mentions_dedup() {
         let mut c = MentionCoalescer::with_defaults();
         let _ = c.submit(m("oc", "e1", "same"), 0);
-        let dec = c.submit(m("oc", "e1", "same"), 10); // identical
+        let dec = c.submit(m("oc", "e1", "same"), 10);
         match dec {
             CoalesceDecision::Buffered { buffered } => assert_eq!(buffered, 1, "dup not added"),
             other => panic!("dup should buffer (not flush), got {other:?}"),
@@ -986,7 +943,6 @@ mod tests {
         assert_eq!(c.buffered_for("oc"), 2);
         assert_eq!(c.buffered_for("gk"), 1);
         let all = c.force_flush_all();
-        // Assignee-sorted: gk before oc.
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].assignee, "gk");
         assert_eq!(all[0].count(), 1);
@@ -1002,7 +958,6 @@ mod tests {
         c.submit(m("oc", "e1", "first batch"), 0);
         let first = c.force_flush("oc").expect("first flush");
         assert_eq!(first.count(), 1);
-        // Well after the window: a new mention opens a fresh buffer.
         c.submit(m("oc", "e2", "second batch"), 5_000);
         let second = c.force_flush("oc").expect("second flush");
         assert_eq!(second.count(), 1);
@@ -1016,10 +971,8 @@ mod tests {
             MentionCoalescer::new(Duration::from_millis(1_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "a"), 0);
         c.submit(m("gk", "e2", "b"), 0);
-        // At t=500 both sub-window-flush.
         let flushed = c.tick(500);
         assert_eq!(flushed.len(), 2, "both assignees flush");
-        // Assignee-sorted.
         assert_eq!(flushed[0].assignee, "gk");
         assert_eq!(flushed[1].assignee, "oc");
     }

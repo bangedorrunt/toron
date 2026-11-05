@@ -67,13 +67,11 @@ async fn sc2_direct_mail_thread_and_ack() {
     register(&mailbox, "demo", "PiAlpha").await;
     let oc_pk = register(&mailbox, "demo", "OCBeta").await;
 
-    // --- 2. Bus push: subscriber watches for gift wraps to OC-β BEFORE send ---
     let mut sub = bus
         .subscribe(Filter::new().kinds([Kind::GiftWrap]).pubkey(oc_pk))
         .await
         .expect("subscribe to OC-β wraps");
 
-    // --- 1. Parity poll: Pi-α sends to OC-β with ack ---
     let sent = mailbox
         .send_message(&SendMessage {
             project_slug: "demo".into(),
@@ -94,8 +92,6 @@ async fn sc2_direct_mail_thread_and_ack() {
         .expect("send_message");
     assert_eq!(sent.count, 1, "one delivery");
 
-    // --- 2. Bus push <50ms: subscriber receives the wrap with zero polling ---
-    // Measure from publish-complete to delivery (not including wrap time).
     let t0 = Instant::now();
     let push_evt = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
@@ -111,8 +107,6 @@ async fn sc2_direct_mail_thread_and_ack() {
     .expect("push event arrives");
     let push_dur = t0.elapsed();
     assert_eq!(push_evt.kind, Kind::GiftWrap, "kind-1059 wrap on bus");
-    // NIP-59: the wrap's pubkey is a random one-time key; the recipient is in
-    // the `p` tag (metadata-hiding).
     let p_tag_npub = push_evt
         .tags
         .iter()
@@ -130,7 +124,6 @@ async fn sc2_direct_mail_thread_and_ack() {
         "bus push {push_dur:?} < 50ms (zero polling)"
     );
 
-    // --- 1b. Parity poll: OC-β fetch_inbox returns the message ---
     let inbox = mailbox
         .fetch_inbox(&FetchInbox {
             project_slug: "demo".into(),
@@ -151,15 +144,11 @@ async fn sc2_direct_mail_thread_and_ack() {
     assert_eq!(msg.body_md, "please review");
     assert_eq!(msg.importance, "high");
     assert!(msg.ack_required, "ack flag set");
-    // Fresh send = thread root: no NIP-10 `e` tag (thread_id None). A reply
-    // carries the root id via `e` (asserted via reply path elsewhere). This
-    // matches NIP-10 semantics — the root IS this message.
     assert!(
         msg.thread_id.is_none(),
         "fresh message has no thread parent (is the root)"
     );
 
-    // --- 4. Ack: OC-β acknowledges; idempotent on repeat ---
     let ack1 = mailbox
         .acknowledge_message("demo", "OCBeta", &msg.id)
         .await
@@ -177,8 +166,6 @@ async fn sc2_direct_mail_thread_and_ack() {
         ack2.acknowledged_at_us
     );
 
-    // thread_id == the sender's root event id (NIP-10 e = root) — for a
-    // fresh send the message itself is the root; a reply would carry it.
     assert_eq!(sent.deliveries.len(), 1);
 
     let _ = std::fs::remove_dir_all(dir);

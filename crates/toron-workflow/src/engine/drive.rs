@@ -200,10 +200,6 @@ where
                     follow.append(&mut more);
                 }
                 RunEffect::ParkUntil { until_ms, .. } => {
-                    // A spawn-await emits its deadline park in the SAME batch
-                    // as StartSpawn. Once the settle lands the model is no
-                    // longer parked, so that effect is stale: sleeping on it
-                    // would hold the run for the whole `no_claim_timeout`.
                     if !matches!(run.model().phase, ModelPhase::Parked { .. }) {
                         continue;
                     }
@@ -272,7 +268,6 @@ where
                             .map_err(|e| anyhow::anyhow!("run {run_id}: spawn fail failed: {e}"))?
                         }
                         SpawnLaunch::TimedOut => {
-                            // The fold owns the canonical timeout text.
                             let at = deadline.unwrap_or_else(now_ms).max(now_ms());
                             verb(move || {
                                 let mut run = run;
@@ -289,9 +284,6 @@ where
                     follow.append(&mut more);
                 }
                 RunEffect::SpawnDetached { spec, .. } => {
-                    // Fire and forget: the job is announced, the run does not
-                    // wait. The consumer owns the terminal; the spec rides the
-                    // engine's map so the drainer can launch it.
                     seams
                         .spawn_specs
                         .lock()
@@ -300,9 +292,6 @@ where
                     seams.spawn_sink.lock().await.push(spec.spawn_key.clone());
                 }
                 RunEffect::Complete { output } => {
-                    // The engine's public contract returns the STEP MAP on
-                    // success (the old `run_workflow` shape); the envelope is
-                    // the model's internal record.
                     return Ok(output.get("steps").cloned().unwrap_or(output));
                 }
                 RunEffect::Fail { output, .. } => return Ok(output),

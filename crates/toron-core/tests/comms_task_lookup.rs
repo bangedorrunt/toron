@@ -116,8 +116,6 @@ async fn a_recipient_sees_only_what_it_received() {
     assert_eq!(got[0].recipient, B);
 }
 
-// --- negative controls ------------------------------------------------------
-
 /// CONTROL: a viewer who neither sent nor received anything gets nothing,
 /// the same answer as an unknown task. No leak, no error.
 #[tokio::test]
@@ -167,9 +165,6 @@ async fn the_query_plan_uses_both_indexes_and_scans_nothing() {
         !plan.iter().any(|l| l.starts_with("SCAN")),
         "scan in plan:\n{text}"
     );
-    // The task's delivery rows drive; the log is reached by msg_key. The
-    // planner's own preference (walk the inbox stream, probe deliveries) is
-    // the O(inbox) shape this pins against.
     assert!(
         plan[0].contains("inbox_delivery_by_task"),
         "the task index must drive:\n{text}"

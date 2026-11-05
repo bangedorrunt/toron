@@ -140,7 +140,6 @@ pub fn split_channel_post(content: &str, max_chars: usize) -> Vec<String> {
             if !cur.is_empty() {
                 parts.push(std::mem::take(&mut cur));
             }
-            // single over-long line: hard-split it
             let mut piece = String::new();
             for ch in line.chars() {
                 piece.push(ch);
@@ -181,7 +180,7 @@ impl ChannelStore {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         if inner.channels.contains_key(id) {
-            return Ok(()); // idempotent
+            return Ok(());
         }
         inner.channels.insert(
             id.to_string(),
@@ -209,7 +208,6 @@ impl ChannelStore {
             .channels
             .get(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
-        // bd-channel-close-purge-bsqb: a retired channel accepts nobody new.
         if ch.closed {
             anyhow::bail!("channel {channel_id} is closed — join is refused");
         }
@@ -223,8 +221,6 @@ impl ChannelStore {
                 Convergence::Rejected { .. } => 0,
             };
             if !matches!(held, Convergence::Rejected { .. }) {
-                // Always ≠ held_gen so other channels' global counter bumps
-                // cannot accidentally equal `held` and skip FenceReAdd.
                 let attempted = held_gen.wrapping_add(1);
                 let (next, fx) = convergence_tick(
                     Some(held),
@@ -297,15 +293,11 @@ impl ChannelStore {
         if let Some(state) = committed {
             inner.authority.insert(channel_id.to_string(), state);
         }
-        // FireLive host action: mutate membership (single SoT).
         let ch = inner
             .channels
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.members.remove(&target);
-        // Ask-user A supersession (GS-062): HOLD Committed across the
-        // post-FireLive critical section so a production join hits FenceReAdd.
-        // (Authority already inserted above.) End with [`Self::settle_authority`].
         drop(inner);
         Ok(())
     }
@@ -375,7 +367,6 @@ impl ChannelStore {
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.closed = true;
-        // Ask-user A supersession: HOLD Disable across critical section.
         drop(inner);
         Ok(())
     }
@@ -441,13 +432,6 @@ impl ChannelStore {
                         && t.as_slice().get(1).map(String::as_str) != Some("false")
                 });
                 if closed {
-                    // A close inside the create event retires immediately;
-                    // a non-creator close tag is an inapplicable no-op.
-                    // GS-062: CLI publish_close is Kind::GroupMetadata 39000
-                    // closed=true — production rebuild path. Settle after
-                    // close() here (same as METADATA leave/close) so replay
-                    // does not permanent-FenceReAdd. Live close() still holds
-                    // for in-process CS.
                     if self.close(&id, &ev.pubkey).is_err() {
                         return Ok(false);
                     }
@@ -458,9 +442,6 @@ impl ChannelStore {
             CHANNEL_MEMBERS => {
                 let id = Self::lifecycle_channel_id(ev)
                     .ok_or_else(|| anyhow::anyhow!("channel members snapshot lacks d/h tag"))?;
-                // Content JSON is the snapshot source of truth: rust-nostr
-                // strips a p-tag that equals the signer, which would drop the
-                // joiner from a 39002 they just signed.
                 let members: Vec<String> = serde_json::from_str(&ev.content).unwrap_or_else(|_| {
                     ev.tags
                         .iter()
@@ -479,10 +460,6 @@ impl ChannelStore {
                 else {
                     anyhow::bail!("legacy channel metadata lacks h tag");
                 };
-                // GS-062: leave/close HOLD after FireLive for in-process CS
-                // (captain A). apply_lifecycle is rebuild/replay — settle so
-                // replayed Kick does not permanently FenceReAdd joins.
-                // Live leave()/close() still hold; CLI/host settle after publish CS.
                 let applied = match ev.content.as_str() {
                     "join" => self.join(id, &ev.pubkey).is_ok(),
                     "leave" => {
@@ -571,8 +548,6 @@ impl ChannelStore {
     ) -> anyhow::Result<Event> {
         let author_pk = author.public_key();
         self.require_member(channel_id, &author_pk)?;
-        // ADR-0019 D8 (bd-q6vx): per-(author,channel) loop + group refuse at
-        // the store boundary, before any event is produced. Refuse writes nothing.
         if toron_core::mailbox::surface::is_group_target(channel_id) {
             anyhow::bail!(toron_core::mailbox::surface::group_refused_msg(channel_id));
         }
@@ -599,7 +574,6 @@ impl ChannelStore {
                 toron_core::mailbox::surface::Exempt::None,
             );
         }
-        // Spec 2: kind-9 for >20 lines without a path is rejected (must be file-first)
         if content.lines().count() > 20
             && !content.contains("path:")
             && !content.contains("sha256:")
@@ -610,7 +584,6 @@ impl ChannelStore {
                 "kind-9 over 20 lines without path rejected — write findings to a file and post summary + path + sha256:12"
             );
         }
-        // bd-channel-truncation-238e: fail LOUD on over-cap posts.
         let chars = content.chars().count();
         if chars > CHANNEL_POST_MAX_CHARS {
             anyhow::bail!(
@@ -795,8 +768,6 @@ impl ChannelStore {
         let Some(ch) = ch else {
             anyhow::bail!("channel not found: {channel_id}");
         };
-        // bd-channel-close-purge-bsqb: a closed (retired) channel refuses
-        // writes outright — member or not.
         if ch.closed {
             anyhow::bail!(
                 "channel {channel_id} is closed — posts and reactions are refused \
@@ -806,9 +777,6 @@ impl ChannelStore {
         if ch.is_member(npub) {
             return Ok(());
         }
-        // bd-membership-gate-remedy-uti4: the gate names its remedy — a
-        // bounce without the fix costs a help-page round-trip. The project
-        // is named when the channel knows it, else a placeholder.
         let project = ch
             .project
             .as_deref()
@@ -843,22 +811,18 @@ mod tests {
             .join("auth-refactor", &bob.public_key())
             .expect("bob joins");
 
-        // Alice (creator) + Bob can post.
         assert!(store.post(&alice, "auth-refactor", "hello", &[]).is_ok());
         assert!(store.post(&bob, "auth-refactor", "hi bob", &[]).is_ok());
-        // Mallory (non-member) is gated at the store boundary.
         assert!(
             store
                 .post(&mallory, "auth-refactor", "intrude", &[])
                 .is_err()
         );
 
-        // Membership gate: non-member cannot read private channel history.
         assert!(store.can_read("auth-refactor", &alice.public_key()));
         assert!(store.can_read("auth-refactor", &bob.public_key()));
         assert!(!store.can_read("auth-refactor", &mallory.public_key()));
 
-        // History visible to members only (store-level access already gated).
         let history = store.history("auth-refactor");
         assert_eq!(history.len(), 2);
         assert!(history.iter().all(|e| e.kind == CHANNEL_MESSAGE));
@@ -884,7 +848,6 @@ mod tests {
                 Some("toron"),
             )
             .expect("create");
-        // Bob joins before post — the bootstrap that must happen at spawn.
         store
             .join("steer-axfm", &bob.public_key())
             .expect("bob joins");
@@ -904,7 +867,6 @@ mod tests {
                 .is_err(),
             "non-member post must be refused"
         );
-        // Idempotent re-join must not error and must keep membership.
         store
             .join("steer-axfm", &bob.public_key())
             .expect("re-join idempotent");
@@ -941,7 +903,6 @@ mod tests {
             Timestamp::now(),
         )
         .expect("members event");
-        // A fresh process, wiped cache: replay restores the room.
         let store = ChannelStore::rebuild([create, members]).expect("rebuild");
         assert!(
             store.is_member("rebuild-room", &member.public_key()),
@@ -968,7 +929,6 @@ mod tests {
         let err = format!("{}", store.post(&author, "cap", &big, &[]).unwrap_err());
         assert!(err.contains(&CHANNEL_POST_MAX_CHARS.to_string()), "{err}");
         assert!(err.contains("--file"), "names the chunking fix: {err}");
-        // at-cap is fine
         let at = "x".repeat(CHANNEL_POST_MAX_CHARS);
         assert!(store.post(&author, "cap", &at, &[]).is_ok());
     }
@@ -977,21 +937,19 @@ mod tests {
     /// numbered 1..N, content preserved in order.
     #[test]
     fn channel_post_split_chunks_are_bounded_and_ordered() {
-        let content = ("line of crew report text.\n").repeat(200); // ~5400 chars
+        let content = ("line of crew report text.\n").repeat(200);
         let chunks = split_channel_post(&content, 700);
         assert!(chunks.len() > 1, "long content splits: {}", chunks.len());
         for (i, c) in chunks.iter().enumerate() {
             assert!(c.chars().count() <= 700, "chunk {i} is {} chars", c.len());
             assert!(c.starts_with(&format!("({}/{}) ", i + 1, chunks.len())));
         }
-        // round-trip: markers stripped, order preserved
         let joined: String = chunks
             .iter()
             .map(|c| c.split_once(' ').map(|x| x.1).expect("body"))
             .collect::<Vec<_>>()
             .join("");
         assert_eq!(joined.replace('\n', ""), content.replace('\n', ""));
-        // short content = single unmarked chunk? No: single chunk gets no marker
         let one = split_channel_post("short", 700);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0], "short");
@@ -1061,15 +1019,11 @@ mod tests {
 
     #[test]
     fn global_sub_exclusion_by_construction() {
-        // A "global subscription" has no member identity → `can_read` is
-        // false for any private channel. This is the same rule the bus fanout
-        // uses: private channel events never reach global subs.
         let store = ChannelStore::new();
         let alice = keys();
         store
             .create_channel(&alice.public_key(), "private-1", "Private", true, None)
             .expect("create");
-        // A non-member reader (the global-sub stand-in) cannot read it.
         let outsider = keys();
         assert!(!store.can_read("private-1", &outsider.public_key()));
     }
@@ -1086,7 +1040,6 @@ mod tests {
         store.join("c", &bob.public_key()).expect("join");
         store.leave("c", &bob.public_key()).expect("leave");
         assert!(!store.is_member("c", &bob.public_key()));
-        // Ask-user A: authority held after FireLive — production join FenceReAdd.
         let err = store
             .join("c", &bob.public_key())
             .expect_err("re-join under held Kick must fence");
@@ -1139,7 +1092,6 @@ mod tests {
         .expect("leave");
         let store = ChannelStore::rebuild([create, members, leave]).expect("rebuild");
         assert!(!store.is_member("c", &bob.public_key()));
-        // apply_lifecycle settled — join must NOT permanent-fence.
         store
             .join("c", &bob.public_key())
             .expect("join after apply_lifecycle leave must work (settled)");
@@ -1171,7 +1123,6 @@ mod tests {
             !store.authority_is_held("c"),
             "create+closed rebuild must settle_authority (CLI 39000 closed path)"
         );
-        // Settled — join must fail as closed, NOT as FenceReAdd from held Disable.
         let err = store
             .join("c", &bob.public_key())
             .expect_err("closed refuses join");
@@ -1181,7 +1132,6 @@ mod tests {
             !msg.contains("fenced"),
             "create+closed rebuild must settle (not FenceReAdd), got {msg}"
         );
-        // Live close() still holds for in-process CS (unchanged).
         let live = ChannelStore::new();
         live.create_channel(&alice.public_key(), "live", "L", false, None)
             .expect("create");
@@ -1262,7 +1212,6 @@ mod tests {
         store
             .leave("a", &bob.public_key())
             .expect("leave a — hold Kick");
-        // Bump global authority_generation via other channel leave/close.
         store.leave("b", &carol.public_key()).expect("leave b");
         store
             .create_channel(&alice.public_key(), "d", "D", false, None)
@@ -1393,7 +1342,6 @@ mod tests {
             .create_channel(&alice.public_key(), "c", "C", false, Some("toron"))
             .expect("create");
 
-        // Canonical kind 9 event, built by hand (as if from the bus).
         let ev9 = build_event(
             &alice,
             toron_kind(CHANNEL_MESSAGE),
@@ -1406,7 +1354,6 @@ mod tests {
         assert_eq!(p9.kind, 9);
         assert_eq!(p9.channel_id, "c");
 
-        // Legacy kind 42 event, ingested the same way.
         let ev42 = build_event(
             &alice,
             toron_kind(CHANNEL_MESSAGE_LEGACY),
@@ -1419,7 +1366,6 @@ mod tests {
         assert_eq!(p42.kind, 42);
         assert_eq!(p42.content, "legacy hello");
 
-        // Both project into history as channel posts.
         let hist = store.history("c");
         assert_eq!(hist.len(), 2);
         assert!(hist.iter().all(|e| e.kind == 9 || e.kind == 42));
@@ -1436,7 +1382,6 @@ mod tests {
             .create_channel(&alice.public_key(), "c", "C", false, None)
             .expect("create");
 
-        // A reaction (kind 7) is not a channel post.
         let post = store.post(&alice, "c", "hello", &[]).expect("post");
         let reaction = store
             .react(&alice, "c", &post.id.to_hex(), "+1")
@@ -1446,7 +1391,6 @@ mod tests {
             "kind 7 is not a channel post"
         );
 
-        // A kind-9 event from a non-member is dropped at the gate.
         let stranger = build_event(
             &mallory,
             toron_kind(CHANNEL_MESSAGE),
@@ -1459,8 +1403,6 @@ mod tests {
             store.ingest(&stranger).is_err(),
             "non-member event dropped before index"
         );
-        // Only the member's post + reaction were recorded; both failed
-        // ingests added nothing.
         assert_eq!(
             store.history("c").len(),
             2,
@@ -1525,10 +1467,8 @@ mod tests {
             .post(&alice, "probe", "one-off ordering probe", &[])
             .expect("pre-close post");
 
-        // Only the creator may close.
         let err = store.close("probe", &bob.public_key()).unwrap_err();
         assert!(err.to_string().contains("creator"), "{err}");
-        // Unknown channel: honest not-found, not a fake membership bounce.
         assert!(store.close("ghost", &alice.public_key()).is_err());
 
         store.close("probe", &alice.public_key()).expect("close");
@@ -1537,31 +1477,25 @@ mod tests {
             "closed flag is visible on the channel"
         );
 
-        // Posts refused on a closed channel — even by a member.
         let err = store.post(&alice, "probe", "after close", &[]).unwrap_err();
         assert!(err.to_string().contains("closed"), "{err}");
-        // Reactions refused too.
         assert!(
             store
                 .react(&alice, "probe", "0".repeat(64).as_str(), "✅")
                 .is_err()
         );
-        // Joins refused: a retired channel accepts nobody new.
         assert!(
             store.join("probe", &keys().public_key()).is_err(),
             "join on a closed channel must fail"
         );
-        // The creator MAY leave a closed channel (leave-rule fix).
         store
             .leave("probe", &alice.public_key())
             .expect("creator leaves a closed channel");
         assert!(!store.is_member("probe", &alice.public_key()));
-        // Close is idempotent.
         store
             .close("probe", &alice.public_key())
             .expect("close again");
 
-        // Pre-close history survives close (close retires, purge removes).
         assert!(!store.history("probe").is_empty());
     }
 }

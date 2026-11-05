@@ -163,16 +163,13 @@ impl ProofGate {
         if proof.kind.as_u16() != REGISTRATION_ATTESTATION {
             return Err(ProofError::Mismatch("wrong kind".into()));
         }
-        // Verify event signature + canonical id (forged/mutated rejected).
         crate::nostr::event::verify_event(proof).map_err(|_| ProofError::BadSignature)?;
-        // Anchor trust.
         let anchor_hex = proof.pubkey.to_hex();
         if !self.trusted_anchors.iter().any(|a| a == &anchor_hex) {
             return Err(ProofError::Mismatch(format!(
                 "untrusted anchor {anchor_hex}"
             )));
         }
-        // Content parse.
         let att: Attestation = serde_json::from_str(&proof.content)
             .map_err(|e| ProofError::Malformed(format!("attestation json: {e}")))?;
         if att.scheme != "schnorr" {
@@ -205,7 +202,6 @@ impl ProofGate {
             hex::decode(sig_hex).map_err(|_| ProofError::Malformed("bad signature hex".into()))?;
         let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
             .map_err(|_| ProofError::BadSignature)?;
-        // Trusted verifier: try each key.
         let mut ok = false;
         for vk in trusted_ed25519 {
             if vk.verify_strict(&att.canonical_bytes(), &sig).is_ok() {
@@ -449,7 +445,6 @@ mod tests {
     async fn test_nonce_persists_across_store_reopen() {
         let anchor = Keys::generate();
         let agent = Keys::generate();
-        // Reopen = new NonceStore on the SAME sqlite file (restart sim).
         let (pool, path) = temp_pool().await;
         {
             let mut store = NonceStore::new(pool.clone());
@@ -465,7 +460,6 @@ mod tests {
                 .await
                 .expect("first ok");
         }
-        // New store instance on same DB — nonce already consumed.
         let store2 = NonceStore::new(pool);
         assert!(store2.is_consumed("nonce-persist").await.expect("query"));
         let _ = std::fs::remove_file(&path);
@@ -478,7 +472,7 @@ mod tests {
         let (mut store, path) = make_store().await;
 
         let mut att = attest(&agent.public_key(), "nonce-expired");
-        att.expires_at = Some(1_700_000_000_u64); // past now()=1_800_000_000
+        att.expires_at = Some(1_700_000_000_u64);
         let ev = build_attestation_event(&anchor, &att, "demo", "BlueLake", now()).expect("build");
         let gate = ProofGate {
             trusted_anchors: vec![anchor.public_key().to_hex()],
@@ -505,7 +499,6 @@ mod tests {
             trusted_anchors: vec![anchor.public_key().to_hex()],
             scheme: ProofScheme::Schnorr,
         };
-        // Claim wrong agent.
         let claim = ProofClaim::new(other.public_key(), "demo", "project:collaborator");
         match gate.verify_schnorr(&ev, &claim, &mut store, now()).await {
             Err(ProofError::Mismatch(_)) => {}
@@ -563,7 +556,6 @@ mod tests {
 
         let att = attest(&agent.public_key(), "nonce-forged");
         let ev = build_attestation_event(&anchor, &att, "demo", "BlueLake", now()).expect("build");
-        // Forge: mutate content but keep id+sig.
         let forged = Event::new(
             ev.id,
             ev.pubkey,
@@ -616,7 +608,6 @@ mod tests {
     #[tokio::test]
     async fn test_ed25519_roundtrip_verify() {
         use ed25519_dalek::{Signer, SigningKey};
-        // Deterministic key (no rand dep needed).
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let vk = signer.verifying_key();
 
@@ -637,7 +628,6 @@ mod tests {
             trusted_anchors: vec![],
             scheme: ProofScheme::Ed25519,
         };
-        // Use a disabled store (no sqlite in this sync test).
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
             .expect("mem pool");
@@ -678,7 +668,6 @@ mod tests {
         let mut store = NonceStore::disabled(pool);
         let claim = ProofClaim::new(agent.public_key(), "demo", "project:collaborator");
         let json = serde_json::to_string(&att).expect("json");
-        // Only `other` is trusted → sig by `signer` rejected.
         assert!(matches!(
             gate.verify_ed25519(&json, &claim, &mut store, now(), &[other.verifying_key()])
                 .await,

@@ -247,8 +247,6 @@ fn filter_inbox_messages(
     q: &FetchInbox,
 ) -> Result<Vec<InboxMessage>, MailError> {
     let since_us = q.since_ts.as_deref().map(parse_rfc3339_us).transpose()?;
-    // ack-SLA: the overdue cutoff is shared with the SLA scan (one meaning
-    // of "overdue" across scan + inbox branch).
     let overdue_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
         - ACK_SLA_DEFAULT_SECS * 1_000_000;
     Ok(items
@@ -262,18 +260,11 @@ fn filter_inbox_messages(
             {
                 return false;
             }
-            // bd-harvest-thread-filter-yp9r: thread filter (post-unwrap —
-            // the thread tag is inside the encrypted wrap; index-served
-            // filtering is impossible for the inbox projection, which is
-            // bus-replay based). `thread_id` here is the inbox row's own
-            // thread field, so the comparison is exact.
             if let Some(t) = &q.thread_id
                 && m.thread_id.as_deref() != Some(t.as_str())
             {
                 return false;
             }
-            // ack-SLA: ack-overdue branch — the recipient's own read state
-            // rides the row (`read_ts_us`), so no extra query is needed.
             let ack_overdue = m.ack_required
                 && matches!(m.importance.as_str(), "high" | "urgent")
                 && m.created_ts_us < overdue_us
@@ -304,32 +295,22 @@ impl Mailbox {
     /// same kind-14 rumor (to/cc) or the bcc-variant rumor. Gift wraps are
     /// metadata-hiding: they carry NO project tags (A3).
     pub async fn send_message(&self, args: &SendMessage) -> anyhow::Result<SendResult> {
-        // ADR-0027 E2: parse extra_tags vocabulary at the boundary; reject
-        // unknown wake/priority/audience loudly (typed, not free strings).
         let parsed_tags = crate::mailbox::send_tags::SendTags::parse(&args.extra_tags)
             .map_err(|e| anyhow::anyhow!(e.message))?;
-        // ADR-0017: the project key is canonicalized first — every spelling
-        // of the project sends under the ONE canonical root.
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await;
-        // ADR-0019 D8 (bd-q6vx): group fan-out refuses at the same layer as
-        // the loop, before resolve (a group name must not reach key lookup).
         for raw in args.to.iter().chain(args.cc.iter()).chain(args.bcc.iter()) {
             if super::surface::is_group_target(raw) {
                 return Err(anyhow::anyhow!(super::surface::group_refused_msg(raw)));
             }
         }
-        // G3: resolve ALL recipients pre-wrap; unknown aborts the whole send.
         let resolved = self.resolve_recipients(&args).await?;
         if resolved.is_empty() {
             anyhow::bail!("no recipients (to/cc/bcc all empty)");
         }
-        // E3 invariants that need recipient count / overseer context.
         parsed_tags
             .validate_for_send(resolved.len(), args.overseer)
             .map_err(|e| anyhow::anyhow!(e.message))?;
-        // ADR-0028 E3: thread_id is never corr. The sender mints corr;
-        // tick never invents it; conflation fails loud here.
         {
             use crate::mailbox::send_tags::{ThreadId, reject_thread_as_corr};
             use std::str::FromStr;
@@ -344,21 +325,7 @@ impl Mailbox {
                 .map_err(|e| anyhow::anyhow!(e.message))?;
         }
 
-        // ADR-0027 E2: a tasked send carrying a corr OWES a receipt — durable
-        // from the moment the send is validated (fresh-eyes fix 2026-09-01:
-        // the store previously had ZERO producers, so `receipt get` and
-        // `wait --corr` could never observe a real send). Best-effort: a
-        // missing index pool (demo mode) must not fail the send.
-        // ADR-0010 D8.2: the failure is remembered — if the send still
-        // enqueues, the corr records degraded (acked-unknown) post-loop.
-        // ADR-0035 Spec 1 (per-method clock, bd-r328): one host-edge clock
-        // read per send; every receipt stamped below shares it. Mid-logic
-        // `Utc::now()` reads are banned — the method is the host, the
-        // `Clock` trait is the seam (tests inject `FakeClock` at the edge).
         let now_ms = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
-        // ADR-0019 D8 (bd-q6vx): per-(from,to) loop, before the first write
-        // (receipt upsert below). Refuse writes nothing. Operator overseer is
-        // exempt by ARGUMENT, never env/TTY.
         {
             let exempt = if args.overseer {
                 super::surface::Exempt::Operator
@@ -393,18 +360,11 @@ impl Mailbox {
                     };
                     if let Err(e) = store.upsert(&receipt).await {
                         eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
-                        // ADR-0010 D8.2: remember the bookkeeping failure — if
-                        // the send still enqueues, the corr records degraded
-                        // (acked-unknown) after the publish loop.
                         receipt_bookkeeping_failed = true;
                     } else {
-                        // Opportunistic bounded retention: keep at most 1000
-                        // newest receipts and expire >30d old rows. Best-effort
-                        // background prune — never blocks the send.
                         let pool = store.pool().clone();
                         tokio::spawn(async move {
                             let s = crate::mailbox::receipts::ReceiptStore::new(pool);
-                            // Host clock (ADR-0035 Spec 1): prune takes host time.
                             let now_ms = crate::index::writer::Clock::now_us(
                                 &crate::index::writer::SystemClock,
                             ) / 1000;
@@ -415,53 +375,26 @@ impl Mailbox {
                 }
                 Err(e) => {
                     eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
-                    // ADR-0010 D8.2: bookkeeping unavailable pre-publish — if
-                    // the send still enqueues, record degraded post-loop.
                     receipt_bookkeeping_failed = true;
                 }
             }
         }
         let sender_keys = if args.overseer {
-            // ADR-0004 Ship 5: the Overseer signs with the OPERATOR key, so
-            // the projection can verify the sender npub against it.
             self.operator().cloned().ok_or_else(|| {
                 anyhow::anyhow!(
                     "overseer send requires an operator key (set operator_key / TORON_OPERATOR_KEY)"
                 )
             })?
         } else {
-            // bd-pin-public-plane-s-easy.1: the sender name may be a slug —
-            // resolve through the fold to the pin's key.
             self.agent_keys_for_resolved(&args.project_slug, &args.sender_name)
                 .await?
         };
 
-        // ONE timestamp for the whole send (bd-ff23): the rumor's
-        // `created_at` is part of the event id, so a retry that re-publishes
-        // an unfinished claim must reuse it to land the SAME event id.
         let rumor_ts = Timestamp::now().as_secs();
 
-        // Build every rumor up front (visible for to/cc, one variant per
-        // bcc) so the idempotent-send claim below records the complete
-        // delivery set BEFORE anything hits the bus. The hex id is
-        // precomputed once per owned rumor (bd-kkid): `id()` takes `&mut`
-        // (internal cache), so computing it here — where the rumor is
-        // already owned — saves one full event clone per recipient later.
         let (mut pending, mut visible_id) =
             build_pending_rumors(&sender_keys, &args, &resolved, rumor_ts);
 
-        // ADR-0028 zfnx.12: corr-keyed idempotent send. Same
-        // (project, sender, corr) within TTL returns the existing event id
-        // instead of emitting. Claim BEFORE publish: a crash between
-        // publish and receipt-upsert (or a Publish retry) converges on the
-        // first rumor. No corr, or no index pool (demo mode): send as usual.
-        //
-        // bd-ff23: the claim row is the durable command — it carries the
-        // rumor's timestamp and whether the publish COMPLETED. A claim whose
-        // publish never finished is re-published below (the same event id,
-        // rebuilt from the stored timestamp): the mail is not lost. A claim
-        // whose publish finished replays its deliveries and publishes
-        // nothing.
         let mut replay: Option<Vec<Delivery>> = None;
         let mut claim: Option<(String, String)> = None;
         if let Some(corr) = parsed_tags.corr.clone() {
@@ -503,12 +436,6 @@ impl Mailbox {
                         rumor_created_at,
                     }) => {
                         match rumor_created_at {
-                            // The prior attempt never completed the publish:
-                            // rebuild the SAME event from the stored
-                            // timestamp and send it now. The mail is not
-                            // lost, and the recipient still sees one message
-                            // (the event id is the same, and the projection
-                            // dedupes on it).
                             Some(ts) if !published => {
                                 let (rebuilt, rebuilt_visible) =
                                     build_pending_rumors(&sender_keys, &args, &resolved, ts as u64);
@@ -522,10 +449,6 @@ impl Mailbox {
                                     serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into())
                                 }));
                             }
-                            // Published, or a claim written before bd-ff23
-                            // (no stored timestamp, so the event cannot be
-                            // rebuilt): replay the FIRST send's deliveries,
-                            // publish nothing, ring nothing.
                             _ => {
                                 let stored: Vec<(String, String)> =
                                     serde_json::from_str(&deliveries_json).unwrap_or_default();
@@ -544,8 +467,6 @@ impl Mailbox {
                         }
                     }
                     Ok(SendClaim::New) => {
-                        // Opportunistic bounded retention (best-effort,
-                        // never blocks the send).
                         let pool = store.pool().clone();
                         tokio::spawn(async move {
                             let s = crate::mailbox::idempotent::IdempotentSendStore::new(pool);
@@ -574,9 +495,6 @@ impl Mailbox {
         let pending_len = pending.len();
         let mut deliveries: Vec<Delivery> = Vec::new();
 
-        // to+cc+bcc: one gift wrap per recipient from the prebuilt rumors.
-        // bd-d0a7: hoist the urgency bit onto the outer 1059 envelope so
-        // relays/watchers order without decrypting (content stays sealed).
         let outer_urgent = args.importance.as_deref() == Some("urgent");
         for (r, rumor, rumor_id) in pending {
             let wrap =
@@ -594,10 +512,6 @@ impl Mailbox {
                         },
                     });
                 }
-                // ADR-0010 D8.1: transport-unknown (the bus did not confirm
-                // storage) — never silence. Print the corr-preserving resend
-                // guidance; a plain re-run of the send mints a NEW corr and
-                // duplicates.
                 Ok(false) => {
                     eprintln!(
                         "{}",
@@ -606,8 +520,6 @@ impl Mailbox {
                         )
                     );
                 }
-                // Bus call itself failed — same uncertainty semantics as
-                // stored=false: loud + resend guidance, never silence.
                 Err(e) => {
                     eprintln!("toron: DM publish failed for {}: {e}", r.name);
                     eprintln!(
@@ -620,10 +532,6 @@ impl Mailbox {
             }
         }
 
-        // bd-ff23: the publish completed → the durable command is SETTLED.
-        // A claim left unpublished (a crash, or a partial publish) is
-        // re-published on the next retry — the same event id, so the
-        // recipient still sees one message.
         if deliveries.len() == pending_len
             && let Some((key, intended_json)) = claim.as_ref()
             && let Ok(store) = self.idempotent_store()
@@ -634,18 +542,12 @@ impl Mailbox {
             );
         }
 
-        // ADR-0010 D8.2: the message enqueued (≥1 confirmed delivery) but the
-        // receipt bookkeeping failed → record degraded (acked-unknown) and
-        // never invite a resend.
         if receipt_bookkeeping_failed
             && !deliveries.is_empty()
             && let Some(corr) = parsed_tags.corr.clone()
         {
             eprintln!("{}", crate::mailbox::receipts::DEGRADED_NOTE);
             if let Ok(store) = self.receipt_store() {
-                // bd-5mxm: one kernel decides each transition — the stored
-                // row (if any) enters `tick` as the model and only a `Stamp`
-                // effect writes. Direct upserts from this path are forbidden.
                 let model = match store.get(corr.as_str()).await.ok().flatten() {
                     Some(row) => crate::mailbox::receipts_core::ReceiptsModel::with_row(
                         corr.as_str(),
@@ -683,17 +585,6 @@ impl Mailbox {
             }
         }
 
-        // bd-i1o3.1: metadata-only wake ring for pane-backed recipients.
-        // Gift-wrap is sealed (kind 1059, p-gated, no project tags) — the
-        // doorbell's `toron watch` never sees it. Emit one lightweight kind-9
-        // per delivery with ONLY: from pin, thread_id, importance. No subject
-        // or content ever touches the wake (seal stays sealed). Reuses the
-        // same bus the job wake (43001) uses — no new Nostr kind.
-        // ADR-0010 D8.3: ring for EVERY attempted recipient, not only
-        // confirmed deliveries — a transport-unknown wrap prefers the rare
-        // duplicate wake over silence (duplicate over silence: the D2
-        // watermark makes the duplicate a no-op for the consumer; silence
-        // loses the message outright).
         let thread_ref = args.thread_id.clone().unwrap_or_else(|| visible_id.clone());
         let importance = args
             .importance
@@ -724,9 +615,6 @@ impl Mailbox {
             }
         }
 
-        // bd-liveness-any-command-mc34: sending proves the sender is alive
-        // (a holder that only sends never reads mail). Best-effort at the
-        // effect edge — after delivery, never failing the send.
         let now_us = super::lease_liveness::host_now_us();
         self.record_inbox_poll(&args.project_slug, &args.sender_name, now_us)
             .await;
@@ -742,7 +630,6 @@ impl Mailbox {
     /// `["e", root, relay, "reply"]` tag on the rumor. Recipients default to
     /// the original message's sender when `to` is empty.
     pub async fn reply_message(&self, args: &SendMessage) -> anyhow::Result<SendResult> {
-        // ADR-0017: canonical root before thread root resolution.
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await;
         let root = args
@@ -813,7 +700,7 @@ impl Mailbox {
         seen_us: i64,
     ) -> anyhow::Result<()> {
         let Some(pool) = self.index_pool.as_ref() else {
-            return Ok(()); // read side already refused; nothing to bump
+            return Ok(());
         };
         sqlx::query(
             "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
@@ -832,23 +719,13 @@ impl Mailbox {
     /// `fetch_inbox`: project + agent projection of unwrapped kind-1059 mail to
     /// the agent's local key, ordered by rumor time (G7), never envelope time.
     pub async fn fetch_inbox(&self, args: &FetchInbox) -> anyhow::Result<Vec<InboxMessage>> {
-        // ADR-0017: canonical root (read state, receipts) for every spelling
-        // of the project key.
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await;
-        // bd-pin-public-plane-s-easy.1: the inbox owner may be named by slug
-        // — resolve through the fold to the pin's key.
         let agent_keys = self
             .agent_keys_for_resolved(&args.project_slug, &args.agent_name)
             .await?;
         let npub = agent_keys.public_key();
 
-        // Subscribe to gift wraps addressed to this agent (#p), drain history.
-        // bd-harvest-thread-filter-yp9r: the bus replay defaults to a 1000-row
-        // newest-tail window (event_store.rs unwrap_or(1000)) — an inbox fetch
-        // must see EVERY wrap or mail silently vanishes past 1000. Request the
-        // store cap explicitly; the caller-facing `limit` only trims rows
-        // AFTER projection.
         let filter = ToronFilter::new()
             .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(npub)
@@ -858,16 +735,8 @@ impl Mailbox {
 
         let mut mails: Vec<UnwrappedMail> = Vec::new();
         for wrap in &events {
-            // bd-py9o: memoized decrypt — fleet polling replays the same
-            // history every few seconds; each wrap is decrypted once per
-            // (recipient, event) instead of once per poll.
             if let Some(gift) = self.cached_unwrap(&agent_keys, wrap, npub) {
                 let rumor = gift.rumor;
-                // ADR-0010 F5: NIP-17 contact control messages (`toron-kind`
-                // contact-request/contact-response) carry no subject and no
-                // body — projecting them yields subjectless empty-body mail
-                // rows. They are protocol control, not mail: the contact
-                // link table is their surface.
                 if let Some(kind) = tag_value(&rumor.tags, "toron-kind")
                     && (kind == "contact-request" || kind == "contact-response")
                 {
@@ -884,34 +753,17 @@ impl Mailbox {
             }
         }
 
-        // G7: order by rumor time (+ts_ms) + local_seq; never envelope time.
         let ordered = order_by_rumor_time(mails);
-        // bd-fts-projection-lag: the read door heals the search projection —
-        // every mail the fetch just decrypted lands in the `messages`/FTS
-        // index even with no projecting daemon running. Idempotent on
-        // rumor-id; contract in `heal_search_projection`.
         self.heal_search_projection(&ordered).await;
         let mut messages: Vec<InboxMessage> = ordered
             .into_iter()
             .filter_map(|(m, _seq)| inbox_from(m))
             .collect();
 
-        // S5 (bd-dup-assign-collapse-ws21): collapse identical
-        // (sender, subject, body-hash) within the window into one row
-        // carrying `duplicate_of: <first-id>` — toron stops double-delivering
-        // duplicate assigns/re-sends; staleness is flywheel's wake concern.
         messages = collapse_duplicates(messages);
 
-        // bd-5icg: read state is a projection concern (never event state).
-        // Populate `read_ts_us` from the `message_reads` table and, when the
-        // caller asks for unread-only, keep only messages with NO read row for
-        // this recipient. Without an index pool the read state cannot be
-        // known — the filter degrades to no filtering (same as pre-bd-5icg)
-        // and every row reports `read_ts_us: None`.
         let mut read_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         if let Some(pool) = self.index_pool.as_ref() {
-            // ADR-0017: expand the project to its alias set so legacy read
-            // rows written under a path-form slug stay visible.
             let set = self.project_read_set(&args.project_slug).await;
             let ph: Vec<String> = (1..=set.len()).map(|i| format!("?{i}")).collect();
             let sql = format!(
@@ -934,9 +786,6 @@ impl Mailbox {
         for m in &mut messages {
             m.read_ts_us = read_ts.get(&m.id).copied();
         }
-        // F19.NIP09 (batch-fix): a NIP-09-tombstoned message must not appear
-        // in the inbox — drop ids marked `deleted` in the index (no index
-        // pool → the filter degrades to no filtering, same as read state).
         if let Some(pool) = self.index_pool.as_ref() {
             let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
             if !ids.is_empty() {
@@ -967,10 +816,6 @@ impl Mailbox {
         if args.unread_only {
             messages.retain(|m| m.read_ts_us.is_none());
         }
-        // bd-since-cursor-70cf: `--since last` resolves the daemon-side
-        // high-water cursor, filters with it, then bumps it to the newest
-        // VISIBLE message ts (atomic UPSERT). Explicit RFC3339 values keep
-        // their existing path; only the literal "last" is intercepted.
         let since_last = args.since_ts.as_deref() == Some("last");
         let cursor_us: i64 = if since_last {
             self.read_inbox_cursor(&args.project_slug, &args.agent_name)
@@ -978,13 +823,11 @@ impl Mailbox {
         } else {
             0
         };
-        // High-water over VISIBLE messages (post delete/unread filters) —
-        // limit-truncated rows still advance the cursor (nothing skipped).
         let high_water_us = messages.iter().map(|m| m.created_ts_us).max().unwrap_or(0);
         if args.urgent_only || args.since_ts.is_some() || args.thread_id.is_some() {
             let mut q = args.clone();
             if since_last {
-                q.since_ts = None; // "last" is not RFC3339; the manual filter below applies it
+                q.since_ts = None;
             }
             messages = filter_inbox_messages(messages, &q)?;
             if since_last {
@@ -999,28 +842,10 @@ impl Mailbox {
             )
             .await?;
         }
-        // bd-oracle-dead-source-72az: EVERY read timestamps the reader
-        // (a poll proves liveness even with an empty inbox, where the
-        // delivery bump above is a no-op). Covers CLI `mail inbox` and the
-        // MCP fetch in one choke point; `toron next` records separately.
-        // The stamp carries the edge clock: a poll proves liveness even
-        // with an empty inbox, where the delivery bump above is a no-op.
         let now_us = super::lease_liveness::host_now_us();
         self.record_inbox_poll(&args.project_slug, &args.agent_name, now_us)
             .await;
 
-        // Parity: AM `fetch_inbox` names the sender (the display name, not the
-        // raw pubkey). toron's gift-wrap unwrap yields only the sender npub;
-        // reverse-resolve npub→name from the agents index so the inbox is
-        // human-readable without a per-message `whois`. Falls back to the hex
-        // npub when no pool is attached or the sender never registered locally.
-        // bd-asbc: `limit` is a NEWEST-N window, not an oldest-N head.
-        // `order_by_rumor_time` hands us an ASCENDING list, so a `.take(n)` over
-        // it kept the OLDEST n and dropped whatever had just arrived —
-        // invisible on a short inbox, and structurally fatal for any caller
-        // polling an inbox for something new. Take the tail instead, and still
-        // return it ascending: the limit narrows the window, it never reorders
-        // it, so a caller rendering the inbox sees the same order either way.
         let mut messages = if let Some(n) = args.limit
             && n < messages.len()
         {
@@ -1059,8 +884,6 @@ impl Mailbox {
         }
         let ids: Vec<String> = ordered.iter().map(|(m, _)| m.rumor_id.to_hex()).collect();
         let mut projected: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Chunked `IN` — a full-history fetch can carry tens of thousands of
-        // rumor ids and SQLite caps bound variables per statement.
         for chunk in ids.chunks(500) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -1076,9 +899,6 @@ impl Mailbox {
                         .filter_map(|r| r.try_get::<String, _>(0).ok()),
                 ),
                 Err(e) => {
-                    // A failed chunk degrades to healing writes for it —
-                    // the sink dedup makes the re-write a no-op when the
-                    // row is actually there.
                     tracing::debug!("projection pre-check failed (healing write covers it): {e}");
                 }
             }
@@ -1091,9 +911,6 @@ impl Mailbox {
         if todo.is_empty() {
             return;
         }
-        // Recipient-npub → project / sender-npub → name maps, the same
-        // shapes `build_unwrap_pipeline` feeds the daemon's sink. The wrap
-        // hides the project; the sink resolves it from the recipient key.
         let roster: Vec<(String, String, String)> =
             sqlx::query_as("SELECT project_slug, name, pubkey FROM agents")
                 .fetch_all(pool)
@@ -1133,7 +950,7 @@ impl Mailbox {
     /// fetch (parameterized over the unique-sender set).
     async fn resolve_sender_names(&self, messages: &mut [InboxMessage]) {
         let Some(pool) = self.index_pool.as_ref() else {
-            return; // no index — leave hex npubs (downgrade, not a failure)
+            return;
         };
         let mut pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in messages.iter() {
@@ -1144,8 +961,6 @@ impl Mailbox {
         if pubkeys.is_empty() {
             return;
         }
-        // Build `WHERE pubkey IN (?, ?, ...)` with one placeholder per unique
-        // sender (sqlx has no first-class `IN Vec` on the macro-free path).
         let placeholders = std::iter::repeat_n("?", pubkeys.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -1273,10 +1088,6 @@ impl Mailbox {
             Tag::parse(["audience", &aud]).expect("audience"),
         ];
         for a in audience {
-            // GS-006 bug 4: audience is pin names (adjective+noun) or npub hex.
-            // Prior code only handled hex -> npub p tag, so pin-name audience never addressed
-            // the doorbell (watch_targets empty -> None). Now always add p tag: hex as npub,
-            // pin name as raw value (doorbell SelfIndex matches both).
             if let Ok(pk) = PublicKey::from_hex(a) {
                 if let Ok(t) = Tag::parse(["p", &pk.to_hex()]) {
                     tags.push(t);
@@ -1349,8 +1160,6 @@ impl Mailbox {
         let Some(pool) = self.index_pool.as_ref() else {
             return Ok(Vec::new());
         };
-        // Oldest obligation first: the publication cap then drops the least
-        // overdue work, not the oldest.
         let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
             "SELECT event_id, thread_id, to_list FROM messages \
              WHERE project_slug = ?1 AND ack_required = 1 \
@@ -1368,8 +1177,6 @@ impl Mailbox {
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let window_us = sla * 1_000_000;
         let mut emitted = Vec::new();
-        // One signer for the whole scan, and one reminder record read per
-        // OBLIGATION (not per post).
         let mut signer: Option<Keys> = None;
         let mut scope_state: HashMap<(String, String), (i64, i64)> = HashMap::new();
         for (post_id, thread_id, to_list_json) in rows {
@@ -1379,11 +1186,6 @@ impl Mailbox {
             if emitted.len() >= max_emit {
                 break;
             }
-            // SLA truth is sqlite (message_reads / receipts store), never the
-            // process-local wrap_idempotency HashMap. ack-SLA: ack state is
-            // per (message, recipient) — one reader's receipt must not
-            // silence the wake for co-recipients. Handled iff EVERY
-            // addressed recipient has a read row.
             let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
             let mut unique: Vec<String> = audience.clone();
             unique.sort();
@@ -1391,8 +1193,6 @@ impl Mailbox {
             let mut handled = !unique.is_empty();
             if handled {
                 for chunk in unique.chunks(50) {
-                    // All-anonymous placeholders: mixing `?1` with bare `?`
-                    // misbinds under sqlx (IN-list silently matches nothing).
                     let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT COUNT(DISTINCT recipient) FROM message_reads \
@@ -1422,9 +1222,6 @@ impl Mailbox {
             {
                 continue;
             }
-            // bd-4v1a: the obligation is the CONVERSATION the post belongs to,
-            // so a thread that re-posts one request every two minutes owes ONE
-            // reminder, not one per post.
             let scope_id = ack_sla_scope_id(thread_id.as_deref(), &post_id);
             let wake_key = ack_sla_wake_audience_key(&audience);
             let scope_key = (scope_id.clone(), wake_key.clone());
@@ -1437,15 +1234,9 @@ impl Mailbox {
                 }
             };
             if wakes >= ACK_SLA_WAKE_BUDGET {
-                // Terminally muted: the obligation stays visible (the reader's
-                // inbox, the durable counter), the nag stops. A permanent mute
-                // alone would trade the flood for a silent drop, so the
-                // record keeps the counter that muted it.
                 continue;
             }
             if emitted_us >= now_us - window_us {
-                // Inside the reminder window: remind once per SLA window, not
-                // on every pass.
                 continue;
             }
             if signer.is_none() {
@@ -1457,8 +1248,6 @@ impl Mailbox {
                     .emit_ack_sla_expired_signed(s, &project_slug, &post_id, tid, &audience)
                     .await;
             }
-            // Record the attempt BEFORE trusting the loop: a wake that was
-            // published but not recorded here is exactly the repeat this guards.
             self.ack_sla_record_wake(&scope_id, &wake_key).await;
             scope_state.insert(scope_key, (wakes + 1, now_us));
             emitted.push(post_id);
@@ -1531,21 +1320,15 @@ impl Mailbox {
         kind: &str,
         acknowledged: bool,
     ) -> anyhow::Result<ReceiptResult> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        // bd-pin-public-plane-s-easy.1: ack/read identity may be a slug —
-        // resolve through the fold to the pin's key.
+        let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self
             .agent_keys_for_resolved(project_slug, agent_name)
             .await?;
         let npub = agent_keys.public_key();
 
-        // Case (a): the wrap addressed to THIS agent (the recipient).
         let original = match self.find_message_for_keys(&agent_keys, message_id).await? {
             Some(gift) => gift,
             None => {
-                // Identity drift: the message exists but was addressed to a
-                // different identity. Discover the actual recipient across
-                // the project's agents (alias-set expanded), then authorize.
                 let (gift, recipient_name) = self
                     .find_message_across_agents(project_slug, message_id)
                     .await?
@@ -1559,8 +1342,6 @@ impl Mailbox {
         };
         let sender_npub = original.sender;
 
-        // ADR-0027 E2.3: corr of the original rumor (typed tag) — used to
-        // transition the durable receipt owed -> acked. Extract once.
         let corr_opt = original.rumor.tags.iter().find_map(|t| {
             let s = t.as_slice();
             if s.first().map(String::as_str) == Some("corr") && s.len() > 1 {
@@ -1570,10 +1351,8 @@ impl Mailbox {
             }
         });
 
-        // Idempotency: already acked/read → return stored receipt.
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
         if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
-            // Even on duplicate, heal a lagging durable receipt (best-effort).
             if let Some(corr_s) = corr_opt.clone()
                 && let Ok(corr) = crate::mailbox::ids::Corr::from_str(&corr_s)
                 && let Ok(store) = self.receipt_store()
@@ -1590,7 +1369,6 @@ impl Mailbox {
             });
         }
 
-        // Build the private kind-14 rumor: toron-kind + NIP-10 e reference.
         let tags = vec![
             Tag::parse(["toron-kind", kind])
                 .map_err(|e| anyhow::anyhow!("failed to build toron-kind tag: {e}"))?,
@@ -1609,7 +1387,6 @@ impl Mailbox {
         self.publish_dm(&wrap).await?;
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
         self.record_read_state(project_slug, npub, &id, ts_us).await;
-        // ADR-0027 E2.3: durable receipt owed -> acked (best-effort).
         if let Some(corr_s) = corr_opt
             && let Ok(corr) = crate::mailbox::ids::Corr::from_str(&corr_s)
             && let Ok(store) = self.receipt_store()
@@ -1661,7 +1438,7 @@ impl Mailbox {
             .await?;
         for agent in agents {
             let Ok(keys) = self.agent_keys_for(project_slug, &agent.name) else {
-                continue; // no local key for this identity — skip
+                continue;
             };
             if let Some(gift) = self.find_message_for_keys(&keys, message_id).await? {
                 return Ok(Some((gift, agent.name)));
@@ -1682,8 +1459,6 @@ impl Mailbox {
         recipient_name: &str,
         gift: &UnwrappedGift,
     ) -> anyhow::Result<()> {
-        // (c.1) The message's own sender is a thread participant.
-        // bd-pin-public-plane-s-easy.1: acker may be named by slug.
         let acker_keys = self
             .agent_keys_for_resolved(project_slug, acker_name)
             .await?;
@@ -1691,8 +1466,6 @@ impl Mailbox {
             return Ok(());
         }
 
-        // (b) Same herdr pane as the recipient (best-effort: no herdr
-        // backend wired → the check degrades to (c) only).
         if let Ok(backend) = HcBackend::connect(None) {
             let client = backend.client();
             if let Ok(agents) = client.agent_list() {
@@ -1710,9 +1483,6 @@ impl Mailbox {
             }
         }
 
-        // (c.2) The acker can unwrap ANY wrap in the same thread — including
-        // the thread ROOT itself: a head message is its own thread (the
-        // projection's attribution rule), so holding the root is membership.
         if let Some(thread_id) = Self::rumor_thread_id(&gift.rumor) {
             let acker_npub = acker_keys.public_key();
             let filter = ToronFilter::new()
@@ -1784,9 +1554,6 @@ impl Mailbox {
             (args.bcc.iter().collect::<Vec<_>>(), RecipientRole::Bcc),
         ] {
             for name in names {
-                // bd-lmcy: role: prefix resolves through the role → pin alias
-                // table at send time (E4). Unknown role fails loudly naming
-                // available roles; auto-spawn on miss is FORBIDDEN.
                 if let Some(role_name) = name.strip_prefix("role:") {
                     if role_name.trim().is_empty() {
                         anyhow::bail!("role name must be non-empty after 'role:' (got {name:?})");
@@ -1813,7 +1580,6 @@ impl Mailbox {
                             );
                         }
                     };
-                    // Resolve the pin (folded alias → canonical) to npub.
                     let target = self.resolve_agent_name(&args.project_slug, &pin).await?;
                     let npub = nident::resolve_name(&args.project_slug, profiles.iter(), &target)
                         .ok_or_else(|| {
@@ -1829,15 +1595,6 @@ impl Mailbox {
                     });
                     continue;
                 }
-                // bd-wh6k: the ROW carries the CANONICAL recipient name — in
-                // Swarm mode the post-fold resolve_agent_name target — never
-                // the raw caller string. Downstream views key on this label;
-                // storing a folded slug forked one delivery into two
-                // disjoint inbox views whose read state can never meet.
-                // ADR-0037 W4: `pin@project` names one project's binding —
-                // the migration-window form for split pins. Only a suffix
-                // that names a project with registrations qualifies; any
-                // other `@` string stays a literal name and fails below.
                 let qualified = match nident::split_qualified(name) {
                     Some((pin, proj)) if self.project_has_agents(proj).await => Some((pin, proj)),
                     _ => None,
@@ -1851,20 +1608,12 @@ impl Mailbox {
                         .ok_or_else(|| anyhow::anyhow!("unknown recipient: {target}@{canonical} (not registered in project {canonical})"))?;
                     (target, crate::nostr::PublicKey::from_hex(&key)?)
                 } else if super::naming::is_npub(name) {
-                    // ADR-0018: an npub is always a routing address (and its
-                    // own canonical label).
                     (
                         name.clone(),
                         crate::nostr::PublicKey::from_hex(name)
                             .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?,
                     )
                 } else {
-                    // The recipient NAME, folded in the sender's project:
-                    // ADR-0018 D1a/D3 + bd-pin-public-plane-s-easy.1 in Swarm
-                    // mode (canonical names, registered pins, folded
-                    // aliases — the fold precedes the shape match); bd-dbdi
-                    // in Open mode (the alias table folds there too, so
-                    // `send --to captain` resolves like `whois captain`).
                     let target = if mode == super::naming::IdentityMode::Swarm {
                         self.resolve_agent_name(&args.project_slug, name).await?
                     } else {
@@ -1873,9 +1622,6 @@ impl Mailbox {
                             .await
                             .unwrap_or_else(|| name.clone())
                     };
-                    // ADR-0037 W3: the name resolves to a KEY, not to a
-                    // (project, name) pair. The sender's project decides the
-                    // routing (`t` tag), never who the recipient is.
                     let local = nident::resolve_name(&args.project_slug, profiles.iter(), &target);
                     let npub = self
                         .resolve_pin_key(&args.project_slug, &target, local)
@@ -2055,7 +1801,7 @@ impl Mailbox {
         ts_us: i64,
     ) {
         let Some(pool) = self.index_pool.as_ref() else {
-            return; // no index — read state cannot be persisted (degrade)
+            return;
         };
         if let Err(e) = sqlx::query(
             "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
@@ -2096,10 +1842,6 @@ fn build_pending_rumors(
     created_at: u64,
 ) -> (Vec<(ResolvedRecipient, UnsignedEvent, String)>, String) {
     let mut visible = build_visible_rumor(&sender_keys.public_key(), args, resolved, created_at);
-    // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
-    // shows in inbox/search rows — never the transport-internal wrap id.
-    // Send → inbox → ack/summarize round-trips must work on one id world
-    // (ADR-0007 D8.2 per-backend usability).
     let visible_id = visible.id().to_hex();
     let mut pending: Vec<(ResolvedRecipient, UnsignedEvent, String)> = Vec::new();
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
@@ -2123,9 +1865,6 @@ fn build_visible_rumor(
 ) -> UnsignedEvent {
     let mut tags: Vec<Tag> = Vec::new();
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-        // npub.to_hex() is infallible; the 4-tuple shape is toron-controlled.
-        // A failure here would indicate SDK invariants broken — panic is the
-        // correct response (not a recoverable send error).
         tags.push(
             Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()])
                 .expect("static p tag shape (npub hex + role literal)"),
@@ -2150,7 +1889,6 @@ fn build_bcc_rumor(
     created_at: u64,
 ) -> UnsignedEvent {
     let mut tags: Vec<Tag> = Vec::new();
-    // to + cc, plus the single bcc — role "bcc" on its own p tag.
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
         tags.push(
             Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()])
@@ -2179,21 +1917,10 @@ fn build_bcc_rumor(
 /// still sends, just without that tag. This matches AM-Rust's tolerant
 /// handling of optional metadata.
 fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
-    // G7 precise timeline: `created_at` is second-granular (nostr
-    // Timestamp), so same-second messages were indistinguishable to the
-    // projection timeline and `since_ts` strict-newer filtering excluded
-    // post-bound mail (found live: am_parity_e2e since_ts conformance,
-    // 2026-08-21 post-wave review). Stamp the µs tag the readers already
-    // honor (unwrap.rs `ts_ms_tag` documents the VALUE as µs despite the
-    // historical name; projection.rs `rumor_timestamp_us` returns it).
     let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
     if let Ok(t) = Tag::parse(["ts_ms", &now_us.to_string()]) {
         tags.push(t);
     }
-    // ADR-0037 §4.4: with one key per pin the recipient key no longer names
-    // a project, so the sending project rides INSIDE the sealed rumor (the
-    // wrap still hides it). The projection attributes the message to this
-    // project when the recipient key is registered there.
     if !args.project_slug.is_empty()
         && let Ok(t) = Tag::parse(["t", &args.project_slug])
     {
@@ -2220,27 +1947,16 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
         tags.push(t);
     }
     if args.overseer {
-        // ADR-0004 Ship 5: mark the override so the projection can recognize
-        // it (key-scoped + tag-scoped defense in depth).
         if let Ok(t) = Tag::parse(["t", OVERSEER_TAG]) {
             tags.push(t);
         }
     }
-    // ADR-0007 F6: caller-supplied rumor tags (the workflow-emitted stamp
-    // from the ActionRunner). Tags are already-built — extend is infallible.
     tags.extend(args.extra_tags.iter().cloned());
     if let Some(thread) = &args.thread_id {
-        // Free-form thread ids ("br-123", "deploy-xyz") are the AM norm — they
-        // are NOT valid NIP-10 event ids. Emit the literal id as a `thread`
-        // tag so it survives the round-trip (inbox_from + the unwrap
-        // projection both read it back). When the id IS a hex event id, also
-        // emit the NIP-10 `e` root tag so strict reply-chain clients resolve.
         if let Ok(t) = Tag::parse(["thread", thread]) {
             tags.push(t);
         }
         if let Ok(root) = EventId::from_hex(thread) {
-            // NIP-10 marked e-tag: a direct reply to the thread root uses
-            // the `root` marker (positional e-tags are deprecated).
             if let Ok(t) = Tag::parse(["e", &root.to_hex(), "", "root"]) {
                 tags.push(t);
             }
@@ -2257,8 +1973,6 @@ fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
         .unwrap_or("normal")
         .to_string();
     let ack_required = tag_has_flag(tags, "ack-required");
-    // thread_id: prefer the literal `thread` tag (free-form AM-style ids);
-    // fall back to the NIP-10 `e` root tag (event-id threads).
     let thread_id = tag_value(tags, "thread")
         .map(ToString::to_string)
         .or_else(|| {
@@ -2269,10 +1983,6 @@ fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
                     .flatten()
             })
         });
-    // Corr is typed at the projection boundary (bd-05yr): a corrupt tag
-    // fails this row loudly (warn + skip) instead of flowing as String.
-    // Search healing already ran upstream, so the mail itself is preserved
-    // in the archive/bus — only assignment projection refuses the row.
     let corr = match tag_value(tags, "corr").map(Corr::from_str) {
         Some(Err(e)) => {
             tracing::warn!(
@@ -2294,7 +2004,7 @@ fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
         ack_required,
         thread_id,
         created_ts_us: mail.ts_us(),
-        read_ts_us: None, // filled by fetch_inbox from the message_reads projection
+        read_ts_us: None,
         duplicate_of: None,
         corr,
         wake: tag_value(tags, "wake").map(ToString::to_string),
@@ -2320,7 +2030,6 @@ fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
 /// staleness handling is flywheel's wake-side concern, S8).
 pub fn collapse_duplicates(messages: Vec<InboxMessage>) -> Vec<InboxMessage> {
     use std::collections::HashMap;
-    // key = (sender, subject, body-hash) -> (first_id, first_ts_us, out_index)
     let mut groups: HashMap<(String, String, String), (String, i64, usize)> = HashMap::new();
     let mut out: Vec<InboxMessage> = Vec::with_capacity(messages.len());
     for m in messages {
@@ -2331,14 +2040,11 @@ pub fn collapse_duplicates(messages: Vec<InboxMessage>) -> Vec<InboxMessage> {
             Some((first_id, first_ts, idx))
                 if m.created_ts_us - first_ts <= DUP_COLLAPSE_WINDOW_US =>
             {
-                // Duplicate within window: the LATEST copy survives at the
-                // group's row slot, marked with the first id.
                 let mut survivor = m;
                 survivor.duplicate_of = Some(first_id.clone());
                 out[*idx] = survivor;
             }
             _ => {
-                // First occurrence (or outside window → new group).
                 out.push(m.clone());
                 groups.insert(key, (m.id, m.created_ts_us, out.len() - 1));
             }
@@ -2429,7 +2135,6 @@ mod tests {
         let split = ["nident::PinKeys::", "Split(split)=>"].concat();
         let i = src.find(&split).expect("the split arm exists");
         let rest = &src[i..];
-        // The arm runs to the next item's doc comment.
         let branch = &rest[..rest.find("///").expect("the split arm closes")];
         assert!(
             branch.contains("Err("),
@@ -2582,8 +2287,6 @@ mod tests {
             bead: None,
         };
 
-        // Two identical assigns (same sender+subject+body) 10s apart → one
-        // row, the LATEST copy, marked duplicate_of = first id.
         let first = mk(
             "first",
             "PiAlpha",
@@ -2607,7 +2310,6 @@ mod tests {
             "survivor carries duplicate_of = first id"
         );
 
-        // Outside the window (2h later) → NOT collapsed.
         let old = mk(
             "old",
             "PiAlpha",
@@ -2626,7 +2328,6 @@ mod tests {
         assert_eq!(kept.len(), 2, "outside window stays separate");
         assert!(kept.iter().all(|m| m.duplicate_of.is_none()));
 
-        // Different body → no collapse.
         let a = mk("a", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
         let b = mk(
             "b",
@@ -2638,7 +2339,6 @@ mod tests {
         let kept2 = collapse_duplicates(vec![a, b]);
         assert_eq!(kept2.len(), 2, "different body is not a duplicate");
 
-        // Different sender → no collapse.
         let c = mk("c", "Beta", "assign", "build it", 1_700_000_000_000_000);
         let kept3 = collapse_duplicates(vec![first, c]);
         assert_eq!(kept3.len(), 2, "different sender is not a duplicate");
@@ -2652,7 +2352,6 @@ mod tests {
         let (_sender_keys, _sender_npub) = register(&mailbox, "demo", "GreenCastle").await;
         let (_k1, old_npub) = register(&mailbox, "demo", "BlueLake").await;
 
-        // Operator wipes the key material (lost disk / recreated key).
         let key_dir = mailbox
             .agent_key_path("demo", "BlueLake")
             .parent()
@@ -2660,7 +2359,6 @@ mod tests {
             .to_path_buf();
         std::fs::remove_dir_all(&key_dir).expect("wipe agents/<name>");
 
-        // Re-register mints a fresh on-disk identity...
         let re = mailbox
             .register_agent("demo", &profile("BlueLake"))
             .await
@@ -2671,7 +2369,6 @@ mod tests {
             "fresh key material derives a fresh npub"
         );
 
-        // ...and EVERY surface converges to it.
         let w = mailbox.whois("demo", "BlueLake").await.expect("whois");
         assert_eq!(
             PublicKey::from_hex(&w.npub).expect("whois npub"),
@@ -2690,9 +2387,6 @@ mod tests {
         let sent = mailbox.send_message(&args).await.expect("send");
         assert_eq!(sent.count, 1, "send claims one delivery");
 
-        // The wrap is addressed to the NEW npub and unwraps with the
-        // on-disk key — before the fix it went to the dead npub and the
-        // inbox starved while send reported success.
         let wraps = wraps_to(&mailbox, &new_npub, 1).await;
         assert_eq!(wraps.len(), 1, "gift-wrap addressed to the NEW npub");
         let keys_now = mailbox
@@ -2766,7 +2460,6 @@ mod tests {
             "limit keeps the NEWEST rows, and still returns them ascending"
         );
 
-        // No limit is still the whole inbox, unchanged.
         let all = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "demo".into(),
@@ -2865,11 +2558,9 @@ mod tests {
         let cold = mailbox.fetch_inbox(&fi).await.expect("cold since last");
         assert_eq!(cold.len(), 1, "cold cursor = 0: the first message is new");
 
-        // No new mail → the SAME cursor yields nothing (no re-delivery).
         let none = mailbox.fetch_inbox(&fi).await.expect("re-poll");
         assert!(none.is_empty(), "re-poll with no new mail is empty");
 
-        // New mail → exactly the new message.
         mailbox
             .send_message(&send("second"))
             .await
@@ -2878,8 +2569,6 @@ mod tests {
         assert_eq!(warm.len(), 1, "only the message after the cursor");
         assert_eq!(warm[0].subject, "second");
 
-        // Explicit RFC3339 keeps working alongside "last"; malformed is a
-        // hard error (never a silent ignore).
         let past = FetchInbox {
             project_slug: "demo".into(),
             agent_name: "ReaderSC".into(),
@@ -2925,7 +2614,6 @@ mod tests {
         assert_eq!(result.count, 2, "2 recipients → 2 wraps");
         assert!(result.verified_sender);
 
-        // Both recipients' wraps unwrap to the same rumor content.
         let wraps_a = wraps_to(&mailbox, &npub_a, 2).await;
         let wraps_b = wraps_to(&mailbox, &npub_b, 2).await;
         assert_eq!(wraps_a.len(), 1);
@@ -2946,16 +2634,13 @@ mod tests {
 
     #[tokio::test]
     async fn overseer_send_signs_with_operator_and_tags() {
-        // ADR-0004 Ship 5: `overseer: true` signs with the OPERATOR key (not
-        // an agent key), sets importance=high, and tags toron:overseer — the
-        // projection-recognizable override envelope.
         let (mailbox, db_path, data_dir) = test_mailbox("overseer").await;
         let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
         let operator_npub = mailbox.operator().expect("operator").public_key();
 
         let args = SendMessage {
             project_slug: "demo".into(),
-            sender_name: String::new(), // overseer ignores sender_name
+            sender_name: String::new(),
             to: vec!["BlueLake".into()],
             subject: "Operator override".into(),
             body_md: "handle this".into(),
@@ -2971,12 +2656,10 @@ mod tests {
         let rumor = unwrap_for_recipient(&recv, &wraps[0])
             .expect("unwrap")
             .rumor;
-        // Signed by the operator key, not an agent.
         assert_eq!(
             rumor.pubkey, operator_npub,
             "overseer rumor is signed by the operator key"
         );
-        // Carries the override marker + high importance.
         let has_overseer = rumor.tags.iter().any(|t| {
             t.as_slice().first().map(String::as_str) == Some("t")
                 && t.as_slice().get(1).map(String::as_str) == Some(OVERSEER_TAG)
@@ -3028,7 +2711,6 @@ mod tests {
                 .collect()
         };
 
-        // to/cc rumor: lists to+cc, NO bcc.
         let to_gift = unwrap_for_recipient(&recv_to, to_wrap).expect("to");
         let to_ps = p_npubs(&to_gift);
         assert!(to_ps.contains(&npub_to.to_hex()));
@@ -3036,7 +2718,6 @@ mod tests {
         assert!(!to_ps.contains(&npub_b1.to_hex()), "to cannot see bcc1");
         assert!(!to_ps.contains(&npub_b2.to_hex()), "to cannot see bcc2");
 
-        // CC receives the same visible rumor (to+cc, no bcc) and can unwrap it.
         let cc_gift = unwrap_for_recipient(&recv_cc, cc_wrap).expect("cc");
         let cc_ps = p_npubs(&cc_gift);
         assert!(cc_ps.contains(&npub_to.to_hex()));
@@ -3044,7 +2725,6 @@ mod tests {
         assert!(!cc_ps.contains(&npub_b1.to_hex()), "cc cannot see bcc1");
         assert!(!cc_ps.contains(&npub_b2.to_hex()), "cc cannot see bcc2");
 
-        // Each bcc rumor: lists to+cc+ITSELF, not the other bcc.
         let b1_gift = unwrap_for_recipient(&recv_bcc1, b1_wrap).expect("b1");
         let b1_ps = p_npubs(&b1_gift);
         assert!(b1_ps.contains(&npub_to.to_hex()));
@@ -3057,7 +2737,6 @@ mod tests {
         assert!(b2_ps.contains(&npub_b2.to_hex()));
         assert!(!b2_ps.contains(&npub_b1.to_hex()), "b2 cannot see bcc1");
 
-        // Non-recipient cannot unwrap ANY wrap.
         let outsider = crate::keys::generate();
         assert!(unwrap_for_recipient(&outsider, to_wrap).is_err());
         assert!(unwrap_for_recipient(&outsider, b1_wrap).is_err());
@@ -3083,7 +2762,6 @@ mod tests {
         };
         let err = mailbox.send_message(&args).await.expect_err("unknown name");
         assert!(err.to_string().contains("unknown recipient"), "{err}");
-        // No partial delivery: no wraps published for BlueLake.
         let (_, npub) = {
             let p = mailbox.project_profiles("demo").await.expect("profiles");
             let npub = crate::nostr::identity::resolve_name("demo", p.iter(), "BlueLake")
@@ -3147,7 +2825,6 @@ mod tests {
         );
         assert!(mailbox.unwrap_cache_hits() >= 3, "memo served every wrap");
 
-        // A NEW message is decrypted exactly once on the next fetch.
         mailbox
             .send_message(&SendMessage {
                 project_slug: "demo".into(),
@@ -3177,7 +2854,6 @@ mod tests {
         let (sender, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_recv, _npub) = register(&mailbox, "demo", "BlueLake").await;
 
-        // Send two messages (rumor timestamps now = close; order is stable).
         for subject in ["first", "second"] {
             let args = SendMessage {
                 project_slug: "demo".into(),
@@ -3235,14 +2911,12 @@ mod tests {
         let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
         let message_id = gift.rumor.clone().id().to_hex();
 
-        // T1: mark READ only.
         let read = mailbox
             .mark_message_read("demo", "BlueLake", &message_id)
             .await
             .expect("read");
         let t1 = read.acknowledged_at_us.expect("read receipt ts");
 
-        // T2 > T1: acknowledge.
         tokio::time::timeout(std::time::Duration::from_millis(1), async {})
             .await
             .ok();
@@ -3257,14 +2931,12 @@ mod tests {
             "bd-bg8t: ack time must exceed the earlier read receipt time ({t1})"
         );
 
-        // Idempotency must not regress.
         let again = mailbox
             .acknowledge_message("demo", "BlueLake", &message_id)
             .await
             .expect("ack again");
         assert_eq!(again.acknowledged_at_us, Some(t2), "no regression");
 
-        // Durable projection keeps the EARLIEST read (T1), not the ack ts.
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT read_ts_us FROM message_reads \
              WHERE project_slug = 'demo' AND recipient = ?1 AND message_id = ?2",
@@ -3298,7 +2970,6 @@ mod tests {
         };
         mailbox.send_message(&args).await.expect("send");
 
-        // The message id = rumor id of the wrap received by BlueLake.
         let wrap = &wraps_to(&mailbox, &npub_recv, 2).await[0];
         let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
         let message_id = gift.rumor.clone().id().to_hex();
@@ -3310,17 +2981,13 @@ mod tests {
         assert!(first.acknowledged);
         let ts = first.acknowledged_at_us.expect("ts");
 
-        // Idempotent: second ack returns the same timestamp, no new event.
         let second = mailbox
             .acknowledge_message("demo", "BlueLake", &message_id)
             .await
             .expect("ack 2");
         assert_eq!(second.acknowledged_at_us, Some(ts), "idempotent ack");
 
-        // The ack wrap is addressed to the ORIGINAL SENDER only (private).
         let _sender_wraps = wraps_to(&mailbox, &npub_sender, 4).await;
-        // sender sees 1 original outbox? No — wraps are addressed to recipients.
-        // The ack wrap targets the sender; count kind-1059 with p=sender npub.
         let ack_wraps = wraps_to(&mailbox, &npub_sender, 4).await;
         assert!(
             ack_wraps.iter().any(|w| {
@@ -3340,14 +3007,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // ---- ADR-0017 D5: ack authorization ----
-    //
-    // acknowledge_message may be performed by (a) the addressed recipient,
-    // (b) any identity bound to the same pane (herdr, not testable here), or
-    // (c) any thread participant. Identity drift (the split-root repro) is
-    // repaired by discovering the actual recipient across the project's
-    // agents before the authorization gate.
-
     #[tokio::test]
     async fn test_ack_by_thread_participant_authorized() {
         let (mailbox, db_path, data_dir) = test_mailbox("ack-thread").await;
@@ -3355,8 +3014,6 @@ mod tests {
         let (bl, bl_npub) = register(&mailbox, "demo", "BlueLake").await;
         let (_rd, _) = register(&mailbox, "demo", "RedDune").await;
 
-        // msg1: GreenCastle → BlueLake (thread T = msg1 id). BlueLake's one
-        // and only thread membership.
         let args = SendMessage {
             project_slug: "demo".into(),
             sender_name: "GreenCastle".into(),
@@ -3370,8 +3027,6 @@ mod tests {
         let msg1 = unwrap_for_recipient(&bl, wrap1).expect("unwrap msg1");
         let thread_id = msg1.rumor.clone().id().to_hex();
 
-        // msg2: RedDune replies in the SAME thread, addressed to GreenCastle.
-        // BlueLake is neither recipient nor sender of msg2 — a participant.
         let reply = SendMessage {
             project_slug: "demo".into(),
             sender_name: "RedDune".into(),
@@ -3392,9 +3047,6 @@ mod tests {
             })
             .expect("msg2 id");
 
-        // BlueLake acks msg2 — its own keys cannot unwrap it (addressed to
-        // GreenCastle), so the drift path discovers the recipient and the
-        // thread-participant gate authorizes.
         let res = mailbox
             .acknowledge_message("demo", "BlueLake", &msg2_id)
             .await
@@ -3412,7 +3064,6 @@ mod tests {
         let (bl, bl_npub) = register(&mailbox, "demo", "BlueLake").await;
         let (_df, _) = register(&mailbox, "demo", "DarkForest").await;
 
-        // GreenCastle → BlueLake; DarkForest has NO membership in the thread.
         let args = SendMessage {
             project_slug: "demo".into(),
             sender_name: "GreenCastle".into(),
@@ -3476,7 +3127,6 @@ mod tests {
             mailbox.send_message(&args).await.expect("send");
         }
 
-        // Before any mark-read: everything is unread.
         let unread = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "demo".into(),
@@ -3489,7 +3139,6 @@ mod tests {
         assert_eq!(unread.len(), 2, "both fresh");
         assert!(unread.iter().all(|m| m.read_ts_us.is_none()));
 
-        // Mark ONE message read (explicit mark_message_read — fetch never marks).
         let wrap = &wraps_to(&mailbox, &npub, 4).await[0];
         let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
         let message_id = gift.rumor.clone().id().to_hex();
@@ -3499,7 +3148,6 @@ mod tests {
             .expect("mark read");
         assert_eq!(first_read.message_id, message_id);
 
-        // Unread-only now excludes exactly the read message.
         let unread = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "demo".into(),
@@ -3515,7 +3163,6 @@ mod tests {
             "mark-read message absent from unread-only"
         );
 
-        // Non-unread path unchanged: both messages still listed, read_ts set.
         let all = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "demo".into(),
@@ -3576,7 +3223,6 @@ mod tests {
 
         drop(mailbox);
 
-        // "Restart": fresh bus + fresh mailbox over the SAME db + key dir.
         let pool2 = schema::connect(db_path.to_str().unwrap())
             .await
             .expect("reconnect");
@@ -3703,8 +3349,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // --- ADR-0018: swarm-mode send-path hardening ---
-
     fn send_args(project: &str, sender: &str, to: &[&str]) -> SendMessage {
         SendMessage {
             project_slug: project.into(),
@@ -3738,7 +3382,6 @@ mod tests {
             .expect("legacy registered pre-swarm");
         mailbox.set_identity_mode("toron", "swarm").await;
 
-        // Canonical recipient delivers.
         mailbox
             .send_message(&send_args(
                 "toron",
@@ -3752,7 +3395,6 @@ mod tests {
             "canonical send delivered"
         );
 
-        // npub recipient delivers (npub is always a routing address).
         mailbox
             .send_message(&send_args(
                 "toron",
@@ -3767,7 +3409,6 @@ mod tests {
             "npub send delivered"
         );
 
-        // Legacy name fails the whole send with the grammar error.
         let err = mailbox
             .send_message(&send_args(
                 "toron",
@@ -3782,7 +3423,6 @@ mod tests {
             "error names the grammar: {msg}"
         );
 
-        // A mixed send (canonical + legacy) also fails — no partial delivery.
         let err = mailbox
             .send_message(&send_args(
                 "toron",
@@ -3818,7 +3458,6 @@ mod tests {
             .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
             .await;
 
-        // Send to the folded alias → delivered to the canonical npub.
         mailbox
             .send_message(&send_args("toron", "flywheel-toron-oc", &["DustySparrow"]))
             .await
@@ -3840,7 +3479,6 @@ mod tests {
             .expect("sender");
         let (_recv_keys, recv_npub) = register(&mailbox, "demo", "BlueLake").await;
 
-        // Open mode (no identity_mode row): legacy names still route.
         mailbox
             .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
             .await
@@ -3872,13 +3510,11 @@ mod tests {
             .await
             .expect("set captain");
 
-        // whois resolves via the fold ...
         let w = mailbox
             .whois("demo", "captain")
             .await
             .expect("whois captain resolves via fold");
         assert_eq!(w.name, "BlueLake");
-        // ... so the send path must route to the same pin, not fail.
         mailbox
             .send_message(&send_args("demo", "GreenCastle", &["captain"]))
             .await
@@ -3891,8 +3527,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-
-    // --- bd-pin-public-plane-s-easy.1: slug → pin (fold is slug→pin) ---
 
     #[tokio::test]
     async fn swarm_send_to_slug_resolves_to_pin_recipient() {
@@ -3908,7 +3542,6 @@ mod tests {
             .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
             .await;
 
-        // Send TO the slug → delivered to the PIN's npub (fold is slug→pin).
         mailbox
             .send_message(&send_args(
                 "toron",
@@ -3943,7 +3576,6 @@ mod tests {
             .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
             .await;
 
-        // Send TO the slug → the delivery ROW names the pin, not the slug.
         let sent = mailbox
             .send_message(&send_args(
                 "toron",
@@ -3958,14 +3590,12 @@ mod tests {
             "row recipient is the post-fold canonical pin"
         );
 
-        // Read AS the slug → receipt keyed by the pin's npub (one identity).
         let id = sent.deliveries[0].payload.event_id.clone();
         mailbox
             .mark_message_read("toron", "flywheel-toron-coder", &id)
             .await
             .expect("read as slug");
 
-        // Fetch-as-PIN: seen, and READ (the two views' states met).
         let as_pin = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "toron".into(),
@@ -3980,7 +3610,6 @@ mod tests {
             "slug-written read state is visible to the pin view"
         );
 
-        // Fetch-as-SLUG unread-only: NO distinct unread copy remains.
         let as_slug_unread = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "toron".into(),
@@ -4011,7 +3640,6 @@ mod tests {
             .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
             .await;
 
-        // Sending AS the slug must sign with the PIN's key.
         mailbox
             .send_message(&send_args("toron", "flywheel-toron-coder", &["BlueRidge"]))
             .await
@@ -4027,8 +3655,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-
-    // --- bd-i1o3: wake completeness ---
 
     #[tokio::test]
     async fn wake_mail_delivered_is_metadata_only() {
@@ -4051,7 +3677,6 @@ mod tests {
             })
             .await
             .expect("send");
-        // Wake is a kind-9 with toron-kind mail-delivered, visible via bus replay
         let filter = crate::bus::Filter::new()
             .kinds([crate::nostr::kinds::toron_kind(9)])
             .hashtag("demo");
@@ -4091,10 +3716,9 @@ mod tests {
         mailbox.ensure_project("demo").await.expect("ensure");
         let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
-        // Insert an overdue high-importance ack_required row directly
         let pool = mailbox.index_pool.as_ref().unwrap().clone();
         let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
-            - 2 * 60 * 60 * 1_000_000; // 2h ago
+            - 2 * 60 * 60 * 1_000_000;
         sqlx::query(
             "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, importance, ack_required, to_list, cc_list, created_ts_us, local_seq) \
              VALUES (?1, 'demo', 'GreenCastle', 'aaaa', 'urgent subject', 'urgent body', 'high', 1, '[\"BlueLake\"]', '[]', ?2, 1)",
@@ -4104,7 +3728,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert overdue msg");
-        // Emit via the SLA-checked path (reuses messages + receipts map)
         let emitted = mailbox
             .check_ack_sla_expired("demo", Some(30 * 60))
             .await
@@ -4132,8 +3755,6 @@ mod tests {
         assert!(wake.content.contains("post-123"), "wake names post");
         assert!(!wake.content.contains("urgent subject"), "no subject leak");
         assert!(!wake.content.contains("urgent body"), "no body leak");
-        // GS-006 bug 4: pin-name audience MUST get a p tag (watch_targets resolves
-        // pin names via SelfIndex). Hex-only tagging left the doorbell never addressed.
         let has_pin_p_tag = wake
             .tags
             .iter()
@@ -4146,15 +3767,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-
-    // NOTE (bd-8jgv): the 39002 watch-default contract lives at its real
-    // boundaries — `cli.rs::wake_watch_kinds_include_39002` reads the clap
-    // default, `plane.rs` covers WAIT_WAKE_KINDS, and cli_channels_lifecycle
-    // proves join/leave end to end. The copy here asserted a hardcoded
-    // literal (production drift could never fail it) plus a vacuous
-    // empty-store replay, so it is removed.
-
-    // ---- ack_overdue_only projection + per-recipient SLA ----
 
     fn overdue_row(
         id: &str,
@@ -4195,8 +3807,6 @@ mod tests {
 
     #[test]
     fn ack_overdue_only_keeps_unacked_required_past_sla() {
-        // Item 1: the flag must filter — ack_required + high/urgent + older
-        // than the SLA + unacked survives; everything else drops.
         let now = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let old = now - 2 * 60 * 60 * 1_000_000;
         let rows = vec![
@@ -4213,7 +3823,6 @@ mod tests {
 
     #[test]
     fn ack_overdue_only_off_changes_nothing() {
-        // Flag off = byte-identical behavior to before the field existed.
         let now = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let old = now - 2 * 60 * 60 * 1_000_000;
         let rows = vec![
@@ -4231,8 +3840,6 @@ mod tests {
 
     #[tokio::test]
     async fn sla_scan_partial_read_still_overdue_per_recipient() {
-        // Item 2: one reader's receipt must not silence the overdue wake
-        // for the other recipient on a fan-out.
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-perrcp").await;
         mailbox.ensure_project("demo").await.expect("ensure");
         let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
@@ -4251,7 +3858,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert fan-out");
-        // Only BlueLake reads; RoseDune never does.
         sqlx::query(
             "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
              VALUES ('demo', 'post-fan', ?1, ?2)",
@@ -4275,7 +3881,6 @@ mod tests {
 
     #[tokio::test]
     async fn sla_scan_all_recipients_read_silences() {
-        // Every recipient handled → no wake (guards the item-2 fix).
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-allread").await;
         mailbox.ensure_project("demo").await.expect("ensure");
         let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
@@ -4327,15 +3932,12 @@ mod tests {
     async fn sla_scan_silences_a_really_projected_fully_read_post() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-e2e").await;
         mailbox.ensure_project("demo").await.expect("ensure");
-        // The live projection path. The sibling SLA tests omit this precisely
-        // because they INSERT rows themselves and never touch the sink.
         mailbox.spawn_unwrap_loop();
         let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_, bnpub) = register(&mailbox, "demo", "BlueLake").await;
         let (_, cnpub) = register(&mailbox, "demo", "RoseDune").await;
         let pool = mailbox.index_pool.as_ref().unwrap().clone();
 
-        // Real send: one `to` + one `cc`, ack-required, high importance.
         mailbox
             .send_message(&crate::mailbox::SendMessage {
                 project_slug: "demo".into(),
@@ -4351,7 +3953,6 @@ mod tests {
             .await
             .expect("send");
 
-        // Wait for the projection sink to land the row.
         let mut row: Option<(String, String, String)> = None;
         for _ in 0..200 {
             row = sqlx::query_as::<_, (String, String, String)>(
@@ -4379,7 +3980,6 @@ mod tests {
             "production projection must persist the `cc` audience"
         );
 
-        // Backdate past the SLA and record BOTH recipients' reads.
         let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
             - 2 * 60 * 60 * 1_000_000;
         sqlx::query("UPDATE messages SET created_ts_us = ?1 WHERE subject = 'sla-e2e'")
@@ -4461,10 +4061,6 @@ mod tests {
         }
         let post_id = row.expect("projected row must exist");
 
-        // The dedupe key is derived from the projected audience, so pin that
-        // the audience really is the recipient — otherwise this test would
-        // still pass with an empty one, and would be asserting nothing about
-        // the key it is meant to exercise.
         let to_json: String =
             sqlx::query_scalar("SELECT to_list FROM messages WHERE event_id = ?1")
                 .bind(&post_id)
@@ -4478,8 +4074,6 @@ mod tests {
             "the wake dedupe key is only meaningful if the audience projected"
         );
 
-        // Overdue, and BlueLake has NOT read it: this is the case that
-        // legitimately warrants exactly one wake.
         let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
             - 2 * 60 * 60 * 1_000_000;
         sqlx::query("UPDATE messages SET created_ts_us = ?1 WHERE subject = 'sla-dedupe'")
@@ -4498,8 +4092,6 @@ mod tests {
             "an overdue unread post with a real audience must be woken once"
         );
 
-        // The whole defect: a second scan of the SAME state must be silent.
-        // Nothing was read, nothing was acked, nothing changed — only time.
         let second = mailbox
             .check_ack_sla_expired("demo", Some(30 * 60))
             .await
@@ -4518,11 +4110,6 @@ mod tests {
             "the dedupe must hold for every later scan, not just the second"
         );
 
-        // ...but the bound is a CADENCE, not a mute. Past the window the post
-        // is still genuinely overdue, so it must be woken again. Backdating the
-        // record is the only way to observe the window without sleeping.
-        // bd-4v1a: the record is keyed by the reminder's SCOPE — this post has
-        // no thread, so its scope IS its id.
         sqlx::query(
             "UPDATE ack_sla_wakes SET emitted_us = ?1 \
              WHERE scope_id = ?2 AND audience = ?3",
@@ -4574,8 +4161,6 @@ mod tests {
             "a repeated recipient is one address, not two"
         );
 
-        // The un-addressed case must still dedupe rather than become an
-        // unkeyed exemption that always re-emits.
         let empty = ack_sla_wake_audience_key(&[]);
         assert_eq!(empty, ack_sla_wake_audience_key(&[]));
         assert_ne!(empty, a, "an empty audience is not a named audience");
@@ -4602,8 +4187,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert");
-        // Re-opening the SAME file is the restart: a fresh process reading the
-        // same durable store must still see the wake.
         drop(pool);
         let reopened = crate::index::schema::connect(path.to_str().unwrap())
             .await
@@ -4620,8 +4203,6 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
-
-    // ---- bd-4v1a: the reminder is scoped, budgeted and bounded ----
 
     /// An overdue ack-required post, inserted straight into the projection
     /// (the scan reads `messages`, not the wire).
@@ -4841,7 +4422,6 @@ mod tests {
                 .await
                 .expect("scan");
             assert_eq!(emitted.len(), 1, "reminder {i} is owed: {emitted:?}");
-            // Let the reminder window lapse so the next scan is a NEW reminder.
             sqlx::query("UPDATE ack_sla_wakes SET emitted_us = emitted_us - ?1")
                 .bind(2 * 60 * 60 * 1_000_000_i64)
                 .execute(&pool)
@@ -4857,7 +4437,6 @@ mod tests {
             emitted.is_empty(),
             "the budget mutes the obligation: {emitted:?}"
         );
-        // The counter is the terminal state, and it is durable.
         let wakes: i64 =
             sqlx::query_scalar("SELECT wakes FROM ack_sla_wakes WHERE scope_id = 'thread-budget'")
                 .fetch_one(&pool)
@@ -4949,8 +4528,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // ---- corr-keyed idempotent send (ADR-0028 zfnx.12) ----
-
     fn idempotent_send_args(corr: &str) -> SendMessage {
         SendMessage {
             project_slug: "demo".into(),
@@ -5006,8 +4583,6 @@ mod tests {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("idem-crash").await;
         let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
-        // The crash: the claim exists (the send claimed the key) but the
-        // publish never happened. Seed the claim the way the send does.
         let store = mailbox.idempotent_store().expect("store");
         let key = crate::mailbox::idempotent::send_key(
             "demo",
@@ -5032,7 +4607,6 @@ mod tests {
             .expect("claim");
         assert_eq!(claim, crate::mailbox::idempotent::SendClaim::New);
 
-        // The retry must publish, not suppress.
         let retry = mailbox
             .send_message(&idempotent_send_args("C-CRASH"))
             .await
@@ -5047,7 +4621,6 @@ mod tests {
             "one rumor after the retry"
         );
 
-        // The next retry converges on the same event and publishes nothing.
         let again = mailbox
             .send_message(&idempotent_send_args("C-CRASH"))
             .await
@@ -5120,8 +4693,6 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_send_crash_window_claim_yields_one_rumor() {
-        // Kill between publish and receipt-upsert: the claim row survives,
-        // the retry must return the claimed event id and publish nothing.
         let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("idem-crash").await;
         let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
@@ -5335,11 +4906,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // bd-fts-projection-lag: search reads the `messages`/FTS projection, whose
-    // only writer was the daemon's unwrap loop. A CLI-only session (no
-    // projecting daemon) left fresh mail invisible to `mail search`. The
-    // recipient's fetch is the read door — it must heal the projection lag by
-    // writing every mail it unwraps through the same idempotent sink.
     #[tokio::test]
     async fn fetch_inbox_projects_to_search_index() {
         let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("ftslag").await;
@@ -5358,8 +4924,6 @@ mod tests {
             .await
             .expect("send");
 
-        // Pre-fetch: send alone must NOT leak into the search index (the
-        // recipient's read is the projection door, not the sender's send).
         let found = mailbox
             .search_messages(&SearchMessages {
                 project_key: "ftslag-proj".into(),
@@ -5380,7 +4944,6 @@ mod tests {
             .expect("fetch");
         assert_eq!(inbox.len(), 1, "fetch sees the mail");
 
-        // Post-fetch: searchable with no daemon having ever run.
         let found = mailbox
             .search_messages(&SearchMessages {
                 project_key: "ftslag-proj".into(),
@@ -5392,7 +4955,6 @@ mod tests {
         assert_eq!(found.len(), 1, "post-fetch: searchable without a daemon");
         assert_eq!(found[0].subject, "fts projection lag probe");
 
-        // Idempotent: a re-fetch must not duplicate the projection.
         mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "ftslag-proj".into(),

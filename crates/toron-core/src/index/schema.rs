@@ -1,6 +1,4 @@
 // governed-by: ADR-0003
-// bd-led.4.1: AM-Rust-compatible SQLite index schema + FTS5 tokenizer contract.
-// Tokenizer contract (AM schema.rs): porter unicode61 remove_diacritics 2, prefix='2 3'.
 
 use std::time::Duration;
 
@@ -139,7 +137,7 @@ async fn ensure_additive(pool: &SqlitePool) -> anyhow::Result<()> {
 ///
 /// Mirrors migration 0005; kept as a runtime hook so the audit test can
 /// exercise the scale fix without re-running the embedded migration.
-pub const TS_US_SCALE_SECONDS_THRESHOLD: i64 = 1_000_000_000_000; // 1e12 µs
+pub const TS_US_SCALE_SECONDS_THRESHOLD: i64 = 1_000_000_000_000;
 
 /// Normalize any `messages.created_ts_us` rows whose scale is implausible
 /// (seconds in a µs field, per [`TS_US_SCALE_SECONDS_THRESHOLD`]). Idempotent.
@@ -184,13 +182,7 @@ async fn connect_with_budget(db_path: &str, busy: Duration) -> anyhow::Result<Sq
         .busy_timeout(busy)
         .statement_cache_capacity(32);
     // bd-2y36: sqlx runs `PRAGMA journal_mode=WAL` while establishing each
-    // connection, and sqlite answers a journal-mode CHANGE with an immediate
-    // SQLITE_BUSY — the busy handler (this budget) is never consulted — so
-    // processes racing the first conversion of a shared fresh file failed
-    // instantly under workspace load (pin: establish_journal_mode_busy_beats_any_budget).
-    // Retry the establish inside the SAME bounded budget: once any holder
     // converts the file the pragma is a no-op and the pool lands. A non-BUSY
-    // error or an expired budget fails loud immediately.
     let deadline = std::time::Instant::now() + busy;
     let pool = loop {
         match SqlitePoolOptions::new()
@@ -210,19 +202,12 @@ async fn connect_with_budget(db_path: &str, busy: Duration) -> anyhow::Result<Sq
             }
         }
     };
-    // Storage-leak guard: WAL autocheckpoint + size caps. Without this an
-    // idle writer can leave a multi-MB WAL that never checkpoints (the prior
-    // 4 MB index.sqlite-wal that survived until reboot). 1k pages ≈ 4 MB.
-    //
-    // bd-741i: do NOT set temp_store=MEMORY. Nested ORDER BY scans that miss
-    // the index put TEMP B-TREEs in RAM; overnight that was 48–128GB RSS
-    // instead of a bounded spill file. Default FILE temp_store is the cap.
     for pragma in [
-        "PRAGMA journal_size_limit = 67108864", // 64 MB hard cap
+        "PRAGMA journal_size_limit = 67108864",
         "PRAGMA wal_autocheckpoint = 1000",
         "PRAGMA synchronous = NORMAL",
-        "PRAGMA cache_size = -16000", // 16 MB page cache (was 64 — 5 conns)
-        "PRAGMA mmap_size = 67108864", // 64 MB mmap (file is ~20 MB)
+        "PRAGMA cache_size = -16000",
+        "PRAGMA mmap_size = 67108864",
     ] {
         let _ = sqlx::query(pragma).execute(&pool).await;
     }
@@ -447,7 +432,6 @@ mod tests {
             .expect("create table");
         drop(boot);
 
-        // Hold the WAL write lock from a dedicated connection.
         let mut holder = connect_single(&db).await.expect("holder conn");
         let mut tx = holder.begin().await.expect("begin");
         sqlx::query("INSERT INTO t VALUES (1)")
@@ -455,8 +439,6 @@ mod tests {
             .await
             .expect("hold write");
 
-        // A writer queues for 6s while the lock is held, then must succeed
-        // the instant the holder commits.
         let db2 = db.clone();
         let attempt = tokio::spawn(async move {
             let pool = connect(&db2).await.expect("attempt pool");
@@ -523,7 +505,6 @@ mod tests {
         ));
         let db = path.to_str().unwrap().to_string();
 
-        // Keep the file in rollback-journal mode with a held write txn.
         let mut holder = SqliteConnection::connect_with(
             &SqliteConnectOptions::new()
                 .filename(&db)
@@ -578,7 +559,6 @@ mod tests {
         ));
         let db = path.to_str().unwrap().to_string();
 
-        // Holder: rollback-journal file, write txn open, releases after 400ms.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let db_holder = db.clone();
         let releaser = tokio::spawn(async move {
@@ -655,7 +635,6 @@ mod tests {
             .expect("journal_mode readable");
         assert_eq!(journal, "wal", "WAL pragma persists");
 
-        // Every base table present.
         for tbl in [
             "agents",
             "messages",
@@ -678,7 +657,6 @@ mod tests {
             assert_eq!(n, 1, "table {tbl} exists");
         }
 
-        // FTS5 virtual table present.
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='messages_fts'",
         )
@@ -781,7 +759,6 @@ mod tests {
         )
         .await;
 
-        // Porter stem: "Running" -> "run", "builds" -> "build".
         for (term, expect, note) in [
             ("run", 1, "porter stem running->run"),
             ("build", 1, "porter stem builds->build"),
@@ -795,7 +772,6 @@ mod tests {
             assert_eq!(n, expect, "{note}: MATCH {term}");
         }
 
-        // Case folding: unicode61 folds query + doc.
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'QUICK'",
         )
@@ -804,7 +780,6 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1, "unicode61 case-fold");
 
-        // remove_diacritics 2: 'café' indexed as 'cafe', 'résumé' as 'resume'.
         for (term, expect) in [("cafe", 1), ("resume", 1)] {
             let n: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?")
@@ -815,7 +790,6 @@ mod tests {
             assert_eq!(n, expect, "remove_diacritics: MATCH {term}");
         }
 
-        // prefix='2 3': 2- and 3-char prefix queries via `term*`.
         for (term, expect, note) in [
             ("qu*", 1, "2-char prefix qu* -> quick"),
             ("jum*", 1, "3-char prefix jum* -> jump"),
@@ -843,9 +817,7 @@ mod tests {
         let (pool, path) = temp_pool("golden").await;
         migrate(&pool).await.expect("migrations apply");
 
-        // The AM golden fixture corpus: each string + the terms that MUST hit it.
         let cases: &[(&str, &[&str])] = &[
-            // porter stems "quickly" -> "quickli" (NOT "quick").
             (
                 "Running builds café quickly",
                 &["run", "build", "cafe", "quickli"],
@@ -909,12 +881,9 @@ mod tests {
         let (pool, path) = temp_pool("scale").await;
         migrate(&pool).await.expect("migrations apply");
 
-        // Seconds-scale row (the reported 2026-08 era value).
         insert_msg(&pool, "e_sec", "old", "seconds scale", 1_786_508_238, 1).await;
-        // Already-correct µs row must be untouched.
         insert_msg(&pool, "e_us", "new", "us scale", 1_786_509_672_000_000, 2).await;
 
-        // Audit query: flag rows whose scale is implausible (< 1e12).
         let bad: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM messages WHERE created_ts_us > 0 AND created_ts_us < ?",
         )
@@ -924,7 +893,6 @@ mod tests {
         .unwrap();
         assert_eq!(bad, 1, "exactly the seconds-scale row is flagged");
 
-        // Migration path (also exercised at upgrade): normalize in place.
         let scaled = normalize_created_ts_scale(&pool).await.expect("normalize");
         assert_eq!(scaled, 1, "one row scaled");
 
@@ -941,7 +909,6 @@ mod tests {
             .unwrap();
         assert_eq!(ts2, 1_786_509_672_000_000, "µs row untouched");
 
-        // Idempotent: second run scales nothing.
         let again = normalize_created_ts_scale(&pool)
             .await
             .expect("normalize again");

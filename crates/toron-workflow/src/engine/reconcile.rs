@@ -94,15 +94,6 @@ pub fn corr_for_effect(effect_key: &str) -> String {
     effect_key.to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Idempotent cleanup + retention policy (ADR-0032 Spec 8.2, bd-v139.3).
-//
-// Cleanup is a fixed set of host effects (never a user-authored undo DSL):
-// each attempt journals under its own stable key, retries converge without
-// touching the original failure, and rollback of completed external work is
-// never claimed.
-// ---------------------------------------------------------------------------
-
 /// The fixed cleanup set (ADR-0032 Spec 8.2): lease release, bounded
 /// captain evidence, bead comment. Nothing else is a cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,14 +262,12 @@ mod effect_reconciliation_tests {
             .expect("the first prepare creates the row");
         assert!(first.created, "the first prepare creates the row");
 
-        // The SAME render attaches: idempotent, never a second effect.
         let again = store
             .prepare_effect(node("ek-1", "digest-a"))
             .await
             .expect("the same render attaches");
         assert!(!again.created, "the same render is idempotent");
 
-        // A CHANGED render for the same logical node must REFUSE.
         let err = store
             .prepare_effect(node("ek-2", "digest-b"))
             .await
@@ -316,37 +305,30 @@ mod effect_reconciliation_tests {
     #[test]
     fn effect_reconciliation_crash_matrix() {
         use EffectState as S;
-        // Before prepared commits: no intent, no dispatch — start fresh.
         assert!(matches!(
             plan_attempt(None, &cap(false, false)),
             DispatchPlan::DispatchNew
         ));
-        // After prepared, before in_flight: fresh intent dispatches.
         assert!(matches!(
             plan_attempt(Some(&view(S::Prepared, 1, false)), &cap(false, false)),
             DispatchPlan::DispatchNew
         ));
-        // In-flight with a live lease: another owner may be dispatching.
         assert!(matches!(
             plan_attempt(Some(&view(S::InFlight, 1, true)), &cap(true, true)),
             DispatchPlan::RefuseBlindRetry { .. }
         ));
-        // In-flight, lease expired, provider queryable: reconcile first.
         assert!(matches!(
             plan_attempt(Some(&view(S::InFlight, 1, false)), &cap(false, true)),
             DispatchPlan::ReconcileFirst { .. }
         ));
-        // In-flight, lease expired, idempotent-only provider: same-key retry.
         assert!(matches!(
             plan_attempt(Some(&view(S::InFlight, 1, false)), &cap(true, false)),
             DispatchPlan::RetrySameKey { attempt: 2 }
         ));
-        // In-flight, lease expired, no capability: refuse, stay unknown-able.
         assert!(matches!(
             plan_attempt(Some(&view(S::InFlight, 1, false)), &cap(false, false)),
             DispatchPlan::RefuseBlindRetry { .. }
         ));
-        // Accepted with lost completion evidence: like in-flight uncertainty.
         assert!(matches!(
             plan_attempt(Some(&view(S::Accepted, 1, false)), &cap(false, true)),
             DispatchPlan::ReconcileFirst { .. }
@@ -355,7 +337,6 @@ mod effect_reconciliation_tests {
             plan_attempt(Some(&view(S::Accepted, 1, false)), &cap(true, false)),
             DispatchPlan::RetrySameKey { attempt: 2 }
         ));
-        // Unknown outcome: query, same-key idempotent retry, or refuse.
         assert!(matches!(
             plan_attempt(Some(&view(S::Unknown, 1, false)), &cap(false, true)),
             DispatchPlan::ReconcileFirst { .. }
@@ -368,17 +349,14 @@ mod effect_reconciliation_tests {
             plan_attempt(Some(&view(S::Unknown, 1, false)), &cap(false, false)),
             DispatchPlan::RefuseBlindRetry { .. }
         ));
-        // Unknown with a live lease: the owner may still complete.
         assert!(matches!(
             plan_attempt(Some(&view(S::Unknown, 1, true)), &cap(true, true)),
             DispatchPlan::RefuseBlindRetry { .. }
         ));
-        // Reconcile-pending belongs to a reconciler, never the dispatcher.
         assert!(matches!(
             plan_attempt(Some(&view(S::ReconcilePending, 1, false)), &cap(true, true)),
             DispatchPlan::RefuseBlindRetry { .. }
         ));
-        // Terminal rows never dispatch again — the stored outcome stands.
         for terminal in [S::Settled, S::Failed, S::Cancelled] {
             assert!(
                 matches!(
@@ -442,7 +420,6 @@ mod effect_reconciliation_tests {
             S::Cancelled,
             S::Parked,
         ];
-        // No intent row yet: both dispatch fresh under every capability.
         for cap in [
             cap(false, false),
             cap(false, true),
@@ -478,7 +455,6 @@ mod effect_reconciliation_tests {
                 }
             }
         }
-        // Negative control: the table actually ran every vector.
         assert_eq!(vectors, 9 * 2 * 3 * 4);
     }
 }

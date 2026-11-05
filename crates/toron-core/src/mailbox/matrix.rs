@@ -25,7 +25,6 @@ use sqlx::SqlitePool;
 pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     let mut leaked = Vec::new();
 
-    // A proof MUST be rejected; if it isn't, record a leak.
     async fn expect_reject(
         leaked: &mut Vec<String>,
         case: &str,
@@ -36,7 +35,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         }
     }
 
-    // Actors.
     let anchor = Keys::generate();
     let agent = Keys::generate();
     let attacker = Keys::generate();
@@ -53,7 +51,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         format!("{nonce_counter:064x}")
     };
 
-    // Valid attestation builder.
     let mk_att = |nonce: &str, expires_at: Option<u64>| Attestation {
         scheme: "schnorr".into(),
         agent_npub: agent.public_key().to_hex(),
@@ -64,7 +61,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         signature: None,
     };
 
-    // 1. Valid control: must PASS.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let valid = build_attestation_event(&anchor, &att, "demo", "PiAlpha", Timestamp::now())
@@ -77,7 +73,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         leaked.push(format!("valid-control: {control:?}"));
     }
 
-    // 2. Wrong kind.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let wrong_kind = crate::nostr::event::build_event(
@@ -97,7 +92,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 3. Forged/mutated signature: flip a content byte AFTER signing.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let valid =
@@ -120,7 +114,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 4. Untrusted anchor.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let untrusted = build_attestation_event(&attacker, &att, "demo", "PiAlpha", Timestamp::now())
@@ -134,7 +127,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 5. Malformed content (not JSON).
     let bad = crate::nostr::event::build_event(
         &anchor,
         toron_kind(REGISTRATION_ATTESTATION),
@@ -152,7 +144,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 6. Scheme mismatch (ed25519 declared on a Schnorr gate).
     let n = next_nonce(&mut nonce_counter);
     let mut att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     att.scheme = "ed25519".into();
@@ -167,7 +158,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 7. Binding mismatch: wrong agent npub.
     let n = next_nonce(&mut nonce_counter);
     let mut att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     att.agent_npub = attacker.public_key().to_hex();
@@ -182,7 +172,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 7b. Wrong project.
     let n = next_nonce(&mut nonce_counter);
     let mut att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     att.project = "other".into();
@@ -198,7 +187,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 8. Expired.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() - 60));
     let expired = build_attestation_event(&anchor, &att, "demo", "PiAlpha", Timestamp::now())
@@ -212,7 +200,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     )
     .await;
 
-    // 9. Replayed nonce: same attestation twice → second is replayed.
     let n = next_nonce(&mut nonce_counter);
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let replayed = build_attestation_event(&anchor, &att, "demo", "PiAlpha", Timestamp::now())
@@ -232,8 +219,6 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         Err(_) => {}
     }
 
-    // 10. Missing proof (None) → the gate's contract is fail-closed: the
-    // register path rejects before calling verify (missing = rejected).
     leaked
 }
 

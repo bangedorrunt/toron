@@ -41,10 +41,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .output()
         .expect("spawn toron")
@@ -82,7 +78,6 @@ async fn sc29_nonmember_cli_post_denied() {
     let dir = std::env::temp_dir().join(format!("toron-sc29-{}", uuid::Uuid::new_v4()));
     setup(&dir, PROJECT, &[A, B, C]).await;
 
-    // A creates the private channel, B joins, A posts once.
     let out = run(
         &dir,
         &[
@@ -120,7 +115,6 @@ async fn sc29_nonmember_cli_post_denied() {
     );
     assert_eq!(exit_code(&out), 0, "A post: {}", stderr_text(&out));
 
-    // History length before: A sees exactly one post.
     let read_before = run(
         &dir,
         &["channel", "read", CHANNEL, "--project", PROJECT, "--as", A],
@@ -147,7 +141,6 @@ async fn sc29_nonmember_cli_post_denied() {
         _ => 0,
     };
 
-    // C (not joined): post denied, read denied.
     let out = run(
         &dir,
         &[
@@ -179,7 +172,6 @@ async fn sc29_nonmember_cli_post_denied() {
         stderr_text(&out)
     );
 
-    // History length unchanged after C's attempts.
     let read_after = run(
         &dir,
         &["channel", "read", CHANNEL, "--project", PROJECT, "--as", A],

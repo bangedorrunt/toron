@@ -15,8 +15,6 @@ use super::{split, widgets};
 
 /// Render the mail tab for the current layout mode.
 pub fn render(f: &mut Frame, area: Rect, model: &Model, mode: LayoutMode) {
-    // Phone width: one pane at a time owns the frame (`h`/`l` and Enter move
-    // between them), and the list rows go one line.
     if mode.single() {
         return match model.pane {
             Pane::Sidebar => render_folders(f, area, model, true),
@@ -74,10 +72,6 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: 
         None => format!("{} — {}", model.mail.folder.title(), rows.len()),
     };
     if rows.is_empty() {
-        // An empty pane is the moment to name the next command, with this
-        // project and pin already in it. A FAILED fetch is settled, not
-        // pending, so it shows the refusal and the command that fixes it
-        // rather than a spinner that never stops.
         let on = model.onboarding();
         let failed = model.mail.error.as_deref();
         let text = if let Some(err) = failed {
@@ -126,8 +120,6 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: 
                 HackerNight::fg_default()
             };
             if narrow {
-                // Phone width: one line per message. A 10-col sender pad plus
-                // a stamp would leave the subject nothing at 45 cols.
                 let mut spans = vec![Span::styled(
                     if row.unread { "● " } else { "  " },
                     if row.unread {

@@ -109,14 +109,9 @@ pub fn plan_park(
             max_secs: hard_cap_secs,
         };
     }
-    // Already past T (or T is now): resume immediately. `checked_sub` rather
-    // than a wrapping subtraction, so a T in the past reads as overdue instead
-    // of as a ~584-billion-year wait.
     if let Some(overdue_ms) = now_ms.checked_sub(until_ms) {
         return ParkDecision::ResumeNow { overdue_ms };
     }
-    // T is in the future. Cap the single wait; the remainder resumes in
-    // another park, so the run stays interruptible.
     let cap_ms = max_wait_secs.saturating_mul(1000);
     let effective = until_ms.min(now_ms.saturating_add(cap_ms));
     let capped_to_ms = (effective < until_ms).then_some(effective);
@@ -166,7 +161,6 @@ pub fn park_intent(
         capped_to_ms,
     } = decision
     else {
-        // ResumeNow parks nothing, so there is no intent to journal.
         return None;
     };
     Some(ParkIntent {
@@ -199,13 +193,11 @@ mod tests {
             },
             "before T the run parks"
         );
-        // At T exactly: resume, do not park again.
         assert_eq!(
             plan_park(t, 300, t, PARK_MAX_WAIT_SECS),
             ParkDecision::ResumeNow { overdue_ms: 0 },
             "at T the run resumes"
         );
-        // Past T: resume, and say how late.
         assert_eq!(
             plan_park(t, 300, t + 5_000, PARK_MAX_WAIT_SECS),
             ParkDecision::ResumeNow { overdue_ms: 5_000 },
@@ -221,7 +213,6 @@ mod tests {
         let t = NOW - 60_000;
         let d = plan_park(t, 300, NOW, PARK_MAX_WAIT_SECS);
         assert_eq!(d, ParkDecision::ResumeNow { overdue_ms: 60_000 });
-        // And it journals nothing: there is no wait to make visible.
         assert_eq!(park_intent("run-1", "n1", &d, None), None);
     }
 
@@ -238,7 +229,6 @@ mod tests {
             },
             "a week is refused, not slept"
         );
-        // Within the hard cap but beyond one cap-length: capped, not refused.
         let two_hours = NOW + 7_200_000;
         let capped = plan_park(two_hours, 300, NOW, PARK_MAX_WAIT_SECS);
         assert_eq!(
@@ -249,7 +239,6 @@ mod tests {
             },
             "the single wait is capped; the rest resumes in another park"
         );
-        // The cap is recorded, so the journal shows the park was shortened.
         let intent = park_intent("run-1", "n1", &capped, Some("busy owner".into()))
             .expect("a capping park still journals");
         assert_eq!(intent.capped_to_ms, Some(NOW + 300_000));
@@ -265,8 +254,6 @@ mod tests {
         let b = park_intent("run-1", "n1", &d, None).expect("journals");
         assert_eq!(a.key, b.key, "the same park yields the same re-drive key");
         assert_eq!(a.key, park_redrive_key("run-1", "n1", t));
-        // A different node or run is a DIFFERENT park, so two busy agents
-        // waiting on the same T do not collapse into one resume.
         assert_ne!(a.key, park_redrive_key("run-1", "n2", t));
         assert_ne!(a.key, park_redrive_key("run-2", "n1", t));
     }
@@ -293,7 +280,6 @@ mod tests {
             Some("busy owner fence: agent held"),
             "the cause is journaled, not just a timestamp"
         );
-        // It round-trips: a resumed process can read the row back.
         let json = serde_json::to_string(&intent).expect("serializes");
         let back: ParkIntent = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, intent);
@@ -318,8 +304,6 @@ mod tests {
     /// that already resumed is a no-op, which is what makes a late cancel safe.
     #[test]
     fn park_cancelled_never_resumes_and_never_reads_as_failure() {
-        // The durable journal's state enum, in toron-core where the store
-        // actually persists it — not the engine's local boundary mirror.
         use toron_core::index::workflow_effects::EffectState;
 
         let t = NOW + 30_000;
@@ -327,12 +311,10 @@ mod tests {
         let intent = park_intent("run-1", "n1", &d, Some("busy owner".into()))
             .expect("a park journals an intent");
 
-        // Before the park: Prepared, which is neither resumable nor terminal.
         assert!(
             !EffectState::Prepared.is_resumable() && !EffectState::Prepared.is_terminal(),
             "an unstarted park is neither resumable nor terminal"
         );
-        // Parked: resumable, NOT terminal, and not Failed.
         assert!(EffectState::Parked.is_resumable(), "a park is resumable");
         assert!(
             !EffectState::Parked.is_terminal(),
@@ -349,14 +331,11 @@ mod tests {
             "a park is never reported as a completed step"
         );
 
-        // Cancelled: terminal, and NOT resumable — the park will never fire.
         assert!(EffectState::Cancelled.is_terminal());
         assert!(
             !EffectState::Cancelled.is_resumable(),
             "a cancelled park must not resume"
         );
-        // The re-drive key still names the same park, so a late cancel is
-        // idempotent: it lands on the row that is already terminal.
         assert_eq!(park_redrive_key("run-1", "n1", t), intent.key);
     }
 
@@ -380,8 +359,6 @@ mod tests {
             DispatchPlan::ResumeParked { attempt: 1 },
             "a parked row resumes, it does not dispatch again"
         );
-        // A settled row is still terminal and still a duplicate — the park
-        // path did not weaken the existing terminal handling.
         let settled = effect_view(EffectState::Settled, 1, false);
         assert_eq!(
             plan_attempt(Some(&settled), &cap),

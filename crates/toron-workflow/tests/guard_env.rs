@@ -1,9 +1,4 @@
 // governed-by: ADR-0004
-//
-// Env-dependent guard-evaluator behavior. Integration test (own crate, not
-// subject to the lib's `#![forbid(unsafe_code)]`): `std::env::set_var` /
-// `remove_var` are `unsafe` in edition 2024, so these cases cannot live in
-// the lib's unit tests. verify-gates only scans `src/{lib,main}.rs` roots.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,7 +8,6 @@ use toron_workflow::{DEFAULT_TIMEOUT_MS, evaluate_guard_default, timeout_from_en
 /// `TORON_GUARD_TIMEOUT_MS` override reads through; unset falls back.
 #[test]
 fn env_override_reads_through() {
-    // Precondition: whatever the ambient env, force the override.
     unsafe { std::env::set_var("TORON_GUARD_TIMEOUT_MS", "42") };
     assert_eq!(timeout_from_env(), Duration::from_millis(42));
 

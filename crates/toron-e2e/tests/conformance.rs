@@ -42,7 +42,6 @@ fn conformance_38_tools_in_golden_schema() {
         .as_array()
         .expect("tools is an array in tools.schema.json");
 
-    // Every golden tool must carry name + inputSchema (schema source of truth).
     let mut missing: Vec<String> = Vec::new();
     for tool in tools {
         let name = tool["name"].as_str().unwrap_or("<unnamed>");
@@ -60,7 +59,6 @@ fn conformance_38_tools_in_golden_schema() {
     );
     assert_eq!(tools.len(), 38, "38 tools — canonical AM-Rust surface");
 
-    // Required args are honored (e.g. acknowledge_message requires message_id).
     let ack = tools
         .iter()
         .find(|t| t["name"].as_str() == Some("acknowledge_message"))
@@ -85,7 +83,6 @@ fn conformance_25_resources_in_golden_catalog() {
     );
     assert_eq!(resources.len(), 25, "25 MCP resources — canonical");
 
-    // Every resource URI is present + scoped.
     for r in resources {
         assert!(r["uri"].as_str().is_some(), "resource must have uri: {r}");
         assert!(
@@ -95,7 +92,6 @@ fn conformance_25_resources_in_golden_catalog() {
         );
     }
 
-    // Spot-check canonical URIs (parity anchors).
     let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
     for anchor in [
         "resource://agents/{project_key}",
@@ -116,7 +112,6 @@ fn conformance_filter_semantics_enumeration() {
     let sem = load_fixture("semantics.json");
     let cases = sem["cases"].as_object().expect("cases is an object");
 
-    // Importance levels: AM-Rust parity.
     let importance = cases["importance_levels"]
         .as_array()
         .expect("importance_levels");
@@ -124,7 +119,6 @@ fn conformance_filter_semantics_enumeration() {
     assert!(importance.iter().any(|i| i.as_str() == Some("urgent")));
     assert!(importance.iter().any(|i| i.as_str() == Some("normal")));
 
-    // Filter semantics must cover the parity-relevant surface.
     let filters = cases["filter_semantics"]
         .as_object()
         .expect("filter_semantics");
@@ -137,7 +131,6 @@ fn conformance_filter_semantics_enumeration() {
         assert!(filters.contains_key(key), "filter semantic missing: {key}");
     }
 
-    // Recency tie rule: same created_ts -> descending id (relevance-compatible).
     assert_eq!(
         cases["recency_tie_rule"].as_str(),
         Some("same created_ts -> ordered by descending message id"),
@@ -147,9 +140,6 @@ fn conformance_filter_semantics_enumeration() {
 
 #[tokio::test]
 async fn conformance_tokenizer_contract_matches_golden_tokens() {
-    // The AM-Rust tokenizer contract produces exact golden tokens. Verified
-    // behaviorally via MATCH (the fts5_tokenize TVF is not built into the
-    // linked SQLite — MATCH exercises the same porter unicode61 pipeline).
     let tok = load_fixture("tokenizer.json");
     let config = tok["config"].as_str().expect("tokenizer config");
     assert_eq!(config, "porter unicode61 remove_diacritics 2");
@@ -177,8 +167,6 @@ async fn conformance_tokenizer_contract_matches_golden_tokens() {
             .filter_map(|t| t.as_str().map(str::to_string))
             .collect();
 
-        // Insert the input as a message body (FTS external-content trigger
-        // indexes it with the AM tokenizer).
         sqlx::query(
             "INSERT INTO messages \
              (event_id, project_slug, sender, sender_pubkey, subject, body, \
@@ -192,9 +180,6 @@ async fn conformance_tokenizer_contract_matches_golden_tokens() {
         .await
         .expect("insert doc");
 
-        // Every golden token must MATCH (porter-stemmed + diacritic-stripped).
-        // `releas` is a documented runtime divergence (see below) — excluded
-        // from the strict loop, asserted explicitly after.
         for token in &expected {
             if token == "releas" {
                 continue;
@@ -213,11 +198,6 @@ async fn conformance_tokenizer_contract_matches_golden_tokens() {
         }
     }
 
-    // KNOWN RUNTIME DIVERGENCE (documented, not papered over):
-    // The golden contract's porter stems "release" → "releas"; the bundled
-    // libsqlite3-sys porter does NOT (keeps "release"). Assert the divergence
-    // explicitly so it surfaces in CI as a documented gap, not a silent skip.
-    // Revisit if toron vendors a different porter (e.g. custom FTS5 tokenizer).
     let has_releas = tok["cases"].as_array().unwrap().iter().any(|c| {
         c["tokens"]
             .as_array()
@@ -242,8 +222,6 @@ async fn conformance_tokenizer_contract_matches_golden_tokens() {
             release_hits > 0,
             "runtime porter keeps 'release' (divergence documented)"
         );
-        // The contract token 'releas' is NOT produced by this runtime porter —
-        // a documented divergence; assert it here so it cannot regress silently.
         // TODO(bd-77u.2): vendor a Porter-strict tokenizer or relax the contract.
         assert_eq!(
             releas_hits, 0,
@@ -265,8 +243,6 @@ async fn conformance_tokenizer_contract_matches_golden_tokens() {
 
 #[tokio::test]
 async fn conformance_samples_validate_against_schema() {
-    // Each request/response sample must satisfy the corresponding tool schema
-    // (schema = golden source, per ADR-0003 rev 7).
     let schema = load_fixture("tools.schema.json");
     let samples = load_fixture("samples.json");
     let tools = schema["tools"].as_array().expect("tools");

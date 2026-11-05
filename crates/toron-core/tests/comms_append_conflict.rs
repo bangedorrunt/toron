@@ -71,7 +71,6 @@ async fn different_content_under_the_same_triple_is_a_hard_conflict() {
     let first = s.append_envelope(&task(B, 0, 0, "original")).await.unwrap();
     let second = s.append_envelope(&task(B, 0, 0, "rewritten")).await;
     assert!(is_conflict(&second), "{second:?}");
-    // Nothing moved: one row, at the first offset, holding the first content.
     let log = rows(&s).await;
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].0, first.offset);
@@ -145,8 +144,6 @@ fn toron_log_refuses_a_conflict_and_still_replays_identical_bytes() {
         "{conflict:?}"
     );
 }
-
-// --- negative controls: these held before the fix and must keep holding ---
 
 /// CONTROL: the same envelope again is still an idempotent replay.
 #[tokio::test]

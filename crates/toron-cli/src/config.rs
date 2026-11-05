@@ -193,8 +193,6 @@ impl Config {
         if !other.mcp_allowed_hosts.is_empty() {
             self.mcp_allowed_hosts = other.mcp_allowed_hosts;
         }
-        // Key by key, so a project file that sets nothing in `[comms]` does
-        // not erase what the user file set.
         if let Some(c) = other.comms
             && c.inbox_log.is_some()
         {
@@ -205,7 +203,6 @@ impl Config {
     }
 
     fn merge_env(&mut self) {
-        // No secrets in env values — only paths/booleans (ADR CLI design).
         if let Ok(v) = env::var("TORON_CONFIG")
             && !v.is_empty()
         {
@@ -333,7 +330,6 @@ mod tests {
 
     #[test]
     fn mcp_allowed_hosts_merge_and_env() {
-        // File value merges.
         let dir = scratch("mcp-hosts");
         let cfg_path = write_config(
             &dir,
@@ -342,7 +338,6 @@ mod tests {
         );
         let cfg = Config::load(Some(&cfg_path));
         assert_eq!(cfg.mcp_allowed_hosts, vec!["toron.example-tailnet.ts.net"]);
-        // Default is empty (loopback only).
         let cfg = Config::default();
         assert!(cfg.mcp_allowed_hosts.is_empty());
     }
@@ -365,7 +360,6 @@ mod tests {
         assert_eq!(file_comms_inbox_log(&on), Some(true));
         let off = write_config(&dir, "off.toml", "[comms]\ninbox_log = false\n");
         assert_eq!(file_comms_inbox_log(&off), Some(false));
-        // CONTROL: a config with no `[comms]` leaves the key absent.
         let none = write_config(&dir, "none.toml", "backend = \"hc\"\n");
         assert_eq!(file_comms_inbox_log(&none), None);
     }
@@ -388,11 +382,9 @@ mod tests {
     fn comms_merges_key_by_key_so_a_silent_layer_does_not_erase_it() {
         let mut cfg = Config::default();
         cfg.merge(toml::from_str("[comms]\ninbox_log = true\n").unwrap());
-        // A later layer that sets other things, or an empty `[comms]`, keeps it.
         cfg.merge(toml::from_str("backend = \"hc\"\n").unwrap());
         cfg.merge(toml::from_str("[comms]\n").unwrap());
         assert_eq!(cfg.comms_inbox_log(), Some(true));
-        // A later layer that sets it wins.
         cfg.merge(toml::from_str("[comms]\ninbox_log = false\n").unwrap());
         assert_eq!(cfg.comms_inbox_log(), Some(false));
     }

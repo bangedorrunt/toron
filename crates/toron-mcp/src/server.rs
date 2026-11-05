@@ -98,7 +98,6 @@ impl ToronServer {
 
 impl ServerHandler for ToronServer {
     fn get_info(&self) -> ServerConfig {
-        // rmcp auto-negotiates: prefers V_2026_07_28, falls back to V_2025_11_25.
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new("toron", env!("CARGO_PKG_VERSION")))
@@ -173,12 +172,6 @@ impl ServerHandler for ToronServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = request.uri.as_str();
-        // bd-pin-public-plane-s-easy.14: data-backed resource URIs project
-        // LIVE mailbox data (reservations, slots, agents, inbox, messages,
-        // threads, projects, ack-overdue) — not the static discovery stub.
-        // The CLI guard reads the reservation roster from
-        // `toron://reservations/{project}`; a stub would hide every lease
-        // (false Unreserved). Static/tooling URIs fall through to the stub.
         let value = if let Some(mb) = self.tools.as_ref().map(super::tools::ToolServer::mailbox) {
             crate::resources::project_resource_value(mb, uri)
                 .await
@@ -301,10 +294,6 @@ async fn start_wake_sidecar(mailbox: &Mailbox) -> Option<toron_core::bus::wake::
     let server = WakeServer::new(
         {
             let mut config = WakeConfig::new(&sock);
-            // bd-j2vo: the concurrent-subscriber cap is the daemon's fd
-            // budget guard. An operator whose fleet needs more subscribers
-            // raises it here; the default keeps the wake plane well under
-            // launchd's default soft fd limit.
             if let Some(cap) = std::env::var("TORON_WAKE_MAX_SUBSCRIBERS")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
@@ -362,9 +351,6 @@ pub async fn build_mailbox_with_opts(
     toron_core::index::schema::migrate(&pool)
         .await
         .context("migrate")?;
-    // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
-    // roots into the alias table on open — legacy rows stay visible
-    // read-only through every spelling of the project key.
     toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
         .await
         .context("reconcile_aliases")?;
@@ -376,16 +362,6 @@ pub async fn build_mailbox_with_opts(
             .with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
-        // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection
-        // LIVE — but ONLY on the serve topology (trigger channel attached).
-        // A serve process is long-lived: it pays the agent-keyring cold KDF
-        // (N × scrypt, ~0.1-0.4s/key release) ONCE and then projects every
-        // wrap live. One-shot consumers (robot CLI, bench, tui) attach no
-        // trigger channel; spawning the loop there made every invocation
-        // replay the bus's stored gift-wraps and rebuild the keyring —
-        // 489-key data dirs burned 35-200s of pure scrypt per `toron mail
-        // inbox` / `reserve conflicts` call (observed 2026-08-17; the daemon
-        // is the projector of record, the CLI reads its SQLite projection).
         mailbox.spawn_unwrap_loop();
     }
     Ok(mailbox)
@@ -405,19 +381,11 @@ async fn build_mailbox(
         let db = std::env::temp_dir().join(format!("toron-mcp-{stamp}.sqlite"));
         (data_dir, db, operator_keys()?)
     } else if let Some(dir) = std::env::var_os("TORON_MCP_DATA_DIR") {
-        // Cross-process test isolation: a caller-provided shared dir
-        // (cli_robot registers in-process, then shells out to the built
-        // binary — both sides MUST see the same root).
         let d = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&d)?;
         let db = d.join("index.sqlite");
         (d, db, operator_keys()?)
     } else {
-        // R2 (ADR-0007 D3): production default is the DURABLE root
-        // ($XDG_DATA_HOME/toron or TORON_DATA_DIR) — per-pid temp roots are
-        // dead as the default. Operator key: explicit TORON_OPERATOR_KEY, or
-        // the stable durable key (generated 0600 on first run; the next
-        // process on the same root loads the SAME key).
         let paths = ToronPaths::resolve();
         paths.ensure_layout()?;
         let _ = paths.ensure_operator_key_mode();
@@ -434,9 +402,6 @@ async fn build_mailbox(
     toron_core::index::schema::migrate(&pool)
         .await
         .context("migrate")?;
-    // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
-    // roots into the alias table on open — legacy rows stay visible
-    // read-only through every spelling of the project key.
     toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
         .await
         .context("reconcile_aliases")?;
@@ -446,9 +411,6 @@ async fn build_mailbox(
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
-        // Serve topology only — see build_mailbox_with_opts: one-shot robot
-        // consumers (demo_mailbox, no trigger channel) must not replay the
-        // bus's stored gift-wraps into a full agent-keyring KDF rebuild.
         mailbox.spawn_unwrap_loop();
     }
     Ok(mailbox)
@@ -479,10 +441,6 @@ fn spawn_mail_trigger_host(
         Ok(host) => {
             host.spawn_mail_trigger_loop(trigger_rx);
             host.spawn_trigger_loop();
-            // bd-host-cut-pqkg: approvals resolve on the bus, and a daemon
-            // restart re-opens persisted non-terminal models. Both loops were
-            // defined but never armed, so a parked durable run would have
-            // stayed parked forever.
             host.spawn_resolution_loop();
             host.spawn_durable_sweep(std::time::Duration::from_secs(30));
             vec![host]
@@ -528,15 +486,8 @@ pub(crate) fn operator_keys() -> anyhow::Result<Option<toron_core::keys::Keys>> 
 /// Blocks until the stdio connection closes.
 pub async fn serve_stdio() -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
-    // bd-m5ym: the Mailbox data_dir is <root>/projects in production;
-    // the serve lock is a root-level file (<root>/serve.pid).
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
-    // Held across `running.waiting()` below: drop removes wake.sock (RAII).
     let _wake = start_wake_sidecar(&mailbox).await;
-    // bd-lease-liveness-oracle-ro8i: the daemon vouches holders that polled
-    // recently (inbox_cursors join), so an expired lease held by a LIVE
-    // agent still blocks. Held across the serve: drop aborts the 15 s
-    // refresh task and clears the oracle (shutdown hygiene).
     let _liveness =
         toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(mailbox.index_pool())
             .await;
@@ -547,7 +498,6 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
         r = running.waiting() => r.map(|_| ()).map_err(anyhow::Error::from),
         _ = shutdown_signal() => Ok(()),
     };
-    // bd-slkn: clean stop persists cursor marks set after the final tick.
     WorkflowHost::persist_hosts_cursors(&hosts).await;
     res?;
     Ok(())
@@ -629,13 +579,6 @@ async fn router_with_mailbox(
 ) -> anyhow::Result<(axum::Router, Vec<WorkflowHost>)> {
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
-    // bd-741i: legacy_session_mode=false — every request is stateless
-    // (SEP-2567). The previous default (legacy true) accumulated
-    // LocalSessionManager sessions for every MCP client and never expired
-    // them; overnight that was part of the 16GB launchd RSS climb.
-    // Tailnet: `tailscale serve` forwards the Tailnet Host, so the rmcp
-    // DNS-rebinding guard must admit `mcp_allowed_hosts` or every proxied
-    // request 403s with "Host header is not allowed".
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
@@ -645,9 +588,6 @@ async fn router_with_mailbox(
                 .with_legacy_session_mode(false)
                 .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
-    // ADR-0006 (bd-esh.5): mount the Blossom blob-serving surface at
-    // `/.blossom` (BUD-01 retrieval + BUD-02 upload) over a per-daemon blob
-    // store rooted at the demo data dir's `blobs/`.
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
     let blossom =
         crate::blob_serve::blossom_router(toron_core::archive::blob::BlobStore::new(blob_root));
@@ -662,20 +602,10 @@ async fn router_with_mailbox(
 /// values (`mcp_allowed_hosts` from config.toml); loopback is always allowed.
 pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
-    // bd-741i: refuse a second writer on this data dir *before* binding so
-    // a flywheel sidecar `toron serve --mcp-http <other-port>` cannot open
-    // a parallel SQLite pool against the live mailbox.
-    // bd-m5ym: lock lives at the data root, not <root>/projects/.
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // bd-serve-double-spawn-oqe6: under launchd/systemd autostart a
-            // second spawn hits this whenever a healthy instance already
-            // owns the address. Exiting cleanly lets the unit's
-            // restart-on-failure policy leave it dead instead of
-            // crash-looping "Address already in use" into serve.err.log.
-            // A squatter that does not speak HTTP is still a hard failure.
             match classify_port_peer(bind_addr).await {
                 PortPeer::HttpPeer => {
                     tracing::info!(
@@ -690,12 +620,7 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
         Err(e) => return Err(e.into()),
     };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
-    // ADR-0036 Spec 2 (bd-ewsi): bound only once THIS instance owns the
-    // address (a healthy HttpPeer instance already returned above and keeps
-    // its own sidecar); held across the serve await — drop removes the file.
     let _wake = start_wake_sidecar(&mailbox).await;
-    // bd-lease-liveness-oracle-ro8i: see serve_stdio — same oracle, same
-    // guard lifetime (drop aborts the refresh and clears the checker).
     let _liveness =
         toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(mailbox.index_pool())
             .await;
@@ -703,7 +628,6 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    // bd-slkn: clean stop persists cursor marks set after the final tick.
     WorkflowHost::persist_hosts_cursors(&hosts).await;
     Ok(())
 }
@@ -754,7 +678,6 @@ mod tests {
     async fn port_peer_classifies_http_junk_and_dead() {
         use tokio::io::AsyncWriteExt;
 
-        // HTTP peer: minimal responder (405 is what axum answers on GET /mcp).
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let responder = tokio::spawn(async move {
@@ -766,7 +689,6 @@ mod tests {
         assert_eq!(classify_port_peer(&addr).await, PortPeer::HttpPeer);
         responder.await.unwrap();
 
-        // Junk peer: accepts the connection but never speaks HTTP.
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let junk = tokio::spawn(async move {
@@ -776,7 +698,6 @@ mod tests {
         assert_eq!(classify_port_peer(&addr).await, PortPeer::NonHttp);
         junk.abort();
 
-        // Dead port: nothing listening at all.
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         drop(l);
@@ -825,7 +746,6 @@ mod tests {
                 .expect("bus"),
         );
 
-        // The serve wire: channel → with_trigger_tx → host loop.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UnwrappedMail>();
         let mailbox = Arc::new(
             Mailbox::new(bus.clone(), data_dir.clone(), None)
@@ -841,7 +761,6 @@ mod tests {
             .register_agent("demo", &AgentProfile::new("BlueLake"))
             .await
             .expect("register recipient");
-        // The workflow ActionRunner sends as `workflow-<project>` (F6 stamp).
         mailbox
             .register_agent("demo", &AgentProfile::new("workflow-demo"))
             .await
@@ -866,17 +785,13 @@ steps:
         let host = WorkflowHost::new(mailbox.clone(), vec![wf]).expect("host");
         let host_handle = host.spawn_mail_trigger_loop(rx);
 
-        // Count kind-1059 gift wraps on the bus: exactly the user send + the
-        // stamped workflow ack — never a third (self-loop would add more).
         let mut sub = bus
             .subscribe(toron_core::bus::Filter::new().kinds([toron_core::nostr::Kind::GiftWrap]))
             .await
             .expect("subscribe");
         let mut wraps = 0u32;
         let mut ack_body_seen = false;
-        // KDFs serialize (~4.4s/key × 3 keys + margins) — 45s is honest.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
-        // The user gift-wrapped send — the F1 trigger source.
         mailbox
             .send_message(&toron_core::mailbox::SendMessage {
                 project_slug: "demo".into(),
@@ -896,9 +811,6 @@ steps:
             if ev.kind.as_u16() == 1059 {
                 wraps += 1;
                 if wraps == 2 {
-                    // Second wrap = the workflow reply; verify its body and
-                    // the workflow-emitted stamp by unwrapping it with the
-                    // recipient key (same key material the loop uses).
                     let key_path = data_dir
                         .join("demo")
                         .join("agents")
@@ -925,7 +837,6 @@ steps:
         assert_eq!(wraps, 2, "user send + one workflow ack (ran exactly once)");
         assert!(ack_body_seen, "workflow reply delivered with expected body");
 
-        // Grace: drain the subscription — a self-loop would add a third wrap.
         let grace = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
             let ev = match tokio::time::timeout_at(grace, sub.next()).await {
@@ -943,8 +854,6 @@ steps:
             "no self-loop: exactly user send + workflow ack observed"
         );
 
-        // Both mails visible to the recipient (projection + trigger path live:
-        // the sink only notifies after a successful projection write).
         let inbox = mailbox
             .fetch_inbox(&toron_core::mailbox::FetchInbox {
                 project_slug: "demo".into(),
@@ -982,8 +891,6 @@ steps:
         toron_core::keys::write_encrypted_key(&key_path, &op, "p", toron_core::keys::TEST_LOG_N)
             .expect("operator key");
 
-        // Serve mailbox (trigger channel): registers two agents and stores a
-        // real gift-wrapped message on the shared bus.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UnwrappedMail>();
         let serve = build_mailbox_with_opts(Some(tx), data_dir.clone(), key_path.clone(), "p")
             .await
@@ -1007,8 +914,6 @@ steps:
             })
             .await
             .expect("send");
-        // The serve loop projected the wrap (keyring built at least once —
-        // generous budget: a debug-build scrypt at log_n 16 is ~4s/key).
         for _ in 0..80 {
             if serve.kdf_load_count() > 0 {
                 break;
@@ -1016,15 +921,9 @@ steps:
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        // One-shot (robot) mailbox on the SAME data dir: the bus replays the
-        // stored wrap on subscribe — with the gate, no loop runs, no keyring
-        // KDF fires.
         let robot = build_mailbox_with_opts(None, data_dir.clone(), key_path.clone(), "p")
             .await
             .expect("robot mailbox");
-        // Bounded observation: a debug-build scrypt at log_n 16 is ~4s/key,
-        // so a regressed (spawning) builder shows its first KDF load within
-        // this window; the gated builder never loads at all.
         for _ in 0..50 {
             if robot.kdf_load_count() > 0 {
                 break;
@@ -1036,8 +935,6 @@ steps:
             0,
             "one-shot construction must not replay stored wraps into a KDF rebuild"
         );
-        // The stored wrap IS visible to the robot's bus (replay works); only
-        // the projection loop is skipped.
         let inbox = robot
             .fetch_inbox(&FetchInbox {
                 project_slug: "demo".into(),

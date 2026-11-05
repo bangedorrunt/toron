@@ -72,8 +72,6 @@ fn render_list(
                 Span::styled(format!("{:<16}", truncate(&row.name, 16)), name_style),
                 Span::styled(format!("{:<9}", row.state_label()), state_style(row)),
             ];
-            // Phone width: pin + state are the row; the harness and the age
-            // are in the detail card (`Enter`).
             if !narrow {
                 let harness = match (&row.program, &row.model) {
                     (Some(p), Some(m)) => format!("{p}/{m}"),

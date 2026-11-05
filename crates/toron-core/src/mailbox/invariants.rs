@@ -100,10 +100,7 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("broadcast").await;
         register(&mailbox, "demo", "GreenCastle").await;
 
-        // No to/cc/bcc → no explicit recipients → send rejected (broadcast
-        // denial).
         assert!(mailbox.invariant_broadcast_rejected().await.expect("inv"));
-        // Explicit recipients succeed.
         register(&mailbox, "demo", "BlueLake").await;
         let ok = mailbox
             .send_message(&SendMessage {
@@ -127,8 +124,6 @@ mod tests {
         let blue = register(&mailbox, "projA", "BlueLake").await;
         register(&mailbox, "projB", "RoseDune").await;
 
-        // A message sent within projA to BlueLake: the projB agent must not
-        // see it via a project-scoped filter.
         mailbox
             .send_message(&SendMessage {
                 project_slug: "projA".into(),
@@ -141,7 +136,6 @@ mod tests {
             .await
             .expect("send in projA");
 
-        // RoseDune (projB) fetch_inbox → empty (no cross-project leak).
         let inbox = mailbox
             .fetch_inbox(&FetchInbox {
                 project_slug: "projB".into(),
@@ -168,7 +162,6 @@ mod tests {
         assert!(overlaps("src/lib.rs", "src/**"), "both directions");
         assert!(!overlaps("src/**", "docs/x.md"));
         assert!(!overlaps("src/a.rs", "src/b.rs"));
-        // Directory patterns vs their own children.
         assert!(overlaps(
             "crates/toron-core/**",
             "crates/toron-core/src/lib.rs"
@@ -180,7 +173,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("ttl").await;
         register(&mailbox, "demo", "BlueLake").await;
 
-        // Acquire with NO explicit TTL → defaults to 90d (not forever).
         let acq = mailbox
             .file_reservation_paths("demo", "BlueLake", &["src/**".into()], None, true, None)
             .await
@@ -188,7 +180,6 @@ mod tests {
         assert_eq!(acq.granted.len(), 1);
         let exp = acq.granted[0].expires_ts_us;
         assert_invariant("ttl-not-forever", exp.is_some(), "default TTL must be set");
-        // expires_ts_us is absolute (now + TTL); the span must be ~90d.
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let span = exp.expect("ttl") - now_us;
         let span_secs = span / 1_000_000;
@@ -204,7 +195,6 @@ mod tests {
 
     #[test]
     fn invariant_wrong_surface_denial() {
-        // Metadata-hiding kinds must NEVER gain project scoping tags (A3).
         let base = Vec::new();
         let scoped = with_project_scoping(crate::nostr::Kind::GiftWrap, base, Some("demo"));
         assert_invariant(
@@ -217,7 +207,6 @@ mod tests {
             crate::nostr::Kind::PrivateDirectMessage
         ));
 
-        // A plain non-hiding kind DOES get scoped.
         let plain = with_project_scoping(toron_kind(PROJECT_MANIFEST), Vec::new(), Some("demo"));
         assert_invariant(
             "wrong-surface",
@@ -259,7 +248,6 @@ mod tests {
         let blue = register(&mailbox, "demo", "BlueLake").await;
         let rose = register(&mailbox, "demo", "RoseDune").await;
 
-        // contacts_only with no approved link → inbound dropped.
         let sender = crate::keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
@@ -272,13 +260,11 @@ mod tests {
             .expect("wrap");
         mailbox.bus.publish(wrap).await.expect("publish");
 
-        // RoseDune's policy: contacts_only. No approved link → drop.
         mailbox
             .set_contact_policy("demo", "RoseDune", ContactPolicy::ContactsOnly)
             .await
             .expect("set contacts_only");
 
-        // The wrap is addressed to `rose`; unwrap requires rose's key.
         let rose_keys = mailbox
             .agent_keys_for("demo", "RoseDune")
             .expect("rose key");
@@ -288,7 +274,6 @@ mod tests {
         ));
         let pipeline = crate::mailbox::unwrap::UnwrapPipeline::new(vec![rose_keys], source, sink);
 
-        // Re-fetch the wrap (it was published above).
         let filter = crate::bus::filter::ToronFilter::new()
             .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(rose)
@@ -304,7 +289,6 @@ mod tests {
             format!("{outcome:?}"),
         );
 
-        // After approving a link, is_approved_contact is true.
         mailbox
             .request_contact(&RequestContact {
                 project_slug: "demo".into(),

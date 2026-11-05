@@ -195,8 +195,6 @@ async fn denial_failures(s: &InboxStore, q: &mut Seqs) -> Vec<String> {
 async fn an_ungoverned_context_is_untouched() {
     let s = store("ungoverned").await;
     let mut q = Seqs::new();
-    // A "crew" that has no role anywhere tasks and verdicts freely: no role
-    // fact, so nothing is checked (today's behaviour).
     let m = q.msg(STRANGER);
     put(&s, &mut q, task(m, CREW, "ctx-legacy", "t-1")).await;
     let m = q.msg(STRANGER);
@@ -208,7 +206,6 @@ async fn an_ungoverned_context_is_untouched() {
 async fn the_first_role_fact_is_the_operators_captain() {
     let s = store("bootstrap").await;
     let mut q = Seqs::new();
-    // A non-operator cannot start a context, whatever it asks for.
     let m = q.msg(STRANGER);
     let r = unauthorized(
         s.append_envelope(&role_fact(m, CTX, STRANGER, Role::Captain, 0))
@@ -223,7 +220,6 @@ async fn the_first_role_fact_is_the_operators_captain() {
             expected: vec!["operator".into()],
         }
     );
-    // The operator cannot start one with anything but a captain.
     let m = q.msg(OP);
     let r = unauthorized(
         s.append_envelope(&role_fact(m, CTX, CREW, Role::Crew, 0))
@@ -238,7 +234,6 @@ async fn the_first_role_fact_is_the_operators_captain() {
         s.roles(CTX).await.unwrap().is_empty(),
         "nothing was written"
     );
-    // The operator's captain governs the context.
     let m = q.msg(OP);
     put(&s, &mut q, role_fact(m, CTX, CAP, Role::Captain, 0)).await;
     let fact = s.role_of(CTX, CAP).await.unwrap().unwrap();
@@ -258,7 +253,6 @@ async fn the_first_role_fact_is_the_operators_captain() {
 async fn a_role_fact_from_a_non_operator_without_the_rank_is_refused() {
     let (s, mut q) = swarm("rolerank").await;
     let before = s.roles(CTX).await.unwrap();
-    // Crew, peer, verifier, loop_self and a stranger cannot issue any role.
     for who in [CREW, PEER, VER, LOOP, STRANGER] {
         let m = q.msg(who);
         unauthorized(
@@ -266,7 +260,6 @@ async fn a_role_fact_from_a_non_operator_without_the_rank_is_refused() {
                 .await,
         );
     }
-    // A supervisor cannot mint a captain or a supervisor, nor touch one.
     for (subject, role) in [
         (STRANGER, Role::Captain),
         (STRANGER, Role::Supervisor),
@@ -284,7 +277,6 @@ async fn a_role_fact_from_a_non_operator_without_the_rank_is_refused() {
             "{r:?}"
         );
     }
-    // A captain cannot mint another captain or demote one.
     let m = q.msg(CAP);
     unauthorized(
         s.append_envelope(&role_fact(m, CTX, STRANGER, Role::Captain, 0))
@@ -295,7 +287,6 @@ async fn a_role_fact_from_a_non_operator_without_the_rank_is_refused() {
         before,
         "no refusal wrote a role"
     );
-    // The operator can do anything: demote the captain.
     let m = q.msg(OP);
     put(&s, &mut q, role_fact(m, CTX, CAP, Role::Peer, 1)).await;
     assert_eq!(s.role_of(CTX, CAP).await.unwrap().unwrap().role, Role::Peer);
@@ -304,7 +295,6 @@ async fn a_role_fact_from_a_non_operator_without_the_rank_is_refused() {
 #[tokio::test]
 async fn a_role_fact_is_fenced_by_gen() {
     let (s, mut q) = swarm("rolegen").await;
-    // gen 0 is on record for CREW; an equal or lower gen is stale.
     for g in [0u32] {
         let m = q.msg(SUP);
         let r = s
@@ -325,7 +315,6 @@ async fn a_role_fact_is_fenced_by_gen() {
         s.role_of(CTX, CREW).await.unwrap().unwrap().role,
         Role::Crew
     );
-    // A higher gen replaces it, and the fence moves up.
     let m = q.msg(SUP);
     put(&s, &mut q, role_fact(m, CTX, CREW, Role::Verifier, 3)).await;
     let m = q.msg(SUP);
@@ -352,7 +341,6 @@ async fn the_authority_table_is_enforced_at_append() {
     let failures = denial_failures(&s, &mut q).await;
     assert!(failures.is_empty(), "{failures:#?}");
 
-    // The refusals are typed and carry the expected set.
     let m = q.msg(CREW);
     let r = unauthorized(s.append_envelope(&task(m, CREW2, CTX, "t-x")).await);
     assert_eq!(
@@ -382,12 +370,9 @@ async fn the_authority_table_is_enforced_at_append() {
         "no role in a governed context"
     );
 
-    // A refusal wrote nothing and consumed no sequence number: the same
-    // sender's next message goes in at the seq it would have had.
     let m = q.msg(CREW);
     put(&s, &mut q, notify(m, SUP, CTX)).await;
 
-    // What the table allows goes through.
     let m = q.msg(SUP);
     put(&s, &mut q, task(m, CREW, CTX, "t-1")).await;
     let m = q.msg(PEER);
@@ -431,7 +416,6 @@ async fn a_supervisor_cannot_verdict_its_own_task_but_can_verdict_a_captains() {
     );
     assert!(expected.contains(&"task/*".to_string()), "{expected:?}");
 
-    // A task the captain sent is not the supervisor's own.
     let m = q.msg(SUP);
     put(&s, &mut q, verdict(m, CAP, CTX, "t-cap")).await;
 }
@@ -439,8 +423,6 @@ async fn a_supervisor_cannot_verdict_its_own_task_but_can_verdict_a_captains() {
 #[tokio::test]
 async fn a_verifier_cannot_done_and_a_crew_can() {
     let (s, mut q) = swarm("verdone").await;
-    // The captain hands the verifier a task. It reads and accepts it, then
-    // is refused `done`.
     let m = q.msg(CAP);
     put(&s, &mut q, task(m, VER, CTX, "t-ver")).await;
     let b = s.next(VER, None, false).await.unwrap();
@@ -469,7 +451,6 @@ async fn a_verifier_cannot_done_and_a_crew_can() {
         "nothing moved"
     );
 
-    // The same sequence by a crew finishes the task.
     let m = q.msg(SUP);
     put(&s, &mut q, task(m, CREW, CTX, "t-crew")).await;
     let b = s.next(CREW, None, false).await.unwrap();
@@ -491,12 +472,10 @@ async fn a_replay_of_an_authorised_append_stays_idempotent_after_the_role_change
     let m = q.msg(SUP);
     let t = task(m, CREW, CTX, "t-1");
     put(&s, &mut q, t.clone()).await;
-    // The captain demotes the supervisor; the old append is still a replay.
     let m = q.msg(CAP);
     put(&s, &mut q, role_fact(m, CTX, SUP, Role::Peer, 1)).await;
     let again = s.append_envelope(&t).await.unwrap();
     assert!(again.replay);
-    // But the demoted sender can no longer task.
     let m = q.msg(SUP);
     unauthorized(s.append_envelope(&task(m, CREW, CTX, "t-2")).await);
 }
@@ -525,7 +504,6 @@ async fn authorize_is_a_dry_run() {
         head,
         "a dry run writes nothing"
     );
-    // The allowed envelope really is appendable at the seq it was checked at.
     let m = q.msg(SUP);
     put(&s, &mut q, task(m, CREW, CTX, "t-x")).await;
     assert!(s.head(CREW).await.unwrap() > head);
@@ -533,8 +511,6 @@ async fn authorize_is_a_dry_run() {
 
 #[tokio::test]
 async fn an_allow_everything_stub_fails_the_authority_suite() {
-    // Negative control. The same suite that passes on the standard table
-    // must fail on a table that allows everything.
     static ALLOW_ALL: [Grant; 36] = {
         let mut out = [Grant {
             role: Role::Captain,
@@ -561,8 +537,6 @@ async fn an_allow_everything_stub_fails_the_authority_suite() {
 
     let (s, mut q) = swarm("stub").await;
     let stub = s.with_authority(Authority::new(&ALLOW_ALL, &Role::ALL));
-    // Under the stub the table's own spec check fails, and so does the
-    // append-level suite (the crew task/verdict are not refused any more).
     assert!(
         !Authority::new(&ALLOW_ALL, &Role::ALL)
             .deviations()
@@ -588,8 +562,6 @@ fn control_contracts_in_known_all_have_an_authority_row() {
         "{control:?}"
     );
     let a = Authority::standard();
-    // approval@1 and lead@1 are captain-only in the table (plus the operator,
-    // who is not a role here). Do not grant either wider so this check stays green.
     const CAPTAIN_ONLY: &[&str] = &["approval", "lead"];
     for name in control {
         if CAPTAIN_ONLY.contains(&name) {
@@ -600,8 +572,6 @@ fn control_contracts_in_known_all_have_an_authority_row() {
             );
             continue;
         }
-        // Someone below the captain must be able to send it; a Control
-        // contract only the captain's wildcard reaches is unclassified.
         assert!(
             Role::ALL
                 .into_iter()
@@ -619,38 +589,31 @@ fn role_and_verdict_bodies_are_strict() {
         epoch: 0,
         seq: n,
     };
-    // A role fact must be addressed to its subject.
     let mut e = role_fact(m(0), CTX, CREW, Role::Crew, 0);
     e.to = Recipient::Npub(CREW2.into());
     assert!(matches!(e.validate(), Err(Reject::BadBody { contract, .. }) if contract == "role@1"));
-    // A subject that is not an npub: refused as an address, and as a body
-    // when only the body names the pin.
     let e = role_fact(m(0), CTX, "alice", Role::Crew, 0);
     assert!(matches!(e.validate(), Err(Reject::BadAddress { .. })));
     let mut e = role_fact(m(0), CTX, CREW, Role::Crew, 0);
     e.body["npub"] = serde_json::json!("alice");
     assert!(matches!(e.validate(), Err(Reject::BadBody { .. })));
-    // An unknown role and an unknown field are refused, not guessed.
     let mut e = role_fact(m(0), CTX, CREW, Role::Crew, 0);
     e.body["role"] = serde_json::json!("god");
     assert!(matches!(e.validate(), Err(Reject::BadBody { .. })));
     let mut e = role_fact(m(0), CTX, CREW, Role::Crew, 0);
     e.body["extra"] = serde_json::json!(1);
     assert!(matches!(e.validate(), Err(Reject::BadBody { .. })));
-    // The wire name of the fence is `gen`.
     let e = role_fact(m(0), CTX, CREW, Role::LoopSelf, 4);
     assert_eq!(e.body["gen"], 4);
     assert_eq!(e.body["role"], "loop_self");
     assert!(e.body.get("generation").is_none());
     assert!(e.validate().is_ok());
-    // A role contract on the wrong class is a class mismatch.
     let mut e = role_fact(m(0), CTX, CREW, Role::Crew, 0);
     e.class = Class::Notify;
     assert!(matches!(
         e.validate(),
         Err(Reject::ContractClassMismatch { .. })
     ));
-    // A verdict names its task, and takes only its fields.
     let mut e = verdict(m(0), CAP, CTX, "t");
     e.task = None;
     assert!(matches!(e.validate(), Err(Reject::BadEnvelope { .. })));

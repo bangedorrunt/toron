@@ -140,9 +140,6 @@ impl DetachedSubscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        // The scope owns cleanup, on every exit path: normal completion,
-        // an early return, or cancellation. There is no later observer that
-        // could notice the channel closed, so this is the only release point.
         if let Some(release) = self.release.take() {
             release();
         }
@@ -184,7 +181,6 @@ mod tests {
             other => panic!("expected Event, got {other:?}"),
         }
         assert!(matches!(sub.next().await, Some(SubscriptionEvent::Eose)));
-        // Channel still open but empty.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), sub.next())
                 .await

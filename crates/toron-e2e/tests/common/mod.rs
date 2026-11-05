@@ -1,9 +1,5 @@
 // governed-by: ADR-0005 (P4.7 — P4 Behavior Test Matrix harness fixtures)
 #![forbid(unsafe_code)]
-// F20.DEADCODE-FIXTURES (batch-fix): test-support module — the fixtures
-// (housekeeper_workflow, cron_registry, next_tick, fixture_registration) are
-// referenced by p1-gated scenario files compiled out in some feature combos;
-// the lint firing on a test-support module is noise, not dead code.
 #![allow(dead_code)]
 
 //! Shared fixtures for the scenario test harness (bd-i84w: the vendor

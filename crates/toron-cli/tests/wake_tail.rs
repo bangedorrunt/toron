@@ -13,9 +13,6 @@ fn src(name: &str) -> String {
 
 #[test]
 fn wake_tail_flag_removed_socket_is_the_path() {
-    // Wave 4 (bd-ud7k): the cutover flag is removed — the socket tail is
-    // unconditional, the in-process subscribe stays as the loud fallback.
-    // Assert the absence, not a spelling: any reintroduction fails loud.
     let cli = src("cli.rs");
     assert!(
         !cli.contains("watch_sock"),
@@ -51,9 +48,6 @@ fn wake_tail_absent_socket_is_loud_never_silent() {
 
 #[test]
 fn wake_tail_wave3_pump_deleted_socket_live() {
-    // Wave 3 (bd-qg6w): the 1s snapshot pump is deleted, the socket tail
-    // is the live path. Pump and socket are never both live (slice C
-    // tripwire contract).
     let plane = src("plane.rs");
     assert!(
         !plane.contains("Re-snapshot sqlite each tick"),
@@ -90,10 +84,6 @@ fn wake_tail_speaks_spec6_frames() {
 
 #[test]
 fn wake_tail_mapping_is_shared_not_copied() {
-    // Byte-identical mapping BY CONSTRUCTION: one formatter, two
-    // transports. A second json! shape in production code is drift
-    // (test scripts below #[cfg(test)] build fake server frames, not
-    // mapping shapes).
     let tail = src("wake_sock.rs");
     let prod = tail.split("#[cfg(test)]").next().unwrap_or(&tail);
     assert!(

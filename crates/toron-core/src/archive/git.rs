@@ -1,14 +1,6 @@
 // governed-by: ADR-0003, ADR-0007
 #![forbid(unsafe_code)]
 
-// bd-led.4.3: Git archive projection (AM-Rust layout), async commit
-// coalescer, TORON_GIT_BINARY override (ADR G16). libgit2 (git2, vendored)
-// is primary; the binary override is honored on the subprocess commit path.
-//
-// Permanent storage of unwrapped canonical content — the auditable system of
-// record + DR source (ADR: "Git archive (unwrapped canonical content) is
-// permanent"). Envelope TTL on the bus does NOT apply here.
-
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -88,11 +80,9 @@ impl CommitCoalescer {
     {
         loop {
             self.notify.notified().await;
-            // Debounce: wait for a quiet window before flushing.
             loop {
                 tokio::select! {
                     _ = self.notify.notified() => {
-                        // More work arrived; keep waiting for quiet.
                     }
                     _ = tokio::time::sleep(debounce) => {
                         if on_flush() {
@@ -215,7 +205,6 @@ impl GitArchive {
             Ok(r) => r,
             Err(_) => git2::Repository::init(root)?,
         };
-        // Touch the single-writer marker.
         std::fs::write(layout::archive_lock(root), b"")?;
         Ok(Self {
             repo,
@@ -408,8 +397,6 @@ mod tests {
 
     #[test]
     fn binary_commit_missing_bin_fails_fast() {
-        // G2: a configured-but-absent binary is a config error, surfaced
-        // fast with the path named — never a hung commit.
         let root = temp_root("nobin");
         let archive = GitArchive::open_or_init_with_binary(
             &root,
@@ -428,8 +415,6 @@ mod tests {
 
     #[test]
     fn binary_commit_hang_is_bounded() {
-        // G2: a hung git binary is killed at the deadline; the error names
-        // the timeout. Fake binary that sleeps past the 1s test bound.
         let dir = temp_root("hangbin");
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("git-hang");
@@ -462,7 +447,6 @@ mod tests {
         let root = temp_root("layout");
         let archive = GitArchive::open_or_init(&root).expect("init");
 
-        // "Send" writes the canonical message + the sender outbox copy.
         let msg = layout::message(&root, 2026, 8, "evt-1");
         let outbox = layout::agent_mail(&root, "PiAlpha", true, "evt-1");
         archive
@@ -501,8 +485,6 @@ mod tests {
 
     #[tokio::test]
     async fn coalescer_collapses_n_writes_to_one_commit() {
-        // Without a coalescer, N writes = N commits. The coalescer batches
-        // staged files and flushes once: 1 commit for many staged files.
         let root = temp_root("coalesce");
         let archive = GitArchive::open_or_init(&root).expect("init");
 
@@ -540,7 +522,6 @@ mod tests {
             .await;
         });
 
-        // 5 rapid pings — the debounce loop should commit once after quiet.
         for i in 0..5 {
             let p = layout::build_slot(&root, &format!("s-{i}"));
             archive
@@ -550,7 +531,6 @@ mod tests {
             coalescer.ping();
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        // Wait past the debounce window so the flush fires.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert_eq!(
             archive.lock().commit_count().unwrap(),
@@ -582,9 +562,6 @@ mod tests {
 
     #[test]
     fn archive_commit_must_not_revert_external_source_commits() {
-        // Daemon holds one GitArchive for process life. After it has committed
-        // once (index cached), a human commits source on another handle.
-        // Next archive commit MUST keep that source (c9dd670 class).
         let root = temp_root("stale-idx");
         let archive = GitArchive::open_or_init(&root).expect("init");
         std::fs::write(root.join("cron.rs"), b"v1").unwrap();
@@ -626,8 +603,6 @@ mod tests {
 
     #[test]
     fn toron_git_binary_override_detected() {
-        // Explicit-binary constructor surfaces as the subprocess binary —
-        // equivalent to TORON_GIT_BINARY env being read by open_or_init.
         let root = temp_root("bin");
         let archive =
             GitArchive::open_or_init_with_binary(&root, Some(PathBuf::from("/usr/bin/git")))

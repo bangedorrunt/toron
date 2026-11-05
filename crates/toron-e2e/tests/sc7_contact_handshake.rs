@@ -75,7 +75,6 @@ async fn sc7_contact_handshake_and_block_all_policy_drop() {
     .await
     .expect("bus");
 
-    // Pi-α on project A, OC-β on project B (cross-project handshake).
     let a = fixture("proja", bus.clone(), pool.clone())
         .await
         .expect("fixture A");
@@ -90,7 +89,6 @@ async fn sc7_contact_handshake_and_block_all_policy_drop() {
         .await
         .expect("register OCBeta");
 
-    // --- Step 1: Pi-α requests contact with OC-β (cross-project) ---
     let link = a
         .mailbox
         .request_contact(&RequestContact {
@@ -107,7 +105,6 @@ async fn sc7_contact_handshake_and_block_all_policy_drop() {
     assert_eq!(link.to_name, "OCBeta");
     assert!(link.to_pubkey.len() == 64, "cross-project npub resolved");
 
-    // --- Step 2: OC-β approves (responder=OCBeta, requester=PiAlpha in demo-a) ---
     let approved = b
         .mailbox
         .respond_contact(&RespondContact {
@@ -121,7 +118,6 @@ async fn sc7_contact_handshake_and_block_all_policy_drop() {
         .expect("approve");
     assert_eq!(approved.status, LinkStatus::Approved);
 
-    // --- Step 3: cross-project approval visible via is_approved_contact ---
     let pi_pk = PublicKey::from_hex(&pi_alpha.npub).expect("PiAlpha pubkey");
     let oc_pk = PublicKey::from_hex(&oc_beta.npub).expect("OCBeta pubkey");
     assert!(
@@ -129,20 +125,17 @@ async fn sc7_contact_handshake_and_block_all_policy_drop() {
         "Pi-α approved by OC-β after handshake"
     );
 
-    // --- Step 4: OC-β sets block_all for inbound ---
     b.mailbox
         .set_contact_policy("demo-b", "OCBeta", ContactPolicy::BlockAll)
         .await
         .expect("set policy");
 
-    // --- Step 5: block_all → policy gate drops Pi-α's inbound ---
     let policy = b.mailbox.contact_policy_for("demo-b", &oc_pk).await;
     assert_eq!(
         policy,
         ContactPolicy::BlockAll,
         "policy recorded as block_all"
     );
-    // BlockAll is enforced even though the AgentLink is approved (policy wins).
     let link_list = b
         .mailbox
         .list_contacts("demo-b", "OCBeta")

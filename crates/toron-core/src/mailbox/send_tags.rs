@@ -317,8 +317,6 @@ impl SendTags {
                     out.bead = Some(v);
                 }
                 _ => {
-                    // Non-vocabulary tags (workflow-emitted, etc.) are ignored
-                    // here — they ride the same extra_tags vehicle.
                 }
             }
         }
@@ -433,8 +431,6 @@ mod tests {
 
     #[test]
     fn send_tags_empty_corr_rejected_at_all_entries() {
-        // Corr authority: empty rejected at parse, constructor, and newtype
-        // (was 3 one-assert tests).
         let err = SendTags::parse(&[tag("corr", "")]).expect_err("empty corr must error");
         assert!(err.message.contains("empty"), "{err}");
         assert_eq!(err.code, MailErrorCode::Malformed);
@@ -459,7 +455,6 @@ mod tests {
 
     #[test]
     fn send_tags_parse_rejects_unknown_enums() {
-        // One table for every closed-vocabulary reject (was 4 one-assert tests).
         for (key, value) in [
             ("verdict", "maybe"),
             ("wake", "bogus"),
@@ -494,14 +489,11 @@ mod tests {
 
     #[test]
     fn send_tags_thread_id_as_corr_fails_loud() {
-        // ADR-0028 E3: thread is the conversation key, corr is the
-        // assignment key — conflation dual-writes assignment.
         let corr: Corr = "thread-abc".parse().expect("corr");
         let thread: ThreadId = "thread-abc".parse().expect("thread");
         let err = reject_thread_as_corr(Some(&thread), Some(&corr))
             .expect_err("thread_id == corr must fail loud");
         assert!(err.message.contains("never"), "{err}");
-        // Distinct values pass.
         let other: Corr = "corr-xyz".parse().expect("corr");
         assert!(reject_thread_as_corr(Some(&thread), Some(&other)).is_ok());
         assert!(reject_thread_as_corr(None, Some(&other)).is_ok());
@@ -522,7 +514,6 @@ mod tests {
             .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let store = ReceiptStore::new(pool);
-        // Seed resulted.
         store
             .upsert(&Receipt {
                 corr: "C-NODOWN".into(),
@@ -534,7 +525,6 @@ mod tests {
             })
             .await
             .expect("seed resulted");
-        // A late owed-on-send upsert must NOT downgrade resulted.
         store
             .upsert(&Receipt {
                 corr: "C-NODOWN".into(),
@@ -549,7 +539,6 @@ mod tests {
         let got = store.get("C-NODOWN").await.expect("get").expect("found");
         assert_eq!(got.state, ReceiptState::Resulted);
         assert_eq!(got.result_path.as_deref(), Some("/tmp/done.json"));
-        // Acked is idempotent: owed-on-send must not drag acked back to owed.
         store
             .upsert(&Receipt {
                 corr: "C-ACK".into(),
@@ -579,7 +568,6 @@ mod tests {
 
     #[test]
     fn send_tags_validate_send_guards() {
-        // Human fan-out and interrupt routing guards, one table (was 3 tests).
         let tags = SendTags {
             audience: Some(Audience::Human),
             ..Default::default()
@@ -626,8 +614,6 @@ mod tests {
         assert_eq!(parsed.wake, Some(Wake::Tasked));
     }
 
-    // ---- mailbox-bound send_tags integration (E2/E3) ----
-
     #[tokio::test]
     async fn send_tags_mail_rumor_carries_and_not_envelope() {
         use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
@@ -672,7 +658,6 @@ mod tests {
         let recv_keys = mailbox
             .load_agent_key(std::path::Path::new(&recv.key_path))
             .expect("key");
-        // Build typed tags
         let tags = SendTags {
             corr: Some("FM-GS-012".parse().expect("corr")),
             wake: Some(Wake::Tasked),
@@ -694,7 +679,6 @@ mod tests {
         let mut msg = msg;
         msg.extra_tags = extra.clone();
         mailbox.send_message(&msg).await.expect("send with tags");
-        // Rumor (kind 14) carries tags: verify via unwrap
         let filter = crate::bus::filter::ToronFilter::new()
             .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(recv_keys.public_key())
@@ -731,7 +715,6 @@ mod tests {
                 .iter()
                 .any(|t| t.as_slice() == ["result_path", "/tmp/out.json"])
         );
-        // Envelope (kind 1059) MUST NOT carry vocabulary — p-gated, no corr/wake
         assert!(
             !wraps[0]
                 .tags

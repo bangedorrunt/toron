@@ -8,14 +8,9 @@
 //! definitions — clients (incl. pi's adapter) parse tool results into typed
 //! shapes without heuristics, closing the bd-96a probe-divergence gap at the
 //! schema layer. None of these are used for actual (de)serialization.
-//
 //! Counts are `i64` (never `usize`): schemars maps unsigned ints to
 //! `uint*` formats unknown to MCP clients, while `i64` emits `int64`.
 
-// All schemas derive from the schemars lineage rmcp re-exports (1.x) —
-// there is deliberately NO direct `schemars` dependency (a split lineage
-// is how `uint*` formats leaked onto the wire before). The module alias
-// stays: the derive macro expands to code referencing `schemars::...`.
 use rmcp::schemars;
 use rmcp::schemars::JsonSchema;
 

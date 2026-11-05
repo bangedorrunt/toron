@@ -73,19 +73,16 @@ async fn register(mailbox: &Mailbox, project: &str, name: &str) -> PublicKey {
 async fn sc_fw_one_process_peer_mail_via_bus() {
     let dir = std::env::temp_dir().join(format!("toron-scfw-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    // ONE process: mailbox + bus share the pool; there is no second daemon.
     let (mailbox, bus) = boot(&dir).await;
 
     let _pi = register(&mailbox, "demo", "PiAlpha").await;
     let oc = register(&mailbox, "demo", "OCBeta").await;
 
-    // OC-β subscribes to its own gift wraps BEFORE the send (push path).
     let mut sub = bus
         .subscribe(Filter::new().kinds([Kind::GiftWrap]).pubkey(oc))
         .await
         .expect("subscribe to OC wraps");
 
-    // Pi-α sends via the mailbox (the MCP tool surface in the same process).
     let sent = mailbox
         .send_message(&SendMessage {
             project_slug: "demo".into(),
@@ -99,7 +96,6 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
         .expect("send");
     assert_eq!(sent.count, 1, "one delivery");
 
-    // OC-β receives via BUS PUSH (<50ms, zero polling) — flywheel NOT in path.
     let t0 = Instant::now();
     let push_evt = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
@@ -128,7 +124,6 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
         t0.elapsed()
     );
 
-    // OC-β reads it back (parity poll) — direct toron_core call, zero IPC.
     let inbox = mailbox
         .fetch_inbox(&FetchInbox {
             project_slug: "demo".into(),
@@ -140,13 +135,8 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
         .expect("fetch");
     assert_eq!(inbox.len(), 1, "one message in OC inbox");
     assert_eq!(inbox[0].body_md, "hello via bus");
-    // Parity: inbox `sender` is the resolved display name (AM-style), not the
-    // raw pubkey — the sender-name resolution rewrites hex npubs for locally
-    // registered agents.
     assert_eq!(inbox[0].sender, "PiAlpha", "from Pi-α (resolved name)");
 
-    // flywheel's loop "dispatch" is a direct call here — no HTTP round trip.
-    // (The health check + a dispatch-equivalent direct call both succeed.)
     assert!(
         mailbox.health_check().await.bus.ok,
         "mailbox healthy in-process"
@@ -174,8 +164,6 @@ fn sc_fw_single_agent_prompt_definition_in_core() {
         .parent()
         .unwrap()
         .join("toron-core/src");
-    // Count `fn agent_prompt(` definitions (not `agent_prompt_coded`, not
-    // calls/references) in toron-core.
     let mut count = 0usize;
     for entry in walk_rs(&core_src) {
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
@@ -205,8 +193,6 @@ fn sc_fw_single_agent_prompt_definition_in_core() {
 #[tokio::test]
 #[ignore = "cross-repo e2e: requires flywheel binary + ~/workspace/flywheel checkout (flywheel CI scope, captain decision 3); verified passing 2026-08-09"]
 async fn sc_fw_flywheel_binary_live() {
-    // Static: exactly one agent_prompt across both repos (flywheel's old
-    // herdr.rs/mail.rs deleted by bd-o8j.2).
     let out = std::process::Command::new("rg")
         .arg("-n")
         .arg("fn agent_prompt")
@@ -221,10 +207,6 @@ async fn sc_fw_flywheel_binary_live() {
         .count();
     assert_eq!(defs, 1, "single agent_prompt after bd-o8j.2: {hits}");
 
-    // Live: the flywheel binary's embedded mailbox health check.
-    // flywheel embeds toron-core: under the harness its mailbox is the
-    // sandbox (an explicit TORON_DATA_DIR any toron-core honours), never the
-    // operator's store.
     let out = toron_core::testkit::apply_test_env(&mut std::process::Command::new("flywheel"))
         .args(["toron", "status"])
         .output()

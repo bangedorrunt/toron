@@ -203,11 +203,6 @@ fn a_crew_task_is_refused_with_the_expected_set_and_exit_3() {
     assert_eq!(v["refused"]["role"], "crew");
     assert_eq!(v["refused"]["class"], "task");
     assert_eq!(v["refused"]["contract"], "task@1");
-    // A refusal carries the role's WHOLE allow-list, not the slice for the
-    // attempted class (bd-5cyi). Crew holds one control verb,
-    // `escalate@1` - the upward handoff, added in Phase 4a - so the set
-    // names it. The in-crate table test moved with the grant (bd-ocpn);
-    // this CLI-level expectation has to move with it.
     assert_eq!(
         v["refused"]["expected"],
         serde_json::json!([
@@ -396,8 +391,6 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
         );
     }
 
-    // No lead@1 row: the captain may steer by role, and is still refused;
-    // only the operator key steers with no lead.
     let v = refused_as(
         &append(&dir, &key, Some("1"), "s0.json", &steer_at(CAP, 1, 1)),
         "no_lead",
@@ -416,7 +409,6 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     );
     assert_eq!(json(&o)["replay"], false);
 
-    // The operator opens the lease for the captain at epoch 1.
     let lead = shaped(
         &op,
         2,
@@ -433,7 +425,6 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
         String::from_utf8_lossy(&o.stderr)
     );
 
-    // The operator at the current epoch is not the holder.
     let v = refused_as(
         &append(&dir, &key, Some("1"), "s1.json", &steer_at(&op, 3, 1)),
         "not_lead_holder",
@@ -442,14 +433,12 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     assert_eq!(v["refused"]["holder"], CAP);
     assert_eq!(v["refused"]["sup_epoch"], 1);
 
-    // Stale epoch from the holder.
     let v = refused_as(
         &append(&dir, &key, Some("1"), "s2.json", &steer_at(CAP, 1, 0)),
         "stale_sup_epoch",
     );
     assert_eq!(v["refused"]["current"], 1);
 
-    // The holder at the current epoch lands.
     let o = append(&dir, &key, Some("1"), "s3.json", &steer_at(CAP, 1, 1));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
     assert_eq!(json(&o)["replay"], false);

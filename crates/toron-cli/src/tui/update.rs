@@ -42,14 +42,8 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.clamp_cursor();
         }
         Msg::ThreadLoaded { thread_id, rows } => {
-            // A stale thread (the operator moved on) never clobbers the reader.
             let want = m.mail.open.as_ref().map(|o| o.thread_id.as_str());
             if want.is_none() || want == Some(thread_id.as_str()) {
-                // Narrow the body-carrying page to this thread. A top-level
-                // message IS its own thread and carries no thread tag, so the
-                // page is the only way to see it — and when the page no longer
-                // holds it (age, limit), fall back to the rows already on
-                // screen rather than opening an empty reader.
                 let mut messages: Vec<MailRow> = rows
                     .iter()
                     .filter(|r| thread_id_of(r) == thread_id)
@@ -64,8 +58,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
                         .cloned()
                         .collect();
                 }
-                // Reading order (oldest first), then the title comes from the
-                // newest message — the subject the operator last saw.
                 messages.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
                 let subject = messages
                     .iter()
@@ -86,7 +78,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.clamp_cursor();
         }
         Msg::ChannelPostsLoaded { channel_id, rows } => {
-            // Only the selected channel's posts are ever drawn.
             let current = m.channels.current().map(|c| c.id.clone());
             if current.as_deref() == Some(channel_id.as_str()) || current.is_none() {
                 m.channels.posts_for = Some(channel_id);
@@ -126,9 +117,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
                 .as_deref()
                 .map(|t| format!(" · thread {}", short_id(t)))
                 .unwrap_or_default();
-            // A message is durable the moment it lands, but the doorbell can
-            // only PROMPT a pane. Say which one happened instead of implying
-            // the recipient was notified.
             match m.recipient_without_a_pane(&to) {
                 Some(pin) => m.set_status(
                     StatusKind::Ok,
@@ -144,10 +132,7 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             }
         }
         Msg::Failed { op, message } => {
-            // Typed failure: show it and keep the last good data on screen.
             settle_failure(&mut m, op, &message);
-            // A refused SEND keeps the draft: retyping a message because the
-            // store hiccuped is the one failure the operator cannot forgive.
             if op == Op::Send
                 && let Some(c) = m.compose.as_mut()
             {
@@ -156,14 +141,10 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.set_status(StatusKind::Error, format!("{}: {message}", op.label()));
         }
         Msg::ReceiptWritten { corr, verb } => {
-            // The write landed on the store. Clear the badge now so the reader
-            // and the list agree immediately: the list clears on the next
-            // inbox fetch, an open thread would keep the badge forever.
             note_receipt(&mut m, &corr, verb);
             m.set_status(StatusKind::Ok, format!("{verb}: {corr}"));
         }
 
-        // --- intents ---------------------------------------------------
         Msg::Quit => {
             m.should_quit = true;
             effects.push(Effect::Quit);
@@ -189,7 +170,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.clamp_cursor();
         }
         Msg::MoveCursor(delta) => match (m.tab, m.pane) {
-            // The Mail sidebar is the folder axis, not a numeric list.
             (Tab::Mail, Pane::Sidebar) => {
                 let folder = m.mail.folder.step(delta);
                 if m.set_folder(folder) {
@@ -201,14 +181,11 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
                 let before = m.channels.selected;
                 m.move_cursor(delta);
                 if m.channels.selected != before {
-                    // A different room: the post pane and reader start over.
                     m.channels.selected_post = 0;
                     m.channels.scroll = 0;
                     effects.extend(reader_refresh(&m));
                 }
             }
-            // A different agent opens at the top of ITS card, not wherever the
-            // last one was scrolled to.
             (Tab::Agents, _) => {
                 let before = m.agents.selected;
                 m.move_cursor(delta);
@@ -233,9 +210,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             _ => m.goto_cursor(if top { 0 } else { usize::MAX }),
         },
         Msg::OpenSelection => {
-            // Only a tab with a reader may own the Reader pane. Installing it
-            // on the dashboard would leave a pane that tab cannot show, and
-            // Esc/h would quietly mean something else from then on.
             if m.tab.has_reader() {
                 m.pane = Pane::Reader;
                 effects.extend(reader_refresh(&m));
@@ -325,10 +299,8 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             effects.push(Effect::RefreshChannels);
         }
 
-        // --- the compose form -------------------------------------------
         Msg::OpenCompose => {
             if m.mode == Mode::Compose {
-                // Already open: `c` must not silently discard a draft.
                 return (m, effects);
             }
             m.compose = Some(open_compose(&m));
@@ -353,8 +325,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         Msg::ComposeInsert(ch) => {
             if let Some(c) = m.compose.as_mut() {
                 c.insert_char(ch);
-                // Typing clears the last refusal: the reason is stale the
-                // moment the form changes.
                 c.error = None;
             }
         }
@@ -375,8 +345,6 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
                 return (m, effects);
             };
             match c.field {
-                // A text stop advances; the body takes the newline, because a
-                // multi-line body with no way to insert a line is not one.
                 Field::Body => c.newline(),
                 Field::To | Field::Subject => c.step_field(1),
                 Field::Wake | Field::Importance | Field::Ack => c.cycle(1),
@@ -443,9 +411,6 @@ fn settle_failure(m: &mut Model, op: Op, message: &str) {
         Op::Channels => m.channels.loaded = true,
         Op::Agents => m.agents.loaded = true,
         Op::Receipts | Op::Health => m.dashboard.loaded = true,
-        // A refused send has no pane to settle; the draft is what it settles,
-        // and the send arm keeps it (the operator's typing is not thrown away
-        // because the store hiccuped).
         Op::Thread | Op::ChannelPosts | Op::Search | Op::Receipt | Op::Send => {}
     }
 }
@@ -453,9 +418,6 @@ fn settle_failure(m: &mut Model, op: Op, message: &str) {
 /// The form `c` opens. The fold decides reply-vs-new from what is on screen, so
 /// the key means one thing and there is no second selector.
 fn open_compose(m: &Model) -> ComposeState {
-    // On the Agents tab the roster IS the recipient picker: `c` addresses the
-    // agent under the cursor, which is how a live/online pin gets chosen
-    // without a completion widget to learn.
     if m.tab == Tab::Agents
         && let Some(row) = m.agents.visible_rows(&m.input).get(m.agents.selected)
     {
@@ -464,8 +426,6 @@ fn open_compose(m: &Model) -> ComposeState {
             ..ComposeState::new()
         };
     }
-    // An open conversation is a reply: pre-addressed to the newest sender and
-    // already in-thread.
     if let Some(open) = &m.mail.open {
         let to = open
             .messages
@@ -568,12 +528,7 @@ fn tick_refresh(m: &Model) -> Vec<Effect> {
             }
             effects
         }
-        // Presence is the Agents tab's whole point: refresh every tick.
         Tab::Agents => vec![Effect::RefreshAgents],
-        // The dashboard DRAWS mail, channels, agents and receipts, so its slow
-        // tick fetches exactly what entering the tab fetches, from the same
-        // function: a chart or card that stopped updating at tab entry would
-        // contradict the header's spinner.
         Tab::Dashboard => {
             if !slow {
                 return Vec::new();

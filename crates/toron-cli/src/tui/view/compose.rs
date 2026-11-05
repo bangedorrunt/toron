@@ -48,24 +48,20 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
         return;
     }
 
-    // Every stop is always drawn, so `Tab` can never focus something invisible.
-    // The body takes what is left; the minimum console size still leaves it a
-    // row (see `MIN_H`).
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // To
-            Constraint::Length(1), // Subject
-            Constraint::Min(1),    // Body
-            Constraint::Length(1), // Wake
-            Constraint::Length(1), // Importance
-            Constraint::Length(1), // Ack
-            Constraint::Length(1), // send
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
     let value_w = inner.width.saturating_sub(LABEL_W as u16 + 2) as usize;
 
-    // To and Subject are single lines, scrolled to keep the caret visible.
     for (field, row) in [(Field::To, rows[0]), (Field::Subject, rows[1])] {
         let text = c.text_of(field);
         let focused = c.field == field;
@@ -80,7 +76,6 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
         }
     }
 
-    // The body: pre-wrapped rows, no second wrap.
     let body_area = rows[2];
     let focused = c.field == Field::Body;
     f.render_widget(
@@ -116,8 +111,6 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
                 ))
             })
             .collect();
-        // No `Wrap`: these rows already fit, and letting the renderer wrap
-        // again is what would move the text out from under the caret.
         f.render_widget(
             Paragraph::new(text).block(widgets::pane_block("", focused)),
             box_area,
@@ -130,7 +123,6 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
         }
     }
 
-    // The toggles and the send stop.
     let wake = match c.wake {
         toron_core::mailbox::send_tags::Wake::Tasked => {
             "tasked — the doorbell treats it as an assignment"
@@ -148,12 +140,9 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
         (Field::Importance, importance, rows[4]),
         (Field::Ack, ack.to_string(), rows[5]),
     ] {
-        // Every stop is labelled the same way, so a toggle reads as a field
-        // with a name rather than a stray value floating in the gutter.
         f.render_widget(line_widget(field, &text, c.field == field), row);
     }
 
-    // The send stop, with the last refusal under it when there is one.
     let send_focused = c.field == Field::Send;
     let marker = if send_focused { "▶" } else { " " };
     let mut line = vec![

@@ -75,7 +75,6 @@ async fn restart_resumes_at_the_unsettled_step() {
     migrate(&pool).await.expect("migrate");
     let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
 
-    // First process: start, settle step 1, hand back step 2, then die.
     let phase_one = {
         let pool = pool.clone();
         let state = state.clone();
@@ -117,8 +116,6 @@ async fn restart_resumes_at_the_unsettled_step() {
     assert_eq!(phase_one.step_index, 1);
     assert_eq!(phase_one.phase, RunPhase::Running);
 
-    // Second process: a fresh engine and journal over the same database. The
-    // settled step must not run again.
     let phase_two = {
         let pool = pool.clone();
         let state = state.clone();
@@ -203,7 +200,6 @@ async fn delay_park_survives_restart_and_rewakes() {
     };
     assert_eq!(until_ms, 6_000);
 
-    // Restart before the wake: the model re-parks to the same instant.
     let pool_after = pool.clone();
     let state_after = state.clone();
     let handle = tokio::runtime::Handle::current();
@@ -331,7 +327,6 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
     .expect("join");
     assert!(matches!(graph, HostError::Unsupported(_)), "{graph:?}");
 
-    // `branch` is linear as of bd-durable-branch-hhgc; `parallel` still is not.
     let parallel_pool = pool.clone();
     let parallel_state = state.clone();
     let parallel_handle = handle.clone();
@@ -359,8 +354,6 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
         "{parallel:?}"
     );
 
-    // Refused before any engine or state row exists, so the host can hand the
-    // workflow to the old engine without cleaning up after this one.
     let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
     assert!(
         state_store
@@ -439,8 +432,6 @@ async fn a_park_already_behind_now_resumes_in_the_same_step() {
             json!({}),
             5_000,
         )?;
-        // The run must not stay parked on a deadline the engine refuses to
-        // schedule: the same call completes it.
         assert!(
             matches!(effects.last(), Some(RunEffect::Complete { .. })),
             "a zero delay finishes immediately: {effects:?}"
@@ -456,10 +447,6 @@ async fn a_park_already_behind_now_resumes_in_the_same_step() {
     .expect("join")
     .expect("zero delay");
 }
-
-// ---------------------------------------------------------------------------
-// Graph driver (bd-durable-graph-impl-r2x1)
-// ---------------------------------------------------------------------------
 
 type HostGraphRun = DurableGraphRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
 
@@ -699,7 +686,6 @@ async fn graph_restart_between_waves_runs_no_settled_node_twice() {
     };
     assert_eq!(node, "plan");
 
-    // Drop the driver mid-wave: `plan` was issued but never settled.
     drop(run);
 
     let (run, effects) = tokio::task::spawn_blocking(open)
@@ -903,7 +889,6 @@ async fn graph_late_node_done_after_a_terminal_is_ignored() {
     .expect("open");
     assert_eq!(effects.len(), 2, "both nodes of wave 1 are dispatched");
 
-    // A non-retryable failure fails the whole run while `zz` is still out.
     let (run, effects) = {
         let mut run = run;
         tokio::task::spawn_blocking(move || {
@@ -926,7 +911,6 @@ async fn graph_late_node_done_after_a_terminal_is_ignored() {
         }
     );
 
-    // The late sibling result changes nothing.
     let (run, effects) = {
         let mut run = run;
         tokio::task::spawn_blocking(move || {
@@ -963,10 +947,6 @@ async fn graph_late_node_done_after_a_terminal_is_ignored() {
         EnginePhase::Failed
     );
 }
-
-// ---------------------------------------------------------------------------
-// Spawn admission and the launch seam (bd-spawn-launcher-flip-d8mv)
-// ---------------------------------------------------------------------------
 
 fn spawn_action(await_: bool, no_claim_timeout: u64) -> Action {
     Action::Spawn {
@@ -1112,7 +1092,6 @@ async fn spawn_park_reemits_the_same_key_after_restart() {
     assert_eq!(keys, ["run-spawn-restart:spawn_it:1"]);
     drop(first);
 
-    // A fresh engine + state handle over the same database: the restart.
     let (mut run, effects) = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -1157,10 +1136,6 @@ async fn spawn_park_reemits_the_same_key_after_restart() {
         })
     );
 }
-
-// ---------------------------------------------------------------------------
-// Branch in the linear plan (bd-durable-branch-hhgc)
-// ---------------------------------------------------------------------------
 
 fn dm(tag: &str) -> Action {
     Action::SendDm {
@@ -1259,7 +1234,6 @@ async fn branch_restart_resumes_the_same_arm() {
     );
     assert!(!phase_one.outputs.contains_key("no"));
 
-    // The restart: a fresh engine and state handle over the same database.
     let (run, effects) = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -1376,10 +1350,6 @@ async fn branch_refusals_leave_no_row() {
     assert!(engine.query("run-branch-impure").is_err());
     assert!(engine.query("run-branch-nested").is_err());
 }
-
-// ---------------------------------------------------------------------------
-// Parallel fan-out lowered onto the graph (bd-durable-parallel-53um)
-// ---------------------------------------------------------------------------
 
 fn parallel_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
     Step {
@@ -1590,10 +1560,6 @@ async fn parallel_refusals_leave_no_row() {
     assert!(engine.query("run-parallel-count").is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Foreach on the shared fan-out path (bd-durable-foreach-jpgx)
-// ---------------------------------------------------------------------------
-
 fn foreach_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
     Step {
         name: Some(name.into()),
@@ -1795,10 +1761,6 @@ async fn foreach_unmaterializable_iterator_refuses_without_row() {
     assert!(engine.query("run-foreach-missing").is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Retry policy on graph nodes (bd-durable-retry-policy-rrck)
-// ---------------------------------------------------------------------------
-
 fn retry_step(name: &str, inner: Step, max_attempts: u32, on_error: StepOnError) -> Step {
     Step {
         name: Some(name.into()),
@@ -1892,7 +1854,6 @@ async fn retry_backoff_park_is_restart_safe() {
                 ToronEngineStore::spawn(pool.clone(), &handle),
                 ToronJournal::spawn(JournalDb::new(pool, "retry", 64), &handle),
             );
-            // Reopen BEFORE the backoff deadline, so the run is still parked.
             DurableGraphRun::open(
                 engine,
                 state,
@@ -1994,10 +1955,6 @@ async fn retry_unparseable_policy_refuses_without_row() {
     assert!(engine.query("run-retry-cap").is_err());
 }
 
-// ---------------------------------------------------------------------------
-// call_workflow as a child run (bd-durable-call-workflow-mg6y)
-// ---------------------------------------------------------------------------
-
 fn named_workflow(name: &str, steps: Vec<Step>) -> Workflow {
     let mut wf = workflow(steps);
     wf.name = name.into();
@@ -2087,7 +2044,6 @@ async fn call_workflow_child_runs_once_and_joins() {
     };
     assert_eq!(child_id, "run-parent:call:1");
 
-    // Open the child idempotently and drive it to its terminal.
     let child_output = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -2135,7 +2091,6 @@ async fn call_workflow_child_runs_once_and_joins() {
     assert_eq!(parent.model().outputs["call"], child_output);
     assert_eq!(parent.model().phase, GraphPhase::Succeeded);
 
-    // Re-opening the completed child re-attaches: no effects, no second run.
     let reused = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -2178,8 +2133,6 @@ async fn call_workflow_restart_reuses_completed_child() {
     let handle = tokio::runtime::Handle::current();
     let seams = child_seams(callee_workflow());
 
-    // Phase one: parent emits the child, the child completes, the parent dies
-    // before the terminal reaches it.
     let (child_id, child_trigger) = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -2241,7 +2194,6 @@ async fn call_workflow_restart_reuses_completed_child() {
         .expect("join");
     }
 
-    // Phase two: the parent resumes and re-attaches to the same child id.
     let (mut parent, effects) = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -2277,7 +2229,6 @@ async fn call_workflow_restart_reuses_completed_child() {
     };
     assert_eq!(*resumed_id, child_id, "the same child, never a second one");
 
-    // Re-attaching to the completed child yields no effects.
     let reused = {
         let pool = pool.clone();
         let state = SyncWorkflowState::spawn(pool.clone(), &handle);
@@ -2500,10 +2451,6 @@ async fn call_workflow_refusals_leave_no_row() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bounded loop in the linear plan (bd-loop-rewrites-fap8)
-// ---------------------------------------------------------------------------
-
 fn loop_step(
     name: &str,
     max: &str,
@@ -2678,7 +2625,6 @@ async fn loop_unbounded_refuses_without_row() {
         ),
     ];
     for (run_id, wf, trigger, label) in cases {
-        // The body case needs an unsequencable body step; rebuild it here.
         let wf = if run_id == "run-loop-body" {
             workflow(vec![loop_step(
                 "spin",

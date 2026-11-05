@@ -213,11 +213,9 @@ mod tests {
             output: Some(out.clone()),
         };
         assert_eq!(ev.output.as_ref().unwrap(), &out);
-        // Round-trips through serde (the sink's wire format).
         let s = serde_json::to_string(&ev).expect("serializes");
         let back: PolicyEvent = serde_json::from_str(&s).expect("deserializes");
         assert_eq!(back.output.as_ref().unwrap(), &out);
-        // Absent output round-trips as None (backward compat).
         let mut ev2 = ev;
         ev2.output = None;
         let s2 = serde_json::to_string(&ev2).expect("serializes");

@@ -1,7 +1,4 @@
 // governed-by: ADR-0003
-// bd-led.6.1: typed backend errors with machine codes.
-// Classification MUST use `code`, never `message` text (herdr protocol v20
-// discipline — ADR-0003 "classify on code, never message text").
 
 use std::str::FromStr;
 
@@ -123,9 +120,6 @@ mod tests {
 
     #[test]
     fn agent_not_idle_roundtrips_through_wire_string() {
-        // The herdr wire code maps to the typed variant (ADR-0003: classify
-        // on code, never message text), and the variant renders back the
-        // same wire string for error display.
         let parsed: BackendErrorCode = "agent_not_idle".parse().expect("mapped");
         assert_eq!(parsed, BackendErrorCode::AgentNotIdle);
         assert_eq!(parsed.as_str(), "agent_not_idle");
@@ -134,9 +128,6 @@ mod tests {
 
     #[test]
     fn agent_blocked_roundtrips_through_wire_string() {
-        // Protocol v20 (herdr 0.8.2): agent.prompt rejects blocked agents
-        // with `agent_blocked` and sends nothing. Same discipline as
-        // agent_not_idle — typed variant, wire-string round-trip.
         let parsed: BackendErrorCode = "agent_blocked".parse().expect("mapped");
         assert_eq!(parsed, BackendErrorCode::AgentBlocked);
         assert_eq!(parsed.as_str(), "agent_blocked");
@@ -148,7 +139,6 @@ mod tests {
         let err = BackendError::agent_not_idle("agent is working");
         assert_eq!(err.code(), &BackendErrorCode::AgentNotIdle);
         assert!(err.to_string().contains("agent_not_idle"), "{err}");
-        // Callers branch on the code, not message text.
         match err.code() {
             BackendErrorCode::AgentNotIdle => {}
             other => panic!("expected AgentNotIdle, got {other:?}"),

@@ -94,8 +94,6 @@ async fn whois_divergence_via_spawn_registry() {
         .expect("register SlateHerder")
         .npub;
 
-    // The live pane carries SlateHerder's stamp, so the direct sweep has no
-    // SilverPond entry — the measured miss.
     let panes = vec![pane_with_stamp("w3S:p1", "SlateHerder", &slate)];
     let agents: Vec<AgentInfo> = Vec::new();
     let without_registry = mailbox
@@ -111,8 +109,6 @@ async fn whois_divergence_via_spawn_registry() {
         "no registry row means nothing to flag"
     );
 
-    // flywheel's registry binds SilverPond to the same pane, whose stamp
-    // names another pin: the row must carry the pane npub + the flag.
     let bindings = spawn_registry_bindings(
         r#"[
             {"pane_id": "w3S:p1", "name": "crew-elme1003214316c7-coder", "profile": "coder",
@@ -143,7 +139,6 @@ async fn whois_divergence_via_spawn_registry() {
         "stamped npub != registered npub must flag identity_divergent"
     );
 
-    // The pane's own pin agrees with its stamp: no false alarm.
     let slate_row = mailbox
         .whois_with_panes("elm-effect-rs", "SlateHerder", &panes, &agents, &bindings)
         .await

@@ -160,8 +160,6 @@ impl MailboxMetrics {
                 "product_bus": ["ensure_product", "products_link", "search_messages_product", "fetch_inbox_product", "summarize_thread_product"],
                 "build_slots": ["acquire_build_slot", "renew_build_slot", "release_build_slot"],
             },
-            // ADR-0020 Spec 3 (wave 1): the CLI Nostr two-plane surface.
-            // Shell nouns — never MCP tools (the 39-tool cluster is frozen).
             "cli": {
                 "plane_s": ["channel", "react"],
                 "plane_j": ["job"],
@@ -269,10 +267,10 @@ mod tests {
     #[test]
     fn latency_histogram_buckets() {
         let m = MailboxMetrics::new();
-        m.record("x", true, 50); // bucket 0 (<100µs)
-        m.record("x", true, 250); // bucket 1 (<500µs)
-        m.record("x", true, 12_000); // bucket 5 (<50ms)
-        m.record("x", true, 999_999); // bucket 7 (last, >200ms)
+        m.record("x", true, 50);
+        m.record("x", true, 250);
+        m.record("x", true, 12_000);
+        m.record("x", true, 999_999);
         let snap = m.snapshot();
         let hist = &snap.tools["x"].latency_hist;
         assert_eq!(hist[0], 1);
@@ -312,7 +310,7 @@ mod tests {
         let lat: Vec<u64> = (0..100).map(|i| i * 10).collect();
         let case = BenchReport::case("inbox", &lat);
         assert_eq!(case.iterations, 100);
-        assert_eq!(case.p50_us, 500); // index 50 of 0..990 by 10s
+        assert_eq!(case.p50_us, 500);
         assert_eq!(case.p95_us, 950);
         assert_eq!(case.avg_us, 495);
     }
@@ -347,8 +345,6 @@ mod tests {
             done_work.store(true, Ordering::Relaxed);
         });
 
-        // Bounded deadlock detector: snapshot() holds per_tool while taking
-        // latency_hist; record() takes latency_hist. Inversion would hang.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !done.load(Ordering::Relaxed) {
             assert!(

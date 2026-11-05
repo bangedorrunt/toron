@@ -143,7 +143,6 @@ async fn a_claim_fences_older_epochs_at_once() {
         ),
         "{zombie:?}"
     );
-    // The claimant starts at seq 0; a gap is still refused.
     let gap = s.append_envelope(&task(A, 1, 1)).await;
     assert!(
         matches!(
@@ -168,8 +167,6 @@ async fn producer_epoch_includes_an_unappended_claim() {
     s.claim_epoch(A, "run").await.unwrap();
     assert_eq!(s.producer_epoch(A).await.unwrap(), Some(0));
 }
-
-// --- negative controls ------------------------------------------------------
 
 /// CONTROL: producers are independent; each starts at 0.
 #[tokio::test]

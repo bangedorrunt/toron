@@ -20,7 +20,6 @@ fn run_reduce_case(
         "name: reduce-case\ntrigger:\n  type: webhook\nsteps:\n{steps_yaml}"
     ))
     .expect("parse");
-    // The engine's local runtime needs a reactor: build it inside.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

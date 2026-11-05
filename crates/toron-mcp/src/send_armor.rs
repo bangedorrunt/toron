@@ -271,8 +271,6 @@ impl Service<SendRequest> for CircuitBreaker {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if let BreakerState::Open { retry_at } = *state {
                 if (self.clock)() >= retry_at {
-                    // Time opens the gate; the probe permit is taken in
-                    // `call`, so exactly one probe is admitted (bd-mbck).
                     *state = BreakerState::HalfOpen {
                         probe_in_flight: false,
                     };
@@ -280,9 +278,6 @@ impl Service<SendRequest> for CircuitBreaker {
                     return Poll::Ready(Err(ArmorError::BreakerOpen));
                 }
             }
-            // Fast refusal: a probe is already in flight — never queue
-            // a second one behind it. (`call` re-checks for the race
-            // where two tasks both passed readiness first.)
             if matches!(
                 *state,
                 BreakerState::HalfOpen {
@@ -292,18 +287,12 @@ impl Service<SendRequest> for CircuitBreaker {
                 return Poll::Ready(Err(ArmorError::BreakerOpen));
             }
         }
-        // The guarded stack's own backpressure applies below the breaker;
-        // its error means the guarded path itself is down → ambiguous.
         self.inner
             .poll_ready(cx)
             .map_err(|e| ArmorError::Ambiguous(e.to_string()))
     }
 
     fn call(&mut self, req: SendRequest) -> Self::Future {
-        // The permit lives here, one atomic take under the lock (bd-mbck):
-        // the shared state may have moved since `poll_ready` (an older
-        // in-flight call settling re-opens), so re-check. A taken permit
-        // or an Open breaker refuses WITHOUT touching inner.
         let probe = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             match *state {
@@ -342,9 +331,6 @@ impl Service<SendRequest> for CircuitBreaker {
                 probe,
                 done: done.clone(),
             };
-            // Tower contract: readiness before every call (the bulkhead
-            // grants its slot here; the breaker's own gate ran in
-            // poll_ready above and re-checked at the top of this call).
             if let Err(e) = inner.ready().await {
                 done.store(true, Ordering::SeqCst);
                 observer.observe(true);
@@ -423,13 +409,11 @@ impl SendArmor {
     /// Single-call guaranteed: nothing in the stack re-fires (retry lives
     /// in the journaled attempt planner).
     pub async fn send(&self, req: SendRequest) -> Result<Result<usize, String>, ArmorError> {
-        // Snapshot the stack under the lock; everything after is lock-free.
         let mut breaker = self
             .stack
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        // Readiness IS the fail-fast point (tower's own gate, no loop).
         breaker.ready().await?;
         breaker.call(req).await
     }
@@ -659,15 +643,12 @@ mod armor_matrix_tests {
         let armor =
             SendArmor::with_tuning(inner, Duration::from_secs(5), 4, 1, Duration::from_secs(30))
                 .with_clock(manual.clock());
-        // Trip open with one failure.
         let out = armor.send(req()).await.expect("armor ok");
         assert_eq!(out, Err("down".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Still open before the reset interval: refused, inner untouched.
         let err = armor.send(req()).await.expect_err("open refuses");
         assert_eq!(err, ArmorError::BreakerOpen);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Past the reset interval: one probe goes through and blocks.
         manual.advance(Duration::from_secs(31));
         let probe = armor.clone();
         let handle = tokio::spawn(async move { probe.send(req()).await });
@@ -677,7 +658,6 @@ mod armor_matrix_tests {
             spins += 1;
             assert!(spins < 10_000, "probe never entered inner");
         }
-        // Second caller while the probe is in flight: refused, no new call.
         let err = armor.send(req()).await.expect_err("second probe refused");
         assert_eq!(err, ArmorError::BreakerOpen);
         assert_eq!(
@@ -685,7 +665,6 @@ mod armor_matrix_tests {
             2,
             "exactly one probe touched inner"
         );
-        // Release the probe: success closes, traffic flows.
         tx.send(Ok(3)).expect("release probe");
         let out = handle.await.expect("probe task").expect("armor ok");
         assert_eq!(out, Ok(3));
@@ -704,8 +683,6 @@ mod armor_matrix_tests {
         let count = calls.clone();
         let armor = SendArmor::with_tuning(
             fake(calls.clone(), move || {
-                // `fake` counts the call before asking: the first inner
-                // call observes count 1.
                 if count.load(Ordering::SeqCst) == 1 {
                     Err("down".into())
                 } else {

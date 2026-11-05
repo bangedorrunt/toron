@@ -106,12 +106,6 @@ fn bind(
     for (name, output) in outputs {
         let name = name.replace('-', "_");
         if let Some(obj) = output.as_object() {
-            // The durable spawn envelope is `{ok, spawn_key, result}`; the
-            // child's value is `result`. Bind its fields BOTH explicitly
-            // (`steps_<node>_result_<field>`) and transparently
-            // (`steps_<node>_<field>`), so a guard authored for the old engine
-            // — where the receipt landed at the top level — reads the same
-            // value on both paths. Envelope fields win on a name collision.
             if let Some(serde_json::Value::Object(result)) = obj.get("result") {
                 for (k, v) in result {
                     let key = k.replace('-', "_");
@@ -474,7 +468,6 @@ fn equal(left: &Lit, right: &Lit) -> bool {
         (Lit::Bool(a), Lit::Bool(b)) => a == b,
         (Lit::Num(a), Lit::Num(b)) => a == b,
         (Lit::Str(a), Lit::Str(b)) => a == b,
-        // A null reference never equals a non-null literal.
         _ => false,
     }
 }

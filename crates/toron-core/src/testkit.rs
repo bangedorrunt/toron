@@ -18,8 +18,6 @@ use std::process::{Child, Command, Stdio};
 /// is the pre-existing behaviour rather than a new gap.
 #[cfg(unix)]
 fn unsafe_free_signal(pid: u32, sig: i32) {
-    // `kill` is async-signal-safe and takes only a pid and an int, so a shell
-    // out is correct and keeps the crate free of `unsafe`.
     let _ = std::process::Command::new("kill")
         .arg(format!("-{sig}"))
         .arg(pid.to_string())
@@ -79,7 +77,6 @@ impl ChildGuard {
     pub fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
             // SAFETY of the wait: `try_wait` in a bounded loop never blocks, so
-            // this cannot deadlock even if the child ignores SIGTERM.
             let pid = child.id();
             unsafe_free_signal(pid, TERM);
             let deadline = std::time::Instant::now() + KILL_GRACE;
@@ -89,7 +86,6 @@ impl ChildGuard {
                     Ok(None) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    // Exited, or out of grace: SIGKILL is the backstop either way.
                     _ => break,
                 }
             }
@@ -117,10 +113,6 @@ pub fn pid_alive(pid: u32) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
-
-// ---------------------------------------------------------------------------
-// The spawn harness: every `toron` a test runs is built here.
-// ---------------------------------------------------------------------------
 
 /// This test process's sandbox: the directory its own in-process code already
 /// uses when it is under test (`$TMPDIR/toron-test-root-<pid>`, or the
@@ -210,7 +202,6 @@ mod tests {
             let pid = guard.pid().expect("pid");
             assert!(pid_alive(pid), "child is running inside its scope");
             pid
-            // guard drops here
         };
         assert!(
             !pid_alive(pid),
@@ -269,10 +260,6 @@ mod bd_yolv_tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(format!(
-                // `sleep 30 & wait`, NOT a bare `sleep 30`: a shell DEFERS trap
-                // handling while blocked on a foreground child, so a bare sleep
-                // would swallow the SIGTERM until it finished 30s later and the
-                // fence would report a broken signal path that does not exist.
                 "trap 'echo caught > {}; exit 0' TERM; sleep 30 & wait",
                 marker.display()
             ))
@@ -280,7 +267,6 @@ mod bd_yolv_tests {
             .stderr(Stdio::null());
         let mut guard = ChildGuard::spawn(&mut cmd).expect("spawn");
         let pid = guard.pid().expect("pid");
-        // Give the trap time to install before signalling.
         std::thread::sleep(std::time::Duration::from_millis(300));
         guard.kill();
         assert!(
@@ -288,7 +274,6 @@ mod bd_yolv_tests {
             "the child never saw SIGTERM (pid {pid}): a SIGKILL-only release cannot run a \
              trap, so this is how the graceful path is observed rather than assumed"
         );
-        // And it is really gone, not merely signalled.
         assert!(!pid_is_alive(pid), "pid {pid} survived the release");
         let _ = std::fs::remove_dir_all(&dir);
     }

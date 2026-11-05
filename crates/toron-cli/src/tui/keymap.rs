@@ -47,7 +47,6 @@ pub fn translate(model: &Model, key: KeyEvent) -> Option<Msg> {
 /// nothing. `Enter` on the `send` stop is always available.
 const fn compose_mode(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl-C keeps its one meaning from normal mode: leave the console now.
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         return Some(Msg::Quit);
     }
@@ -85,9 +84,6 @@ const fn insert_mode(key: KeyEvent) -> Option<Msg> {
 /// Navigation and actions.
 fn normal_mode(model: &Model, key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl-C never reaches the shell inside a raw-mode alternate screen, so
-    // the conventional meaning ("leave now") is bound to it deliberately —
-    // the one documented deviation from the skill's never-bind list.
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         return Some(Msg::Quit);
     }
@@ -109,8 +105,6 @@ fn normal_mode(model: &Model, key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('g') => Some(Msg::GotoCursor(true)),
         KeyCode::Char('G') => Some(Msg::GotoCursor(false)),
 
-        // h/l walk the panes; l drills into the reader from the list, h backs
-        // out of the reader (panic button: never a dead end).
         KeyCode::Char('h') | KeyCode::Left => Some(if model.pane == Pane::Reader {
             Msg::CloseReader
         } else {
@@ -129,8 +123,6 @@ fn normal_mode(model: &Model, key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('r') => Some(Msg::Refresh),
         KeyCode::Char('a') if model.tab == Tab::Mail => Some(Msg::AckSelected),
         KeyCode::Char('m') if model.tab == Tab::Mail => Some(Msg::ReadSelected),
-        // `c` composes everywhere; the closed-channel filter moved to `C` so
-        // the console's primary action is not tab-scoped.
         KeyCode::Char('c') => Some(Msg::OpenCompose),
 
         KeyCode::Char('[') => Some(Msg::StepRefresh(-REFRESH_STEP_MS)),

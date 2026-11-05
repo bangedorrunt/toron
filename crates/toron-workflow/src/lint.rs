@@ -78,9 +78,6 @@ pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) ->
 
     check_name(&mut report, &wf.name, "workflow");
 
-    // Trigger type is validated by serde (unknown `type` fails parse); the
-    // remaining trigger-specific checks. `None` trigger = invoke-only
-    // (ADR-0005 Spec 2) — no reactive checks apply.
     if let Some(trigger) = &wf.trigger {
         match trigger {
             Trigger::MessagePosted { channel, project } => {
@@ -93,7 +90,6 @@ pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) ->
                 }
             }
             Trigger::Schedule { cron, .. } => {
-                // Validate the 5/6-field cron shape crudely (non-empty, 5+ fields).
                 let fields: Vec<&str> = cron.split_whitespace().collect();
                 if fields.len() < 5 || fields.len() > 6 {
                     report.issues.push(LintIssue {
@@ -130,12 +126,10 @@ pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) ->
         }
     }
 
-    // Workflow-level guard.
     if let Some(guard) = &wf.guard {
         check_guard(&mut report, guard, "workflow guard");
     }
 
-    // Steps.
     if wf.steps.is_empty() && wf.graph.is_none() {
         report.issues.push(LintIssue {
             level: Level::Warning,
@@ -146,17 +140,12 @@ pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) ->
     }
     check_steps(&mut report, &wf.steps);
 
-    // Graph (ADR-0005 Spec 4b): DAG acyclicity + resolvable needs + no orphans.
     if let Some(graph) = &wf.graph {
         check_graph(&mut report, graph);
     }
 
-    // ADR-0024 Spec 1 R-E lints (kind-aware fail_run)
     check_re_lint(&mut report, wf);
 
-    // ADR-0019 wave-2 structural playbook lints (bd-w2-lints-6k6l): feature
-    // data_shape, bug-fix repro predecessor, prototype/arena n>=2 + mode
-    // rules, forensics read-only, principles registry.
     crate::playbook_lint::lint_playbook(&mut report, wf, principle_names);
 
     report
@@ -225,8 +214,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         return;
     }
 
-    // (2) needs resolvable + collect the dependency edge set.
-    let mut edges: Vec<(&str, &str)> = Vec::new(); // (needs → node)
+    let mut edges: Vec<(&str, &str)> = Vec::new();
     for (name, node) in nodes {
         check_action(report, &node.action);
         if let Some(guard) = &node.guard {
@@ -246,8 +234,6 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         }
     }
 
-    // (1) acyclic — DFS with a recursion stack. A back-edge to an in-progress
-    // node is a cycle.
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut in_stack: std::collections::HashSet<&str> = std::collections::HashSet::new();
     fn dfs<'a>(
@@ -280,17 +266,12 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         }
     }
 
-    // (3) no orphans — every node must be reachable from a root. A root is a
-    // node with NO incoming dependency edges (nothing is a `to` of an edge:
-    // edges are stored (need → node), so a node with a `needs` entry appears
-    // as a `to`).
     let has_incoming: std::collections::HashSet<&str> = edges.iter().map(|(_, to)| *to).collect();
     let roots: Vec<&str> = nodes
         .keys()
         .map(String::as_str)
         .filter(|n| !has_incoming.contains(n))
         .collect();
-    // Reachability from all roots.
     let mut reachable: std::collections::HashSet<&str> = std::collections::HashSet::new();
     fn reach<'a>(
         node: &'a str,
@@ -320,9 +301,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
 
 /// ADR-0024 Spec 1 R-E lints
 fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
-    // Walk steps with enclosing_retry flag
     fn walk_step(step: &Step, inside_retry: bool, report: &mut LintReport) {
-        // R-E3: spawn + fail_run without enclosing Retry
         if matches!(step.action, Action::Spawn { .. })
             && step.on_error == crate::schema::StepOnError::FailRun
             && !inside_retry
@@ -338,10 +317,6 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
         }
         match &step.action {
             Action::Retry { step: inner, .. } => {
-                // R-E1: retry on blocked/auth must escalate, never retry
-                // Any Retry that would retry a fail_run step is flagged as
-                // retrying blocked/auth (the only safe retry kinds are
-                // rate_limit/timeout handled by the engine's kind-aware loop).
                 if inner.on_error == crate::schema::StepOnError::FailRun {
                     report.issues.push(LintIssue {
                         level: Level::Warning,
@@ -381,11 +356,6 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
             if matches!(node.action, Action::Spawn { .. })
                 && node.on_error == crate::schema::StepOnError::FailRun
             {
-                // For graph nodes, there is no syntactic enclosing Retry unless
-                // the node's action IS Retry wrapping spawn. Treat bare spawn
-                // fail_run in graph as R-E3.
-                // Check if this node is itself inside a Retry node? Graph is flat,
-                // so we treat any bare spawn fail_run as R-E3 unless its action is Retry.
                 let is_wrapped = matches!(node.action, Action::Retry { .. });
                 if !is_wrapped {
                     report.issues.push(LintIssue {
@@ -397,7 +367,6 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
                     });
                 }
             }
-            // R-E1 for graph retry nodes
             if let Action::Retry { step: inner, .. } = &node.action
                 && inner.on_error == crate::schema::StepOnError::FailRun
             {
@@ -416,9 +385,6 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
 
 /// Validate a guard expression's syntax with evalexpr (no evaluation).
 fn check_guard(report: &mut LintReport, guard: &str, ctx: &str) {
-    // bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): evalexpr accepts
-    // ONLY double-quoted strings. The runtime normalizes `'...'` tolerantly,
-    // but authors must write the canonical `"..."` form — flag it here.
     if crate::guard::normalize_single_quoted_literals(guard) != guard {
         report.issues.push(LintIssue {
             level: Level::Error,
@@ -429,17 +395,11 @@ fn check_guard(report: &mut LintReport, guard: &str, ctx: &str) {
         });
         return;
     }
-    // Template refs ({{trigger.x}}, {{steps.y}}) are substituted before eval;
-    // the raw guard is not valid evalexpr when it references them, so lint
-    // replaces template tokens with a literal before syntax-checking.
     let flattened = crate::guard::normalize_guard_paths(guard);
     let substituted = substitute_templates(&flattened);
     let parse_err = evalexpr::build_operator_tree::<evalexpr::DefaultNumericTypes>(&substituted)
         .err()
         .map(|e| e.to_string());
-    // evalexpr's builder is lenient (deferred errors); also reject guards that
-    // trail a binary operator or are empty after substitution — those would
-    // fail at eval time, so lint flags them now.
     let trimmed = substituted.trim();
     let trailing_op = trimmed.ends_with("==")
         || trimmed.ends_with("!=")
@@ -467,7 +427,6 @@ fn check_guard(report: &mut LintReport, guard: &str, ctx: &str) {
             line: None,
         });
     } else {
-        // Emit the 100ms timeout contract as an advisory.
         report.issues.push(LintIssue {
             level: Level::Warning,
             message: format!(
@@ -504,9 +463,6 @@ fn substitute_templates(s: &str) -> String {
 
 /// Validate an action's fields.
 fn check_action(report: &mut LintReport, action: &Action) {
-    // ADR-0032 Spec 2 (bd-htoo): the authoring gate consumes the closed
-    // contract table. Deprecated variants with no wired sink fail here so
-    // they never reach execution by accident.
     let contract = crate::action_contract::contract_for(action);
     if !contract.supported {
         report.issues.push(LintIssue {
@@ -520,9 +476,6 @@ fn check_action(report: &mut LintReport, action: &Action) {
         return;
     }
     match action {
-        // bd-ynef: a park must be BOUNDED and must carry an absolute wake
-        // time. Linting it here means an unbounded park is caught at author
-        // time, not discovered as a multi-day sleep in production.
         Action::Park {
             until_ms,
             max_wait_secs,
@@ -548,8 +501,6 @@ fn check_action(report: &mut LintReport, action: &Action) {
                     line: None,
                 });
             }
-            // A template is legal (it may resolve to a real time); a literal
-            // that is not an integer is not, and the engine would refuse it.
             if !until_ms.contains("{{") && until_ms.trim().parse::<u64>().is_err() {
                 report.issues.push(LintIssue {
                     level: Level::Error,
@@ -670,9 +621,6 @@ fn check_action(report: &mut LintReport, action: &Action) {
                     line: None,
                 });
             }
-            // ADR-0032 Spec 7: one retry coordinator. A retry wrapper nested
-            // directly inside another multiplies bounds (2x2=4 attempts) —
-            // reject at lint so the outer policy is the single owner.
             if matches!(step.action, Action::Retry { .. }) {
                 report.issues.push(LintIssue {
                     level: Level::Error,
@@ -740,8 +688,6 @@ fn check_action(report: &mut LintReport, action: &Action) {
             }
         }
         Action::Reduce { .. } => {
-            // ADR-0032 Spec 2 (bd-3pti): the authoring gate consumes the
-            // closed contract table for the new variant.
             for v in crate::action_contract::validate_action(action) {
                 report.issues.push(LintIssue {
                     level: Level::Error,
@@ -755,9 +701,6 @@ fn check_action(report: &mut LintReport, action: &Action) {
 
 /// The complete lint entrypoint: parse YAML then lint.
 pub fn lint_yaml(yaml: &str) -> Result<LintReport, String> {
-    // ADR-0012: cron is a DISTINCT type. A cron-YAML carries top-level
-    // `schedule`/`owner`; it is NOT a workflow — reject it here so the two
-    // types stay distinct at lint (the cron lint path is its validator).
     if is_cron_yaml(yaml) {
         return Ok(LintReport {
             issues: vec![LintIssue {
@@ -796,9 +739,6 @@ pub fn lint_cron(spec: &CronSpec) -> LintReport {
     check_name(&mut report, &spec.name, "cron");
     check_cron_schedule(&mut report, &spec.schedule);
 
-    // Owner profile (the fixer's identity). Profile RESOLUTION against the
-    // flywheel-tier catalog is deferred to the CLI (bd-25g7.1 scope); lint
-    // checks the field is present + identifier-safe.
     if spec.owner.trim().is_empty() {
         report.issues.push(LintIssue {
             level: Level::Error,
@@ -1184,17 +1124,13 @@ steps:
 
     #[test]
     fn template_substitution_keeps_guards_valid() {
-        // Guards with {{trigger.x}} must lint clean (tokens substituted).
         assert_eq!(
             substitute_templates("{{trigger.channel}} == 'x'"),
             "0 == 'x'"
         );
         assert_eq!(substitute_templates("{{steps.a.out}} > 0"), "0 > 0");
-        // Valid evalexpr after substitution.
         assert!(evalexpr::build_operator_tree::<evalexpr::DefaultNumericTypes>("0 == 'x'").is_ok());
     }
-
-    // ---- ADR-0012: cron lint is DISTINCT from workflow lint (bd-25g7.1) ----
 
     const ADR_CRON_YAML: &str = r##"
 name: weekly-upgrade
@@ -1245,7 +1181,6 @@ steps:
 
     #[test]
     fn cron_lint_bad_schedule_rejected() {
-        // 4 fields — not 5-field vixie.
         let yaml = "name: c\nschedule: '30 3 * *'\nowner: o\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
         assert!(
@@ -1257,7 +1192,6 @@ steps:
             report.issues
         );
 
-        // Minute 99 — invalid cron expression.
         let yaml = "name: c\nschedule: '99 3 * * 0'\nowner: o\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
         assert!(
@@ -1286,7 +1220,6 @@ steps:
 
     #[test]
     fn cron_lint_bad_policy_rejected() {
-        // repeat_threshold 0 — degenerate (escalates on the FIRST failure).
         let yaml =
             "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  repeat_threshold: 0\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
@@ -1299,7 +1232,6 @@ steps:
             report.issues
         );
 
-        // no_claim_timeout 0 — abort immediately, never wait.
         let yaml =
             "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  no_claim_timeout: 0\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
@@ -1355,7 +1287,6 @@ graph:
         assert!(err.contains("yaml parse error"), "actionable: {err}");
     }
 
-    // ---- ADR-0024 Spec 1 R-E lints (kind_aware): one matrix test (was 5).
     #[test]
     fn kind_aware_retry_rules_matrix() {
         let lint = |yaml: &str| {

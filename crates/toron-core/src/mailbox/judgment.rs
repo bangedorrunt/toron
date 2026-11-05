@@ -128,8 +128,6 @@ pub fn record_from_value(
         .and_then(serde_json::Value::as_u64)
         .and_then(|x| u32::try_from(x).ok())
         .ok_or_else(|| anyhow::anyhow!("judgment-ask output missing u32 field `pack_version`"))?;
-    // JSON cannot spell non-finite floats (serde_json rejects them at parse),
-    // so no fin-mirror is needed at this boundary — a present number is finite.
     let confidence = obj
         .get("confidence")
         .and_then(serde_json::Value::as_f64)
@@ -159,18 +157,9 @@ pub fn record_from_value(
             .unwrap_or(false),
         note,
         answers,
-        // Parse boundary cannot see the judged state; `ask_judgment` fills
-        // the hash before journaling (bd-8yj0).
         state_hash: String::new(),
     })
 }
-
-// ── Pack registry + offline seeds (ADR-0035 Spec 3, bd-8yj0) ───────────────
-// Packs are data, versioned. System-one delegates to flywheel (which resolves
-// the pack; unknown there is a typed error, never a guess). Offline answers
-// known packs hermetically (no subprocess); an offline ask naming an
-// unseeded pack falls through to the child so doors that name flywheel-side
-// packs keep working (flywheel resolves; unknown there errors loud).
 
 /// One question in a pack. IDs are for code; full meaning stays inline here.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -415,7 +404,6 @@ pub fn check_judgment_args(
 }
 
 fn stdout_tail(s: &str) -> String {
-    // Char-boundary safe: byte slicing can split a multibyte char (bd-7qcw).
     const N: usize = 300;
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= N {
@@ -513,8 +501,6 @@ impl super::Mailbox {
                  refusing rather than returning an unjournaled answer"
             )
         })?;
-        // Discriminating replay (bd-fbgi): version/state drift is loud.
-        // Claims never replay (bd-uhkr): an unsettled claim is not an answer.
         let expected_version = find_pack(pack_id).map(|p| p.version);
         let expected_hash = state_hash(state);
         if let Some(record) =
@@ -525,9 +511,6 @@ impl super::Mailbox {
                 replayed: true,
             });
         }
-        // Claim-before-invoke (bd-uhkr): Prepared row BEFORE spawn. A lost
-        // race owns nothing — replay the winner's final row, else refuse as
-        // inflight (never a second spawn, never a double model pay).
         if !claim_judgment(pool, project_slug, effect_key, pack_id, expected_version).await? {
             if let Some(record) =
                 journal_get_final_for(pool, effect_key, expected_version, &expected_hash).await?
@@ -541,15 +524,11 @@ impl super::Mailbox {
                 "ask_judgment `{effect_key}` inflight under another caller (claim-before-invoke dedup) — retry after it settles, never spawn twice"
             );
         }
-        // Offline + seeded pack: hermetic scripted answer, no subprocess.
-        // Offline + unseeded pack: fall through to the child (flywheel
-        // resolves the pack; unknown there is a typed error, never a guess).
         if transport == "offline"
             && let Some(pack) = find_pack(pack_id)
         {
             let record = offline_answer(effect_key, &pack, state);
             if !journal_settle(pool, project_slug, &record).await? {
-                // Lost settle race: another caller settled first — replay it.
                 let record =
                     journal_get_final_for(pool, effect_key, expected_version, &expected_hash)
                         .await?
@@ -567,7 +546,6 @@ impl super::Mailbox {
         let bin = flywheel_bin();
         let argv = judgment_argv(effect_key, pack_id, &state_json, transport);
         let mut cmd = tokio::process::Command::new(&bin);
-        // Timeout drop kills the child (no orphaned flywheel ask).
         cmd.kill_on_drop(true);
         let child = cmd
             .args(&argv)
@@ -604,10 +582,6 @@ impl super::Mailbox {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let mut record = parse_judgment_stdout(effect_key, pack_id, &stdout)?;
         record.state_hash = state_hash(state);
-        // Settle the pre-spawn claim (bd-uhkr). A lost settle race replays
-        // the winner — INSERT OR IGNORE would silently keep a stale claim.
-        // Child/spawn failures above return with `?`: the claim stays for
-        // crash-resume to reap (never a silent pay, never a delete).
         if !journal_settle(pool, project_slug, &record).await? {
             let record = journal_get_final_for(pool, effect_key, expected_version, &expected_hash)
                 .await?
@@ -648,9 +622,6 @@ impl super::Mailbox {
             transport,
             timeout_secs.unwrap_or(JUDGMENT_DEFAULT_TIMEOUT_SECS),
         );
-        // Host-owned model (bd-uhkr): duplicate keys dedup here instead of
-        // spawning a second child. The lock scope ends before any await
-        // (parking_lot guards are !Send and must never cross one).
         let emitted: Option<JudgeEffect> = {
             let mut guard = self.judge_model.lock();
             let (next, effects) = tick(&guard, &JudgeMsg::Request { effect });
@@ -662,7 +633,6 @@ impl super::Mailbox {
             })
         };
         let Some(effect) = emitted else {
-            // Dup with a settled row replays it; live flight refuses loud.
             let pool = self.index_pool.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("judge_wake_priority journal unavailable (no index open)")
             })?;
@@ -706,9 +676,6 @@ impl super::Mailbox {
                 Some(effect.timeout_secs),
             )
             .await;
-        // Memory tracks live flight only: the DB claim is the cross-caller
-        // guard, so drop the key on both success and failure (a retry then
-        // meets the claim row, never a second spawn).
         self.judge_model.lock().inflight.remove(effect_key);
         let outcome = outcome?;
         let answers = &outcome.record.answers;
@@ -723,18 +690,6 @@ impl super::Mailbox {
         Ok((gate, route, outcome))
     }
 }
-
-// ── Effect::Judge kernel (ADR-0035 Spec 3, bd-sd9j) ───────────────────────
-// Judgment as a deferred Effect value: tick constructs it (pure data),
-// the interpreter runs it exactly once at the edge (journal-before-ask),
-// and confidence routing decides Act vs human. One Judge variant with one
-// interpreter; substitutes (FakeJudge) ride the same Effect shape.
-//
-// Note on fences: dispatch_core-style import fences cannot apply to this
-// file — the interpreter (subprocess, sqlx, clock) cohabits it by scope
-// (mailbox/judgment.rs only). Kernel purity is structural instead: `tick`
-// takes `&Model, &Msg` and returns owned data, with zero IO types in its
-// signature, plus the determinism test below.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -949,12 +904,6 @@ pub async fn journal_get_for(
     Ok(Some(record))
 }
 
-// ── Lane Q claim-before-invoke (bd-uhkr) ────────────────────────────────
-// A Prepared claim row lands BEFORE the child spawns. A second caller in
-// the window sees the claim and returns/waits — never a second spawn, never
-// a double model pay. Crash between model-return and settle leaves the
-// claim (not a silent pay); `reconcile_judgment_claims` reaps it on resume.
-
 /// Placeholder model id marking an unsettled claim (never a final answer).
 pub const CLAIM_MODEL_ID: &str = "__claim__";
 
@@ -1157,7 +1106,6 @@ mod tests {
 
     #[test]
     fn test_stdout_tail_multibyte_safe_bd_7qcw() {
-        // 400 × U+00E9 (800 bytes): a byte slice at len-300 splits a char.
         let s = "é".repeat(400);
         let tail = stdout_tail(&s);
         assert!(tail.starts_with('…'), "truncated marker");
@@ -1213,7 +1161,6 @@ mod tests {
 
     #[test]
     fn test_parse_confidence_passthrough_bd_ncpt() {
-        // JSON cannot spell non-finite floats, so any present number is finite.
         let r = parse_judgment_stdout("k", "p", &sample_out("k", "p")).expect("parse");
         assert!((r.confidence - 0.8).abs() < 1e-9);
         assert_eq!(r.note, "ok");
@@ -1317,8 +1264,6 @@ mod tests {
         assert_eq!(r.state_hash, "");
     }
 
-    // ── Lane I kernel + replay identity (bd-sd9j) ────────────────────────
-
     fn judge_effect(key: &str) -> JudgeEffect {
         JudgeEffect::request(
             key,
@@ -1339,7 +1284,6 @@ mod tests {
         );
         assert_eq!(fx1.len(), 1);
         assert!(matches!(fx1[0], Effect::Judge(_)));
-        // Duplicate key emits nothing (replay dedup at tick level).
         let (_, fx2) = tick(
             &m1,
             &JudgeMsg::Request {
@@ -1347,7 +1291,6 @@ mod tests {
             },
         );
         assert!(fx2.is_empty());
-        // Settled drops the key; a fresh request emits again.
         let record = offline_answer(
             "k",
             &find_pack("wake-priority").unwrap(),
@@ -1404,17 +1347,13 @@ mod tests {
         let pack = find_pack("wake-priority").unwrap();
         let state = serde_json::json!({"urgency": 0.9});
         let record = offline_answer("k", &pack, &state);
-        // Full identity replays.
         replay_check(&record, Some(pack.version), &state_hash(&state)).expect("match replays");
-        // Version drift is loud.
         let err = replay_check(&record, Some(pack.version + 1), &state_hash(&state)).unwrap_err();
         assert!(matches!(err, JudgeError::VersionMismatch { .. }), "{err}");
         assert!(err.to_string().contains("version_mismatch"));
-        // State drift is loud.
         let err = replay_check(&record, Some(pack.version), "deadbeef").unwrap_err();
         assert!(matches!(err, JudgeError::StalePack { .. }), "{err}");
         assert!(err.to_string().contains("stale_pack"));
-        // Legacy rows without a hash skip only the hash check.
         let mut legacy = record;
         legacy.state_hash = String::new();
         replay_check(&legacy, Some(pack.version), "anything").expect("legacy hash skipped");
@@ -1479,8 +1418,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_judge_wake_priority_seam_offline_bd_sd9j() {
-        // Production seam end to end on the hermetic transport:
-        // tick -> Effect::Judge -> journal -> interpret -> route.
         use std::sync::Arc;
         let tag = format!("seam-{}", uuid::Uuid::new_v4());
         let db_path = std::env::temp_dir().join(format!("toron-judge-{tag}.sqlite"));
@@ -1501,8 +1438,6 @@ mod tests {
             Some(crate::keys::generate()),
         )
         .with_index_pool(pool);
-        // Offline seed answers 0.5/0.5/0.5 regardless of inputs: gate Queue,
-        // escalated seed routes to human. Inputs still bind the journal row.
         let scores = WakeScores {
             urgency: 0.9,
             actionability: 0.9,
@@ -1516,7 +1451,6 @@ mod tests {
         assert_eq!(route, JudgeRoute::EscalateHuman);
         assert!(!outcome.replayed);
         assert_eq!(outcome.record.effect_key, "seam-k1");
-        // Same call replays the journaled row (same state binds).
         let (gate2, route2, outcome2) = mailbox
             .judge_wake_priority("toron", "seam-k1", scores, "offline", Some(10))
             .await
@@ -1542,13 +1476,11 @@ mod tests {
         journal_insert(&pool, "toron", &record)
             .await
             .expect("insert");
-        // Full identity hits.
         let hit = journal_get_for(&pool, "k", Some(pack.version), &state_hash(&state))
             .await
             .expect("get")
             .expect("row");
         assert_eq!(hit, record);
-        // Drift is loud, not a silent row.
         assert!(
             journal_get_for(&pool, "k", Some(pack.version + 1), &state_hash(&state))
                 .await
@@ -1559,7 +1491,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        // Missing key is None, never an error.
         assert!(
             journal_get_for(&pool, "nope", Some(1), "x")
                 .await
@@ -1590,12 +1521,6 @@ mod tests {
         assert_eq!(back, r);
     }
 
-    // ── Lane Q claim-before-invoke + host-owned model (bd-uhkr) ─────────
-    // Law: Prepared claim row BEFORE spawn (second caller waits/returns,
-    // never double-pays); JudgeModel host-owned and threaded through calls
-    // (never per-call new); crash between model-return and settle leaves a
-    // claim, not a silent pay; resume reconciles claims.
-
     async fn uhkr_pool() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -1623,9 +1548,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_second_caller_never_spawns_bd_uhkr() {
-        // Pre-claimed key = a parallel caller inside the spawn window.
-        // ask_judgment must refuse as inflight WITHOUT spawning a child
-        // (system-one would spawn; the inflight refusal proves no spawn).
         let pool = uhkr_pool().await;
         let pack = find_pack("wake-priority").unwrap();
         let state = serde_json::json!({"urgency": 0.9});
@@ -1655,9 +1577,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_crash_leaves_claim_reconcile_clears_bd_uhkr() {
-        // Crash between model-return and settle: the claim row survives,
-        // no final answer exists, and resume reaps the claim so the key
-        // is claimable again (never a silent pay, never a wedged key).
         let pool = uhkr_pool().await;
         let pack = find_pack("wake-priority").unwrap();
         let state = serde_json::json!({"urgency": 0.9});
@@ -1702,8 +1621,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_host_model_shared_and_dedupes_bd_uhkr() {
-        // The model is host-owned: clones share one instance (never
-        // per-call new), so a duplicate Request dedupes across callers.
         use std::sync::Arc;
         let pool = uhkr_pool().await;
         let m1 = uhkr_mailbox(pool).await;
@@ -1737,9 +1654,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_success_settles_claim_no_leftovers_bd_pgvf() {
-        // bd-pgvf symptom: journal-after-invoke double-journals and strands
-        // rows. A successful ask settles its claim: exactly one journal row
-        // survives, zero claim rows remain, and a repeat ask replays it.
         let pool = uhkr_pool().await;
         let mailbox = uhkr_mailbox(pool.clone()).await;
         let state = serde_json::json!({"urgency": 0.9});

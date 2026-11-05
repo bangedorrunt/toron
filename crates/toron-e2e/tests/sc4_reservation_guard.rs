@@ -61,7 +61,6 @@ async fn sc4_reservation_conflict_and_guard() {
     register(&mailbox, "demo", "PiAlpha").await;
     register(&mailbox, "demo", "OCBeta").await;
 
-    // --- Pi-α reserves src/** exclusive ---
     let acquire = mailbox
         .file_reservation_paths(
             "demo",
@@ -75,7 +74,6 @@ async fn sc4_reservation_conflict_and_guard() {
         .expect("PiAlpha reserve src/**");
     assert_eq!(acquire.conflicts.len(), 0, "first reserve granted");
 
-    // --- OC-β checks src/lib.rs → conflict (symmetric fnmatch) ---
     let report = mailbox
         .check_file_reservation_conflicts("demo", "OCBeta", &["src/lib.rs".into()])
         .await
@@ -83,7 +81,6 @@ async fn sc4_reservation_conflict_and_guard() {
     assert!(!report.conflict_free, "OCBeta blocked by PiAlpha's src/**");
     assert_eq!(report.conflicts.len(), 1);
     assert!(!report.conflicts[0].holders.is_empty());
-    // bd-dsu1: the report carries the conflicting lease's event id.
     assert_eq!(
         report.conflicts[0].reservation_ids.len(),
         acquire.granted.len(),
@@ -94,7 +91,6 @@ async fn sc4_reservation_conflict_and_guard() {
         "conflict id equals PiAlpha's lease event id"
     );
 
-    // --- Guard: OCBeta's staged src/lib.rs blocked; PiAlpha's own not ---
     let other = Reservation {
         holder: "PiAlpha".into(),
         pattern: "src/**".into(),
@@ -118,12 +114,9 @@ async fn sc4_reservation_conflict_and_guard() {
     );
     assert!(own.is_empty(), "own reservation never blocks");
 
-    // --- Symmetric: OCBeta holding src/lib.rs ALSO conflicts with src/** ---
-    // (mutual check in the other direction — the conflict rule is symmetric).
     let reversed = guard_blocked_paths("PiAlpha", &["src/lib.rs".into()], &[]);
     assert!(reversed.is_empty());
 
-    // --- Release → OC-β clear ---
     let released = mailbox
         .release_file_reservations("demo", "PiAlpha", &[])
         .await

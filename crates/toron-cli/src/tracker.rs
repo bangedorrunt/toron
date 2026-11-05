@@ -22,9 +22,6 @@ pub fn closed_bead_ids(repo: &Path) -> BTreeSet<String> {
     let mut closed = BTreeSet::new();
     for line in raw.lines() {
         let line = line.trim();
-        // Cheap prefilter: a closed row necessarily names the status, so only
-        // pay for a parse on lines that could be one. Keeps a multi-MB
-        // tracker file off the interactive `reserve list` path.
         if line.is_empty() || !line.contains("closed") {
             continue;
         }

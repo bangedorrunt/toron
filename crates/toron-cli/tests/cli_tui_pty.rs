@@ -1,8 +1,5 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0031
-// No unsafe here and no ambient mutation: unlike cli_tui.rs this file passes
-// `TORON_MCP_DATA_DIR` to the child process directly, so it never calls
-// `std::env::set_var`.
 
 //! The narrow-PTY witness: the REAL binary on a REAL terminal at the geometry
 //! a phone SSH client reports.
@@ -66,8 +63,6 @@ fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i
         "stty cols 45 rows 24; exec '{}' tui --project tuipty --as PtyAgent --refresh-ms 250",
         program.display()
     );
-    // macOS script: [file [command ...]]; util-linux: -c <command> [file].
-    // script(1) runs the toron binary, so it runs under the harness.
     let mut command = Command::new("script");
     toron_core::testkit::apply_test_env(&mut command);
     if cfg!(target_os = "macos") {
@@ -104,8 +99,6 @@ fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i
     };
 
     let shown = |needle: &str| drawn.lock().expect("drawn buffer").contains(needle);
-    // Hold stdin open across the whole sequence: keeping the pty session alive
-    // is what keeps the console drawing at all.
     let mut stdin = child.stdin.take().expect("pty stdin");
     for (until, keys) in steps {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -127,11 +120,6 @@ fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i
             Some(status) => break status,
             None => {
                 if Instant::now() >= deadline {
-                    // Still running after the key sequence. `kill` only signals, it
-                    // does NOT reap — so the reap has to be here, in the SAME branch,
-                    // or the console stays a ZOMBIE for the rest of the suite's life.
-                    // That is the same orphan class the doorbell reaper exists to
-                    // clean up in production, and a failing run must not add one.
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
@@ -163,9 +151,6 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
     // spawn-harness: run through script(1), which console_keys builds under
     // `apply_test_env`.
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
-    // Wait for the onboarding TEXT, not the header: `--project tuipty` is only
-    // ever printed by a command the empty pane named. The header already says
-    // `tuipty/PtyAgent`, so waiting on that would pass before the pane settled.
     let (drawn, code) = console_on_a_45_col_pty(program, "--project tuipty");
 
     assert_eq!(
@@ -184,12 +169,6 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
         drawn.contains("1M"),
         "the phone-width chrome compacted the tab bar:\n{drawn}"
     );
-    // The data dir is fresh and `PtyAgent` is not registered in it, so the
-    // inbox fetch is REFUSED. The pane must still name a real, pasteable
-    // command at this width — `agent bootstrap` is the fix for exactly that
-    // refusal, and `mail send` is what a loaded-but-empty inbox names. Either
-    // one settles the pane; `loading the index…` forever is the failure this
-    // witness exists to catch.
     assert!(
         drawn.contains("toron agent bootstrap --project tuipty")
             || drawn.contains("toron mail send --project tuipty"),
@@ -215,18 +194,11 @@ fn the_compose_form_opens_and_cancels_at_45_columns() {
     // spawn-harness: run through script(1), which console_keys builds under
     // `apply_test_env`.
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
-    // `Importance` is drawn by the form and by nothing else, so it is the
-    // needle that proves the form reached the screen at this width. Esc then
-    // leaves the form; `q` quits from the tab behind it.
     let (drawn, code) = console_keys(
         program,
         &[
             ("--project tuipty", "c"),
             ("Importance", "\u{1b}"),
-            // Wait for the CANCEL to land before quitting: sending `q` in the
-            // same read as the escape would arrive as Alt-q and be typed into
-            // the field instead of quitting. Waiting also proves Esc cancelled
-            // the form rather than leaving it (where `q` would also type).
             ("compose cancelled", "q\n"),
         ],
     );

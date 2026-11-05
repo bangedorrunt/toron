@@ -60,8 +60,6 @@ fn boundary(seq: i64, effect_keys: Option<&str>) -> NewRunStateCheckpoint {
     }
 }
 
-// --- 1. replay is exact ---------------------------------------------------
-
 #[tokio::test]
 async fn replay_returns_the_model_and_the_pending_write_set_at_that_boundary() {
     let (s, _p) = store("replay-hit").await;
@@ -75,12 +73,8 @@ async fn replay_returns_the_model_and_the_pending_write_set_at_that_boundary() {
 
     let r = s.replay(T, 2).await.expect("boundary 2 replays");
 
-    // The model, not a re-derivation of it: the row is the authority.
     assert_eq!(r.model["step"], 2, "the model is the stored one");
     assert_eq!(r.seq, 2);
-    // The half a bare model_json cannot give a reader. Without these keys a
-    // reader cannot tell whether re-entering this boundary repeats a
-    // dispatch that already left the machine.
     assert_eq!(
         r.effect_keys,
         vec!["prompt:pane-1".to_string(), "fetch-inbox:toron".to_string()],
@@ -97,9 +91,6 @@ async fn replay_of_a_missing_boundary_fails_loud_instead_of_showing_a_neighbour(
         s.append(boundary(seq, None)).await.expect("append");
     }
 
-    // TYPED FAILURE, not a defect and not a hang: the caller named a boundary
-    // and got an answer saying there is not one. The message has to name it,
-    // because the whole refusal is "this is not the step you asked for".
     let err = s.replay(T, 9).await.expect_err("boundary 9 does not exist");
     let text = err.to_string();
     assert!(
@@ -108,10 +99,6 @@ async fn replay_of_a_missing_boundary_fails_loud_instead_of_showing_a_neighbour(
          step is missing: {text}"
     );
 
-    // The contrast that makes the contract legible: the resume seed is the one
-    // read allowed to fall back, and it still finds 3. If `replay` also fell
-    // back it would be indistinguishable from a resume, which is exactly the
-    // confusion it must not create.
     assert_eq!(
         s.load_for_resume(T, 9)
             .await
@@ -123,8 +110,6 @@ async fn replay_of_a_missing_boundary_fails_loud_instead_of_showing_a_neighbour(
          below, the other refuses, and the difference is the contract."
     );
 }
-
-// --- 2. the pending-write set is never silently empty ---------------------
 
 #[tokio::test]
 async fn a_null_pending_write_set_is_a_boundary_that_owned_nothing() {
@@ -145,9 +130,6 @@ async fn an_unreadable_pending_write_set_fails_closed_instead_of_reading_as_empt
         .await
         .expect("append");
 
-    // The dangerous reading: an empty set tells a reader that re-entering this
-    // boundary is safe. A corrupt set that reads as empty would say exactly
-    // that about a boundary whose effects nobody can name. Fail closed.
     let err = s
         .replay(T, 1)
         .await
@@ -159,15 +141,11 @@ async fn an_unreadable_pending_write_set_fails_closed_instead_of_reading_as_empt
          to inspect that row: {text}"
     );
 
-    // The row is still visible, so an operator can see the boundary exists
-    // and is unreadable rather than concluding the thread ends at nothing.
     assert!(
         s.get(T, 1).await.expect("get").is_some(),
         "the boundary remains visible even though its reader refuses"
     );
 }
-
-// --- 3. plan_fork is a pure fold -----------------------------------------
 
 fn replay_with_keys(keys: &[&str]) -> RunStateReplay {
     RunStateReplay {
@@ -184,9 +162,6 @@ fn replay_with_keys(keys: &[&str]) -> RunStateReplay {
 
 #[test]
 fn one_boundary_and_one_intent_produce_one_plan_every_time() {
-    // DETERMINISM. The fold is pure, so the same two inputs cannot produce two
-    // answers. Run it enough times that a hidden clock or a HashMap iteration
-    // order would show up as a difference.
     let b = replay_with_keys(&["prompt:pane-1"]);
     let first = plan_fork(&b, &ForkIntent::Dry);
     for _ in 0..64 {
@@ -201,9 +176,6 @@ fn one_boundary_and_one_intent_produce_one_plan_every_time() {
 
 #[test]
 fn the_default_intent_is_dry_so_dry_is_what_a_caller_gets_for_free() {
-    // DRY BY DEFAULT is a property of the TYPE, not of a caller remembering.
-    // `ForkIntent::default()` is what an unconfigured caller reaches, and the
-    // only way to perform is to name the variant explicitly.
     assert_eq!(ForkIntent::default(), ForkIntent::Dry);
     let plan = plan_fork(
         &replay_with_keys(&["prompt:pane-1"]),
@@ -211,8 +183,6 @@ fn the_default_intent_is_dry_so_dry_is_what_a_caller_gets_for_free() {
     );
     assert!(!plan.would_perform, "the default intent dispatches nothing");
 }
-
-// --- 4. the fork hazard is visible, not optional --------------------------
 
 #[test]
 fn a_dry_fork_from_a_boundary_that_owned_effects_names_those_effects() {
@@ -226,8 +196,6 @@ fn a_dry_fork_from_a_boundary_that_owned_effects_names_those_effects() {
         vec!["prompt:pane-1".to_string(), "fetch-inbox:toron".to_string()],
         "the plan carries the set a reader must reason about"
     );
-    // The refusal that BLOCKS reads first, because it is the one that decides
-    // whether performing is even legal.
     let first = plan.refusals.first().expect("at least one refusal");
     assert!(
         first.contains("prompt:pane-1") && first.contains("already reached a provider"),
@@ -241,8 +209,6 @@ fn a_dry_fork_from_a_boundary_that_owned_effects_names_those_effects() {
 
 #[test]
 fn performing_still_cannot_install_and_still_reports_the_hazard_first() {
-    // ACKNOWLEDGEMENT IS REQUIRED, and even once given it buys nothing here:
-    // the acknowledgement waives the HAZARD, not the absence of an installer.
     let plan = plan_fork(
         &replay_with_keys(&["prompt:pane-1"]),
         &ForkIntent::Perform(AcknowledgeDispatchedEffects::accept()),
@@ -267,8 +233,6 @@ fn performing_still_cannot_install_and_still_reports_the_hazard_first() {
 
 #[test]
 fn a_fork_from_a_boundary_that_owned_nothing_still_refuses_to_install() {
-    // The absence of effects is not a licence: it removes ONE refusal and the
-    // installer refusal stands, so a plan can never read as "safe to resume".
     let plan = plan_fork(&replay_with_keys(&[]), &ForkIntent::Dry);
     assert!(
         plan.refusals.iter().all(|r| !r.contains("already reached")),
@@ -280,8 +244,6 @@ fn a_fork_from_a_boundary_that_owned_nothing_still_refuses_to_install() {
     );
     assert!(!plan.installable);
 }
-
-// --- 5. no code path installs --------------------------------------------
 
 #[test]
 fn install_refuses_and_says_whose_call_the_authority_is() {
@@ -299,9 +261,6 @@ fn install_refuses_and_says_whose_call_the_authority_is() {
          reaches for it learns why at the call site: {text}"
     );
 
-    // A refusal that only ever fires once is not a rule. Drive it on a
-    // boundary that owned nothing, on one with no parent, and on the oldest
-    // shape the store can hold: the answer does not vary with the input.
     for keys in [&[][..], &["a"][..], &["a", "b", "c"][..]] {
         let mut b = replay_with_keys(keys);
         b.parent_checkpoint_id = None;
@@ -314,12 +273,6 @@ fn install_refuses_and_says_whose_call_the_authority_is() {
 
 #[tokio::test]
 async fn the_read_path_adds_nothing_to_the_log() {
-    // The structural claim, checked the only way it can be: run a real replay
-    // against a real store, then prove the store holds exactly the boundaries
-    // that were appended and not one more. The read side hands out a value
-    // with no store, no pool, and no `append` on it, so there is no path from
-    // a reader back into the log — this is the evidence for that, rather than
-    // a restatement of the type's shape.
     let (s, _p) = store("read-is-read-only").await;
     s.append(boundary(1, None)).await.expect("append 1");
     s.append(boundary(2, Some(r#"["prompt:pane-1"]"#)))

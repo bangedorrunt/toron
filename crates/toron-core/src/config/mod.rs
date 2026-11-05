@@ -155,9 +155,6 @@ pub fn sandbox_for(
             temp_dir: temp_dir.to_path_buf(),
             root: per_process,
         };
-        // The marker names the harness's directory. Anything that is not
-        // scratch (a relative value, `1`, or a real home) is not trusted as a
-        // root: the process is still under test, in its own sandbox.
         if marker.is_absolute() && sandbox.is_scratch(marker) {
             sandbox.root = marker.to_path_buf();
         }
@@ -420,8 +417,6 @@ pub fn ensure_operator_key_at(
                 .map_err(|e| anyhow::anyhow!("write operator key {}: {e}", canonical.display()))?;
             Ok(keys)
         }
-        // The old default minted here, which is how a machine ends up with two
-        // operator identities. Refuse and hand over the exact move.
         OperatorKeySource::RefuseLegacy => anyhow::bail!(
             "refusing to mint a second operator identity: no key at {}, but a LEGACY \
              key exists at {}. They are different keys, so operator-signed work would \
@@ -990,10 +985,6 @@ mod tests {
         let paths = ToronPaths {
             root: PathBuf::from("/root"),
         };
-        // ADR-0038: the KEY is no longer under the data root (it is a secret,
-        // so it lives in the config home). This assertion used to pin
-        // `/root/operator/operator.ncryptsec`, which is exactly the derivation
-        // that let the daemon and the documented path hold two identities.
         assert_eq!(
             paths.operator_key_path(),
             operator_key_path(),
@@ -1026,12 +1017,6 @@ mod tests {
 
     #[test]
     fn operator_key_created_0600_and_idempotent_across_openers() {
-        // Two "processes" opening the same canonical path must see the SAME
-        // operator key (the R2 two-process sharing unit equivalent).
-        //
-        // The paths are passed IN (ADR-0038). Resolving them here would point
-        // at the ambient config home — a test that did that would load, and on
-        // a machine without a key MINT, the operator's real identity.
         let root = scratch("opkey");
         std::fs::create_dir_all(&root).expect("dirs");
         let canonical = root.join("operator_nsec");
@@ -1057,13 +1042,10 @@ mod tests {
             "second opener loads the SAME key (no re-mint)"
         );
 
-        // Wrong passphrase fails loudly, never silently re-mints.
         assert!(
             ensure_operator_key_at(&canonical, &legacy, "wrong").is_err(),
             "passphrase mismatch errors"
         );
-        // A legacy-only key REFUSES: minting beside it is how a machine ends up
-        // with two operator identities that sign differently (ADR-0038).
         let other = scratch("opkey-legacy");
         std::fs::create_dir_all(&other).expect("dirs");
         let canonical2 = other.join("operator_nsec");
@@ -1108,7 +1090,7 @@ mod tests {
     /// rejected). Decrypt is payload-driven, so existing log_n=12 keys keep
     /// working after the bump.
     #[test]
-    #[allow(clippy::assertions_on_constants)] // guard against future KDF weakening
+    #[allow(clippy::assertions_on_constants)]
     fn operator_key_kdf_not_weak() {
         assert!(
             OPERATOR_KEY_LOG_N >= 14,
@@ -1171,13 +1153,10 @@ mod tests {
 
     #[test]
     fn mailbox_root_lifts_projects_to_parent() {
-        // bd-m5ym: production Mailbox data_dir is <root>/projects;
-        // root-level files belong at <root>/.
         assert_eq!(
             mailbox_root(&PathBuf::from("/data/toron/projects")),
             PathBuf::from("/data/toron")
         );
-        // Demo/test roots pass through unchanged.
         assert_eq!(
             mailbox_root(&PathBuf::from("/tmp/toron-mcp-demo-123")),
             PathBuf::from("/tmp/toron-mcp-demo-123")
@@ -1216,8 +1195,6 @@ mod tests {
             PathBuf::from("operator_nsec"),
             "no home at all keeps the relative name"
         );
-        // The whole point: the key path must not be derived from the data root
-        // (that derivation is exactly how two operator identities appeared).
         for (xdg, home) in [
             (Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home"))),
             (None, Some(PathBuf::from("/home"))),
@@ -1257,7 +1234,6 @@ mod tests {
             0o600,
             "the mode is the thing the function is named for"
         );
-        // Absent file: a no-op, never an error (generation writes 0600 itself).
         ensure_key_mode_at(&dir.join("absent")).expect("absent is a no-op");
         let _ = std::fs::remove_dir_all(&dir);
     }

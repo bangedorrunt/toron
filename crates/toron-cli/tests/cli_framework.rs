@@ -18,7 +18,6 @@ fn help_is_examples_first() {
     let out = run(&["--help"]);
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    // clig.dev / ADR-0003: help leads with examples, not just a usage line.
     assert!(
         text.contains("Examples") || text.contains("example"),
         "help must surface examples, got: {text}"
@@ -29,15 +28,12 @@ fn help_is_examples_first() {
 
 #[test]
 fn usage_error_exits_2() {
-    // Unknown subcommand -> clap usage error -> exit 2.
     let out = run(&["definitely-not-a-command"]);
     assert_eq!(out.status.code(), Some(2), "usage errors must exit 2");
 }
 
 #[test]
 fn missing_required_arg_exits_2() {
-    // `toron serve` without --mcp-stdio/--mcp-http is a runtime error (1),
-    // but a missing subcommand entirely is a usage error (2).
     let out = run(&[]);
     assert_eq!(out.status.code(), Some(2), "no command must exit 2");
 }
@@ -50,7 +46,6 @@ fn status_json_parses() {
     let value: serde_json::Value =
         serde_json::from_str(&text).expect("status --json must emit valid JSON");
     assert!(value.is_object());
-    // Federated relays must default to empty (opt-in).
     assert_eq!(value["relays"], serde_json::json!([]));
 }
 
@@ -59,7 +54,6 @@ fn status_human_is_not_json() {
     let out = run(&["status"]);
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    // Human form is a labeled table, not bare JSON.
     assert!(text.contains("toron status") || text.contains("data_dir"));
     let first_line = text.lines().next().unwrap_or("");
     assert!(
@@ -70,7 +64,6 @@ fn status_human_is_not_json() {
 
 #[test]
 fn env_config_overrides_project_file() {
-    // TORON_BACKEND=hc must win over a project .toron.toml saying bogus.
     let mut cmd = toron();
     cmd.current_dir("tests")
         .env("TORON_BACKEND", "hc")

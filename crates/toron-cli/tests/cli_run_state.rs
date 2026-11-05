@@ -89,16 +89,11 @@ async fn replay_prints_the_model_and_the_pending_write_set() {
         v["model"]["step"], 2,
         "the stored model, not a re-derivation"
     );
-    // The load-bearing half: a reader cannot decide whether re-entering this
-    // boundary repeats a dispatch unless the verbs prints which effects it
-    // owned.
     assert_eq!(
         v["effect_keys"],
         serde_json::json!(["prompt:pane-1", "fetch-inbox:toron"])
     );
 
-    // A boundary that owned nothing reports an empty set rather than a
-    // missing key, so a caller does not have to distinguish the two.
     let (ok2, stdout2, _) = run(
         &root,
         &["run-state", "replay", "--thread", T, "--seq", "1", "--json"],
@@ -149,8 +144,6 @@ async fn fork_is_dry_and_refuses_to_install() {
 #[tokio::test]
 async fn a_missing_boundary_is_a_named_failure_not_a_nearby_row() {
     let root = seeded_root().await;
-    // Exit 1 (runtime failure, not 2 — the usage was legal, the boundary is
-    // not there), and the message names the boundary asked for.
     let (ok, _, stderr) = run(
         &root,
         &["run-state", "replay", "--thread", T, "--seq", "9", "--json"],
@@ -166,9 +159,6 @@ async fn a_missing_boundary_is_a_named_failure_not_a_nearby_row() {
 #[tokio::test]
 async fn thread_and_seq_are_required_rather_than_defaulted() {
     let root = seeded_root().await;
-    // clap owns exit 2 for usage errors. A default would let a typo replay a
-    // boundary nobody asked for, which is the confusion the exact read exists
-    // to prevent.
     for args in [
         vec!["run-state", "replay", "--seq", "1"],
         vec!["run-state", "replay", "--thread", T],
@@ -187,9 +177,6 @@ async fn thread_and_seq_are_required_rather_than_defaulted() {
 
 #[tokio::test]
 async fn an_absent_index_is_an_answer_not_a_panic() {
-    // A run with no run-state recording has no index at all. That is a real
-    // state (the recorder is opt-in), so the verb has to say so rather than
-    // crash on a path that does not exist.
     let empty = std::env::temp_dir().join(format!(
         "toron-cli-run-state-empty-{}-{}",
         std::process::id(),

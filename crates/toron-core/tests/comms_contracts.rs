@@ -103,14 +103,12 @@ fn phase43_contracts_accept_their_body_and_refuse_a_missing_link() {
     reply.causation = None;
     assert!(matches!(reply.validate(), Err(Reject::BadEnvelope { .. })));
 
-    // gen 0 is legal; task is what cancel requires.
     let mut cancel = env(Class::Control, "cancel", serde_json::json!({}));
     assert_eq!(cancel.generation, 0);
     assert!(cancel.validate().is_ok());
     cancel.task = None;
     assert!(matches!(cancel.validate(), Err(Reject::BadEnvelope { .. })));
 
-    // decision omitted. env.task is the run id.
     let mut approval = env(Class::Control, "approval", serde_json::json!({}));
     assert!(approval.validate().is_ok());
     approval.task = None;
@@ -129,7 +127,6 @@ fn phase43_contracts_accept_their_body_and_refuse_a_missing_link() {
         .is_ok()
     );
 
-    // The envelope itself still denies an unknown field.
     let mut v = serde_json::to_value(env(
         Class::Request,
         "request",

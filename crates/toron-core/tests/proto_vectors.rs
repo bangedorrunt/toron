@@ -130,6 +130,19 @@ fn choreo_vectors_from_lean_pass_in_rust() {
         let role = toron_core::authority::Role::parse(v["role"].as_str().unwrap())
             .unwrap_or_else(|| panic!("vector {i}: bad role: {line}"));
         let state = v["state"].as_u64().unwrap() as u32;
+        if v["topology"].as_str().unwrap() == "loop" {
+            let open = toron_core::topology::global_of(toron_core::topology::Topology::Open)
+                .and_then(|g| toron_core::topology::project(g, role, state))
+                .map(|a| a.verbs)
+                .unwrap_or_default();
+            let got = toron_core::topology::global_of(topo)
+                .and_then(|g| toron_core::topology::project(g, role, state))
+                .map(|a| a.verbs)
+                .unwrap_or_default();
+            assert_eq!(got, open, "vector {i}: loop loads as open: {line}");
+            n += 1;
+            continue;
+        }
         let got = toron_core::topology::global_of(topo)
             .and_then(|g| toron_core::topology::project(g, role, state));
         match got {

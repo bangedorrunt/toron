@@ -122,10 +122,8 @@ pub fn unwrap(recipient: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, Gift
     if gift_wrap.kind != Kind::GiftWrap {
         return Err(GiftWrapError::NotGiftWrap);
     }
-    // NIP-44: verify the envelope Schnorr sig before decrypting ciphertext.
     crate::nostr::event::verify_event(gift_wrap)?;
 
-    // Outer: decrypt seal with recipient key against the wrap's random pubkey.
     let seal_json = decrypt(
         recipient.secret_key(),
         &gift_wrap.pubkey,
@@ -137,11 +135,9 @@ pub fn unwrap(recipient: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, Gift
         return Err(GiftWrapError::NotGiftWrap);
     }
 
-    // Inner: decrypt rumor with recipient key against the seal's sender pubkey.
     let rumor_json = decrypt(recipient.secret_key(), &seal.pubkey, &seal.content)?;
     let rumor = UnsignedEvent::from_json(rumor_json)?;
 
-    // NIP-59: the rumor author must equal the seal signer.
     if rumor.pubkey != seal.pubkey {
         return Err(GiftWrapError::SenderMismatch);
     }
@@ -223,7 +219,6 @@ mod tests {
         assert_eq!(unwrapped.rumor.pubkey, rumor.pubkey);
         assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage);
         assert_eq!(unwrapped.rumor.content, "secret payload");
-        // Rumor tags survive the wrap.
         assert_eq!(unwrapped.rumor.tags, rumor.tags);
     }
 
@@ -240,23 +235,18 @@ mod tests {
 
     #[test]
     fn test_non_recipient_cannot_read_seal() {
-        // The seal content is NIP-44-encrypted to the recipient; a third party
-        // who observes the wrap cannot decrypt the seal even with the sender's
-        // pubkey. The wrap's random key never appears to outsiders.
         let sender = sender_keys();
         let recipient = recipient_keys();
         let stranger = stranger_keys();
         let rumor = sample_rumor(sender.public_key());
         let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
-        // Stranger attempts: cannot decrypt the seal payload.
         let seal_json = decrypt(stranger.secret_key(), &wrapped.pubkey, &wrapped.content);
         assert!(seal_json.is_err());
     }
 
     #[test]
     fn test_sender_mismatch_rejected() {
-        // A rumor that lies about its author must be rejected (NIP-59).
         let sender = sender_keys();
         let recipient = recipient_keys();
         let impersonated = stranger_keys();
@@ -288,13 +278,11 @@ mod tests {
 
     #[test]
     fn test_wrap_randomizes_created_at() {
-        // NIP-17: seal + wrap created_at are randomized (up to 2 days back).
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
         let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
-        // The rumor's created_at (mail timeline) differs from the wrap's.
         assert_ne!(wrapped.created_at.as_secs(), 1_700_000_000_u64);
         let now = Timestamp::now().as_secs();
         assert!(wrapped.created_at.as_secs() <= now);
@@ -303,10 +291,6 @@ mod tests {
 
     #[test]
     fn test_wrap_uses_fresh_one_time_key_per_wrap() {
-        // NIP-59 metadata hiding: the wrap's pubkey MUST NOT be the sender's
-        // identity key (a relay observer would learn the sender), and two
-        // wraps from the same sender MUST use different one-time keys
-        // (unlinkability — adr-0003 "one-time random key per wrap" claim).
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
@@ -327,7 +311,6 @@ mod tests {
             w1.pubkey, w2.pubkey,
             "each wrap uses a FRESH one-time key (unlinkable wraps)"
         );
-        // The seal inside is sender-signed; unwrap recovers the true sender.
         let u = unwrap(&recipient, &w1).expect("unwrap");
         assert_eq!(u.sender, sender.public_key());
     }
@@ -362,14 +345,10 @@ mod tests {
 
     #[test]
     fn test_tampered_seal_rejected() {
-        // The seal (kind-13) is sender-SIGNED, not just encrypted. Tampering
-        // the seal's content invalidates its id/sig; unwrap must reject it at
-        // verify_event (gift_wrap.rs:100), never deliver a forged rumor.
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
 
-        // Build the honest seal, then tamper with its content.
         let seal = ::nostr::nips::nip59::GiftWrapSealBuilder::new(rumor, recipient.public_key())
             .finalize(&sender)
             .expect("seal");
@@ -382,7 +361,6 @@ mod tests {
             "TAMPERED",
             seal.sig,
         );
-        // Wrap the tampered seal as a valid-looking gift wrap (ephemeral key).
         let ephemeral = Keys::generate();
         let content = encrypt(
             ephemeral.secret_key(),
@@ -405,9 +383,6 @@ mod tests {
 
     #[test]
     fn test_outer_urgency_tag() {
-        // bd-d0a7: one urgency bit on the OUTER 1059 wrap. An urgent DM
-        // carries the outer tag, a normal DM does not, and the sealed
-        // content stays undecryptable without the recipient key in both.
         let sender = sender_keys();
         let recipient = recipient_keys();
         let stranger = stranger_keys();
@@ -421,13 +396,10 @@ mod tests {
             .expect("normal wrap");
         assert!(!outer_urgency(&normal), "normal wrap carries no outer tag");
 
-        // Seal holds in both cases: a third party learns urgency but never
-        // content (email-importance-flag precedent).
         for wrapped in [&urgent, &normal] {
             assert!(decrypt(stranger.secret_key(), &wrapped.pubkey, &wrapped.content).is_err());
             assert!(!wrapped.content.contains("secret payload"));
         }
-        // The urgent wrap still unwraps for the real recipient.
         let unwrapped = unwrap(&recipient, &urgent).expect("unwrap urgent");
         assert_eq!(unwrapped.rumor.content, "secret payload");
     }
@@ -439,7 +411,6 @@ mod tests {
         let rumor = sample_rumor(sender.public_key());
         let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
         assert!(!wrapped.content.contains("secret payload"));
-        // Job kinds work through the same wrapper.
         let job_rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000_u64),

@@ -39,8 +39,6 @@ fn live_shapes() -> Value {
             }),
         );
     }
-    // Parity catalog must stay exactly the frozen surface (cross-checks the
-    // catalog_freshness gate from the shapes side).
     let parity = tool_catalog().expect("parity catalog builds");
     assert_eq!(parity.len(), 38, "parity catalog is 38 tools");
     for entry in &parity {
@@ -119,7 +117,6 @@ fn catalog_shapes_frozen() {
 
 #[test]
 fn catalog_shapes_tampered_shape_fails() {
-    // Bite-proof: a one-word description change must be reported as drift.
     let live = live_shapes();
     let frozen: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
     assert!(

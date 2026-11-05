@@ -418,8 +418,6 @@ pub const fn partition(action: &Action) -> ActionPartition {
         | Action::Reduce { .. }
         | Action::Loop { .. }
         | Action::Spawn { .. } => ActionPartition::EngineControl,
-        // bd-ynef: a park is engine control, not a host sink. It calls no
-        // provider; it hands the run a wake time and journals the intent.
         Action::Park { .. } => ActionPartition::EngineControl,
         Action::SendMessage { .. } | Action::SendDm { .. } => {
             ActionPartition::HostSink { sink: "mailbox" }
@@ -886,11 +884,6 @@ mod tests {
             .iter()
             .filter(|a| matches!(partition(a), ActionPartition::EngineControl))
             .count();
-        // bd-ynef: Action::Park joined EngineControl, so this is 10, not 9.
-        // Park is engine-owned control flow: the engine hands back
-        // "park until T" and re-drives at T. names.len() is unchanged at 16
-        // because Park already existed as a variant and only its partition
-        // moved, and unsupported is unaffected (react + call_webhook).
         assert_eq!(control, 10, "engine-owned control actions");
         let unsupported = actions
             .iter()
@@ -992,7 +985,6 @@ mod tests {
         assert_eq!(calls.get(), 1, "no retry on dispatch error");
         assert_eq!(err.code, ActionErrorCode::ProviderError);
         assert_eq!(err.stage, ActionStage::Effect);
-        // bd-zczp: timeout is ambiguous — Unknown + Reconcile, not Failed.
         assert_eq!(err.effect_state, Some(EffectState::Unknown));
         assert_eq!(err.disposition, Disposition::Reconcile);
         assert_eq!(err.kind, Some(FailureKind::Timeout));

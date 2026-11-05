@@ -32,8 +32,6 @@ use crate::config::Config;
 use crate::output::{ColorChoice, OutputFormat, render_json, stdout_is_tty};
 
 fn main() -> ExitCode {
-    // Exit codes (clig.dev, ADR-0003): 0 ok · 1 runtime · 2 usage (clap
-    // handles 2) · 3 doctor --check fails-closed.
     let cli = Cli::parse();
     match run(&cli) {
         Ok(code) => code,
@@ -45,20 +43,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
-    // Config precedence: --config flag > project ./.toron.toml > user config > system.
-    // Env vars layer above files (see Config::load).
     let cfg = Config::load(cli.globals.config.as_deref());
     let format = OutputFormat::from_globals(&cli.globals);
     let color = ColorChoice::from_globals(&cli.globals, stdout_is_tty());
 
-    // Robot mode global flags (bd-led.8.4): emit a JSON snapshot and exit.
-    // These short-circuit before the command dispatch so an agent driver can
-    // poll state without knowing the subcommand surface (ADR-0003).
     if cli.globals.robot_snapshot || cli.globals.robot_status || cli.globals.robot_capabilities {
         return run_robot_flag(&cli.globals, format);
     }
 
-    // A subcommand is required unless a robot flag short-circuited above.
     let Some(command) = &cli.command else {
         let mut cmd = <cli::Cli as clap::CommandFactory>::command();
         let _ = cmd.print_help();
@@ -138,9 +130,6 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             run_run_state(cmd, &cfg, format)?;
             ExitCode::SUCCESS
         }
-        // bd-reserve-with-lease-2lvt: dispatched BEFORE the robot arm — the
-        // child process runs in THIS process and cwd (a daemon cannot run
-        // it), and the wrapper must exit with the command's own code.
         Command::Reserve(crate::cli::ReserveCommand::WithLease(args)) => {
             with_lease::run_cli(args, cli.globals.dry_run)?
         }
@@ -160,17 +149,12 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Presence(_)
         | Command::Watch(_)
         | Command::Wait(_) => {
-            // Two-plane surface (ADR-0020 Spec 2): same in-process mailbox as
-            // the MCP server, but the Nostr plane as shell commands. Usage
-            // errors (unknown --as, --once without --timeout-ms) exit 2.
             match plane::run_plane_command(command) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) if e.downcast_ref::<plane::UsageError>().is_some() => {
                     eprintln!("toron: error: {e:#}");
                     ExitCode::from(2)
                 }
-                // Idle exit → 4 (documented extension): watch --live
-                // --idle-exit fired; a supervisor treats it as Died→respawn.
                 Err(e) if e.downcast_ref::<plane::IdleExit>().is_some() => {
                     eprintln!("toron: {e}");
                     ExitCode::from(4)
@@ -211,11 +195,6 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
     const ITERATIONS: u64 = 20;
     let mut latencies = Vec::with_capacity(ITERATIONS as usize);
 
-    // Non-startup cases measure the mailbox PRIMITIVE, not mailbox
-    // construction — build once, then time 20 iterations against the same
-    // instance (construction cost would otherwise dominate and skew the
-    // percentile report). `startup` measures construction itself, so it keeps
-    // a fresh demo_mailbox() per iteration.
     let mb = if args.case == cli::BenchCaseArg::Startup {
         None
     } else {
@@ -224,13 +203,8 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
 
     for _ in 0..ITERATIONS {
         let start = std::time::Instant::now();
-        // Each case measures the mailbox primitive's latency. Success/failure
-        // is irrelevant to the timing benchmark (a missing agent key or empty
-        // index still exercises the full dispatch path), so errors are
-        // swallowed — the report reflects the operation's cost.
         let _ = match args.case {
             cli::BenchCaseArg::Startup => {
-                // Mailbox construction (bus + SQLite) + health probe.
                 let _mb = toron_mcp::demo_mailbox().await;
                 Ok(())
             }
@@ -324,9 +298,6 @@ async fn run_serve(
 /// success, an error counter on failure.
 #[tokio::main]
 async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
-    // bd-pin-public-plane-s-easy.14: the robot path uses the SAME mailbox
-    // selector as flywheel — daemon when configured/serving, else the
-    // durable XDG root. No second in-process mailbox when the daemon serves.
     let source = crate::mailbox_source::MailboxSource::resolve().await?;
     let tool_name = operator::robot_tool_name(command);
     let start = std::time::Instant::now();
@@ -430,7 +401,6 @@ fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
 
 fn run_config(cfg: &Config, args: &cli::ConfigArgs, format: OutputFormat) -> anyhow::Result<()> {
     if args.sample {
-        // stdout = data: the annotated sample config (see examples/toron.sample.toml).
         println!("{}", include_str!("../examples/toron.sample.toml"));
         return Ok(());
     }
@@ -504,10 +474,6 @@ fn run_run_state(
         let pool = toron_core::index::schema::connect(db_path.to_str().unwrap()).await?;
         let store = RunStateStore::new(pool);
         let boundary = store.replay(&thread, seq).await?;
-        // The fork arm is dry by construction. There is no --perform flag
-        // here: an opt-in that this build cannot honour would be a flag that
-        // lies. The acknowledged `Perform` intent exists in the core for the
-        // host that owns the installer, and is reachable by naming the hazard.
         let value = match cmd {
             RunStateCommand::Replay(_) => serde_json::json!({
                 "thread": boundary.thread_id,
@@ -648,10 +614,8 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                     args.state
                 );
             }
-            // Boundary parse (ADR-0035 Spec 6): an empty corr fails loud.
             let corr = toron_core::mailbox::Corr::from_str(&args.corr)
                 .map_err(|e| anyhow::anyhow!("invalid --corr: {e}"))?;
-            // Host clock (ADR-0035 Spec 1): the store takes host time.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)

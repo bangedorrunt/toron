@@ -60,8 +60,6 @@ pub fn build_event(
 /// [`VerifyError::BadSignature`] when the signature does not check against the
 /// event pubkey.
 pub fn verify_event(event: &Event) -> Result<(), VerifyError> {
-    // bd-verify-once-ph7t: count wrap-envelope verifies only (the double-
-    // verified object); seal verifies inside unwrap are inherent to decrypt.
     #[cfg(test)]
     if event.kind == crate::nostr::Kind::GiftWrap {
         VERIFY_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -97,7 +95,6 @@ mod tests {
     use super::*;
     use crate::nostr::{SecretKey, Tag};
 
-    // Fixed test keypair: secret key 0x01 → known pubkey (NIP-19-style hex).
     fn test_keys() -> Keys {
         let sk =
             SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
@@ -129,8 +126,6 @@ mod tests {
         )
         .expect("build ok");
 
-        // Golden: fixed keypair (sk=0x01) + fixed created_at + fixed tags →
-        // fixed canonical event id. Captured from an independent build.
         assert_eq!(
             event.id.to_hex(),
             "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b"
@@ -139,10 +134,7 @@ mod tests {
             event.pubkey.to_hex(),
             "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
         );
-        // Canonical JSON must round-trip byte-identical (wire-compatible).
         let golden_json = r#"{"id":"b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1700000000,"kind":14,"tags":[["t","demo"],["p","f86c44a2de95d9149b51c6a29afeabba264c18e2fa7c49de93424a0c56947785"]],"content":"hello world""#;
-        // id + pubkey + created_at + kind + tags + content are the golden
-        // prefix; sig is BIP-340-randomized so strip it before comparing.
         let json = event.as_json();
         let (prefix, _sig) = json.split_at(json.rfind(r#","sig":"#).expect("sig field"));
         assert_eq!(prefix, golden_json);
@@ -168,7 +160,6 @@ mod tests {
             ts,
         )
         .expect("build ok");
-        // Same inputs → same canonical id (sig is randomized by BIP-340 aux-rand).
         assert_eq!(event.id, event2.id);
         assert_eq!(
             event.as_json()[..event.as_json().rfind(r#","sig":"#).unwrap()],
@@ -188,7 +179,6 @@ mod tests {
         )
         .expect("build ok");
 
-        // pubkey for secret key 0x01 is a fixed, well-known value.
         assert_eq!(
             event.pubkey.to_hex(),
             "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -222,7 +212,6 @@ mod tests {
         )
         .expect("build ok");
 
-        // Mutate content but keep id+sig → id no longer canonical.
         let forged = Event::new(
             event.id,
             event.pubkey,
@@ -250,7 +239,6 @@ mod tests {
         )
         .expect("build ok");
 
-        // Flip a byte in the signature (keep id + rest intact).
         let mut sig_bytes = event.sig.to_bytes();
         sig_bytes[0] ^= 0xFF;
         let bad_sig = crate::nostr::Signature::from_slice(&sig_bytes).expect("sig parse");
@@ -282,7 +270,6 @@ mod tests {
         )
         .expect("build ok");
 
-        // Add a tag → id no longer canonical.
         let mut tags = event.tags.clone();
         tags.push(Tag::parse(["t", "forged"]).expect("tag"));
         let forged = Event::new(

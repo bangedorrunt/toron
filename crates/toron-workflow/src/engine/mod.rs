@@ -37,8 +37,6 @@ use leaf::LeafSeams;
 
 use serde::{Deserialize, Serialize};
 
-// Re-export the split-out surface exactly as the former single file exposed it
-// (lib.rs + toron-mcp/cli/e2e import via `engine::*` — zero external edits).
 pub use boundary::{
     ActionErrorCode, ActionFailure, ActionInvocation, ActionOutcome, ActionPartition, ActionStage,
     DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EvidenceRef,
@@ -48,11 +46,6 @@ pub use boundary::{
     invoke_compat, is_failure_value, normalize_dispatch_result, partition,
 };
 pub use control_flow::{build_workflow_run_terminal, stamp_workflow_emitted};
-// bd-engine-run-path-journaling-fwlx: the effect-journal bypass markers are
-// part of the contract an embedding reports against — an injected
-// `EffectRunner` that does not cover a host sink must carry the SAME marker the
-// engine's own fall-through uses, or the ledger grows two vocabularies for one
-// gap.
 pub use control_flow::{EFFECT_JOURNAL_BYPASSED, EFFECT_JOURNAL_SINK_UNCOVERED};
 pub use reconcile::{
     CleanupKind, CleanupRequest, DispatchPlan, EffectView, FORCED_CLEANUP_CAPABILITY,
@@ -649,8 +642,6 @@ impl WorkflowEngine {
         LeafSeams {
             async_runner: self.async_effect_runner.clone(),
             sync_runner: self.effect_runner.clone(),
-            // The engine's own sink is the seam's verify surface: a verify
-            // leaf projects through the SAME sink the embedding installed.
             verify_sink: self.verify_sink.clone(),
             journal_mode: self.journal_mode,
         }
@@ -702,8 +693,6 @@ impl WorkflowEngine {
         trigger: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let at = drive::now_ms();
-        // A child trigger carries `inputs`; bind the callee's declared defaults
-        // exactly like `invoke` does (a provided value always wins).
         let mut trigger = trigger;
         if let Some(inputs) = trigger
             .get("inputs")

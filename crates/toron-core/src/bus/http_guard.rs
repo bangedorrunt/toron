@@ -17,7 +17,6 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => {
-            // IPv4-mapped-IPv6 (::ffff:a.b.c.d) — check the embedded IPv4.
             if let Some(v4) = ipv4_mapped_to_v4(v6) {
                 return is_private_v4(v4);
             }
@@ -29,7 +28,6 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 /// Resolve `::ffff:a.b.c.d` (IPv4-mapped-IPv6) to the embedded IPv4.
 const fn ipv4_mapped_to_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     match v6.octets() {
-        // ::ffff:0:0/96
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d] => Some(Ipv4Addr::new(a, b, c, d)),
         _ => None,
     }
@@ -40,17 +38,11 @@ const fn ipv4_mapped_to_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 fn is_private_v4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     match octets {
-        // Loopback 127.0.0.0/8
         [127, ..] => true,
-        // RFC1918 10.0.0.0/8
         [10, ..] => true,
-        // RFC1918 172.16.0.0/12
         [172, b, ..] if (16..=31).contains(&b) => true,
-        // RFC1918 192.168.0.0/16
         [192, 168, ..] => true,
-        // Link-local 169.254.0.0/16
         [169, 254, ..] => true,
-        // CGNAT 100.64.0.0/10 (RFC 6598)
         [100, b, ..] if (64..=127).contains(&b) => true,
         _ => false,
     }
@@ -59,17 +51,13 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
 /// Link-local IPv6 (fe80::/10) and unique-local (fc00::/7) + loopback (::1).
 fn is_private_v6(ip: Ipv6Addr) -> bool {
     let octets = ip.octets();
-    // Loopback ::1
     if ip == Ipv6Addr::LOCALHOST {
         return true;
     }
-    // Link-local fe80::/10 → first byte fe or ff? fe80::/10 = 1111111010
-    // first 10 bits: 0xfe80/16 covers it (0xFE80..0xFEBF).
     let first16 = u16::from_be_bytes([octets[0], octets[1]]);
     if (0xfe80..=0xfebf).contains(&first16) {
         return true;
     }
-    // Unique-local fc00::/7 → first byte fc or fd.
     if octets[0] == 0xfc || octets[0] == 0xfd {
         return true;
     }
@@ -127,10 +115,8 @@ mod tests {
 
     #[test]
     fn test_cgnat_private() {
-        // 100.64.0.0/10 (RFC 6598)
         assert!(is_private_ip(parse("100.64.0.1")));
         assert!(is_private_ip(parse("100.127.255.254")));
-        // 100.63.x is NOT CGNAT.
         assert!(!is_private_ip(parse("100.63.0.1")));
         assert!(!is_private_ip(parse("100.128.0.1")));
     }
@@ -144,11 +130,9 @@ mod tests {
 
     #[test]
     fn test_ipv4_mapped_ipv6_private() {
-        // ::ffff:10.0.0.1 → RFC1918 private.
         assert!(is_private_ip(parse("::ffff:10.0.0.1")));
         assert!(is_private_ip(parse("::ffff:127.0.0.1")));
         assert!(is_private_ip(parse("::ffff:192.168.1.1")));
-        // ::ffff:8.8.8.8 → public.
         assert!(!is_private_ip(parse("::ffff:8.8.8.8")));
     }
 
@@ -203,7 +187,6 @@ mod tests {
             assert!(is_private_ip(ip), "{url} host {host} must be blocked");
         }
 
-        // Allowed literals (public IPv4 / IPv6; bracket the IPv6).
         let allowed = ["http://8.8.8.8/x", "http://[2001:4860:4860::8888]/x"];
         for url in allowed {
             let host = url

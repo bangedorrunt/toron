@@ -53,22 +53,17 @@ mod tests {
 
     #[test]
     fn hour_buckets_window_and_edges() {
-        let now = 100 * HOUR + 60; // one minute into hour 100
-        // The 3-hour window is [98, 99, 100]: one event this hour, one two
-        // hours ago, and one five hours ago (outside the window entirely).
+        let now = 100 * HOUR + 60;
         let ts = vec![now, now - 2 * HOUR, now - 5 * HOUR, now - HOUR];
         let buckets = hour_buckets(&ts, now, 3);
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets, vec![1, 1, 1], "oldest bucket first, now last");
-        // out-of-window events are dropped, never counted into a wrong bucket
         assert_eq!(
             hour_buckets(&[now - 5 * HOUR], now, 3),
             vec![0, 0, 0],
             "an event older than the window is not shown"
         );
-        // a future timestamp clamps into the newest bucket instead of panicking
         assert_eq!(hour_buckets(&[now + 10 * HOUR], now, 3), vec![0, 0, 1]);
-        // empty window never divides by zero
         assert_eq!(hour_buckets(&[], now, 1), vec![0]);
     }
 
@@ -77,7 +72,6 @@ mod tests {
         assert_eq!(bar_widths(&[1, 2, 4], 10), vec![2, 5, 10]);
         assert_eq!(bar_widths(&[0, 0], 10), vec![0, 0]);
         assert_eq!(bar_widths(&[], 10), Vec::<u16>::new());
-        // max_width 0 is a no-op, never a division by zero
         assert_eq!(bar_widths(&[3], 0), vec![0]);
     }
 

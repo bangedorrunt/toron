@@ -19,9 +19,6 @@ use super::{ToolOutput, ToolServer, nonneg_secs};
 
 #[tool_router(router = reservation_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // FILE RESERVATIONS (5)
-    // ------------------------------------------------------------------
 
     /// `check_file_reservation_conflicts` (read-only): symmetric-glob report.
     #[tool(
@@ -52,8 +49,6 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<FileReservationPathsArgs>,
     ) -> ToolOutput {
-        // Additive optional: CLI `reserve transfer` composes this existing
-        // tool so the daemon runs the atomic release+acquire helper.
         if let Some(from) = args.transfer_from.as_deref().filter(|s| !s.is_empty()) {
             let Some(path) = args.paths.first() else {
                 return ToolOutput::err("transfer via file_reservation_paths needs paths[0]");
@@ -230,10 +225,6 @@ impl ToolServer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct CheckFileReservationConflictsArgs {
     pub project_key: String,
@@ -292,10 +283,6 @@ pub struct ReleaseFileReservationsByReasonArgs {
     pub bead_id: String,
     pub notify_previous: Option<bool>,
 }
-
-// ---------------------------------------------------------------------------
-// bd-locks-list-daemon-xetz — additive read tool types
-// ---------------------------------------------------------------------------
 
 /// `list_file_reservations` args (additive read).
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]

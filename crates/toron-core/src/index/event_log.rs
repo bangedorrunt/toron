@@ -52,9 +52,6 @@ impl EventLog {
         payload: &str,
         ts_us: i64,
     ) -> anyhow::Result<i64> {
-        // Single retry on generation contention (UNIQUE): re-read max and
-        // re-insert. Single-writer discipline makes this a rarity, never
-        // the path.
         for _ in 0..3 {
             let mut tx = self.pool.begin().await?;
             match self
@@ -110,7 +107,6 @@ impl EventLog {
         .execute(&mut **tx)
         .await?;
         if inserted.rows_affected() == 0 {
-            // Lost the event_id race after the pre-check: read the winner.
             return self
                 .existing_in(tx, event_id)
                 .await?
@@ -358,7 +354,6 @@ mod tests {
     async fn duplicate_append_is_commutative_noop() {
         let (log, _p) = log("dedupe").await;
         let g = log.append("e1", "k", "{\"v\":1}", 10).await.expect("a1");
-        // Same id, different payload: stored row wins, manifest unmoved.
         assert_eq!(log.append("e1", "k", "{\"v\":2}", 11).await.expect("a2"), g);
         assert_eq!(log.generation().await.expect("gen"), g);
         let rows = log.read_since(0).await.expect("read");

@@ -1,7 +1,4 @@
 // governed-by: ADR-0003
-// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
-// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
-// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-led.8.4 acceptance: robot-mode global flags + bench.
 //!
@@ -64,9 +61,6 @@ fn robot_capabilities_emits_valid_json() {
     assert_eq!(clusters.len(), 9, "9 AM-Rust clusters");
     assert!(clusters["messaging"].is_array());
     assert!(v["json"].as_bool().unwrap(), "json capability advertised");
-    // ADR-0020 Spec 3: the CLI Nostr plane nouns are shell verbs, not MCP
-    // tools. They MUST be advertised under the `cli` cluster — and the MCP
-    // tool cluster count stays 9 (39 tools frozen).
     let cli = v["cli"].as_object().expect("cli cluster");
     let flat: Vec<&str> = cli
         .values()
@@ -97,8 +91,6 @@ fn robot_snapshot_emits_valid_json() {
 
 #[test]
 fn robot_flag_works_without_subcommand() {
-    // --robot-* must short-circuit; a bare `toron --robot-status` (no
-    // subcommand) must NOT hit the "requires a subcommand" error.
     let out = run(&["--robot-status"]);
     assert!(out.status.success(), "robot flag needs no subcommand");
     parse(&out.stdout);

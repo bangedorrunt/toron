@@ -90,13 +90,13 @@ pub fn fold_strict(rows: &[EnvelopeRow]) -> Result<HashMap<String, ReceiptState>
                     row.corr
                 ));
             }
-            (Some(ReceiptState::Resulted), _) => {} // terminal: ignore
+            (Some(ReceiptState::Resulted), _) => {}
             (Some(_), ReceiptState::Resulted) => {
                 states.insert(row.corr.clone(), ReceiptState::Resulted);
             }
-            (Some(ReceiptState::Acked), ReceiptState::Owed) => {} // ignore downgrade
-            (Some(ReceiptState::Degraded), ReceiptState::Owed) => {} // never re-owed
-            (Some(ReceiptState::Acked), ReceiptState::Degraded) => {} // ack wins
+            (Some(ReceiptState::Acked), ReceiptState::Owed) => {}
+            (Some(ReceiptState::Degraded), ReceiptState::Owed) => {}
+            (Some(ReceiptState::Acked), ReceiptState::Degraded) => {}
             (Some(_), next) => {
                 states.insert(row.corr.clone(), next);
             }
@@ -105,8 +105,6 @@ pub fn fold_strict(rows: &[EnvelopeRow]) -> Result<HashMap<String, ReceiptState>
     Ok(states)
 }
 
-// ponytail: table cases live in the fold tests; store tests pin the two
-// guards v2 relies on. v2-owned gaps go to follow-on beads, not here.
 #[cfg(test)]
 mod journal_envelope_tests {
     use super::*;
@@ -174,9 +172,9 @@ mod journal_envelope_tests {
         let rows = vec![
             row("c1", ReceiptState::Owed, Some(1)),
             row("c1", ReceiptState::Acked, Some(2)),
-            row("c1", ReceiptState::Owed, Some(3)), // ignored downgrade
+            row("c1", ReceiptState::Owed, Some(3)),
             row("c1", ReceiptState::Resulted, Some(4)),
-            row("c1", ReceiptState::Acked, Some(5)), // ignored past terminal
+            row("c1", ReceiptState::Acked, Some(5)),
         ];
         let map = fold_strict(&rows).expect("folds");
         assert_eq!(map["c1"], ReceiptState::Resulted);
@@ -205,7 +203,6 @@ mod journal_envelope_tests {
         use std::str::FromStr;
         let (pool, _path) = test_pool("guards").await;
         let store = ReceiptStore::new(pool);
-        // Fixed host clock (ADR-0035 Spec 1): no wall reads in tests either.
         let now = 7001;
         let c1 = Corr::from_str("c1").expect("corr");
         store

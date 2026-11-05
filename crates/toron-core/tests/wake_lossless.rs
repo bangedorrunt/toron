@@ -53,7 +53,6 @@ impl Fixture {
     async fn new(name: &str) -> Self {
         let tag = format!("{}-{}-{}", name, std::process::id(), uuid::Uuid::new_v4());
         let db = std::env::temp_dir().join(format!("toron-wake-lossless-{tag}.sqlite"));
-        // Unix socket paths are short on macOS: keep this one compact.
         let sock = std::env::temp_dir().join(format!(
             "twl-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -222,10 +221,6 @@ fn legacy_cursor(ev: &Event) -> String {
     format!("{}:{}", ev.created_at.as_secs(), ev.id.to_hex())
 }
 
-// ---------------------------------------------------------------------------
-// Finding (b): resume more than 1000 rows behind.
-// ---------------------------------------------------------------------------
-
 /// REPRO (b): flywheel's 2655-row resume, from a cursor at the very first
 /// row. Before the fix 1000 rows came back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -287,10 +282,6 @@ async fn control_a_resume_inside_the_newest_window_was_always_exact() {
     assert_eq!(seen.ids, ids(&history[1001..]));
 }
 
-// ---------------------------------------------------------------------------
-// Finding (a): live burst loss.
-// ---------------------------------------------------------------------------
-
 /// REPRO (a): a live burst inside one second. Before the fix about half of
 /// it was suppressed by the `(created_at, id)` cursor, with no frame at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -340,10 +331,6 @@ async fn control_a_live_burst_in_distinct_seconds_was_always_whole() {
     let seen = client.live(burst.len(), Duration::from_secs(20)).await;
     assert_eq!(seen.ids, ids(&burst));
 }
-
-// ---------------------------------------------------------------------------
-// Explicit gap: the one case the store cannot replay.
-// ---------------------------------------------------------------------------
 
 /// Pretend the cap evicted arrivals up to `through` (prune's own recording is
 /// pinned in the event_store unit tests; this drives the frame).

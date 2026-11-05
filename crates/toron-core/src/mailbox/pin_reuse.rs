@@ -184,7 +184,6 @@ impl Mailbox {
         gate.verify_schnorr(proof, &claim, &mut NonceStore::new(pool), Timestamp::now())
             .await
             .map_err(|e| anyhow::anyhow!("proof of possession for pin {pin} refused: {e}"))?;
-        // Proven: the custodian copy of that key becomes this project's key.
         let keys = self.agent_keys_for(&from, pin)?;
         if keys.public_key().to_hex() != anchor {
             anyhow::bail!("pin {pin}: the key file in {from} does not match its registered key");
@@ -273,7 +272,6 @@ mod tests {
             .expect("reuse");
         assert_eq!(b.npub, a.npub, "the SAME npub, not a second key");
         assert!(!b.created);
-        // Idempotent afterwards: a plain upsert in beta keeps the key.
         let again = mb
             .register_agent("beta", &profile("AmberFox"))
             .await
@@ -307,7 +305,6 @@ mod tests {
                 "{e}"
             );
         }
-        // A proof for ANOTHER project does not open this one.
         let for_gamma = mb
             .prove_pin_possession("alpha", "AmberFox", "gamma")
             .await
@@ -331,7 +328,6 @@ mod tests {
         mb.register_agent("alpha", &profile("BirchOwl"))
             .await
             .expect("other pin");
-        // BirchOwl's key signs a claim for AmberFox's npub: wrong signer.
         let birch = mb.agent_keys_for("alpha", "BirchOwl").unwrap();
         let amber_hex = mb
             .agent_keys_for("alpha", "AmberFox")
@@ -360,7 +356,6 @@ mod tests {
             .expect_err("forged")
             .to_string();
         assert!(e.contains("pin AmberFox") && e.contains("refused"), "{e}");
-        // Tampered content (signature no longer matches) is refused too.
         let mut tampered = mb
             .prove_pin_possession("alpha", "AmberFox", "beta")
             .await
@@ -371,7 +366,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        // Replay: the first use passes, the second is refused.
         let good = mb
             .prove_pin_possession("alpha", "AmberFox", "beta")
             .await
@@ -475,8 +469,6 @@ mod tests {
         mb.register_agent("beta", &profile("SplitCat"))
             .await
             .unwrap();
-        // A legacy split, written as it existed before W2 (triggers off for
-        // the fixture only, then back on).
         let pool = mb.index_pool().unwrap().clone();
         sqlx::query("DROP TRIGGER agents_one_key_per_pin_insert")
             .execute(&pool)

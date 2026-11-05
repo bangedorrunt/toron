@@ -93,8 +93,6 @@ fn known_carries_the_control_class_and_it_is_not_interchangeable() {
             "{name}@1 is a KNOWN Control contract"
         );
     }
-    // A Control contract sent under another class is refused by name, before
-    // its body is read: the class is part of the contract, not a hint.
     for name in &control {
         let e = env(
             SYS,
@@ -119,8 +117,6 @@ fn known_carries_the_control_class_and_it_is_not_interchangeable() {
 #[tokio::test]
 async fn an_urgent_steer_in_the_log_drives_the_smaller_ring_budget() {
     let s = store("urgent").await;
-    // A lead whose holder is the steering key, so this holds with or without
-    // the F7 holder fence: the steer is the holder's at the current epoch.
     s.append_envelope(&env(
         OP,
         0,
@@ -134,11 +130,9 @@ async fn an_urgent_steer_in_the_log_drives_the_smaller_ring_budget() {
     .await
     .expect("operator opens the lead");
 
-    // Nothing unread: normal.
     let empty = s.next(CREW, None, true).await.unwrap();
     assert_eq!(urgency(&empty.items), Urgency::Normal);
 
-    // A normal steer is normal.
     s.append_envelope(&env(
         SYS,
         0,
@@ -155,7 +149,6 @@ async fn an_urgent_steer_in_the_log_drives_the_smaller_ring_budget() {
     assert_eq!(urgency(&batch.items), Urgency::Normal);
     assert_eq!(urgency(&batch.items).max_rings(), MAX_RINGS);
 
-    // An urgent steer, read back from the log, is urgent: the smaller budget.
     s.append_envelope(&env(
         SYS,
         1,
@@ -174,8 +167,6 @@ async fn an_urgent_steer_in_the_log_drives_the_smaller_ring_budget() {
     assert_eq!(urgency(&batch.items).max_rings(), MAX_RINGS_URGENT);
     const { assert!(MAX_RINGS_URGENT < MAX_RINGS) };
 
-    // A cancel carries no priority: the contract refuses the field rather
-    // than letting it read as urgent.
     let err = s
         .append_envelope(&env(
             SYS,
@@ -201,8 +192,6 @@ async fn an_urgent_steer_in_the_log_drives_the_smaller_ring_budget() {
 #[tokio::test]
 async fn a_captain_notice_rides_escalate_as_control_and_is_not_urgent() {
     let s = store("notice").await;
-    // The deaf notice's context is per notice (`<project>:<key>`), never a
-    // governed crew context, so the role-less system producer may append.
     let notice_ctx = "proj:deaf-captain:aa01:7";
     let notice = env(
         SYS,
@@ -228,8 +217,6 @@ async fn a_captain_notice_rides_escalate_as_control_and_is_not_urgent() {
         .expect("the captain has the notice");
     assert_eq!(item.envelope.class, Class::Control);
     assert_eq!(item.envelope.contract, ContractId::new("escalate", 1));
-    // A notice is not a steer: it does not take the urgent budget, even when
-    // its prose says "urgent".
     assert_eq!(urgency(&batch.items), Urgency::Normal);
 
     let loud = env(

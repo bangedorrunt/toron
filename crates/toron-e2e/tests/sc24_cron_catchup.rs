@@ -1,5 +1,4 @@
 // governed-by: ADR-0005 (P4.3/P4.7 — scheduler durability, Behavior Test
-// Matrix row `cron_catchup`)
 #![forbid(unsafe_code)]
 
 //! SC-24 — `cron_catchup` (Behavior Test Matrix row, ADR-0005 Spec 3).
@@ -27,9 +26,8 @@ const EVERY_MINUTE: &str = "0 * * * * *";
 /// `now` — a single tick, not every missed one.
 #[test]
 fn sc24_catchup_selects_latest_due_tick_only() {
-    // last_fired = 2026-01-01T00:00:00Z. due ticks at :00 every minute.
-    let last_fired = 1_767_225_600i64; // 2026-01-01T00:00:00Z
-    let now = last_fired + 3 * 60; // three minutes of "downtime" → 4 due ticks missed
+    let last_fired = 1_767_225_600i64;
+    let now = last_fired + 3 * 60;
 
     let catch_up = latest_due_at_or_before(EVERY_MINUTE, last_fired, now)
         .expect("a catch-up tick exists after downtime");
@@ -49,7 +47,6 @@ fn sc24_catchup_selects_latest_due_tick_only() {
         "catch-up tick is strictly after last_fired (no re-fire of an already-run tick): {catch_up} > {last_fired}"
     );
 
-    // The catch-up is ONE tick — the next due after it is in the future.
     let next_after = next_due(EVERY_MINUTE, catch_up).expect("next tick after catch-up");
     assert!(
         next_after > now,

@@ -35,8 +35,6 @@ use super::spawn::{SpawnSpec, unknown_profile_error};
 use super::template::render_action_lenient;
 
 /// Where one run is in the linear model.
-// The phase carries the spawn spec by value: that record IS the persisted park,
-// and boxing it would make the restart path indirect for no gain.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "phase")]
@@ -201,8 +199,6 @@ impl RunPlan {
         let mut entries: Vec<PlanEntry> = Vec::new();
         for (index, step) in workflow.steps.iter().enumerate() {
             match &step.action {
-                // bd-loop-rewrites-fap8: a bounded loop expands into a marker,
-                // its body entries, and a static end that jumps back or out.
                 Action::Loop { body, .. } => {
                     let marker = entries.len();
                     entries.push(PlanEntry::Loop {
@@ -504,9 +500,6 @@ pub fn advance_with(
             };
             let name = step_name(&step, authored);
             if step.on_error == StepOnError::FailRun && is_failure_value(value) {
-                // The executor's fail_run arm already returns the enriched
-                // bundle; a guard/render refusal does not, so build it here with
-                // the ONE builder.
                 let output = if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
                     value.clone()
                 } else {
@@ -528,8 +521,6 @@ pub fn advance_with(
             (next, effects)
         }
         RunMsg::Woke { now_ms } => {
-            // A spawn-await deadline is the one park whose wake can FAIL the
-            // node, so it is handled before the delay arm.
             if let RunPhase::AwaitingSpawn {
                 node,
                 spec,
@@ -601,7 +592,6 @@ pub fn advance_with(
                 return (next, Vec::new());
             };
             if &awaiting != node {
-                // A settlement for another node/key is stale.
                 return (next, Vec::new());
             }
             let landed = serde_json::json!({
@@ -638,9 +628,6 @@ pub fn advance_with(
             };
             let name = step_name(&step, authored);
             next.outputs.insert(name, decision.clone());
-            // Parity with the old linear Context path (control_flow.rs:995):
-            // the decision is published under the node name AND the canonical
-            // `decision` alias, so template refs written either way resolve.
             next.outputs.insert("decision".into(), decision.clone());
             next.step_index += 1;
             next.phase = RunPhase::Running;
@@ -668,7 +655,6 @@ pub(crate) fn next_effects(
         };
         match entry {
             PlanEntry::Step { authored, step } => {
-                // A reduce is PURE: the fold computes it, no host effect.
                 if let Action::Reduce { .. } = &step.action {
                     let name = step_name(step.as_ref(), authored);
                     let value = crate::engine::reduce::evaluate(
@@ -720,8 +706,6 @@ pub(crate) fn next_effects(
                         model.phase = RunPhase::Running;
                     }
                     Err(error) => {
-                        // Defensive: admission resolved the bound before any
-                        // row, so this only fires on a corrupted definition.
                         let value = serde_json::json!({ "ok": false, "error": error });
                         let fail_run = step
                             .as_ref()
@@ -766,21 +750,17 @@ pub(crate) fn next_effects(
                     .as_deref()
                     .map(|guard| evaluate_pure_guard(guard, &model.trigger, &model.outputs));
                 let exited = match verdict {
-                    // `until` true stops the loop with the pass count.
                     Some(PureGuard::True) => Some(serde_json::json!({
                         "ok": true,
                         "iterations": progress.iteration,
                         "stopped": "until",
                     })),
-                    // A guard that cannot be decided is a loop failure, never
-                    // a silent extra pass.
                     Some(PureGuard::Error(error)) => Some(serde_json::json!({
                         "ok": false,
                         "error": error,
                         "iterations": progress.iteration,
                     })),
                     Some(PureGuard::False) => None,
-                    // No `until`: the bound alone ends the loop.
                     None => None,
                 };
                 let exited = exited.or_else(|| {
@@ -806,7 +786,6 @@ pub(crate) fn next_effects(
                         model.outputs.insert(name.clone(), value.clone());
                         if failed && fail_run {
                             let mut output = fail_run_value(&name, &value, None);
-                            // The exhaustion bundle keeps its pass count.
                             if let Some(iterations) = value.get("iterations") {
                                 output["iterations"] = iterations.clone();
                             }
@@ -847,13 +826,10 @@ pub(crate) fn next_effects(
                 );
                 match evaluate_pure_guard(&guard, &model.trigger, &model.outputs) {
                     PureGuard::True => {
-                        // Enter the then arm; its ArmEnd also handles an
-                        // empty arm, so the two cases share one layout.
                         model.step_index += 1;
                         model.phase = RunPhase::Running;
                     }
                     PureGuard::False => {
-                        // Skip the then entries and their ArmEnd.
                         model.step_index += then_len + 2;
                         model.phase = RunPhase::Running;
                     }
@@ -876,8 +852,6 @@ pub(crate) fn next_effects(
                             };
                             return vec![RunEffect::Fail { step: name, output }];
                         }
-                        // `on_error: continue`: land the failure value and
-                        // skip both arms, exactly like a failed leaf.
                         model.step_index += then_len + else_len + 3;
                         model.phase = RunPhase::Running;
                     }
@@ -995,11 +969,7 @@ fn step_effects(
             no_claim_timeout: _,
             context: _,
         } => {
-            // The spec table is plan-entry aligned, so an arm spawn resolves
-            // from its entry position (bd-engine-facade-74nw).
             let Some(spec) = spawns.get(model.step_index).and_then(Option::as_ref) else {
-                // Design (f): a profile that cannot be prepared is a step
-                // VALUE, never a run failure.
                 let error = unknown_profile_error(profile);
                 model.outputs.insert(
                     name.clone(),
@@ -1010,7 +980,6 @@ fn step_effects(
                 return next_effects(model, now_ms, spawns);
             };
             if !*await_ {
-                // Fire-and-forget: the job is published, the run does not park.
                 model.outputs.insert(
                     name.clone(),
                     serde_json::json!({ "ok": true, "spawned": true }),
@@ -1051,9 +1020,6 @@ fn step_effects(
                     iteration,
                 }];
             }
-            // Unreachable through `advance(RunMsg::Start)`, which refuses the
-            // shape first. Kept so a direct caller cannot mistake a control
-            // action for a host step.
             let error = format!(
                 "step '{name}' uses '{}', which the linear model cannot sequence",
                 action.type_name()
@@ -1099,10 +1065,6 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
     }
     for (index, step) in workflow.steps.iter().enumerate() {
         match &step.action {
-            // bd-durable-branch-hhgc: a branch is a choice inside the linear
-            // plan. Its guard must be decidable from trigger + outputs (the
-            // fold has no host), and its arms must be plain host-sink leaves
-            // — nested control flow is a later shape, not a silent sub-run.
             Action::Branch {
                 if_guard,
                 then,
@@ -1129,7 +1091,6 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                     }
                 }
             }
-            // bd-loop-rewrites-fap8: a bounded loop is a linear-plan entry.
             Action::Loop { max, until, body } => {
                 let literal = max.trim().parse::<u64>().is_ok();
                 let template = max.trim().starts_with("{{") && max.trim().ends_with("}}");
@@ -1260,9 +1221,6 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
                 step: Box::new(step.clone()),
                 iteration: current_iteration(model),
             }],
-            // A marker is consumed by the next transition; `resume` advances
-            // one before it asks for effects, so this is unreachable for a
-            // model the fold wrote.
             None => Vec::new(),
         },
     }
@@ -1273,10 +1231,6 @@ fn step_name(step: &Step, index: usize) -> String {
         .clone()
         .unwrap_or_else(|| format!("step_{}", index + 1))
 }
-
-// ---------------------------------------------------------------------------
-// Graph run model (bd-durable-graph-impl-r2x1)
-// ---------------------------------------------------------------------------
 
 /// The largest `retry:` policy the scheduler will honor
 /// (bd-durable-retry-policy-rrck). A typo cannot park a run for days.
@@ -1662,10 +1616,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
             value,
             now_ms,
         } => {
-            // A wave can already be terminal when this arrives: a `fail_run`
-            // render refusal returns its `Fail` while earlier nodes of the same
-            // wave are already dispatched. A late result must never land an
-            // output on a failed run or schedule a wave over it.
             if next.is_terminal() {
                 return (next, Vec::new());
             }
@@ -1681,9 +1631,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 .and_then(|g| g.nodes.get(node))
                 .cloned();
             let on_error = node_def.as_ref().map(|n| n.on_error);
-            // A `retry:` node carries its own policy; a plain node falls back
-            // to the scheduler default (3 attempts, exponential backoff).
-            // bd-durable-retry-policy-rrck.
             let retry_policy = node_def.as_ref().and_then(|n| match &n.action {
                 Action::Retry {
                     max_attempts,
@@ -1693,8 +1640,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 _ => None,
             });
             let failed = is_failure_value(value);
-            // A policy node retries ANY failure; a plain node keeps the
-            // scheduler's rule (retryable kinds only, and only on fail_run).
             let retrying = failed
                 && match retry_policy {
                     Some(_) => true,
@@ -1731,7 +1676,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                     );
                 }
             }
-            // Land unless this is a failure the node's `on_error` fails on.
             if !failed || on_error != Some(StepOnError::FailRun) {
                 next.outputs.insert(node.clone(), value.clone());
                 next.node_state.insert(node.clone(), NodeState::Settled);
@@ -1744,8 +1688,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 .unwrap_or("")
                 .to_string();
             if retrying {
-                // Exhausted a retry path: the bundle reports the attempt
-                // count (bd-durable-retry-policy-rrck).
                 let disposition =
                     disposition_for_kind(&kind, value.get("disposition").and_then(|v| v.as_str()));
                 let fail = GraphFail {
@@ -1765,9 +1707,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 };
                 return (next, vec![GraphEffect::Fail { fail }]);
             }
-            // A bare refusal (guard/render) is enriched here, exactly as the
-            // linear fold does; a value that already carries the terminal
-            // bundle passes through unchanged.
             let output = if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
                 value.clone()
             } else {
@@ -1836,8 +1775,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                         next.node_state.insert(node, NodeState::Settled);
                     }
                     NodeParkReason::Retry => {
-                        // The retry re-snapshots at re-dispatch, exactly as the
-                        // old scheduler cloned `outputs` again on the re-spawn.
                         let inputs = next.outputs.clone();
                         next.node_state.insert(
                             node.clone(),
@@ -1911,7 +1848,6 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 .unwrap_or("")
                 .to_string();
             if on_error != Some(StepOnError::FailRun) {
-                // `continue`: land the child's FULL failure bundle.
                 next.outputs.insert(node.clone(), output.clone());
                 next.node_state.insert(node.clone(), NodeState::Settled);
                 let mut effects = vec![GraphEffect::ChildJoin {
@@ -2045,8 +1981,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
         return Vec::new();
     }
     loop {
-        // Refresh per wave: a foreach expansion writes new nodes into the
-        // model's graph, so the next round must see them.
         let Some(graph) = model.workflow.graph.clone() else {
             return Vec::new();
         };
@@ -2070,8 +2004,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
             .collect();
         if ready.is_empty() {
             if !model.has_pending() {
-                // Every remaining node is settled; the terminal check above
-                // covers the all-settled case, so this is a defensive stall.
                 model.phase = GraphPhase::Succeeded;
                 return vec![GraphEffect::Complete {
                     output: serde_json::Value::Object(outputs_map(&model.outputs)),
@@ -2100,11 +2032,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
             }];
         }
 
-        // bd-durable-foreach-jpgx: a ready `foreach` marker expands into one
-        // node per item BEFORE the wave dispatches. The list is read here, in
-        // the fold, from trigger + outputs — the same pure inputs the rest of
-        // the scheduler uses. The expansion is persisted with the model, so a
-        // restart resumes the same copies.
         let mut expanded = false;
         {
             let mut expanded_graph = graph.clone();
@@ -2168,7 +2095,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     }
                 };
                 if items.is_empty() {
-                    // `run_foreach` over an empty list is an empty collection.
                     model
                         .outputs
                         .insert(name.clone(), serde_json::Value::Array(Vec::new()));
@@ -2180,8 +2106,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                 for (i, item) in items.into_iter().enumerate() {
                     let copy = copies[i].clone();
                     if expanded_graph.nodes.contains_key(&copy) {
-                        // Lowering refuses this; a hand-edited model fails
-                        // closed instead of overwriting a node.
                         let error = format!("foreach copy '{copy}' already exists");
                         model.phase = GraphPhase::Failed {
                             error: error.clone(),
@@ -2210,7 +2134,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     model.node_state.insert(copy.clone(), NodeState::Pending);
                     model.items.insert(copy, item);
                 }
-                // The marker becomes the join over its copies.
                 if let Some(join) = expanded_graph.nodes.get_mut(name) {
                     join.needs = copies;
                 }
@@ -2224,8 +2147,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
 
         model.wave += 1;
         let wave = model.wave;
-        // The spawn-time snapshot: a node never sees a same-wave sibling that
-        // finished first, exactly like the old scheduler's `outputs.clone()`.
         let snapshot = model.outputs.clone();
         let snapshot_map = outputs_map(&snapshot);
         let mut effects = Vec::new();
@@ -2233,9 +2154,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
 
         for name in &ready {
             let node = &graph.nodes[name];
-            // Required change 1 (Captain review): the planning render runs HERE,
-            // when the wave is scheduled, so its failure keeps the old shape and
-            // the rest of the wave is never spawned.
             if let Err(e) = render_action_lenient(&node.action, &model.trigger, &snapshot_map) {
                 let error = format!("render: {e}");
                 if node.on_error == StepOnError::FailRun {
@@ -2284,8 +2202,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     dispatched += 1;
                 }
                 Action::RequestApproval { message } => {
-                    // Required change 2 (Captain review): the fold builds the
-                    // same evidence payload the old graph approval publishes.
                     let payload = build_approval_payload(
                         &model.run_id,
                         &model.workflow.name,
@@ -2309,11 +2225,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
-                // bd-durable-parallel-53um / bd-durable-foreach-jpgx: the
-                // join marker of a fan-out. Its `needs` are its copies, and
-                // the graph schedules only when nothing is in flight, so every
-                // copy is settled and the value is a pure fold — no effect, no
-                // second scheduler.
                 _ if is_fanout_join(&graph, name, node) => {
                     let values: Vec<serde_json::Value> = node
                         .needs
@@ -2322,8 +2233,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                         .collect();
                     let value = collect_parallel(values.clone());
                     if node.on_error == StepOnError::FailRun && is_failure_value(&value) {
-                        // The bundle keeps the failed copy's kind/disposition,
-                        // exactly like the per-node failure carrier.
                         let kind = values
                             .iter()
                             .find(|v| is_failure_value(v))
@@ -2364,9 +2273,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     model.node_state.insert(name.clone(), NodeState::Settled);
                     continue;
                 }
-                // bd-durable-call-workflow-mg6y: a child call opens a child run
-                // and parks the node on it. The child reference and trigger are
-                // read HERE, from the fold's definition + trigger + outputs.
                 Action::CallWorkflow { .. } => {
                     let rendered = match render_action_lenient(
                         &node.action,
@@ -2412,7 +2318,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                         inputs,
                     } = rendered
                     else {
-                        // Cannot happen: the arm matched the same action.
                         continue;
                     };
                     let child_run_id = format!("{}:{}:{}", model.run_id, name, 1);
@@ -2443,7 +2348,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                             dispatched += 1;
                         }
                         Err(error) => {
-                            // Defensive: static refusals happen at open.
                             let value = serde_json::json!({ "ok": false, "error": error });
                             if node.on_error == StepOnError::FailRun {
                                 let output = fail_run_value(name, &value, None);
@@ -2476,10 +2380,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                         }
                     }
                 }
-                // A reduce is PURE, but it still goes through the single-shot
-                // node executor (strict render at execution time). The
-                // executor computes the fold; the scheduler settles it like
-                // any node.
                 Action::Reduce { .. } => {
                     model.node_state.insert(
                         name.clone(),
@@ -2498,9 +2398,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
-                // A `retry:` policy is a per-node wrapper: dispatch the node
-                // (the executor unwraps to the inner step) and let the
-                // scheduler own the attempts (bd-durable-retry-policy-rrck).
                 Action::Retry { .. } => {
                     model.node_state.insert(
                         name.clone(),
@@ -2538,9 +2435,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     dispatched += 1;
                 }
                 action => {
-                    // Unreachable through `open`, which refuses the shape first.
-                    // Kept fail-closed so a direct caller cannot mistake an
-                    // unsequencable node for a settled one.
                     let error = format!(
                         "node '{name}' uses '{}', which the graph model cannot sequence",
                         action.type_name()
@@ -2564,8 +2458,6 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
         }
 
         if dispatched == 0 {
-            // Every ready node settled inline (planning-render failures);
-            // schedule the next wave in the same transition.
             continue;
         }
         model.phase = GraphPhase::Running;
@@ -2806,11 +2698,7 @@ fn lowered_shape_refusal(workflow: &Workflow) -> Option<String> {
                     ));
                 }
             }
-            // A child call is native to the graph model; the callee itself is
-            // validated at open (bd-durable-call-workflow-mg6y).
             Action::CallWorkflow { .. } => {}
-            // Captain review: a graph-lowered shape mixed with spawn or a
-            // linear branch refuses WHOLE rather than half-running.
             Action::Spawn { .. } | Action::Branch { .. } => {
                 return Some(format!(
                     "workflow mixes graph-lowered steps with '{}' at step '{name}': the durable graph admits neither; split the workflow",
@@ -2899,9 +2787,6 @@ pub fn durable_graph(
                 prev = Some(name);
             }
             Action::Foreach { over, each: _ } => {
-                // Validate what can be known at open: a literal or
-                // trigger/inputs list must already BE a list. A `steps.*` read
-                // is materialized by the fold, which owns the outputs map.
                 let at_open = resolve_template_ref(over, trigger, &serde_json::Map::new());
                 match (at_open, foreach_over_steps_root(over)) {
                     (Some(serde_json::Value::Array(_)), _) => {}
@@ -2945,8 +2830,6 @@ pub fn durable_graph(
             }
         }
     }
-    // A foreach expands into `{name}:{i}` at schedule time; an authored node
-    // with that shape would be overwritten, so refuse it now.
     for fanout in &foreach_names {
         let prefix = format!("{fanout}:");
         for name in nodes.keys() {
@@ -3015,8 +2898,6 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
             continue;
         }
         if let Action::Foreach { over, each } = &node.action {
-            // A foreach fan-out marker or its expanded join. The `over` shape
-            // is refused before a row; the list itself is read in the fold.
             if let Some(reason) = foreach_over_refusal(over) {
                 return Some(format!("graph node '{name}': {reason}"));
             }
@@ -3029,7 +2910,6 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
             continue;
         }
         if let Action::Parallel { each, .. } = &node.action {
-            // The join marker of a lowered fan-out: collect its copies.
             if node.needs.is_empty() {
                 return Some(format!(
                     "graph node '{name}' is a parallel join with no copies in `needs`"
@@ -3066,13 +2946,9 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
 
 fn is_graph_sequencable(action: &Action) -> bool {
     match action {
-        // A retry wrapper IS the node: the scheduler owns its attempts, the
-        // executor unwraps to the inner step (bd-durable-retry-policy-rrck).
         Action::Retry {
             max_attempts, step, ..
         } => retry_policy_refusal(step, *max_attempts).is_none(),
-        // A child call: the callee is validated at open with the host's
-        // workflow resolver (bd-durable-call-workflow-mg6y).
         Action::CallWorkflow { .. } => true,
         Action::Delay { .. } | Action::RequestApproval { .. } | Action::Reduce { .. } => true,
         _ => matches!(partition(action), ActionPartition::HostSink { .. }),

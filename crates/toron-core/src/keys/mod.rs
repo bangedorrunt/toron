@@ -151,13 +151,11 @@ mod tests {
     #[test]
     fn test_nsec_not_in_serialized_events_or_cryptsec() {
         let keys = generate();
-        // The cryptsec payload must not contain the hex or bech32 nsec.
         let cryptsec = encrypt(&keys, "pass", TEST_LOG_N).expect("encrypt");
         let nsec_bech32 = keys.secret_key().to_bech32().expect("nsec bech32");
         assert!(!cryptsec.contains(&nsec_bech32));
         assert!(!cryptsec.contains(&keys.secret_key().to_secret_hex()));
 
-        // A signed event must not contain the nsec either.
         use crate::nostr::event::build_event;
         use crate::nostr::{Kind, Tag, Timestamp};
         let ev = build_event(
@@ -177,7 +175,6 @@ mod tests {
     fn test_keys_debug_does_not_leak_nsec() {
         let keys = generate();
         let debug = format!("{keys:?}");
-        // `Keys` Debug prints only the public key; the nsec must not appear.
         assert!(!debug.contains("sec"));
         assert!(!debug.contains(&keys.secret_key().to_secret_hex()));
         assert!(debug.contains(&keys.public_key().to_hex()));
@@ -185,7 +182,6 @@ mod tests {
 
     #[test]
     fn test_operator_key_roundtrip_via_env_path_semantics() {
-        // TORON_OPERATOR_KEY is a PATH, not a secret (CLI design).
         let keys = generate();
         let path = temp_path("operator.ncryptsec");
         write_encrypted_key(&path, &keys, "op-pass", TEST_LOG_N).expect("write");

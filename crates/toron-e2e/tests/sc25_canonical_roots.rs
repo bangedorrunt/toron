@@ -49,7 +49,6 @@ async fn boot(dir: &std::path::Path) -> (Mailbox, InProcessBus, sqlx::SqlitePool
     )
     .with_agent_passphrase("toron-dev")
     .with_index_pool(pool.clone());
-    // Daemon-open migration: fold any pre-existing path-slug roots.
     mailbox
         .reconcile_project_aliases()
         .await
@@ -97,7 +96,6 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     std::fs::create_dir_all(&dir).unwrap();
     let (mailbox, _bus, pool) = boot(&dir).await;
 
-    // --- ensure_project via both spellings → ONE canonical root ---
     let first = mailbox.ensure_project(SHORT).await.expect("ensure short");
     assert_eq!(first.slug, SHORT, "short slug is canonical");
     let second = mailbox.ensure_project(PATH).await.expect("ensure path");
@@ -107,7 +105,6 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     );
     assert!(!second.created, "second ensure is a no-op on the same root");
 
-    // --- registration state spans both, no duplicate rows ---
     let path_npub = register(&mailbox, PATH, "PiAlpha").await;
     let short_npub = register(&mailbox, SHORT, "PiAlpha").await;
     assert_eq!(path_npub, short_npub, "same identity via either root");
@@ -118,20 +115,14 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     );
     assert_eq!(agent_rows(&pool, PATH).await, 0, "no path-slug rows");
 
-    // whois resolves through either spelling.
     let whois_short = mailbox.whois(SHORT, "PiAlpha").await.expect("whois short");
     let whois_path = mailbox.whois(PATH, "PiAlpha").await.expect("whois path");
     assert_eq!(whois_short.npub, whois_path.npub, "whois spans both roots");
 
-    // Register the recipient via the SHORT slug — cross-root addressing.
     let oc_npub = register(&mailbox, SHORT, "OCBeta").await;
 
-    // The unwrap loop projects inbound wraps into the index (search reads
-    // the projection). Spawn it after registration so the npub→project map
-    // sees every agent.
     let _loop = mailbox.spawn_unwrap_loop();
 
-    // --- send via PATH root, fetch + ack via SHORT root ---
     let sent = mailbox
         .send_message(&send(PATH, "PiAlpha", "OCBeta", "cross-root ping"))
         .await
@@ -139,7 +130,6 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     assert_eq!(sent.count, 1, "one delivery");
     let message_id = sent.deliveries[0].payload.event_id.clone();
 
-    // Wait for the projection to land (poll, not a fixed sleep).
     let pool2 = pool.clone();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -188,7 +178,6 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
         "same stored receipt"
     );
 
-    // --- search spans both roots ---
     let hits_short = mailbox
         .search_messages(&toron_core::mailbox::search::SearchMessages {
             project_key: SHORT.into(),
@@ -211,7 +200,6 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     assert_eq!(hits_path.len(), 1, "search via path root finds it too");
     assert_eq!(hits_path[0].id, message_id);
 
-    // --- registration state spans both after the fact (upsert) ---
     let npub_after = register(&mailbox, PATH, "OCBeta").await;
     assert_eq!(npub_after, oc_npub, "upsert keeps the one identity");
 
@@ -224,10 +212,6 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
     std::fs::create_dir_all(&dir).unwrap();
     let (mailbox, _bus, pool) = boot(&dir).await;
 
-    // Reconstruct the pre-ADR-0017 state by hand: a project root + identity
-    // living under the PATH-slug spelling — legacy key file at the nested
-    // tree, legacy profile event tagged `#t = <path slug>`, legacy agents
-    // row — exactly what the 2026-08-14 repro left on disk.
     let legacy_slug = "/srv/legacy/toron";
     let profile = AgentProfile::new("RoseDune");
     let result = toron_core::nostr::identity::create_agent_identity(
@@ -264,7 +248,6 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
     .await
     .expect("legacy agents row");
 
-    // Daemon-open migration folds the legacy root into the alias table.
     mailbox
         .reconcile_project_aliases()
         .await
@@ -275,8 +258,6 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
         "legacy path-slug root is aliased read-only: {set:?}"
     );
 
-    // The legacy identity is reachable through the canonical slug: whois via
-    // alias-spelling resolution.
     let whois = mailbox
         .whois(SHORT, "RoseDune")
         .await
@@ -287,9 +268,6 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
         "legacy registration visible read-only"
     );
 
-    // Recovery path (ADR-0017 D3): re-registering under the canonical slug
-    // ADOPTS the legacy key (alt-root fallback) — same npub, no second
-    // identity; the legacy row stays archived.
     let npub = register(&mailbox, SHORT, "RoseDune").await;
     assert_eq!(
         npub, whois.npub,

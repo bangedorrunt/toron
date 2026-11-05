@@ -1,5 +1,4 @@
 // governed-by: ADR-0005 (P4.2 — spawn await failure, Behavior Test Matrix row
-// `spawn_await_failure`)
 #![forbid(unsafe_code)]
 
 //! SC-20 — `spawn` + `await: true` FAILS on the job's error (Behavior Test
@@ -63,7 +62,6 @@ steps:
         launcher: Some(failing_launcher()),
     };
 
-    // 1. Open with seams: the spawn step prepares and parks (StartSpawn).
     let (engine_store, journal, state) = durable::handles(&pool);
     let (wf_open, trig_open) = (wf.clone(), trigger.clone());
     let (run, effects) = tokio::task::spawn_blocking(move || {
@@ -90,8 +88,6 @@ steps:
         "run is genuinely SUSPENDED (not done) before the error"
     );
 
-    // 2. The job agent FAILS: await the launcher (an error, not a decision)
-    //    and feed it through `spawn_failed`.
     let error = failing_launcher()(spec.clone())
         .await
         .expect_err("mock launcher fails");
@@ -107,9 +103,6 @@ steps:
     let _ = effects;
     drop(run);
 
-    // 3. The parked run settled: the step FAILED (not a decision) — Spec 0
-    //    propagates the failure. The step output carries ok:false with the
-    //    job's error.
     let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
     let json = state_store
         .load("sc20-spawn-failure")

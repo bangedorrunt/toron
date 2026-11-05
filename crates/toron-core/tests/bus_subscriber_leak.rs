@@ -67,20 +67,16 @@ async fn dropped_global_subscription_is_released() {
     let bus = bus().await;
     let keys = toron_core::nostr::Keys::generate();
 
-    // Seed one project-scoped event, so `project_slug(event).is_some()` holds
-    // and the access gate is actually exercised.
     bus.publish(scoped_lease(&keys, "alpha", "seed"))
         .await
         .expect("seed publish");
 
     assert_eq!(bus.subscriber_count(), 0, "clean start");
 
-    // Unscoped filter => global subscriber. This is the shape every
-    // `collect_replay` and MCP resource read uses.
     let global = Filter::new().kinds([toron_kind(FILE_RESERVATION)]);
     for _ in 0..10 {
         let sub = bus.subscribe(global.clone()).await.expect("subscribe");
-        drop(sub); // caller is done with it; receiver is closed
+        drop(sub);
     }
 
     assert_eq!(
@@ -95,16 +91,6 @@ async fn dropped_scoped_subscription_is_released() {
     let bus = bus().await;
     let keys = toron_core::nostr::Keys::generate();
 
-    // Scoped filter => NOT global, so a matching publish COULD reach it. Note
-    // what this does and does not prove: `drop(sub)` runs before the publish
-    // on this thread, so the Drop hook has already unregistered the entry and
-    // the publish finds nothing to reap. This is therefore a second SHAPE of
-    // the same Drop path as the global case above, not a witness for
-    // `fanout_to`'s TrySendError::Closed arms — those need a publisher that
-    // cloned the subscriber before the drop, an interleaving the public API
-    // cannot express deterministically. Its value is that a project-scoped
-    // filter is released just as reliably as a global one, with traffic
-    // flowing in the same window.
     let scoped =
         toron_core::bus::filter::kind_project_filter(toron_kind(FILE_RESERVATION), "alpha");
     for _ in 0..10 {

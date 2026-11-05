@@ -120,8 +120,6 @@ fn approval_awaits_then_lands_decision() {
     assert_eq!(model.phase, RunPhase::Succeeded);
     assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
     assert_eq!(model.outputs["step_1"]["outcome"], json!("approved"));
-    // Parity with the old linear Context path: the canonical alias is
-    // published alongside the node name, so either template ref resolves.
     assert_eq!(model.outputs["decision"]["outcome"], json!("approved"));
 }
 
@@ -205,10 +203,6 @@ fn state_serde_round_trips() {
         }
     ));
 }
-
-// ---------------------------------------------------------------------------
-// Graph model (bd-durable-graph-impl-r2x1)
-// ---------------------------------------------------------------------------
 
 fn graph_workflow(nodes: &[(&str, Action, &[&str], StepOnError)]) -> Workflow {
     let mut map = BTreeMap::new();
@@ -531,8 +525,6 @@ fn graph_wave_order_is_btreemap_and_a_terminal_stops_it() {
         "a wave is emitted in node-name order, not author order"
     );
 
-    // Both nodes are in flight; a terminal on the first one still lands it and
-    // leaves the sibling alone.
     let (model, effects) = advance_graph(
         &model,
         &GraphMsg::NodeDone {
@@ -582,7 +574,6 @@ fn linear_continue_failure_keeps_the_bundle() {
         json!("{\"ok\":false}")
     );
 
-    // And the bundle survives the state round-trip a restart performs.
     let encoded = serde_json::to_string(&model).expect("serialize");
     let decoded: RunModel = serde_json::from_str(&encoded).expect("deserialize");
     assert_eq!(decoded.outputs["step_1"]["kind"], json!("timeout"));
@@ -655,10 +646,6 @@ fn linear_bare_failure_is_enriched_on_fail_run() {
     );
     assert!(output.get("attempts").is_none(), "{output}");
 }
-
-// ---------------------------------------------------------------------------
-// Durable spawn park (bd-spawn-park-toron-vwu3)
-// ---------------------------------------------------------------------------
 
 fn spawn_step(await_: bool, no_claim_timeout: u64) -> Step {
     Step {
@@ -866,18 +853,12 @@ fn spawn_restart_reissues_the_same_key() {
     assert_eq!(node, "spawn_it");
     assert_eq!(spec.spawn_key, "run-1:spawn_it:1");
 
-    // And the stored phase carries the same spec, so the republish is
-    // byte-identical across processes.
     let stored = match &model.phase {
         RunPhase::AwaitingSpawn { spec, .. } => spec.clone(),
         other => panic!("still awaiting: {other:?}"),
     };
     assert_eq!(stored, spec.clone());
 }
-
-// ---------------------------------------------------------------------------
-// Branch in the linear plan (bd-durable-branch-hhgc)
-// ---------------------------------------------------------------------------
 
 fn dm(tag: &str) -> Action {
     Action::SendDm {
@@ -973,7 +954,6 @@ fn branch_true_arm_runs_false_skips() {
             panic!("the chosen arm's first step runs: {effects:?}");
         };
         assert_eq!(step.name.as_deref(), Some(taken));
-        // Drive the chosen arm to completion (the then arm has two steps).
         let (model, effects) = {
             let (mut model, mut effects) = (model, effects);
             for tick in 0..4 {
@@ -1031,7 +1011,6 @@ fn branch_restart_never_flips_arm() {
     };
     assert_eq!(step.name.as_deref(), Some("yes-2"));
 
-    // The restart: the persisted model carries the arm cursor, not the choice.
     let json_text = serde_json::to_string(&model).expect("serialize");
     let restored: RunModel = serde_json::from_str(&json_text).expect("restore");
     let effects = resume_effects(&restored);
@@ -1167,7 +1146,6 @@ fn branch_refuses_impure_guards_and_unsupported_arms() {
         assert!(reason.contains("not pure"), "{guard}: {reason}");
     }
 
-    // A nested control-flow step in an arm refuses whole.
     let wf = workflow(vec![branch(
         "{{trigger.gate}} == true",
         vec![step(Action::Delay { secs: 1 }, StepOnError::Continue)],
@@ -1177,8 +1155,6 @@ fn branch_refuses_impure_guards_and_unsupported_arms() {
     let reason = unsupported_reason(&wf).expect("nested control flow refuses");
     assert!(reason.contains("inside an arm"), "{reason}");
 
-    // An unsequencable action in an arm refuses whole. (A `spawn` IS
-    // sequenced now: its spec is prepared on the plan entries.)
     let wf = workflow(vec![branch(
         "{{trigger.gate}} == true",
         vec![step(
@@ -1244,7 +1220,6 @@ fn shipped_agent_reach_else_arm_fails_closed() {
         .expect("parse agent-reach-upgrade")
     };
 
-    // verified = false → else arm → notify-fail succeeds → fail-closed fails.
     let model = RunModel::new("run-reach", parse(), json!({}));
     let spec = spawn_spec("run-reach", "upgrade", true, 600);
     let (model, effects) = advance_with(&model, &RunMsg::Start { now_ms: 0 }, &[Some(spec)]);
@@ -1293,7 +1268,6 @@ fn shipped_agent_reach_else_arm_fails_closed() {
     assert_eq!(output["failed_step"], json!("fail-closed"));
     assert!(matches!(model.phase, RunPhase::Failed { .. }));
 
-    // verified = true → then arm → notify-ok → green.
     let model = RunModel::new("run-reach-ok", parse(), json!({}));
     let spec = spawn_spec("run-reach-ok", "upgrade", true, 600);
     let (model, _) = advance_with(&model, &RunMsg::Start { now_ms: 0 }, &[Some(spec)]);
@@ -1320,10 +1294,6 @@ fn shipped_agent_reach_else_arm_fails_closed() {
     assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
     assert_eq!(model.phase, RunPhase::Succeeded);
 }
-
-// ---------------------------------------------------------------------------
-// Parallel fan-out lowered onto the graph (bd-durable-parallel-53um)
-// ---------------------------------------------------------------------------
 
 fn parallel(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
     Step {
@@ -1410,7 +1380,6 @@ fn parallel_fanout_runs_each_copy_once() {
         "one wave, first attempt: {effects:?}"
     );
 
-    // The first two settlements are still mid-wave: no join, no next step.
     let (model, effects) = settle_copies(&model, &["fan:0", "fan:1"], json!({"ok": true}), 2_000);
     assert!(
         effects.is_empty(),
@@ -1498,7 +1467,6 @@ fn parallel_join_waits_on_a_partial_wave() {
     let effects = resume_graph_effects(&restored);
     assert_eq!(executed(&effects), ["fan:1"]);
 
-    // A wake while a copy is in flight must not fire the join.
     let (restored, effects) = advance_graph(&restored, &GraphMsg::Woke { now_ms: 3_000 });
     assert!(
         effects.is_empty(),
@@ -1548,7 +1516,6 @@ fn parallel_copy_failure_continue_lands_bundle() {
         "the full failure bundle rides the results"
     );
 
-    // The same collected value with `fail_run` on the join fails the run.
     let model = lowered_model(
         "run-par-fail-run",
         fanout_workflow("2", StepOnError::Continue, StepOnError::FailRun),
@@ -1570,7 +1537,6 @@ fn parallel_copy_failure_continue_lands_bundle() {
 /// and a count that does not resolve at open.
 #[test]
 fn parallel_refuses_mixes_and_unsequencable_copies() {
-    // Mix: spawn + parallel.
     let mixed = workflow(vec![
         named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
         parallel(
@@ -1586,7 +1552,6 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
     let reason = durable_graph(&mixed, &json!({})).expect_err("lowering refuses the mix");
     assert!(reason.contains("mixes graph-lowered steps"), "{reason}");
 
-    // Mix: branch + parallel (the linear branch is the same refusal).
     let mixed = workflow(vec![
         branch(
             "{{trigger.gate}} == true",
@@ -1604,7 +1569,6 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
     let reason = durable_graph(&mixed, &json!({})).expect_err("branch + parallel refuses");
     assert!(reason.contains("mixes graph-lowered steps"), "{reason}");
 
-    // Unsequencable copy action.
     let bad = workflow(vec![parallel(
         "fan",
         "2",
@@ -1621,7 +1585,6 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
     let reason = unsupported_reason(&bad).expect("call_webhook copy refuses");
     assert!(reason.contains("call_webhook"), "{reason}");
 
-    // A count that cannot resolve at open.
     let unresolvable = workflow(vec![parallel(
         "fan",
         "{{inputs.n}}",
@@ -1642,10 +1605,6 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
         "a trigger-carried count resolves at open"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Foreach on the shared fan-out path (bd-durable-foreach-jpgx)
-// ---------------------------------------------------------------------------
 
 fn foreach_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
     Step {
@@ -1794,7 +1753,6 @@ fn foreach_item_failure_applies_on_error() {
     assert_eq!(collected["error"], json!("item timed out"));
     assert_eq!(collected["results"][0], bundle);
 
-    // The join's fail_run fails the run with the item's kind.
     let model = lowered_model(
         "run-foreach-fail-run",
         foreach_workflow(
@@ -1820,27 +1778,22 @@ fn foreach_item_failure_applies_on_error() {
 /// names a step which is not upstream.
 #[test]
 fn foreach_unmaterializable_iterator_refuses_without_row() {
-    // Literal, but not a list.
     let wf = foreach_workflow("42", StepOnError::Continue, StepOnError::Continue);
     let reason = durable_graph(&wf, &json!({})).expect_err("a number is not a list");
     assert!(reason.contains("must resolve to a list"), "{reason}");
 
-    // A trigger value that is not a list.
     let wf = foreach_workflow("{{inputs.n}}", StepOnError::Continue, StepOnError::Continue);
     let reason =
         durable_graph(&wf, &json!({"inputs": {"n": 3}})).expect_err("a count is not a list");
     assert!(reason.contains("must resolve to a list"), "{reason}");
 
-    // A trigger ref that does not resolve at open.
     let reason = durable_graph(&wf, &json!({})).expect_err("missing list");
     assert!(reason.contains("does not resolve at open"), "{reason}");
 
-    // A non-template, non-JSON spelling.
     let wf = foreach_workflow("not a list", StepOnError::Continue, StepOnError::Continue);
     let reason = durable_graph(&wf, &json!({})).expect_err("not a ref");
     assert!(reason.contains("must be a JSON list"), "{reason}");
 
-    // Upstream output: allowed only for an EARLIER step.
     let upstream = workflow(vec![
         named("plan", dm("plan"), StepOnError::Continue),
         foreach_step(
@@ -1866,7 +1819,6 @@ fn foreach_unmaterializable_iterator_refuses_without_row() {
     let reason = durable_graph(&forward, &json!({})).expect_err("not earlier");
     assert!(reason.contains("not an earlier step"), "{reason}");
 
-    // The mix with spawn refuses whole (same rule as parallel).
     let mixed = workflow(vec![
         named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
         foreach_step(
@@ -1882,10 +1834,6 @@ fn foreach_unmaterializable_iterator_refuses_without_row() {
         "{reason}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Retry policy on graph nodes (bd-durable-retry-policy-rrck)
-// ---------------------------------------------------------------------------
 
 fn retry_step(
     name: &str,
@@ -2054,7 +2002,6 @@ fn retry_backoff_park_is_restart_safe() {
     assert_eq!(node, "flaky");
     assert!(inputs.is_empty(), "the first-step snapshot is unchanged");
 
-    // A success on the last attempt completes the run.
     let (restored, effects) = advance_graph(
         &restored,
         &GraphMsg::NodeDone {
@@ -2078,7 +2025,6 @@ fn retry_unparseable_policy_refuses_without_row() {
         assert!(unsupported_reason(&wf).is_some(), "{max_attempts}");
     }
 
-    // Nested retry.
     let nested = workflow(vec![retry_step(
         "outer",
         retry_step(
@@ -2095,7 +2041,6 @@ fn retry_unparseable_policy_refuses_without_row() {
     let reason = durable_graph(&nested, &json!({})).expect_err("nested");
     assert!(reason.contains("nested retry"), "{reason}");
 
-    // A wrapper around a graph-lowered shape.
     let around_parallel = workflow(vec![retry_step(
         "outer",
         parallel(
@@ -2111,7 +2056,6 @@ fn retry_unparseable_policy_refuses_without_row() {
     let reason = durable_graph(&around_parallel, &json!({})).expect_err("fan-out wrap");
     assert!(reason.contains("retry wraps 'parallel'"), "{reason}");
 
-    // The spawn mix refuses whole.
     let mixed = workflow(vec![
         named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
         retry_step(
@@ -2128,10 +2072,6 @@ fn retry_unparseable_policy_refuses_without_row() {
         "{reason}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// call_workflow as a child run (bd-durable-call-workflow-mg6y)
-// ---------------------------------------------------------------------------
 
 fn call_step(name: &str, callee: &str, inputs: serde_json::Value, on_error: StepOnError) -> Step {
     Step {
@@ -2186,7 +2126,6 @@ fn call_workflow_node_awaits_child() {
     assert_eq!(callee, "child");
     assert_eq!(trigger["inputs"]["goal"], json!("ship it"));
 
-    // A resume re-attaches to the same child instead of opening a second one.
     let restored: GraphModel =
         serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
     let resumed = resume_graph_effects(&restored);
@@ -2269,10 +2208,6 @@ fn call_workflow_child_failure_carries_bundle_to_parent_on_error() {
     assert_eq!(fail.error, "child exploded");
     assert!(matches!(model.phase, GraphPhase::Failed { .. }));
 }
-
-// ---------------------------------------------------------------------------
-// Bounded loop in the linear plan (bd-loop-rewrites-fap8)
-// ---------------------------------------------------------------------------
 
 fn loop_step(
     name: &str,
@@ -2451,7 +2386,6 @@ fn loop_max_iterations_fails_with_bundle() {
     );
     assert!(matches!(model.phase, RunPhase::Failed { .. }));
 
-    // `continue` lands the exhaustion value and the run proceeds.
     let model = loop_model("2", Some("steps_check_ok == true"), StepOnError::Continue);
     let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
     let (model, _) = advance(
@@ -2478,7 +2412,6 @@ fn loop_max_iterations_fails_with_bundle() {
 /// `fail_run` fails the run with that step's bundle.
 #[test]
 fn loop_body_failure_applies_on_error() {
-    // A `continue` body failure lands and the loop keeps its own policy.
     let model = RunModel::new(
         "run-loop-body",
         workflow(vec![loop_step(
@@ -2513,7 +2446,6 @@ fn loop_body_failure_applies_on_error() {
         json!({"ok": false, "error": "flaky"})
     );
 
-    // A `fail_run` body failure ends the run at the body step.
     let model = RunModel::new(
         "run-loop-body-fail",
         workflow(vec![loop_step(

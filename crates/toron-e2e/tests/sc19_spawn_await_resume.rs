@@ -1,5 +1,4 @@
 // governed-by: ADR-0005 (P4.2 — spawn await resume, Behavior Test Matrix row
-// `spawn_await_resume`)
 #![forbid(unsafe_code)]
 
 //! SC-19 — `spawn` + `await: true` SUSPENDS and resumes on the job's receipt
@@ -61,7 +60,6 @@ steps:
         launcher: Some(receipt_launcher()),
     };
 
-    // 1. Open with seams: the spawn step prepares and parks (StartSpawn).
     let (engine_store, journal, state) = durable::handles(&pool);
     let (wf_open, trig_open) = (wf.clone(), trigger.clone());
     let (run, effects) = tokio::task::spawn_blocking(move || {
@@ -92,14 +90,9 @@ steps:
         "the spec carries the run:node:attempt correlation key"
     );
 
-    // 2. The job agent completes: await the launcher (a plain future — no
-    //    blocking, so no spawn_blocking needed) and feed the receipt.
-    //    (A timeout arm like sc18's would fire first on a hung launcher;
-    //    this one settles immediately.)
     let receipt = receipt_launcher()(spec.clone())
         .await
         .expect("mock launcher settles");
-    // Owned copy: the feed closure must be 'static for spawn_blocking.
     let node = node.clone();
     let (run, effects) = tokio::task::spawn_blocking(move || {
         let mut run = run;
@@ -112,7 +105,6 @@ steps:
     let _ = effects;
     drop(run);
 
-    // 3. The parked run resumed and completed: read the settled model.
     let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
     let json = state_store
         .load("sc19-spawn-resume")

@@ -42,10 +42,6 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// doctor
-// ---------------------------------------------------------------------------
-
 #[derive(serde::Serialize)]
 struct CheckResult {
     name: &'static str,
@@ -59,10 +55,6 @@ struct CheckResult {
 /// Informational (ok stays true): doctor NAMES the rows, cleanup is the
 /// fold path's job (`fold_agent_name_alias` absorbs idempotently).
 fn check_engine_store(cfg: &Config) -> CheckResult {
-    // ADR-0043: workflow execution is the in-process durable engine
-    // (`OurEngine` + the pure run models). Probe the store the host uses:
-    // a missing or unwritable index is the honest failure, not a vendor
-    // server that no longer exists.
     let Some(dir) = resolve_data_dir(cfg, None) else {
         return CheckResult {
             name: "engine_store",
@@ -463,11 +455,6 @@ fn check_git() -> CheckResult {
 }
 
 fn check_keys(cfg: &Config) -> CheckResult {
-    // ADR-0038: ONE resolution, the same one the daemon unit and the mailbox
-    // host use. An explicit `operator_key`/`TORON_OPERATOR_KEY` wins; otherwise
-    // the canonical config-home key. The detail names which source resolved,
-    // because the whole defect this replaces was an operator who could not tell
-    // which of two keys a process would read.
     match &cfg.operator_key {
         Some(p) if p.is_file() => CheckResult {
             name: "keys",
@@ -491,9 +478,6 @@ fn check_keys(cfg: &Config) -> CheckResult {
                     ),
                 };
             }
-            // A legacy data-root key is a DIFFERENT identity. Reporting a bare
-            // "not configured" here would hide the exact hazard the ADR closes,
-            // so name both paths and never pick one silently.
             let legacy = toron_core::config::legacy_operator_key_path();
             if legacy.is_file() {
                 return CheckResult {
@@ -526,7 +510,6 @@ pub fn run_doctor(
     args: &DoctorArgs,
     format: OutputFormat,
 ) -> anyhow::Result<ExitCode> {
-    // Disaster-recovery subcommands take precedence over the check surface.
     if let Some(DoctorCmd::Reconstruct(rargs)) = &args.command {
         return run_doctor_reconstruct(cfg, rargs, format);
     }
@@ -559,15 +542,6 @@ pub fn run_doctor(
         Ok(ExitCode::SUCCESS)
     }
 }
-
-// ---------------------------------------------------------------------------
-// doctor reconstruct (bd-jwa, ADR-0004 Ship 3): rebuild the SQLite index
-// from the Git archive. AM `am doctor reconstruct` parity. Reuses the proven
-// `rebuild_index_from_git` path (proof: sc14a_dr_rebuild test).
-//
-// Exit codes: 0 ok · 1 rebuild failed (quarantine preserved) · 3 diagnostic
-// (nothing to reconstruct / cannot locate data dir).
-// ---------------------------------------------------------------------------
 
 /// One project's reconstruct outcome.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -618,7 +592,6 @@ fn enumerate_projects(data_dir: &Path, filter: Option<&str>) -> Vec<PathBuf> {
         {
             continue;
         }
-        // Archive signature: a `messages/` dir (the rebuild path reads it).
         if path.join("messages").is_dir() {
             out.push(path);
         }
@@ -681,10 +654,8 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
     let db_path = root.join("index.sqlite");
     let archive_messages = count_archive_messages(root);
 
-    // Current state of the index (if any).
     let (db_exists, integrity_ok, index_rows) = inspect_index(&db_path).await?;
 
-    // Healthy: present, integral, rows match the archive. Skip (no mutation).
     if db_exists && integrity_ok && index_rows == Some(archive_messages as i64) {
         return Ok(ReconstructReport {
             slug,
@@ -697,7 +668,6 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
         });
     }
 
-    // Dry-run: report what would happen, mutate nothing.
     if dry_run {
         return Ok(ReconstructReport {
             slug,
@@ -715,7 +685,6 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
         });
     }
 
-    // Forensic bundle + quarantine the original db (and its wal/shm).
     let ts = unix_ts_secs();
     let forensic_dir = root.join(format!("doctor-forensic-{ts}"));
     let quarantine = if db_exists {
@@ -743,9 +712,8 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
         None
     };
 
-    // Build a fresh db at `index.sqlite.new`, migrate, rebuild from archive.
     let new_db = root.join("index.sqlite.new");
-    let _ = std::fs::remove_file(&new_db); // clear any stale .new
+    let _ = std::fs::remove_file(&new_db);
     let new_db_str = new_db.to_string_lossy().to_string();
     let (rebuilt, rows) =
         match toron_core::index::rebuild::build_fresh_index(&new_db_str, root).await {
@@ -764,7 +732,6 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
             }
         };
 
-    // Convergence verify: fresh rows == rebuilt == archive count.
     if rows != rebuilt || rebuilt != archive_messages {
         let _ = std::fs::remove_file(&new_db);
         return Ok(ReconstructReport {
@@ -780,9 +747,6 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
         });
     }
 
-    // Atomic swap: `index.sqlite.new` → `index.sqlite` (POSIX atomic rename).
-    // Drop the now-empty WAL siblings first so the renamed main file is
-    // self-contained (no orphaned -wal/-shm).
     let _ = std::fs::remove_file(root.join("index.sqlite.new-wal"));
     let _ = std::fs::remove_file(root.join("index.sqlite.new-shm"));
     std::fs::rename(&new_db, &db_path)?;
@@ -857,8 +821,6 @@ pub fn run_doctor_reconstruct(
         Vec::new()
     };
 
-    // Run the reconstruct per project under a dedicated runtime (run_doctor
-    // is sync; the work is async sqlx/rebuild).
     let mut reports = Vec::with_capacity(projects.len());
     if resolved && !projects.is_empty() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -941,10 +903,6 @@ pub fn run_doctor_reconstruct(
         ReconstructExit::Diagnostic => ExitCode::from(3),
     })
 }
-
-// ---------------------------------------------------------------------------
-// metrics (in-process counters, file-backed so separate processes aggregate)
-// ---------------------------------------------------------------------------
 
 /// Per-process counter state, persisted to a JSON file so an operator can
 /// observe cumulative tool usage across invocations. The file is only written
@@ -1107,10 +1065,6 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// key
-// ---------------------------------------------------------------------------
-
 /// Default key path for the AGENT and ANCHOR roles:
 /// `~/.config/toron/<role>_nsec` (no HOME → relative).
 ///
@@ -1134,8 +1088,6 @@ pub fn run_key(cfg: &Config, cmd: &KeyCommand) -> anyhow::Result<()> {
 
 fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> {
     let path = args.out.clone().unwrap_or_else(|| match args.role {
-        // ADR-0038: the ONE canonical operator path — same resolution the
-        // daemon unit writes into its env and `doctor` reports against.
         crate::cli::RoleArg::Operator => cfg
             .operator_key
             .clone()
@@ -1143,13 +1095,6 @@ fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> 
         crate::cli::RoleArg::Agent => default_key_path("agent"),
         crate::cli::RoleArg::Anchor => default_key_path("anchor"),
     });
-    // Fail closed on an existing key file. An identity is not a build artifact:
-    // overwriting one in place destroys the only copy of a secret, and there is
-    // no recovery for a key you did not back up. This is not hypothetical — it
-    // is how the operator key at the canonical path was lost on 2026-09-30,
-    // when a test that isolated HOME but not XDG_CONFIG_HOME ran `key generate`
-    // against the real config home. Refusing costs one `mv`; the alternative
-    // costs an identity.
     if path.exists() {
         anyhow::bail!(
             "refusing to overwrite the existing key at {} — move or remove it first, or \
@@ -1169,28 +1114,17 @@ fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> 
 fn run_key_inspect(cfg: &Config, args: &KeyInspectArgs) -> anyhow::Result<()> {
     let path = match &args.path {
         Some(p) => p.clone(),
-        // Same default as `generate`: explicit config, else the canonical
-        // operator key. Asking "what is my operator npub?" with no arguments
-        // now answers instead of erroring (ADR-0038).
         None => cfg
             .operator_key
             .clone()
             .unwrap_or_else(toron_core::config::operator_key_path),
     };
     let password = key_password();
-    // Load/decrypt failure bubbles as a runtime error (exit 1); only the
-    // public key is ever printed — never the nsec.
     let keys = toron_core::keys::load_encrypted_key(&path, &password)?;
     print_json(&json!({ "npub": keys.public_key().to_hex() }))
 }
 
-// ---------------------------------------------------------------------------
-// project
-// ---------------------------------------------------------------------------
-
 fn run_project_list() -> anyhow::Result<()> {
-    // R2 (ADR-0007 D3): list projects under the resolved durable data dir —
-    // the `/tmp/toron-mcp-demo` hardcode is dead as the default.
     let cfg = Config::load(None);
     let Some(data_dir) = resolve_data_dir(&cfg, None) else {
         anyhow::bail!("no data dir");
@@ -1228,10 +1162,6 @@ pub fn run_project(cmd: &ProjectCommand) -> anyhow::Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// relay
-// ---------------------------------------------------------------------------
-
 pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
     match cmd {
         RelayCommand::List => print_json(&json!({ "relays": cfg.relays })),
@@ -1259,13 +1189,7 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// backend
-// ---------------------------------------------------------------------------
-
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
-    // Clean break: no `herdr` alias. The typed `BackendArg` can only be
-    // `hc` is the only backend; config/env is a free string, so validate here.
     let effective = cfg.effective_backend();
     if effective != "hc" {
         anyhow::bail!("unknown backend {effective:?} (want hc)");
@@ -1300,8 +1224,6 @@ mod backend_selection_tests {
 
     #[test]
     fn legacy_backend_is_refused_naming_hc() {
-        // `Config::load` does NOT normalize — the free-string config value
-        // reaches `run_backend`, which fails naming the valid backend.
         let err = run_backend(&cfg_with("herdr"), &BackendCommand::Status)
             .expect_err("legacy herdr must be refused");
         assert!(err.to_string().contains("want hc"), "{err}");

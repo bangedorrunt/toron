@@ -158,14 +158,8 @@ impl InProcessBus {
     /// Open the bus on a SQLite pool (event-store table created idempotently).
     pub async fn open(pool: SqlitePool, config: InProcessBusConfig) -> anyhow::Result<Self> {
         let store = BusEventStore::new(pool).await?;
-        // bd-741i: prune was never scheduled in production — expired rows
-        // piled up, WAL lingered, and the snapshot memo stayed cold. One
-        // background tick per PRUNE_INTERVAL is the whole contract.
         let prune_store = store.clone();
         tokio::spawn(async move {
-            // Sleep first: tokio interval fires immediately, which would
-            // bump mutations on every `open()` and bust the snapshot memo
-            // before the first real replay (bd-3gwy / bd-741i).
             loop {
                 tokio::time::sleep(BusEventStore::PRUNE_INTERVAL).await;
                 if let Err(e) = prune_store.prune().await {
@@ -184,8 +178,6 @@ impl InProcessBus {
     }
 
     fn stage_log(&self, stage: Stage, event: &Event, detail: &str) {
-        // bd-ii04: writers emit taxonomy kinds by construction — every
-        // Stage maps via STAGE_MAP (proven by inspection_events tests).
         let emitted = super::inspection::InspectionEvent::for_stage(stage.name(), detail);
         if self.config.detailed_stage_logging {
             tracing::debug!(
@@ -221,35 +213,23 @@ impl InProcessBus {
     /// gating). A subscription is global when its filter has no `#t` scoping.
     fn access_gate(&self, sub: &Subscriber, event: &Event) -> bool {
         if Self::project_slug(event).is_some() {
-            // Project-scoped event: subscriber must be scoped to this project.
             if sub.global {
                 return false;
             }
-            // Subscriber's filter must match the event's own #t.
             return sub.filter.match_event(event, MatchEventOptions::default());
         }
         true
     }
 
     fn fanout_to(&self, sub: &Subscriber, event: &Event) {
-        // Before the replay task finishes (snapshot + delta + EOSE), live
-        // fanout must neither re-deliver snapshot members nor race the
-        // delta: claim the id in the shared `delivered` set — whichever
-        // path inserts first delivers, the other steps aside
-        // (exactly-once, bd-subscribe-fanout-gap-race-tgex).
         let id = event.id.to_hex();
         if !sub.replay_done.load(std::sync::atomic::Ordering::Acquire) {
-            // Snapshot members are (being) delivered by the replay task.
             if sub.snapshot.contains(&id) {
                 return;
             }
             if !sub.delivered.lock().insert(id.clone()) {
-                return; // the replay task's delta already delivered it
+                return;
             }
-            // Lossless: if the channel is full we drop publisher-side with a
-            // warning (the event remains in the store for cursor-based
-            // replay) — and release the claim so the replay task may still
-            // deliver it through the delta.
             match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -257,20 +237,17 @@ impl InProcessBus {
                     self.note_full_drop(sub, event);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // Subscriber dropped its receiver; remove the subscription.
                     self.subs.write().remove(&sub.id);
                 }
             }
             return;
         }
-        // Post-EOSE: single delivery path, no dedup bookkeeping needed.
         match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.note_full_drop(sub, event);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Subscriber dropped its receiver; remove the subscription.
                 self.subs.write().remove(&sub.id);
             }
         }
@@ -326,8 +303,6 @@ impl InProcessBus {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
 
-        // Global = filter has no project scoping (#t via hashtags or #l label)
-        // AND not trusted. A trusted subscriber is always project-scoped.
         use crate::nostr::SingleLetterTag;
         let t_tag = SingleLetterTag::LOWERCASE_T;
         let l_tag = SingleLetterTag::LOWERCASE_L;
@@ -335,10 +310,6 @@ impl InProcessBus {
             && !filter.generic_tags.contains_key(&t_tag)
             && !filter.generic_tags.contains_key(&l_tag);
 
-        // Take the history snapshot synchronously (fast DB read). The
-        // snapshot is the exactly-once base; the background task's delta
-        // phase below closes the snapshot→map-insert gap; anything published
-        // once the subscriber is in the fanout map is delivered live.
         let snapshot = self
             .store
             .replay(&filter)
@@ -348,14 +319,6 @@ impl InProcessBus {
             Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
         let delivered: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Push the snapshot, then the DELTA, then EOSE in a background task
-        // so `subscribe` never blocks on a small channel (lossless
-        // backpressure inside the task). The delta (bd-subscribe-fanout-gap-
-        // race-tgex): events stored after the snapshot read but published
-        // before this subscriber entered the fanout map were missed by both
-        // paths. Store writes precede fanout, so a full re-read now contains
-        // every gap event; the shared `delivered` set dedups against live
-        // fanout (exactly-once preserved).
         let replay_tx = tx.clone();
         let snapshot_clone = snapshot;
         let replay_done_clone = replay_done.clone();
@@ -366,8 +329,6 @@ impl InProcessBus {
         let snapshot_ids_clone = snapshot_ids.clone();
         tokio::spawn(async move {
             for ev in snapshot_clone {
-                // Access gate applies to replay too: a global subscription
-                // never receives project-scoped history.
                 if global_clone && Self::project_slug(&ev).is_some() {
                     continue;
                 }
@@ -375,9 +336,6 @@ impl InProcessBus {
                     return;
                 }
             }
-            // Delta: everything the store now holds beyond the snapshot.
-            // Best-effort with a warning on read failure — live fanout and
-            // future stores still cover forward traffic.
             match store_clone.replay(&filter_clone).await {
                 Ok(delta) => {
                     for ev in delta {
@@ -386,10 +344,10 @@ impl InProcessBus {
                         }
                         let id = ev.id.to_hex();
                         if snapshot_ids_clone.contains(&id) {
-                            continue; // replayed in the snapshot phase
+                            continue;
                         }
                         if !delivered_clone.lock().insert(id) {
-                            continue; // live fanout already delivered it
+                            continue;
                         }
                         if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
                             return;
@@ -402,7 +360,6 @@ impl InProcessBus {
             }
             let _ = replay_tx.send(SubscriptionEvent::Eose).await;
             replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
-            // Single-path delivery from here on; the dedup set is dead.
             delivered_clone.lock().clear();
         });
 
@@ -414,7 +371,6 @@ impl InProcessBus {
             snapshot: snapshot_ids,
             delivered,
             replay_done,
-            // Pre-dated so the FIRST full drop warns immediately.
             last_full_warn: Arc::new(Mutex::new(
                 std::time::Instant::now()
                     .checked_sub(Subscriber::FULL_WARN_INTERVAL)
@@ -423,13 +379,6 @@ impl InProcessBus {
         });
         self.subs.write().insert(id.clone(), sub);
 
-        // Unregister on the caller's scope, not on the next publish. The
-        // `Closed` arm in `fanout_to` cannot be the release path for an
-        // access-gated subscriber: `access_gate` refuses it every scoped
-        // event, so no publish ever reaches it and the entry (plus its
-        // capacity-1024 mpsc block) would pin for the life of the daemon.
-        // parking_lot locks synchronously, so this is safe from `Drop`
-        // outside a runtime context (bd-cqo2).
         let registry = self.subs.clone();
         let release_id = id.clone();
         Ok(Subscription::new(id, rx).with_release(Box::new(move || {
@@ -441,14 +390,11 @@ impl InProcessBus {
 #[async_trait::async_trait]
 impl Bus for InProcessBus {
     async fn publish(&self, event: Event) -> Result<PublishOk, BusError> {
-        // 1. Verify: reject forged/mutated events (wrong id or sig).
-        //    F23.BUS-DEDUP (batch-fix): shared canonical mapping in bus/common.rs.
         if let Err(e) = crate::bus::common::verify_publish_event(&event) {
             self.stage_log(Stage::Verify, &event, &e.to_string());
             return Err(e);
         }
 
-        // 2. Auth: reject non-allowlisted authors if policy requires.
         if self.config.auth == AuthPolicy::Allowlist
             && !self
                 .config
@@ -460,10 +406,6 @@ impl Bus for InProcessBus {
             return Err(BusError::Publish("author not allowlisted".into()));
         }
 
-        // 3. Ephemeral kinds (20000–29999, e.g. presence 20001) are broadcast
-        //    but NOT stored. GS-062 / Buzz #7532 pattern: fail closed without
-        //    Redis — after verify+auth, confirm SQLite store health (`SELECT 1`).
-        //    Unreachable store → presence_admit(false) → refuse fanout.
         if crate::bus::is_ephemeral_kind(event.kind) {
             let store_ok = self.store.is_healthy().await;
             if let Err(reason) = crate::bus::convergence::presence_admit(store_ok) {
@@ -474,12 +416,6 @@ impl Bus for InProcessBus {
             return self.fanout(event, false);
         }
 
-        // 3. Dedup: store by event id (ON CONFLICT DO NOTHING). Addressable
-        //    kinds (NIP-33 parameterized-replaceable, e.g. kind-30031 file
-        //    reservations) additionally collapse to the latest event per
-        //    (kind, author, d_tag) — without this a renewal storm accumulates
-        //    hundreds of superseded events on one coordinate, which overflows
-        //    replay's window and hides the newest state (bd-cumj).
         let stored = if crate::bus::is_addressable(event.kind) {
             self.store.insert_addressable(&event).await
         } else {
@@ -567,7 +503,6 @@ impl Bus for InProcessBus {
     }
 }
 
-// Allow constructing a bus for tests without exposing internals.
 impl InProcessBus {
     /// Count of currently registered subscriptions (diagnostics).
     pub fn subscriber_count(&self) -> usize {
@@ -577,7 +512,6 @@ impl InProcessBus {
     /// Access-gated fanout to live subscribers (shared by stored + ephemeral
     /// publish paths).
     fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
-        // 4. Access-gated fanout to live subscribers.
         let subs: Vec<Arc<Subscriber>> = {
             let guard = self.subs.read();
             guard.values().cloned().collect()
@@ -595,9 +529,6 @@ impl InProcessBus {
             self.stage_log(Stage::Fanout, &event, "no matching subscriber");
         }
 
-        // 5-7. Hooks: search / audit / workflow-trigger are wired by the
-        // projection + workflow layers (bd-led.3.3 / bd-led.3.7). InProcessBus
-        // records the hook stage boundary for observability.
         self.stage_log(Stage::SearchHook, &event, "search hook boundary (no-op)");
         self.stage_log(Stage::AuditHook, &event, "audit hook boundary (no-op)");
         self.stage_log(
@@ -697,9 +628,6 @@ mod tests {
         }
 
         let filter = crate::bus::project_filter("demo");
-        // First subscribe: publishes already memoized each event (inserts
-        // warm the hot cache), so this snapshot may parse nothing — the
-        // cold-parse path is covered by the store-level gate.
         let mut s1 = bus.subscribe(filter.clone()).await.expect("sub 1");
         let first = drain(&mut s1, 32, Duration::from_millis(400)).await;
         assert_eq!(
@@ -711,7 +639,6 @@ mod tests {
         );
         let mid = bus.event_store().sql_scans();
 
-        // Second subscribe: identical filter, no new events.
         let scans_before_second = mid;
         let mut s2 = bus.subscribe(filter.clone()).await.expect("sub 2");
         let second = drain(&mut s2, 32, Duration::from_millis(400)).await;
@@ -733,7 +660,6 @@ mod tests {
             "second identical subscribe must NOT run the SQL id-scan (bd-3gwy)"
         );
 
-        // A NEW event is parsed exactly once and reaches BOTH paths.
         let fresh = signed(&keys, PROJECT_MANIFEST, "fresh", "demo");
         bus.publish(fresh).await.expect("publish fresh");
         let mut s3 = bus.subscribe(filter).await.expect("sub 3");
@@ -743,8 +669,6 @@ mod tests {
             .filter(|e| matches!(e, SubscriptionEvent::Event(_)))
             .count();
         assert_eq!(third_events, n + 1);
-        // The publish bumped the mutation version, so the third subscribe
-        // runs exactly ONE fresh id-scan; post-mutation replays memoize.
         assert_eq!(
             bus.event_store().sql_scans(),
             scans_before_second + 1,
@@ -765,7 +689,6 @@ mod tests {
         let ev = signed(&keys, PROJECT_MANIFEST, "hello", "demo");
         let ok = bus.publish(ev.clone()).await.expect("publish");
         assert!(ok.stored);
-        // Replay + EOSE come first, then the live event.
         let items = drain(&mut sub, 8, Duration::from_millis(200)).await;
         let saw_event = items
             .iter()
@@ -794,7 +717,6 @@ mod tests {
         .await;
         let keys = Keys::generate();
 
-        // Seed history so the subscribe-time snapshot read takes real time.
         let mut expected: Vec<String> = Vec::with_capacity(500);
         for i in 0..300 {
             let ev = signed(&keys, PROJECT_MANIFEST, &format!("seed {i}"), "demo");
@@ -802,8 +724,6 @@ mod tests {
             expected.push(ev.id.to_hex());
         }
 
-        // Publisher streams 200 more events while subscribe() races through
-        // its snapshot-read → map-insert window.
         let pub_bus = bus.clone();
         let pub_keys = keys.clone();
         let publisher = tokio::spawn(async move {
@@ -823,7 +743,6 @@ mod tests {
         let live_ids = publisher.await.expect("publisher");
         expected.extend(live_ids);
 
-        // Drain everything: snapshot + delta + EOSE + live, until quiet.
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut saw_eose = false;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -871,7 +790,6 @@ mod tests {
             .expect("sub");
 
         let ev = signed(&keys, PROJECT_MANIFEST, "original", "demo");
-        // Forge: change content but keep id+sig.
         let forged = Event::new(
             ev.id,
             ev.pubkey,
@@ -886,8 +804,6 @@ mod tests {
             other => panic!("expected InvalidEvent, got {other:?}"),
         }
 
-        // No event should arrive (verify failed → no fanout). Eose is the
-        // only thing the subscription ever receives.
         let items = drain(&mut sub, 4, Duration::from_millis(100)).await;
         let forged_leaked = items
             .iter()
@@ -914,7 +830,6 @@ mod tests {
         assert!(!dup.stored, "duplicate must not be stored");
         assert_eq!(bus.store.count().await.expect("count"), 1);
 
-        // Drain replay + EOSE; only one copy of the event may be delivered.
         let items = drain(&mut sub, 8, Duration::from_millis(200)).await;
         let count = items
             .iter()
@@ -945,7 +860,6 @@ mod tests {
         .expect("build");
         bus.publish(ev).await.expect("publish");
 
-        // New subscription replays only non-expired events.
         let mut sub = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
@@ -971,8 +885,6 @@ mod tests {
         let ev = signed(&keys, PROJECT_MANIFEST, "latency", "demo");
         bus.publish(ev.clone()).await.expect("publish");
 
-        // Measure only up to the moment the live event arrives (Eose precedes
-        // it; read one item at a time with a tight per-item timeout).
         let mut delivered = false;
         for _ in 0..8 {
             match tokio::time::timeout(Duration::from_millis(200), sub.next()).await {
@@ -986,10 +898,6 @@ mod tests {
         }
         assert!(delivered, "live event must be delivered");
         let elapsed = start.elapsed();
-        // Smoke ceiling, not a latency SLO: under parallel test load a
-        // scheduler stall routinely exceeds 50ms (bd-lib-suite-flake-j6jg).
-        // 2s still catches pathological transport regressions (relay
-        // round-trip, lost wake) while tolerating load jitter.
         assert!(
             elapsed < Duration::from_secs(2),
             "publish→receive latency {elapsed:?} must be < 2s"
@@ -1003,9 +911,7 @@ mod tests {
         let (bus, path) = temp_bus().await;
         let keys = Keys::generate();
 
-        // A global subscription: filter matches everything, no project scoping.
         let mut global = bus.subscribe(Filter::new()).await.expect("global sub");
-        // A scoped subscription.
         let mut scoped = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
@@ -1014,7 +920,6 @@ mod tests {
         let ev = signed(&keys, PROJECT_MANIFEST, "scoped secret", "demo");
         bus.publish(ev.clone()).await.expect("publish");
 
-        // Scoped sub receives it.
         let scoped_items = drain(&mut scoped, 8, Duration::from_millis(200)).await;
         assert!(
             scoped_items
@@ -1023,7 +928,6 @@ mod tests {
             "project-scoped sub must receive project event, got {scoped_items:?}"
         );
 
-        // Global sub must NOT receive the project-scoped event (access gate).
         let global_items = drain(&mut global, 8, Duration::from_millis(150)).await;
         let global_leaked = global_items
             .iter()
@@ -1042,8 +946,6 @@ mod tests {
         let (bus, path) = temp_bus().await;
         let keys = Keys::generate();
 
-        // Trusted ingress: empty filter, no scoping — must still see scoped
-        // events (the workflow-trigger loop's subscription shape).
         let mut trusted = bus
             .subscribe_trusted(Filter::new())
             .await
@@ -1115,7 +1017,6 @@ mod tests {
             .await
             .expect("sub");
 
-        // Build a presence event (no #t scoping → global sub receives it).
         let payload = crate::nostr::presence::PresencePayload {
             state: crate::nostr::presence::PresenceState::Working,
             status: None,
@@ -1131,7 +1032,6 @@ mod tests {
             "store must stay empty"
         );
 
-        // Live delivery still works.
         let items = drain(&mut sub, 4, Duration::from_millis(200)).await;
         assert!(
             items
@@ -1166,7 +1066,6 @@ mod tests {
         let keys = Keys::generate();
         let ev = signed(&keys, PROJECT_MANIFEST, "fanout", "demo");
 
-        // Three concurrent subscribers on the same project filter.
         let mut subs = Vec::new();
         for _ in 0..3 {
             let sub = bus
@@ -1205,13 +1104,11 @@ mod tests {
         .await;
         let keys = Keys::generate();
 
-        // A subscriber that never drains → its channel fills at capacity 2.
         let _overflowed_sub = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
             .expect("overflow sub");
 
-        // Publish 6 events; publish must NEVER block despite the full channel.
         let mut ev_ids = Vec::new();
         for i in 0..6 {
             let ev = signed(&keys, PROJECT_MANIFEST, &format!("burst {i}"), "demo");
@@ -1220,7 +1117,6 @@ mod tests {
             ev_ids.push(ev.id);
         }
 
-        // A new subscriber replays ALL 6 from the store (nothing lost).
         let mut fresh = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
@@ -1241,7 +1137,6 @@ mod tests {
         }
         assert_eq!(got.len(), 6, "all 6 events recovered, got {items:?}");
 
-        // Bus still healthy.
         let h = bus.health().await.expect("health");
         assert!(h.ok);
         let _ = std::fs::remove_file(&path);
@@ -1260,19 +1155,13 @@ mod tests {
         .await;
         let keys = Keys::generate();
 
-        // A subscriber that never drains → its channel fills at capacity 2.
         let mut overflowed = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
             .expect("overflow sub");
-        // Settle: drain history + EOSE and let the replay task finish, so the
-        // bus is on the single-path (post-EOSE) delivery phase and the drop
-        // accounting below is deterministic.
         let _ = drain(&mut overflowed, 64, Duration::from_millis(300)).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // Publish 8 events: the first 2 fit the empty channel, the remaining
-        // 6 drop publisher-side — every drop exactly counted on the bus.
         let mut ev_ids = Vec::new();
         for i in 0..8 {
             let ev = signed(&keys, PROJECT_MANIFEST, &format!("burst {i}"), "demo");
@@ -1291,7 +1180,6 @@ mod tests {
             "the WARN fires once, then is rate-limited per subscriber"
         );
 
-        // Lossless: a fresh subscriber replays all 8 from the store.
         let mut fresh = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
@@ -1324,7 +1212,6 @@ mod tests {
         let (bus, path) = temp_bus().await;
         let keys = Keys::generate();
 
-        // 30013 with scoping tags applied by the caller (identity flow).
         let tags = with_project_scoping(
             crate::nostr::kinds::toron_kind(AGENT_PROFILE),
             vec![Tag::parse(["d", "demo:BlueLake"]).expect("d")],
@@ -1343,7 +1230,6 @@ mod tests {
             .await
             .expect("publish 30013");
 
-        // Recover from store replay and assert dual tags survived the bus.
         let mut sub = bus
             .subscribe(crate::bus::project_filter("demo"))
             .await
@@ -1373,7 +1259,6 @@ mod tests {
             dump_failure(replayed, "dual-tag NIP-32 l", &items)
         );
 
-        // Kind-1059 gift wrap: no project tags on the envelope.
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -1385,7 +1270,6 @@ mod tests {
         );
         let wrapped = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
             .expect("wrap");
-        // Wrap is metadata-hiding → no scoping tags applied by the helper.
         assert!(is_metadata_hiding_kind(wrapped.kind));
         let scoped_wrap_tags =
             with_project_scoping(wrapped.kind, wrapped.tags.clone(), Some("demo"));
@@ -1397,7 +1281,6 @@ mod tests {
         assert!(!has_t, "wrap must not gain a #t tag");
         assert!(!has_l, "wrap must not gain a NIP-32 label");
 
-        // And the raw envelope (as produced by gift_wrap) has only the p tag.
         let visible: Vec<Vec<String>> = wrapped
             .tags
             .iter()
@@ -1431,7 +1314,6 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("forged event must be rejected"),
         };
-        // Stage detail must be in the error (self-diagnosing).
         assert!(
             err.to_string().contains("verify") || err.to_string().contains("id"),
             "error must identify the failing stage, got: {err}"

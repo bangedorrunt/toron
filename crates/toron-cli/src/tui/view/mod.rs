@@ -50,7 +50,6 @@ pub fn split(area: Rect, mode: LayoutMode, sidebar: bool) -> Panes {
     let sidebar_w = match (sidebar, mode) {
         (false, _) => 0,
         (true, LayoutMode::Tri) => (area.width / 5).clamp(18, 28),
-        // Two-pane widths: the sidebar is real but tight (80 cols / 6 = 13).
         (true, _) => (area.width / 6).clamp(14, 20),
     };
     let inner = Rect {
@@ -62,7 +61,6 @@ pub fn split(area: Rect, mode: LayoutMode, sidebar: bool) -> Panes {
         LayoutMode::Tri => ((inner.width as u32 * 38 / 100) as u16)
             .max(28)
             .min(inner.width),
-        // Two-pane: both sides stay readable (20 cols is a truncated subject).
         _ => ((inner.width as u32 * 45 / 100) as u16)
             .max(24)
             .min(inner.width.saturating_sub(20).max(1)),
@@ -117,8 +115,6 @@ pub fn render(f: &mut Frame, model: &Model) {
     if model.mode == Mode::Help {
         render_help(f, area);
     }
-    // The form is a modal over whatever tab is behind it; it is drawn last so
-    // it owns the frame it covers.
     if model.mode == Mode::Compose {
         compose::render(f, area, model);
     }
@@ -141,8 +137,6 @@ fn render_header(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
     } else {
         format!("{} live", spinner(model.tick))
     };
-    // Phone width: the store column and the tick counter go first — and the tab
-    // name arrives here, because the tab bar is down to one letter per tab.
     let line = if narrow {
         Line::from(vec![
             Span::styled(" toron ", HackerNight::fg_emphasis()),
@@ -226,8 +220,6 @@ fn render_footer(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
         StatusKind::Info => HackerNight::fg_muted(),
     };
     let status = if model.status.text.is_empty() {
-        // Phone width: the store detail is a paragraph, and the cadence plus
-        // the layout label are the two facts worth the line.
         let text = if narrow {
             format!(" {}ms  ·  {layout}", model.settings.refresh_ms)
         } else {

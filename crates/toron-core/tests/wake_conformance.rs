@@ -129,7 +129,6 @@ async fn conformance_replay_then_live_no_poll() {
         "EOSE delivered after replay"
     );
 
-    // Live tail on the SAME subscription: no second subscribe (no poll).
     bus.publish(kind9(&keys, "live-1")).await.expect("publish");
     let live = drain(&mut sub, 8).await;
     let live_ids = event_ids(&live);
@@ -148,7 +147,6 @@ async fn conformance_shed_resync_zero_loss_zero_dup() {
     let (bus, _path) = temp_bus_with_capacity(4).await;
     let keys = Keys::generate();
 
-    // Subscribe FIRST so all N publish live into a tiny channel nobody drains.
     let mut slow = bus.subscribe(project_filter(SLUG)).await.expect("sub");
     let mut published = Vec::new();
     for i in 0..N {
@@ -165,7 +163,6 @@ async fn conformance_shed_resync_zero_loss_zero_dup() {
     );
     let shed_count = N - live_ids.len();
 
-    // Resync via store replay on a fresh subscription.
     let mut replay = bus.subscribe(project_filter(SLUG)).await.expect("resub");
     let replayed = drain(&mut replay, N + 8).await;
     let replay_ids: HashSet<String> = event_ids(&replayed).into_iter().collect();
@@ -173,8 +170,6 @@ async fn conformance_shed_resync_zero_loss_zero_dup() {
     let union: HashSet<String> = live_ids.union(&replay_ids).cloned().collect();
     let all: HashSet<String> = published.into_iter().collect();
     assert_eq!(union, all, "live + replay covers every event: zero loss");
-    // replay_ids is a HashSet of N distinct published ids at len N:
-    // full history with no internal duplicates by construction.
     assert_eq!(
         replay_ids.len(),
         N,
@@ -198,8 +193,6 @@ async fn conformance_kill9_midstream_cursor_resume() {
     }
 
     let mut sub = bus.subscribe(project_filter(SLUG)).await.expect("sub");
-    // Consume exactly CONSUMED events (history precedes EOSE, so a bounded
-    // drain would return CONSUMED+1 events, not events + EOSE).
     let mut delivered = Vec::new();
     for _ in 0..CONSUMED {
         match tokio::time::timeout(SILENCE, sub.next()).await {
@@ -210,7 +203,6 @@ async fn conformance_kill9_midstream_cursor_resume() {
     assert_eq!(delivered.len(), CONSUMED);
     let cursor = delivered.last().unwrap().clone();
 
-    // kill -9: no close handshake, just drop.
     drop(sub);
 
     let mut resub = bus.subscribe(project_filter(SLUG)).await.expect("resub");
@@ -235,21 +227,13 @@ async fn conformance_kill9_midstream_cursor_resume() {
 /// refuses; unchecked (blind delete) never takes over.
 #[test]
 fn conformance_stale_takeover_identity() {
-    // Dead holder, checked: adopt.
     assert!(takeover_allowed(false, true, true));
-    // Dead holder, foreign identity, checked: adopt.
     assert!(takeover_allowed(false, false, true));
-    // Live holder, same owner: refuse.
     assert!(!takeover_allowed(true, true, true));
-    // Live holder, foreign identity (pid reused by a non-owner process,
-    // serve.pid pattern): identity check proves staleness -> adopt.
     assert!(takeover_allowed(true, false, true));
-    // No identity check (blind delete): never, even when dead.
     assert!(!takeover_allowed(false, true, false));
     assert!(!takeover_allowed(false, false, false));
 
-    // ManualClock drives the staleness half: heartbeat older than the
-    // takeover grace means the holder is treated as dead.
     let mut clock = ManualClock::new(1_000);
     let last_beat = clock.now_ms;
     clock.advance(30_000);
@@ -284,21 +268,17 @@ fn conformance_quiet_vs_deaf() {
     let mut clock = ManualClock::new(50_000);
     let timeout = 10_000;
 
-    // Quiet bus: heartbeat 1ms ago, zero events observed -> not deaf.
     assert!(!is_deaf(clock.now_ms - 1, clock.now_ms, timeout));
 
-    // Fresh heartbeat exactly at the timeout edge -> not deaf.
     assert!(!is_deaf(clock.now_ms - timeout, clock.now_ms, timeout));
 
-    // One ms past the edge -> deaf.
     clock.advance(1);
     assert!(is_deaf(clock.now_ms - timeout - 1, clock.now_ms, timeout));
 
-    // Long-quiet but heartbeating watcher stays not-deaf across advances.
     let mut now = ManualClock::new(0);
     for _ in 0..5 {
         now.advance(5_000);
-        let beat = now.now_ms; // heartbeat each quiet interval
+        let beat = now.now_ms;
         assert!(!is_deaf(beat, now.now_ms, timeout));
     }
 }
@@ -307,8 +287,6 @@ fn conformance_quiet_vs_deaf() {
 /// vocabulary byte-identical, no TCP listener in the bus sources.
 #[tokio::test]
 async fn conformance_no_new_surface() {
-    // Frozen wake vocabulary: kind-9 publishes with a `t` project tag and a
-    // `p` mention tag, and the project-filtered subscriber still receives it.
     let (bus, _path) = temp_bus_with_capacity(Subscription::DEFAULT_CAPACITY).await;
     let keys = Keys::generate();
     let ev = build_event(
@@ -322,7 +300,6 @@ async fn conformance_no_new_surface() {
         Timestamp::now(),
     )
     .expect("build");
-    // Presence kind is distinct and stays ephemeral vocabulary, not wake.
     assert_ne!(CHANNEL_MESSAGE, PRESENCE);
     bus.publish(ev.clone()).await.expect("publish");
     let mut sub = bus.subscribe(project_filter(SLUG)).await.expect("sub");
@@ -330,7 +307,6 @@ async fn conformance_no_new_surface() {
     let ids = event_ids(&got);
     assert_eq!(ids, vec![ev.id.to_hex()]);
 
-    // No TCP surface in the bus: UDS only by default.
     const BUS_MOD: &str = include_str!("../src/bus/mod.rs");
     const BUS_IPC: &str = include_str!("../src/bus/in_process.rs");
     const BUS_SUB: &str = include_str!("../src/bus/subscription.rs");

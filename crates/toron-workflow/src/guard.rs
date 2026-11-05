@@ -175,8 +175,6 @@ pub fn normalize_single_quoted_literals(expr: &str) -> String {
                 out.push(c);
             }
             '\'' => {
-                // Collect to the closing unescaped `'`; abort verbatim when
-                // unterminated (fail loud at parse, never silently mangle).
                 let mut body = String::new();
                 let mut inner_escaped = false;
                 let mut closed = false;
@@ -206,8 +204,6 @@ pub fn normalize_single_quoted_literals(expr: &str) -> String {
                     }
                 }
                 if !closed {
-                    // Unterminated: emit the opening quote + consumed tail
-                    // verbatim so the parse error names the real text.
                     let _ = &mut rest;
                     out.push('\'');
                     out.push_str(&body);
@@ -326,19 +322,14 @@ pub async fn evaluate_guard(
         return GuardOutcome::Unset;
     };
 
-    // GS-028 NEW-3 tolerance: single-quoted literals normalize before the
-    // pre-scan + eval so `== 'true'` behaves like `== "true"`.
     let normalized = normalize_single_quoted_literals(expr);
     let expr = normalized.as_str();
 
     // Stack-safety pre-scan (iterative, O(n), no recursion): reject
-    // pathological expressions before evalexpr's recursive tree builder can
-    // overflow the 512KB blocking-pool stack (uncatchable SIGABRT).
     if let Some(reason) = complexity_violation(expr) {
         return GuardOutcome::TooComplex { reason };
     }
 
-    // Build the context once (cheap). Variables + the 4 custom fns.
     let mut ctx = HashMapContext::<DefaultNumericTypes>::new();
     for (k, v) in variables {
         let _ = ctx.set_value(k.clone(), v.clone());
@@ -358,8 +349,6 @@ pub async fn evaluate_guard(
         Ok(Ok(Err(err))) => GuardOutcome::EvalError {
             err: err.to_string(),
         },
-        // The blocking task panicked — treat as an eval error (don't hang the
-        // run on a panicking expression).
         Ok(Err(panic)) => GuardOutcome::EvalError {
             err: format!("guard panicked: {panic}"),
         },
@@ -438,9 +427,9 @@ pub fn complexity_violation(expr: &str) -> Option<String> {
             "expression is {len} chars, exceeds {MAX_GUARD_CHARS} limit"
         ));
     }
-    let mut depth = 0usize; // paren nesting (calls/subexpressions)
-    let mut parens = 0usize; // total `(` count (tree size)
-    let mut bracket = 0usize; // `[` nesting (evalexpr array/tuple literals)
+    let mut depth = 0usize;
+    let mut parens = 0usize;
+    let mut bracket = 0usize;
     let mut in_string = false;
     let mut escaped = false;
     for c in expr.chars() {
@@ -517,7 +506,6 @@ mod tests {
             GuardOutcome::Unset
         );
         assert!(GuardOutcome::Unset.proceeds());
-        // Empty/whitespace guard is also Unset.
         assert_eq!(
             evaluate_guard(Some("   "), &HashMap::new(), Duration::from_millis(100)).await,
             GuardOutcome::Unset
@@ -526,7 +514,6 @@ mod tests {
 
     #[tokio::test]
     async fn boolean_literal_outcome() {
-        // Literal true proceeds, literal false skips (was 2 tests).
         let out = evaluate_guard(Some("true"), &HashMap::new(), Duration::from_millis(100)).await;
         assert_eq!(out, GuardOutcome::Bool(true));
         assert!(out.proceeds());
@@ -538,8 +525,6 @@ mod tests {
     #[tokio::test]
     async fn variable_comparison_true() {
         let v = vars(&[("trigger_channel", "#forge")]);
-        // evalexpr identifiers can't contain '.', so tests use underscores;
-        // the engine substitutes {{trigger.channel}} → a valid identifier.
         let out = evaluate_guard(
             Some("trigger_channel == \"#forge\""),
             &v,
@@ -596,10 +581,6 @@ mod tests {
 
     #[tokio::test]
     async fn adversarial_guard_rejected_not_hung() {
-        // ~20MB expression: 5000 nested str_contains calls with 2000-char
-        // string args. Pathological but formerly VALID evalexpr — and it
-        // stack-overflowed the whole test process (this test is the
-        // regression: pre-scan must reject it before parse).
         let hay = "x".repeat(2_000);
         let needle = "y".repeat(2_000);
         let mut expr = String::from("true");
@@ -624,8 +605,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_fires_on_slow_valid_guard() {
         let mut m = HashMap::new();
-        // 8MB haystack; values live in the context, so the EXPRESSION stays
-        // short and passes the pre-scan.
         m.insert("text".into(), Value::from("x".repeat(8_000_000)));
         let out = evaluate_guard(
             Some("str_contains(text, \"zzzz\")"),
@@ -634,8 +613,8 @@ mod tests {
         )
         .await;
         match out {
-            GuardOutcome::TimedOut { .. } => { /* expected: 1ms deadline vs ms-scale scan */ }
-            GuardOutcome::Bool(false) => { /* occasionally finishes <1ms — also fine */ }
+            GuardOutcome::TimedOut { .. } => {  }
+            GuardOutcome::Bool(false) => {  }
             other => panic!("expected TimedOut or Bool(false), got {other:?} (must not hang)"),
         }
     }
@@ -643,8 +622,6 @@ mod tests {
     /// Paren-depth pre-scan catches nested expressions without crashing.
     #[tokio::test]
     async fn paren_depth_guard_rejected() {
-        // 200-deep nested ( ... ) — over MAX_PAREN_DEPTH=64, under the char
-        // cap. Parens here are real grouping, not string literals.
         let expr = "(".repeat(200) + "true" + &")".repeat(200);
         let out = evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
         assert!(
@@ -657,7 +634,6 @@ mod tests {
     #[tokio::test]
     async fn parens_in_string_literals_do_not_count() {
         assert!(complexity_violation("str_contains(text, \"a(b)c\") && true").is_none());
-        // A legit-ish guard under the caps passes.
         let out = evaluate_guard(
             Some("str_contains(text, \"a(b)c\") && true"),
             &vars(&[("text", "x a(b)c y")]),
@@ -672,8 +648,6 @@ mod tests {
     /// bracket scan is the only defense).
     #[tokio::test]
     async fn bracket_nesting_rejected_not_hung() {
-        // 200-deep `[[[[...]]]]` wrapping a scalar — under the char cap, over
-        // MAX_PAREN_DEPTH=64 bracket depth.
         let expr = "[".repeat(200) + "true" + &"]".repeat(200);
         let out = evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
         assert!(
@@ -722,28 +696,23 @@ mod tests {
             normalize_single_quoted_literals("a == 'true'"),
             "a == \"true\""
         );
-        // Single quotes inside double-quoted literals pass through.
         assert_eq!(
             normalize_single_quoted_literals("a == \"don't\""),
             "a == \"don't\""
         );
-        // Unterminated single quote passes through (parse fails loud).
         assert_eq!(normalize_single_quoted_literals("a == 'x"), "a == 'x");
 
         let d = Duration::from_millis(200);
-        // The exact GS-028 repair shape: single-quoted 'true' compares true.
         let v = vars(&[("steps_verify_1_ok", "true")]);
         assert_eq!(
             evaluate_guard(Some("steps_verify_1_ok == 'true'"), &v, d).await,
             GuardOutcome::Bool(true)
         );
-        // And false when the output differs.
         let v_false = vars(&[("steps_verify_1_ok", "false")]);
         assert_eq!(
             evaluate_guard(Some("steps_verify_1_ok == 'true'"), &v_false, d).await,
             GuardOutcome::Bool(false)
         );
-        // OR-chain across three verifies (the full repair decide guard).
         let v2 = vars(&[
             ("steps_verify_1_ok", "false"),
             ("steps_verify_2_ok", "true"),

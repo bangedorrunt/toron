@@ -38,8 +38,6 @@ const fn default_enabled() -> bool {
     true
 }
 
-
-
 /// The tick body for a spec-driven loop: a [`Workflow`] built from the
 /// CronSpec's steps/graph/policy — the SAME shape the shared engine runs
 /// (one engine, two input types; `call_workflow` composes workflows).
@@ -48,10 +46,6 @@ const fn default_enabled() -> bool {
 /// the loop fires.
 pub fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
     Workflow {
-        // The tick body is a WRAPPER around the spec, not the spec's name:
-        // a cron may `call_workflow` a catalog workflow with the same name,
-        // and the recursion guard compares names. `-tick` keeps the two
-        // distinct without changing the cron's identity or run id.
         name: format!("{}-tick", spec.name),
         description: spec.description.clone(),
         trigger: None,
@@ -118,9 +112,6 @@ pub fn latest_due_at_or_before(cron_expr: &str, last_fired: i64, now: i64) -> Op
 ///    through (crate uses 1=Sun too).
 pub fn normalize_cron(expr: &str) -> String {
     let mut fields: Vec<String> = expr.split_whitespace().map(str::to_string).collect();
-    // 5-field (vixie) → 6-field (crate): prepend seconds=0 AND remap the dow.
-    // 6/7-field and `@`-shorthand expressions pass through unchanged — their
-    // day-of-week fields are already in the crate's 1-7 (1=Sunday) form.
     if fields.len() == 5 {
         fields.insert(0, "0".to_string());
         if let Some(dow) = fields.get_mut(5) {
@@ -235,7 +226,6 @@ mod tests {
         let due = next_due("30 3 * * *", from).expect("valid expr yields a tick");
         assert!(due > from, "next tick is in the future");
         use chrono::{Datelike, Timelike};
-        // Monday 2023-11-20 00:00 UTC. Sunday (0) → the Sunday after.
         let from = DateTime::parse_from_rfc3339("2023-11-20T00:00:00Z")
             .unwrap()
             .timestamp();
@@ -268,11 +258,11 @@ mod tests {
         use crate::cron_core::{Catchup, next_future, select_fireable};
         use crate::schema::CronCatchup;
         let schedules = [
-            "*/10 * * * *",   // every 10 minutes
-            "30 3 * * *",     // daily
-            "0 * * * *",      // hourly
-            "*/1 * * * * *",  // every second (6-field)
-            "not a schedule", // unparsable
+            "*/10 * * * *",
+            "30 3 * * *",
+            "0 * * * *",
+            "*/1 * * * * *",
+            "not a schedule",
         ];
         let base = 1_700_000_000i64;
         let mut cases = 0usize;
@@ -288,10 +278,6 @@ mod tests {
                         let kernel_fire =
                             select_fireable(kernel_catchup, Some(last_fired), now, &candidates);
                         let kernel_sleep = next_future(Some(last_fired), now, &candidates);
-                        // Full-decision agreement: the legacy Option carries
-                        // fire-or-sleep-target in one value; the kernel
-                        // splits them (Fire vs SleepUntil) and the durable
-                        // child recombines identically (fire wins).
                         assert_eq!(
                             kernel_fire.or(kernel_sleep),
                             legacy,
@@ -367,7 +353,6 @@ mod tests {
     #[test]
     fn latest_catchup_runs_only_the_most_recent_missed_tick() {
         use chrono::TimeZone;
-        // Every 10 minutes starting at 10:00. Ticks at 10:00, 10:10, 10:20…
         let base = chrono::Utc
             .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
             .unwrap()
@@ -379,14 +364,10 @@ mod tests {
             "on-time: sleep to the next scheduled tick"
         );
 
-        // Down for 25 minutes (ticks 10:00, 10:10, 10:20 all due while down):
-        // catch up to the LATEST (10:20), not 10:00 or 10:10.
         let now = base + 25 * 60;
         let caught = latest_due_at_or_before("*/10 * * * *", base, now).unwrap();
         assert_eq!(caught, base + 20 * 60, "latest missed tick, not a burst");
 
-        // And firing that ONE tick advances `last_fired` to it; the next tick
-        // is then strictly after — no replay of the intermediate missed ones.
         let next = next_due("*/10 * * * *", caught).unwrap();
         assert!(next > now, "resume from the latest caught-up tick");
     }
@@ -400,12 +381,9 @@ mod tests {
             .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
             .unwrap()
             .timestamp();
-        // last_fired = 10:00, now = 10:01 → next due is 10:10 (in the future).
         let due = latest_due_at_or_before("*/10 * * * *", base, base + 60).unwrap();
         assert!(due > base + 60, "sleep to the next scheduled tick");
     }
-
-    // ---- ADR-0012 / bd-25g7.2: CronSpec-driven loops ----
 
     /// The spec's tick body maps to a workflow the SHARED engine runs:
     /// steps + graph cloned, policy mapped (catchup lives on the loop, not
@@ -459,7 +437,6 @@ mod tests {
             .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
             .unwrap()
             .timestamp();
-        // Down 25 minutes: ticks 10:00/10:10/10:20 all due while down.
         let now = base + 25 * 60;
         let caught = due_tick("*/10 * * * *", base, now, CronCatchup::Latest).unwrap();
         assert_eq!(caught, base + 20 * 60, "latest missed tick only");

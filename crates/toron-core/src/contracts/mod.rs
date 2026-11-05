@@ -43,7 +43,6 @@ pub const KNOWN: &[(&str, u32, Class)] = &[
     ("escalate", 1, Class::Control),
     ("steer", 1, Class::Control),
     ("lead", 1, Class::Control),
-    // not_ready@1 is Class::Receipt, not Control.
     ("not_ready", 1, Class::Receipt),
 ];
 

@@ -91,11 +91,6 @@ pub fn guard_blocked_paths_resolved(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// bd-2dox strict sweep-guard: every staged path must be covered by the
-// committer's OWN active reservation or the shared-safe bookkeeping list.
-// ---------------------------------------------------------------------------
-
 /// Shared-safe bookkeeping paths: tracker files every lane must touch to
 /// claim/close beads — never require a reservation of their own.
 pub const SHARED_SAFE_PATHS: &[&str] = &[
@@ -286,8 +281,6 @@ fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
     }
     match pat[pi] {
         '*' => {
-            // Collapse `**` runs into a single `*` (fnmatch treats them the
-            // same for path matching).
             let mut next = pi;
             while next < pat.len() && pat[next] == '*' {
                 next += 1;
@@ -295,7 +288,6 @@ fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
             if next == pat.len() {
                 return true;
             }
-            // Try every split point in the remaining text.
             for k in ti..=text.len() {
                 if match_impl(pat, text, next, k) {
                     return true;
@@ -331,7 +323,6 @@ const fn parse_class(pat: &[char], start: usize) -> Option<(bool, usize)> {
     if neg {
         i += 1;
     }
-    // Empty class `[]` / `[!]` are literal `[`.
     if i >= pat.len() || pat[i] == ']' {
         return None;
     }
@@ -383,13 +374,6 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
     let script_path = hooks.join("pre-commit");
     let legacy_path = hooks.join("pre-commit.legacy");
 
-    // bd-2dox: never clobber a pre-existing hook (the legacy mcp-agent-mail
-    // chain-runner in the flywheel repo). Preserve it as pre-commit.legacy
-    // and chain it AFTER the guard. NOT pre-commit.orig: the legacy
-    // chain-runner itself looks for pre-commit.orig and would exec itself
-    // (infinite recursion) if parked there. If BOTH a foreign pre-commit
-    // and a pre-commit.legacy exist, refuse — there is no lossless place
-    // for the legacy hook.
     let existing_is_toron = script_path.exists()
         && std::fs::read_to_string(&script_path)
             .map(|s| s.contains("installed by toron"))
@@ -440,11 +424,6 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
     file.write_all(script.as_bytes())?;
     set_executable(&script_path)?;
 
-    // bd-9mb8: the bead-hunk attribution check needs the commit MESSAGE,
-    // which only exists at the commit-msg stage — pre-commit runs before
-    // the editor opens. Install a companion commit-msg hook that passes
-    // "$1" through --msg-file. Same courtesy as pre-commit: a foreign
-    // hook is never clobbered (ours is recognized by the marker).
     let cm_path = hooks.join("commit-msg");
     let cm_is_toron = cm_path.exists()
         && std::fs::read_to_string(&cm_path)
@@ -472,10 +451,6 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
         set_executable(&cm_path)?;
     }
 
-    // bd-jhes GitFact producer: post-commit hook appends ONE JSONL line to the
-    // flywheel fact journal on every SUCCESSFUL commit. Best-effort — ANY
-    // failure must NEVER block or fail the commit (the hook exits 0 always).
-    // Same courtesy as commit-msg: never clobber a foreign hook.
     let pc_path = hooks.join("post-commit");
     let pc_is_toron = pc_path.exists()
         && std::fs::read_to_string(&pc_path)
@@ -518,8 +493,6 @@ pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     std::fs::remove_file(&script_path)?;
-    // bd-9mb8: remove our companion commit-msg hook too — but never a
-    // foreign one (same marker rule as install).
     let cm_path = repo.path().join("hooks").join("commit-msg");
     let cm_is_toron = std::fs::read_to_string(&cm_path)
         .map(|s| s.contains("installed by toron"))
@@ -527,7 +500,6 @@ pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
     if cm_is_toron {
         std::fs::remove_file(&cm_path)?;
     }
-    // bd-jhes: remove our post-commit GitFact producer too — never a foreign hook.
     let pc_path = repo.path().join("hooks").join("post-commit");
     let pc_is_toron = std::fs::read_to_string(&pc_path)
         .map(|s| s.contains("installed by toron"))
@@ -597,14 +569,6 @@ pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
     git2::Repository::open(repo_path).map_or_else(|_| Vec::new(), |repo| staged_paths(&repo))
 }
 
-// ---------------------------------------------------------------------------
-// bd-26yr build gate: a commit that does not build breaks every other agent's
-// fence, because they share one repository and one target dir. Measured on the
-// elm-effect-rs port: five separate incidents in one session, each from work
-// that was never built before it was committed, each reddening `cargo test -p
-// elm-effect` for BOTH crews.
-// ---------------------------------------------------------------------------
-
 /// Seconds a build gate pass may take before it gives up. Generous, because the
 /// point is to catch a genuinely broken tree rather than to race a cold build,
 /// but bounded, because a pre-commit hook that hangs is worse than one that
@@ -625,7 +589,6 @@ pub fn path_can_affect_rust_build(path: &str) -> bool {
     if file == "Cargo.toml" || file == "Cargo.lock" {
         return true;
     }
-    // `.cargo/config.toml` and friends reshape the build.
     if path.split('/').any(|seg| seg == ".cargo") {
         return true;
     }
@@ -647,11 +610,6 @@ pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> 
     let mut packages: Vec<String> = Vec::new();
     let excluded = workspace_excludes(repo);
     for path in staged {
-        // bd-g70r: a path vendored from another project (workspace `exclude`,
-        // ADR-0040 §5) names a package cargo's `-p` can never resolve, so it
-        // gates nothing instead of deriving a bogus spec. A literal entry is
-        // a dir prefix (`vendor` covers `vendor/…`); a glob entry keeps the
-        // [`pattern_matches`] rule.
         if excluded.iter().any(|e| {
             pattern_matches(e, path)
                 || (!e.chars().any(|c| c == '*' || c == '?' || c == '[')
@@ -659,7 +617,6 @@ pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> 
         }) {
             continue;
         }
-        // A Cargo.toml itself names its own package, which the same walk finds.
         let mut cursor = repo.join(path);
         if cursor.is_file() {
             cursor = match cursor.parent() {
@@ -691,7 +648,6 @@ fn workspace_excludes(repo: &Path) -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            // An unterminated list never leaks into the next table.
             if collecting {
                 break;
             }
@@ -721,7 +677,6 @@ fn workspace_excludes(repo: &Path) -> Vec<String> {
             rest = &tail[end + 1..];
         }
         if rest.contains(']') {
-            // The list closed (single- or multi-line); one key per manifest.
             break;
         }
     }
@@ -733,9 +688,6 @@ fn workspace_excludes(repo: &Path) -> Vec<String> {
 fn package_name_at_or_above(repo: &Path, from: &Path) -> Option<String> {
     let mut cursor = from.to_path_buf();
     loop {
-        // A manifest with no `[package]` is a workspace container: the chain
-        // falls through and the walk keeps going, so a member crate nested
-        // under it still resolves.
         let manifest = cursor.join("Cargo.toml");
         if manifest.is_file()
             && let Some(name) = package_name_in_manifest(&manifest)
@@ -808,8 +760,6 @@ pub fn build_gate_blocks_timed(
     let Some(bin) = build_tool.or_else(resolve_build_tool) else {
         return Vec::new();
     };
-    // Only build-affecting paths contribute package names (md under a crate
-    // must not drag that crate into the gate).
     let build_paths: Vec<String> = staged
         .iter()
         .filter(|p| path_can_affect_rust_build(p))
@@ -820,8 +770,6 @@ pub fn build_gate_blocks_timed(
         return Vec::new();
     }
     let mut command = std::process::Command::new(&bin);
-    // mbx and cargo both take `build -p …` as the first args. Preferring mbx
-    // avoids the bare-`cargo` misparse under the mbx shim (flywheel AGENTS).
     command.arg("build");
     for package in &packages {
         command.arg("-p").arg(package);
@@ -832,7 +780,6 @@ pub fn build_gate_blocks_timed(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    // Own process group so a timed-out kill reaps grandchildren (fake cargo → sleep).
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -888,7 +835,6 @@ pub fn build_gate_blocks_timed(
         }
     }
     if timed_out {
-        // Kill the process group, then reap — never an unbounded wait after the deadline.
         #[cfg(unix)]
         {
             let pgid = child.id();
@@ -902,7 +848,6 @@ pub fn build_gate_blocks_timed(
         }
         let _ = child.wait();
     } else if !matches!(child.try_wait(), Ok(Some(_))) {
-        // Exited between try_wait and here: reap without blocking long.
         let _ = child.try_wait();
     }
 
@@ -946,14 +891,6 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged diff must
-// appear in the commit message. Foreign bead-tagged code sweeping into a
-// peer's shared-tree window otherwise lands with no commit carrying its id —
-// breaking commit-before-close traceability while close gates pass on
-// technicalities (observed: flywheel a1498f1 absorbed the oxjy fix).
-// ---------------------------------------------------------------------------
-
 /// One bead-hunk attribution violation (bd-9mb8): `token` appears on an
 /// ADDED line of the staged diff but is absent from the commit message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -979,9 +916,7 @@ fn bd_tokens(text: &str) -> Vec<String> {
             {
                 end += 1;
             }
-            // The regex body `[a-z0-9-]+` requires at least one char after
             // the prefix; trailing hyphens are trimmed for prose safety
-            // ("bd-x--" → "bd-x") but never past that first body char.
             if end > start + 3 {
                 let mut e = end;
                 while e > start + 4 && b[e - 1] == b'-' {
@@ -1066,9 +1001,6 @@ pub fn staged_added_lines_matching(repo_path: &Path, skip: &dyn Fn(&str) -> bool
             && !skip(&current_path)
             && let Ok(c) = std::str::from_utf8(line.content())
         {
-            // libgit2 content excludes the origin sign; re-add '+' so the
-            // blob is a valid added-lines-only unified diff for
-            // [`bead_hunk_violations`]'s line filter.
             added.push('+');
             added.push_str(c);
         }
@@ -1076,27 +1008,6 @@ pub fn staged_added_lines_matching(repo_path: &Path, skip: &dyn Fn(&str) -> bool
     });
     added
 }
-
-// ---------------------------------------------------------------------------
-// bd-lyih: DECLARED projected paths.
-//
-// The bead-hunk rule is right for work a repository performs and wrong for
-// prose it VENDORS. toron.dev projects 44 guide pages out of toron, flywheel,
-// beads and chiebukuro, and 15 of those carry example bead ids inside bash
-// fences. Those ids belong to the SOURCE ledger: naming them in the site's
-// commit message would assert work the site did not do, and the attribution
-// table is the thing the rule exists to keep true.
-//
-// So the exemption is DECLARED, per path, in the same file git already uses
-// for exactly this question. It is deliberately not a heuristic and not a
-// path-prefix guess, and it is deliberately NOT [`SHARED_SAFE_PATHS`]: a
-// projected path still needs a lease, because the exemption is about who the
-// bead id belongs to, not about who may write the file.
-//
-// The declaration is also bounded. [`projected_decl_fault`] refuses one that
-// reaches compiled source, so `**` or `crates/*/src/**` cannot be used to
-// switch the rule off wholesale and hide real work behind a projection.
-// ---------------------------------------------------------------------------
 
 /// The `.gitattributes` attribute that declares a path as projected. Chosen
 /// because it is the ecosystem's existing marker for generated content, so
@@ -1126,8 +1037,6 @@ fn parse_gitattributes_line(line_no: usize, line: &str) -> AttrLine {
     if t.is_empty() || t.starts_with('#') {
         return AttrLine::DoesNot;
     }
-    // `!pattern` is git's negation form: these paths carry no attributes at
-    // all, so they are never projected whatever an earlier rule said.
     if let Some(negated) = t.strip_prefix('!') {
         return match negated.split_once(char::is_whitespace) {
             Some((pattern, _)) => AttrLine::Undeclares(pattern.trim().to_string()),
@@ -1150,7 +1059,6 @@ fn parse_gitattributes_line(line_no: usize, line: &str) -> AttrLine {
             line: t.to_string(),
         };
     }
-    // A line that never mentions our attribute says nothing about projection.
     if !attrs.split_whitespace().any(|a| {
         a == PROJECTED_ATTR || a.starts_with(&format!("{PROJECTED_ATTR}=")) || a == UNSET_ATTR
     }) {
@@ -1268,9 +1176,6 @@ fn build_source_probes(repo_path: &Path) -> Vec<String> {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Build output and VCS internals cannot hold a crate root, and
-            // `target/` is enormous; skipping them keeps this a repo-scale
-            // check rather than a commit-latency one.
             if matches!(name.as_str(), ".git" | "target" | "node_modules") {
                 continue;
             }
@@ -1299,8 +1204,6 @@ fn build_source_probes(repo_path: &Path) -> Vec<String> {
 /// it is passed in rather than re-derived so a caller can validate a set it
 /// built some other way.
 pub fn projected_decl_fault(repo_path: &Path, declared: &[String]) -> Option<ProjectedDeclFault> {
-    // Unreadable first. Skipping a line we cannot parse is indistinguishable
-    // from honouring it, and only one of those is safe to guess at.
     for (i, line) in read_gitattributes(repo_path).lines().enumerate() {
         match parse_gitattributes_line(i + 1, line) {
             AttrLine::Malformed { line_no, line } => {
@@ -1355,18 +1258,11 @@ pub fn added_lines_for_hunk_attribution(repo_path: &Path) -> String {
     })
 }
 
-// ---------------------------------------------------------------------------
-// bd-jhes GitFact producer: strict guard appends committed facts to the
-// flywheel fact journal. Best-effort — ANY failure must NEVER block commit.
-// ---------------------------------------------------------------------------
-
 /// Journal path for GitFacts: `$XDG_STATE_HOME/flywheel/journals/git-facts.jsonl`
 /// when `XDG_STATE_HOME` is set (hermetic for tests), else the hard-coded
 /// fallback `/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl`
 /// named in bd-jhes (which is `$XDG_STATE_HOME` default on this host).
 pub fn git_fact_journal_path() -> std::path::PathBuf {
-    // Under test the hard-coded fallback below is the operator's real journal,
-    // so an unset XDG_STATE_HOME means the sandboxed home's state dir instead.
     let xdg = crate::config::home_env("XDG_STATE_HOME")
         .or_else(|| crate::config::sandbox_home().map(|home| home.join(".local").join("state")));
     git_fact_journal_path_with_xdg(xdg.as_deref())
@@ -1425,7 +1321,6 @@ pub fn append_git_fact_to_path(
         serde_json::Value::String(pin.to_string()),
     );
     let line = serde_json::Value::Object(obj);
-    // Best-effort: never bubble errors. Guarded row (G7).
     let _ = (|| -> anyhow::Result<()> {
         crate::jsonl::append_row(journal_path, &line)?;
         Ok(())
@@ -1523,15 +1418,12 @@ mod tests {
         assert!(blocked.is_empty(), "own reservation must not block");
     }
 
-    // ---- bd-guard-crossproject-lease-er38: cross-project lease spelling ----
-
     #[test]
     fn er38_translates_sibling_repo_spelling() {
         assert_eq!(
             cross_project_pattern("../flywheel/src/x.rs", "flywheel"),
             Some("src/x.rs".to_string())
         );
-        // Whole-repo lease (with or without trailing slash) covers all of it.
         assert_eq!(
             cross_project_pattern("../flywheel", "flywheel"),
             Some("**".to_string())
@@ -1544,11 +1436,8 @@ mod tests {
 
     #[test]
     fn er38_rejects_non_matching_shapes() {
-        // A different sibling never translates here.
         assert_eq!(cross_project_pattern("../other/src/x.rs", "flywheel"), None);
-        // Repo-relative spellings are not escapes; caller keeps them as-is.
         assert_eq!(cross_project_pattern("src/x.rs", "flywheel"), None);
-        // Deep escapes and backslash spellings are never guessed.
         assert_eq!(cross_project_pattern("../../x.rs", "flywheel"), None);
         assert_eq!(
             cross_project_pattern("..\\flywheel\\x.rs", "flywheel"),
@@ -1558,9 +1447,6 @@ mod tests {
 
     #[test]
     fn er38_toron_namespaced_lease_satisfies_flywheel_guard() {
-        // The regression: a lease taken on project toron as
-        // `../flywheel/src/x.rs` must cover staged `src/x.rs` when the
-        // commit happens in the flywheel repo — with NO second lease.
         let raw = res("CrimsonIsland", "../flywheel/src/x.rs", true);
         let translated = cross_project_pattern(&raw.pattern, "flywheel").expect("translate");
         let own = vec![res("CrimsonIsland", &translated, true)];
@@ -1568,14 +1454,12 @@ mod tests {
         let blocks = guard_check_strict(Some("CrimsonIsland"), &staged, &own, SHARED_SAFE_PATHS);
         assert!(blocks.is_empty(), "one lease must cover: {blocks:?}");
 
-        // Symmetric fairness: the same spelling held by ANOTHER agent blocks.
         let foreign = vec![res("TealDune", &translated, true)];
         let blocks =
             guard_check_strict(Some("CrimsonIsland"), &staged, &foreign, SHARED_SAFE_PATHS);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, StrictBlockKind::HeldBy("TealDune".into()));
 
-        // Without translation the guard saw Unreserved — the defect.
         let untranslated = vec![res("CrimsonIsland", "../flywheel/src/x.rs", true)];
         let blocks = guard_check_strict(
             Some("CrimsonIsland"),
@@ -1664,8 +1548,6 @@ mod tests {
 
     #[test]
     fn test_double_star_footgun_misses_top_level_bd_v354() {
-        // bd-v354 (prior guard saga 2026-09-19): `**` collapses to `*` but the literal `/`
-        // still needs a `/` in the path, so `src/**/*.rs` misses top-level.
         assert!(
             !pattern_matches("src/**/*.rs", "src/main.rs"),
             "src/**/*.rs must NOT match top-level src/main.rs (fnmatch rule)"
@@ -1677,8 +1559,6 @@ mod tests {
     fn test_count_pattern_matches_bd_v354() {
         let files = vec!["src/main.rs".to_string(), "src/sub/a.rs".to_string()];
         assert_eq!(count_pattern_matches("src/**/*.rs", &files), 1);
-        // `*` crosses `/` (fnmatch), so `src/*.rs` already covers both;
-        // the footgun is the literal `/` in `**/` missing top-level.
         assert_eq!(count_pattern_matches("src/*.rs", &files), 2);
         assert_eq!(count_pattern_matches("*.md", &files), 0);
     }
@@ -1722,7 +1602,6 @@ mod tests {
             whitespace_path_warning("docs/decisions/**").is_none(),
             "an ordinary glob is silent"
         );
-        // A trailing space is the same mistake, and the suggestion drops it.
         let trailing = whitespace_path_warning("a.rs ").expect("warn on a trailing space");
         assert!(
             trailing.contains("with `a.rs`"),
@@ -1824,7 +1703,6 @@ mod tests {
                 .expect("commit");
         }
 
-        // Now stage a NEW file only; lib.rs/README.md stay clean in the index.
         std::fs::create_dir_all(root.join("docs")).expect("docs dir");
         std::fs::write(root.join("docs/plan.md"), "plan\n").expect("write");
         {
@@ -1843,15 +1721,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // ------------------------------------------------------------------
-    // bd-2dox: strict sweep-guard — every staged path must be covered by the
-    // committer's OWN active reservation or the shared-safe bookkeeping list.
-    // ------------------------------------------------------------------
-
     #[test]
     fn strict_blocks_cross_agent_exclusive() {
-        // B stages A's exclusively-reserved file + B's own file. B's own
-        // path passes; A's path is blocked naming the holder.
         let staged = vec!["src/foo.rs".to_string(), "src/b.rs".to_string()];
         let reservations = vec![res("A", "src/foo.rs", true), res("B", "src/b.rs", true)];
         let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -1873,8 +1744,6 @@ mod tests {
 
     #[test]
     fn strict_own_shared_reservation_covers() {
-        // A SHARED lease is still the agent's own active reservation — it
-        // covers the staged path in strict mode (it never blocks others).
         let staged = vec!["src/lib.rs".to_string()];
         let reservations = vec![res("me", "src/**", false)];
         let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -1883,8 +1752,6 @@ mod tests {
 
     #[test]
     fn strict_allows_beads_bookkeeping_without_reservation() {
-        // Tracker bookkeeping files are never reserved; the shared-safe list
-        // lets them through so every lane can close beads.
         let staged = vec![
             ".beads/issues.jsonl".to_string(),
             ".beads/beads.base.jsonl".to_string(),
@@ -1898,9 +1765,6 @@ mod tests {
 
     #[test]
     fn strict_blocks_unattributed_fail_closed() {
-        // The sweep-guard must NOT fail open: with no agent attribution the
-        // committer's staged paths cannot be verified — block with the env
-        // message (exit 1, never a silent pass-through).
         let staged = vec!["src/lib.rs".to_string()];
         let reservations = vec![res("me", "src/**", true)];
         let blocked = guard_check_strict(None, &staged, &reservations, SHARED_SAFE_PATHS);
@@ -1910,8 +1774,6 @@ mod tests {
 
     #[test]
     fn strict_blocks_unreserved_path() {
-        // A staged path covered by NO reservation is a sweep risk — the
-        // strict guard requires the committer to reserve what they stage.
         let staged = vec!["src/lib.rs".to_string()];
         let blocked = guard_check_strict(Some("me"), &staged, &[], SHARED_SAFE_PATHS);
         assert_eq!(blocked.len(), 1);
@@ -1921,8 +1783,6 @@ mod tests {
 
     #[test]
     fn strict_foreign_shared_lease_never_blocks_own_coverage() {
-        // Another agent's SHARED lease does not block; the path is covered
-        // by the committer's own exclusive lease.
         let staged = vec!["src/lib.rs".to_string()];
         let reservations = vec![res("other", "src/**", false), res("me", "src/lib.rs", true)];
         let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -1932,10 +1792,10 @@ mod tests {
     #[test]
     fn strict_mixed_report_names_each_violation() {
         let staged = vec![
-            "a/hers.rs".to_string(),           // HeldBy(Other)
-            "b/unowned.rs".to_string(),        // Unreserved
-            "c/mine.rs".to_string(),           // own — passes
-            ".beads/issues.jsonl".to_string(), // shared-safe — passes
+            "a/hers.rs".to_string(),
+            "b/unowned.rs".to_string(),
+            "c/mine.rs".to_string(),
+            ".beads/issues.jsonl".to_string(),
         ];
         let reservations = vec![res("Other", "a/**", true), res("me", "c/**", true)];
         let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -1958,8 +1818,6 @@ mod tests {
 
     #[test]
     fn strict_non_strict_paths_unchanged() {
-        // Sanity: the legacy fail-open check is untouched (byte-identical
-        // behavior for non-strict surfaces).
         let staged = vec!["src/lib.rs".to_string()];
         let reservations = vec![res("other", "src/**", true)];
         assert!(guard_check_blocked(None, &staged, &reservations).is_empty());
@@ -1969,12 +1827,8 @@ mod tests {
         );
     }
 
-    // --- bd-pin-public-plane-s-easy.1: pin and slug are ONE holder ---
-
     #[test]
     fn resolved_guard_treats_pin_and_slug_as_same_holder() {
-        // A reservation held by the PIN must not block a commit attributed
-        // to the SLUG (same holder after the fold slug → pin).
         let staged = vec!["src/lib.rs".to_string()];
         let reservations = vec![res("BlueRidge", "src/**", true)];
         let resolve = |name: &str| -> String {
@@ -1990,7 +1844,6 @@ mod tests {
             "slug commit must not block against pin-held reservation"
         );
 
-        // Reverse: slug-held reservation, pin commit.
         let reservations = vec![res("flywheel-toron-coder", "src/**", true)];
         let blocked = guard_blocked_paths_resolved("BlueRidge", &staged, &reservations, &resolve);
         assert!(blocked.is_empty(), "pin commit vs slug-held reservation");
@@ -2018,8 +1871,6 @@ mod tests {
             "slug attribution counts as the pin holder's own coverage"
         );
 
-        // A genuinely DIFFERENT holder still blocks (resolved comparison is
-        // not a wildcard).
         let reservations = vec![res("OtherPin", "src/**", true)];
         let blocked = guard_check_strict_resolved(
             Some("flywheel-toron-coder"),
@@ -2032,12 +1883,8 @@ mod tests {
         assert_eq!(blocked[0].kind, StrictBlockKind::HeldBy("OtherPin".into()));
     }
 
-    // --- bd-pin-public-plane-s-easy.10: anti-sweep — strict guard is the control ---
-
     #[test]
     fn anti_sweep_blocks_staging_path_held_by_another_agent() {
-        // Agent A holds src/a.rs (exclusive). Agent B stages src/a.rs →
-        // HeldBy(A). The strict guard is the control, not a DM.
         let staged = vec!["src/a.rs".to_string()];
         let reservations = vec![res("A", "src/a.rs", true)];
         let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -2048,7 +1895,6 @@ mod tests {
 
     #[test]
     fn anti_sweep_allows_staging_only_own_reserved_path() {
-        // Agent B stages ONLY its own reserved path → passes (no sweep).
         let staged = vec!["src/b.rs".to_string()];
         let reservations = vec![res("A", "src/a.rs", true), res("B", "src/b.rs", true)];
         let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -2060,8 +1906,6 @@ mod tests {
 
     #[test]
     fn anti_sweep_unreserved_path_is_unreserved_not_whispered() {
-        // A staged path covered by NO reservation is Unreserved (fail-closed
-        // sweep control — the anti-sweep contract, not a nudge).
         let staged = vec!["src/other.rs".to_string()];
         let reservations = vec![res("A", "src/a.rs", true)];
         let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
@@ -2072,9 +1916,6 @@ mod tests {
 
     #[test]
     fn test_install_hook_defaults_strict_on_with_escape_hatch() {
-        // bd-pin-public-plane-s-easy.10: the installed hook must default
-        // TORON_GUARD_STRICT=1 (strict is the control) and document the
-        // operator escape TORON_GUARD_STRICT=0 — never silent fail-open.
         let root = std::env::temp_dir().join(format!(
             "toron-guard-strict-{}-{}.git",
             std::process::id(),
@@ -2102,11 +1943,6 @@ mod tests {
 
     #[test]
     fn test_install_preserves_existing_hook_as_legacy_and_chains() {
-        // bd-2dox: installing into a repo with a pre-existing non-toron hook
-        // (the legacy mcp-agent-mail chain-runner) must preserve it as
-        // pre-commit.legacy and chain it AFTER the guard — never clobber.
-        // NOT pre-commit.orig: the chain-runner itself execs pre-commit.orig
-        // and would recurse infinitely if parked there.
         let root = std::env::temp_dir().join(format!(
             "toron-guard-chain-{}-{}.git",
             std::process::id(),
@@ -2139,7 +1975,6 @@ mod tests {
             "hook chains the preserved legacy hook"
         );
 
-        // Uninstall restores the legacy hook.
         let removed = uninstall_precommit_guard(&root).expect("uninstall");
         assert!(removed);
         let restored = std::fs::read_to_string(&script_path).expect("read restored");
@@ -2158,9 +1993,6 @@ mod tests {
 
     #[test]
     fn test_install_refuses_to_clobber_when_legacy_occupied() {
-        // If BOTH a foreign pre-commit and a pre-commit.legacy exist, install
-        // must refuse (cannot preserve without overwriting) — never silent
-        // clobber.
         let root = std::env::temp_dir().join(format!(
             "toron-guard-clobber-{}-{}.git",
             std::process::id(),
@@ -2187,12 +2019,6 @@ mod tests {
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    // -----------------------------------------------------------------------
-    // bd-9mb8: bead-hunk attribution — bd-* tokens ADDED by the staged diff
-    // must appear in the commit message, else the commit is attributed to
-    // nobody for that work.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn bead_hunks_foreign_token_blocked() {
@@ -2303,17 +2129,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // -----------------------------------------------------------------------
-    // bd-lyih: DECLARED projected paths.
-    //
-    // A repository that vendors prose from another repo (toron.dev projects
-    // 44 guides out of four projects) carries bead ids that belong to the
-    // SOURCE ledger. Naming them here would assert work this repo did not
-    // do, and the attribution table is the thing the rule exists to keep
-    // true. So the exemption is DECLARED, per-path, and the guard refuses a
-    // declaration that reaches compiled source.
-    // -----------------------------------------------------------------------
-
     /// Build a repo with a real crate (so there IS hand-written source to
     /// protect), an optional `.gitattributes`, and two staged files: one
     /// under `docs/guides/` (the projection) and one under the crate's
@@ -2419,9 +2234,6 @@ mod tests {
 
     #[test]
     fn without_the_declaration_the_projected_path_still_owes_attribution() {
-        // The negative control for the test above: same files, same message,
-        // only the .gitattributes line removed. If this does NOT now name
-        // bd-9z2q, the exemption proved nothing.
         let root = projection_repo(None, true);
         let added = added_lines_for_hunk_attribution(&root);
         let v = bead_hunk_violations(&added, "docs: refresh [bd-4t7w]");
@@ -2435,9 +2247,6 @@ mod tests {
 
     #[test]
     fn a_projected_path_still_needs_its_own_reservation() {
-        // The exemption is for the HUNK rule only. The staged-path check
-        // must keep demanding a lease, or the projection becomes an
-        // unaudited write lane.
         let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
         let staged = vec!["docs/guides/mail.md".to_string()];
         let blocked = guard_check_strict(Some("me"), &staged, &[], SHARED_SAFE_PATHS);
@@ -2459,9 +2268,6 @@ mod tests {
 
     #[test]
     fn a_bare_double_star_declaration_is_refused() {
-        // "Cannot be widened to hide real work" — `**` would exempt every
-        // source file in every crate, so the guard must refuse it outright
-        // rather than honour it.
         let root = projection_repo(Some("** linguist-generated=true\n"), true);
         assert!(
             matches!(
@@ -2486,11 +2292,6 @@ mod tests {
 
     #[test]
     fn a_false_line_subtracts_from_a_broader_declaration() {
-        // The author wrote "these are hand-written" and the guard must
-        // believe them. Git's rule is last-match-wins, so `docs/**` followed
-        // by `docs/guides/** linguist-generated=false` leaves the guide
-        // NOT projected — a flattened pattern list cannot express this and
-        // would exempt the guide anyway.
         let root = projection_repo(
             Some(
                 "docs/** linguist-generated=true\n\
@@ -2529,15 +2330,8 @@ mod tests {
 
     #[test]
     fn an_anchored_declaration_is_refused_because_it_exempts_nothing() {
-        // The failure this pins: a leading `/` anchors the pattern for git but
-        // not for `pattern_matches`, which compares repo-relative paths. The
-        // declaration then reads exactly like a working one and exempts
-        // nothing, so a genuine foreign id in a generated file is still
-        // charged to this commit with no explanation of why.
         let root = projection_repo(Some("/docs/guides/** linguist-generated=true\n"), true);
 
-        // The inert behaviour, asserted first: the guard is not merely
-        // refusing a style, it is refusing a pattern that does not work.
         assert!(
             !is_projected_path(&root, "docs/guides/mail.md"),
             "the anchored pattern matches nothing, which is the whole fault"
@@ -2551,7 +2345,6 @@ mod tests {
              generated guide's, still owed attribution"
         );
 
-        // And the refusal, so the trap cannot be reintroduced quietly.
         let fault = projected_decl_fault(&root, &projected_paths_in(&root)).expect("refused");
         assert_eq!(
             fault,
@@ -2566,9 +2359,6 @@ mod tests {
 
     #[test]
     fn the_unanchored_spelling_of_that_pattern_is_honoured() {
-        // Negative control for the test above. Without it, "refused" and "the
-        // path is simply not matched" are indistinguishable, and a matcher
-        // that stopped working for every pattern would pass both.
         let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
 
         assert_eq!(
@@ -2591,8 +2381,6 @@ mod tests {
 
     #[test]
     fn a_malformed_declaration_line_is_refused() {
-        // Fail closed: a line we cannot parse must not be silently skipped,
-        // because skipping it is indistinguishable from honouring it.
         let root = projection_repo(Some("docs/guides/**\n"), true);
         assert!(
             matches!(
@@ -2649,7 +2437,6 @@ mod tests {
         let cm = std::fs::read_to_string(hooks.join("commit-msg")).expect("read");
         assert!(cm.contains("user's own"), "foreign commit-msg untouched");
 
-        // ...and uninstall must NOT delete the user's hook either.
         assert!(uninstall_precommit_guard(&root).expect("uninstall"));
         assert!(
             hooks.join("commit-msg").exists(),
@@ -2658,10 +2445,6 @@ mod tests {
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    // -----------------------------------------------------------------------
-    // bd-jhes GitFact producer
-    // -----------------------------------------------------------------------
 
     #[test]
     fn git_fact_line_shape_with_bead_id() {
@@ -2726,22 +2509,18 @@ mod tests {
             extract_bead_id("multiple bd-first-one and bd-second-two"),
             Some("bd-first-one".to_string())
         );
-        // boundary check: x-bd-hidden should not match
         assert_eq!(extract_bead_id("x-bd-hidden"), None);
     }
 
     #[test]
     fn git_fact_journal_write_failure_does_not_panic() {
-        // Simulate unwritable journal by making the journal_path a directory.
         let dir = std::env::temp_dir().join(format!(
             "toron-git-fact-unwritable-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
-        // Using the directory itself as the file path must not panic and must not block.
         append_git_fact_to_path(&dir, "toron", "deadbeef", "subject", None, "Pin");
-        // Also test record helper with unwritable journal — must not panic.
         let repo_dir = std::env::temp_dir().join(format!(
             "toron-git-fact-repo-{}-{}",
             std::process::id(),
@@ -2749,7 +2528,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&repo_dir).expect("repo parent");
         let repo = git2::Repository::init(&repo_dir).expect("init repo");
-        // create an initial commit so HEAD exists
         std::fs::write(repo_dir.join("a.txt"), "hello\n").expect("write");
         let mut index = repo.index().expect("index");
         index.add_path(Path::new("a.txt")).expect("add");
@@ -2760,7 +2538,6 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init commit", &tree, &[])
             .expect("commit");
         drop(tree);
-        // record with the directory-as-file must not panic (best-effort)
         record_git_fact_for_head_with_journal(&repo_dir, "TestPin", &dir);
         drop(repo);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2922,17 +2699,14 @@ mod tests {
         .expect("member manifest");
         std::fs::write(root.join("crates/alpha/src/lib.rs"), "\n").expect("member file");
 
-        // The nearest manifest wins, even one nested well below the root.
         assert_eq!(
             cargo_packages_for_staged(&root, &["crates/alpha/src/lib.rs".to_string()]),
             vec!["alpha"]
         );
-        // A `[workspace]`-only manifest does not stop the climb.
         assert_eq!(
             cargo_packages_for_staged(&root, &["tools/note.md".to_string()]),
             vec!["enclosing"]
         );
-        // Two staged files in one package name it once.
         assert_eq!(
             cargo_packages_for_staged(
                 &root,
@@ -2976,13 +2750,10 @@ mod tests {
         )
         .expect("member manifest");
 
-        // A vendored path alone gates nothing instead of naming an
-        // unresolvable `-p elm-effect-schema`.
         assert_eq!(
             cargo_packages_for_staged(&root, &["vendor/vendored-lib/src/lib.rs".to_string()]),
             Vec::<String>::new()
         );
-        // Mixed staging still gates the member.
         assert_eq!(
             cargo_packages_for_staged(
                 &root,
@@ -3033,8 +2804,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("crates/alpha/README.md"), "x\n").unwrap();
-        // Pure filter: md alone never reaches cargo, even when a package walk
-        // would have named `alpha` / `enclosing`.
         assert!(build_gate_blocks(&root, &["crates/alpha/README.md".into()]).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3056,7 +2825,6 @@ mod tests {
         let shim_dir = root.join("shim");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let cargo_shim = shim_dir.join("cargo");
-        // Fake cargo: ignore args, sleep long. Marker string for pgrep.
         std::fs::write(
             &cargo_shim,
             "#!/bin/sh\necho sleeping-fake-cargo\nsleep 600\n",
@@ -3083,7 +2851,6 @@ mod tests {
             "guard returned in {:?}, expected near the 400ms deadline",
             elapsed
         );
-        // Grace for reaping; then no leftover from this shim's marker.
         std::thread::sleep(std::time::Duration::from_millis(100));
         let out = std::process::Command::new("pgrep")
             .args(["-f", "sleeping-fake-cargo"])

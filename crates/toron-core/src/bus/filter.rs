@@ -209,7 +209,6 @@ mod tests {
             kind_project_filter(crate::nostr::kinds::toron_kind(PROJECT_MANIFEST), "demo")
                 .match_event(&ev, MatchEventOptions::default())
         );
-        // Wrong kind → no match.
         assert!(
             !kind_project_filter(crate::nostr::kinds::toron_kind(AGENT_PROFILE), "demo")
                 .match_event(&ev, MatchEventOptions::default())

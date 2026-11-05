@@ -88,7 +88,6 @@ async fn handle_conn(
 ) -> anyhow::Result<()> {
     let ws: WebSocketStream<TcpStream> = tokio_tungstenite::accept_async(stream).await?;
     let (mut sink, mut stream) = ws.split();
-    // (subscription_id, filter) active on THIS connection.
     let mut local_subs: Vec<(SubscriptionId, Filter)> = Vec::new();
     let mut live_rx = live_tx.subscribe();
 
@@ -105,7 +104,6 @@ async fn handle_conn(
                 match parsed {
                     ClientMessage::Event(event) => {
                         let event: Event = event.into_owned();
-                        // Verify + dedup by id. Lock only briefly.
                         let accepted = {
                             let mut st = state.lock();
                             if event.verify().is_err() || st.events.iter().any(|e| e.id == event.id) {
@@ -122,7 +120,6 @@ async fn handle_conn(
                         );
                         sink.send(WsMessage::Text(ok.as_json())).await?;
                         if accepted {
-                            // Broadcast live to every connection's subscriptions.
                             let _ = live_tx.send(event);
                         }
                     }
@@ -133,7 +130,6 @@ async fn handle_conn(
                             .next()
                             .map(Cow::into_owned)
                             .unwrap_or_default();
-                        // Replay stored matches (clone under lock, no guard across await).
                         let stored: Vec<Event> = state.lock().events.clone();
                         for ev in stored {
                             if filter.match_event(&ev, MatchEventOptions::default()) {
@@ -141,7 +137,6 @@ async fn handle_conn(
                                 sink.send(WsMessage::Text(msg.as_json())).await?;
                             }
                         }
-                        // EOSE.
                         let eose = RelayMessage::eose(sub_id.clone());
                         sink.send(WsMessage::Text(eose.as_json())).await?;
                         local_subs.push((sub_id, filter));
@@ -156,7 +151,6 @@ async fn handle_conn(
             live = live_rx.recv() => {
                 match live {
                     Ok(event) => {
-                        // Forward to this connection's own matching subscriptions.
                         let subs = local_subs.clone();
                         for (sub_id, filter) in subs {
                             if filter.match_event(&event, MatchEventOptions::default()) {

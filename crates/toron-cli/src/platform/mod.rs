@@ -1,8 +1,4 @@
 // governed-by: ADR-0031
-// Platform boundary (bd-nc5d, RUST PRACTICES): OS behavior lives in
-// `platform/<os>.rs`; core (`daemon.rs`) holds shared contracts only.
-// `#[cfg(target_os)]` selection happens HERE and only here — leaves carry
-// no cfg attributes at all.
 
 use std::path::Path;
 
@@ -10,10 +6,10 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaemonState {
     /// Running under launchd (macOS).
-    #[allow(dead_code)] // linux/fallback builds never construct this variant
+    #[allow(dead_code)]
     RunningLaunchd,
     /// Running under systemd (Linux).
-    #[allow(dead_code)] // macos/fallback builds never construct this variant
+    #[allow(dead_code)]
     RunningSystemd,
     /// Running via pidfile spawn (fallback).
     RunningPidfile(u32),
@@ -33,7 +29,7 @@ pub(crate) struct InstallCtx<'a> {
     pub pass: &'a Path,
     pub out_log: &'a Path,
     pub err_log: &'a Path,
-    #[allow(dead_code)] // read only by the linux installer
+    #[allow(dead_code)]
     pub state: &'a Path,
 }
 

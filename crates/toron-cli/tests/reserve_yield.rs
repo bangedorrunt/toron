@@ -68,7 +68,6 @@ async fn reserve_yield_suppresses_resume() {
             .expect("register");
     }
 
-    // The holder takes the lane. A live lease is the other half of the rule.
     mailbox
         .file_reservation_paths(
             PROJECT,
@@ -81,7 +80,6 @@ async fn reserve_yield_suppresses_resume() {
         .await
         .expect("Holder acquires the lane");
 
-    // No marker yet: nothing is suppressed, even with the lane taken.
     assert!(
         mailbox
             .suppressed_resume_beads(PROJECT)
@@ -91,7 +89,6 @@ async fn reserve_yield_suppresses_resume() {
         "a live lease alone suppresses nothing — the yield is the missing half"
     );
 
-    // (2) one yield suppresses the bead while the holder's lease is live.
     mailbox
         .record_reservation_yield(PROJECT, "Yielder", BEAD, "Holder", "handing the lane back")
         .await
@@ -105,7 +102,6 @@ async fn reserve_yield_suppresses_resume() {
         "a yield naming a live holder suppresses that bead"
     );
 
-    // A yield for a bead nobody yielded claims nothing.
     mailbox
         .record_reservation_yield(PROJECT, "Yielder", OTHER, "GhostHolder", "not a holder")
         .await
@@ -119,7 +115,6 @@ async fn reserve_yield_suppresses_resume() {
         "an unresolvable holder suppresses nothing (no live lease to join)"
     );
 
-    // (1) a second yield for the same (bead, holder) collapses to one marker.
     mailbox
         .record_reservation_yield(PROJECT, "Yielder", BEAD, "Holder", "saying it twice")
         .await
@@ -138,7 +133,6 @@ async fn reserve_yield_suppresses_resume() {
         "the repeat refreshes the note instead of adding a row"
     );
 
-    // The board the loop reads resolves holder liveness in the same call.
     let (views, suppressed) = mailbox
         .reservation_yield_board(PROJECT)
         .await
@@ -162,7 +156,6 @@ async fn reserve_yield_suppresses_resume() {
     );
     assert_eq!(suppressed, vec![BEAD.to_string()]);
 
-    // (3) the holder releases: the marker clears without any delete path.
     mailbox
         .release_file_reservations(PROJECT, "Holder", &["src/**".to_string()])
         .await

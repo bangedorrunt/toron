@@ -25,7 +25,6 @@ fn extract_artifacts(
     let mut artifacts = Vec::new();
     for (node, value) in outputs {
         if let Some(obj) = value.as_object() {
-            // Look for sha-like fields
             for key in ["sha", "commit_sha", "commit"] {
                 if let Some(sha) = obj.get(key).and_then(|v| v.as_str()) {
                     artifacts.push(serde_json::json!({
@@ -35,7 +34,6 @@ fn extract_artifacts(
                     }));
                 }
             }
-            // Look for path-like fields
             for key in [
                 "path",
                 "receipt_path",
@@ -60,12 +58,8 @@ fn extract_artifacts(
                     artifacts.push(art);
                 }
             }
-            // If the node is a verify or commit-like, but the output is just {"sha": "..."} without kind, we already handled
-            // Also handle case where output is {"ok": true, "sha": "..."} - we already handled sha above
-            // For generic path without sha, we already handled
         }
     }
-    // Sort by node for stable hash
     artifacts.sort_by(|a, b| a["node"].as_str().cmp(&b["node"].as_str()));
     artifacts
 }
@@ -77,7 +71,6 @@ pub(crate) fn compute_evidence_hash(
     artifacts: &[serde_json::Value],
     ledger_path: &str,
 ) -> String {
-    // Build canonical object with sorted keys via BTreeMap
     let mut map = std::collections::BTreeMap::new();
     map.insert(
         "run_id".to_string(),
@@ -87,7 +80,6 @@ pub(crate) fn compute_evidence_hash(
         "node".to_string(),
         serde_json::Value::String(node.to_string()),
     );
-    // For artifacts, only include path and sha for each, sorted
     let arts: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
@@ -131,7 +123,6 @@ pub(crate) fn build_approval_payload(
     let all_nodes: std::collections::BTreeSet<String> = graph.nodes.keys().cloned().collect();
     let done_set: std::collections::BTreeSet<String> = outputs.keys().cloned().collect();
     let mut pending: Vec<String> = all_nodes.difference(&done_set).cloned().collect();
-    // Remove the current node from pending (it's the one being requested)
     pending.retain(|n| n != node_name);
     pending.sort();
 
@@ -537,9 +528,6 @@ pub(crate) async fn evaluate_step_guard(
     let Some(g) = guard.filter(|g| !g.trim().is_empty()) else {
         return GuardVerdict::Proceed;
     };
-    // Dotted paths (`steps.gate.ok`, `inputs.mode`) and quoted bools
-    // (`== "true"`) are the spellings compose and the playbooks use.
-    // The binder stores flat names and real booleans.
     let flattened = crate::guard::normalize_guard_paths(g);
     let rewritten = crate::guard::rewrite_bool_string_literals(&flattened);
     let vars = guard_vars(trigger, step_outputs);
@@ -549,7 +537,6 @@ pub(crate) async fn evaluate_step_guard(
         crate::guard::GuardOutcome::Bool(false) => GuardVerdict::Skip {
             reason: format!("guard false on node {node:?}"),
         },
-        // Every non-boolean outcome is a loud contract failure (I10).
         crate::guard::GuardOutcome::TypeError { got } => GuardVerdict::Fail {
             error: format!("guard {g:?} on node {node:?} evaluated to non-boolean ({got})"),
         },
@@ -729,8 +716,6 @@ pub(crate) fn resolve_template_ref(
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
         return Some(value);
     }
-    // `@items` and a bare name are the compose spelling of "the list called
-    // items". JSON literals and `{{...}}` are handled above.
     let name = trimmed.trim_start_matches('@');
     if name.is_empty() || name == trimmed && trimmed.contains(' ') {
         return None;
@@ -756,7 +741,6 @@ pub(crate) fn validate_graph_runtime(graph: &Graph) -> Result<(), String> {
     if nodes.is_empty() {
         return Err("graph is empty — no nodes".to_string());
     }
-    // Unknown needs first (names the missing dependency).
     for (name, node) in nodes {
         for need in &node.needs {
             if !nodes.contains_key(need) {
@@ -766,9 +750,6 @@ pub(crate) fn validate_graph_runtime(graph: &Graph) -> Result<(), String> {
             }
         }
     }
-    // Cycle check via Kahn's algorithm: peel nodes with no incoming edges;
-    // leftovers participate in a cycle. (All needs are known nodes here —
-    // unknown refs returned above.)
     let mut indegree: std::collections::HashMap<&str, usize> = nodes
         .iter()
         .map(|(name, node)| (name.as_str(), node.needs.len()))

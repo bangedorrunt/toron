@@ -114,14 +114,12 @@ pub fn resolve_coordinate<'a>(
         return None;
     }
 
-    // Highest-priority class wins.
     let best_class = events
         .iter()
         .map(|e| KeyPriority::of(e, operator))
         .max()
         .unwrap_or(KeyPriority::Agent);
 
-    // Among the best class, NIP-01 latest-wins (created_at desc, lowest id).
     events
         .into_iter()
         .filter(|e| KeyPriority::of(e, operator) == best_class)
@@ -177,7 +175,6 @@ mod tests {
         assert_eq!(key.pubkey, keys.public_key().to_hex());
         assert_eq!(key.d, "proj:src/**");
 
-        // Non-addressable → None.
         let note = build_event(
             &keys,
             crate::nostr::Kind::TextNote,
@@ -246,7 +243,6 @@ mod tests {
             "{\"status\":\"revoked\"}",
             1_700_000_001,
         );
-        // operator=None → both are Agents; the newer lease wins.
         let resolved = resolve_coordinate([&lease, &revoke], None).expect("resolved");
         assert_eq!(resolved.id, lease.id);
     }

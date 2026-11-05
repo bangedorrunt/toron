@@ -33,11 +33,11 @@ fn p_roles(rumor: &UnsignedEvent) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn sc3_bcc_privacy_matrix() {
-    let sender = Keys::generate(); // Pi-α
-    let to_keys = Keys::generate(); // OC-β
-    let cc_keys = Keys::generate(); // Grok-γ
-    let b1_keys = Keys::generate(); // Pi-δ
-    let b2_keys = Keys::generate(); // Pi-ε
+    let sender = Keys::generate();
+    let to_keys = Keys::generate();
+    let cc_keys = Keys::generate();
+    let b1_keys = Keys::generate();
+    let b2_keys = Keys::generate();
     let stranger_keys = Keys::generate();
 
     let to = to_keys.public_key();
@@ -47,7 +47,6 @@ async fn sc3_bcc_privacy_matrix() {
 
     let npub = |pk: &PublicKey| pk.to_hex();
 
-    // --- visible rumor: to + cc only, NO bcc (ADR G3) ---
     let visible = gift_wrap::build_rumor(
         sender.public_key(),
         Timestamp::from(1_700_000_000),
@@ -59,7 +58,6 @@ async fn sc3_bcc_privacy_matrix() {
         "body",
     );
 
-    // --- bcc-variant rumors: to + cc + ONE bcc (each omits the other) ---
     let variant1 = gift_wrap::build_rumor(
         sender.public_key(),
         Timestamp::from(1_700_000_000),
@@ -83,15 +81,11 @@ async fn sc3_bcc_privacy_matrix() {
         "body",
     );
 
-    // --- wrap one copy per recipient ---
     let wrap_to = gift_wrap::gift_wrap(&sender, &to, visible.clone()).unwrap();
     let wrap_cc = gift_wrap::gift_wrap(&sender, &cc, visible).unwrap();
     let wrap_b1 = gift_wrap::gift_wrap(&sender, &bcc1, variant1).unwrap();
     let wrap_b2 = gift_wrap::gift_wrap(&sender, &bcc2, variant2).unwrap();
 
-    // --- assertions ---
-
-    // to + cc see the VISIBLE rumor: to+cc, no bcc.
     for (keys, wrap) in [(&to_keys, &wrap_to), (&cc_keys, &wrap_cc)] {
         let uw = gift_wrap::unwrap(keys, wrap).expect("recipient unwraps");
         let roles = p_roles(&uw.rumor);
@@ -103,7 +97,6 @@ async fn sc3_bcc_privacy_matrix() {
         );
     }
 
-    // bcc1 sees its variant: to+cc+itself, NOT bcc2.
     let uw_b1 = gift_wrap::unwrap(&b1_keys, &wrap_b1).expect("bcc1 unwraps");
     let roles1 = p_roles(&uw_b1.rumor);
     assert!(roles1.iter().any(|(n, r)| n == &npub(&to) && r == "to"));
@@ -114,7 +107,6 @@ async fn sc3_bcc_privacy_matrix() {
         "bcc1 cannot see bcc2"
     );
 
-    // bcc2 symmetric.
     let uw_b2 = gift_wrap::unwrap(&b2_keys, &wrap_b2).expect("bcc2 unwraps");
     let roles2 = p_roles(&uw_b2.rumor);
     assert!(roles2.iter().any(|(n, r)| n == &npub(&bcc2) && r == "bcc"));
@@ -123,7 +115,6 @@ async fn sc3_bcc_privacy_matrix() {
         "bcc2 cannot see bcc1"
     );
 
-    // Non-recipients cannot unwrap (cryptographically enforced).
     for wrap in [&wrap_to, &wrap_cc, &wrap_b1, &wrap_b2] {
         assert!(
             gift_wrap::unwrap(&stranger_keys, wrap).is_err(),
@@ -131,7 +122,6 @@ async fn sc3_bcc_privacy_matrix() {
         );
     }
 
-    // Cross-check: bcc1's wrap is NOT the visible wrap (would leak).
     assert_ne!(wrap_b1.id, wrap_to.id, "bcc variant is a distinct event");
     assert_ne!(wrap_b2.id, wrap_to.id, "bcc variant is a distinct event");
 }

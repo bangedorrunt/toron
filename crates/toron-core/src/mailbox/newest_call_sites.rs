@@ -124,7 +124,7 @@ fn adversarial_arrivals(
         .iter()
         .map(|content| build_event(keys, kind, *content, tags(), at).expect("build"))
         .collect();
-    events.sort_by_key(|a| std::cmp::Reverse(a.id)); // DESC, so the smallest id lands last
+    events.sort_by_key(|a| std::cmp::Reverse(a.id));
     events
 }
 
@@ -302,8 +302,6 @@ async fn whois_reads_the_higher_id_profile_on_a_shared_second() {
         },
     ];
     let at = Timestamp::from_secs(1_700_000_000);
-    // Each profile carries the expectations whois derives from it, so the
-    // winner's answers travel with the event instead of being looked up.
     let mut built: Vec<(Event, &str, &str)> = profiles
         .iter()
         .map(|p| {

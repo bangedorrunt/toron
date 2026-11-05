@@ -145,7 +145,6 @@ pub fn tick(model: &BusyOwnerModel, msg: &BusyOwnerMsg) -> (BusyOwnerModel, Vec<
                 );
             }
             if next.holders.contains_key(agent) {
-                // Busy: start or continue bounded hold.
                 if let Some(hold) = next.holds.get(agent) {
                     if *now_ms >= hold.until_ms {
                         let held_for = now_ms.saturating_sub(hold.since_ms);
@@ -244,7 +243,6 @@ pub fn tick(model: &BusyOwnerModel, msg: &BusyOwnerMsg) -> (BusyOwnerModel, Vec<
             let g = next.generation.entry(agent.clone()).or_insert(0);
             *g = g.saturating_add(1);
             let generation = *g;
-            // Stale holder cannot reclaim after fork.
             let stale_holder = next
                 .holders
                 .get(agent)
@@ -345,7 +343,6 @@ mod tests {
             &fx[0],
             BusyOwnerEffect::GenerationAdvanced { generation: 1, .. }
         ));
-        // Stale release at gen 0 is fenced.
         let (_m, fx) = tick(
             &m,
             &BusyOwnerMsg::Release {

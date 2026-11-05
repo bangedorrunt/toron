@@ -448,7 +448,6 @@ pub fn thread_rows(messages: &[MailRow]) -> Vec<ListRow> {
         .into_iter()
         .map(|t| {
             let others = t.participants.len().saturating_sub(1);
-            // A thread is unread when any of its messages is.
             let unread = messages
                 .iter()
                 .any(|m| thread_id_of(m) == t.id && m.unread());
@@ -494,10 +493,6 @@ pub fn filter_rows(rows: &mut Vec<ListRow>, filter: &str) {
             || r.meta.to_ascii_lowercase().contains(&needle)
     });
 }
-
-// ---------------------------------------------------------------------------
-// Channels
-// ---------------------------------------------------------------------------
 
 /// One channel row (kind 39000/39002 lifecycle projection).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -586,10 +581,6 @@ impl ChannelsState {
         rows
     }
 }
-
-// ---------------------------------------------------------------------------
-// Agents
-// ---------------------------------------------------------------------------
 
 /// One agent row: the registered roster joined with the presence projection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -686,10 +677,6 @@ impl AgentsState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dashboard
-// ---------------------------------------------------------------------------
-
 /// Receipt transition counts (durable store).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReceiptCounts {
@@ -752,10 +739,6 @@ impl DashboardState {
         WINDOWS[(i + delta).rem_euclid(WINDOWS.len() as isize) as usize]
     }
 }
-
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
 
 /// Where the data came from (the mailbox selector's verdict).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -821,10 +804,6 @@ impl SettingsState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Status line
-// ---------------------------------------------------------------------------
-
 /// Status-line severity (vim one-liner feedback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -854,10 +833,6 @@ impl Default for Status {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Onboarding
-// ---------------------------------------------------------------------------
-
 /// The commands an empty pane names, built for THIS project and pin so the
 /// operator can paste them without editing. A placeholder stays a placeholder:
 /// an unknown pin is never guessed.
@@ -875,10 +850,6 @@ pub struct Onboarding {
     /// Register this pin in the roster.
     pub agent: String,
 }
-
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
 
 /// The whole UI state. One model, one fold (`update::tick`).
 #[derive(Debug, Clone, PartialEq)]

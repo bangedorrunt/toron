@@ -74,15 +74,10 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
         }
     }
 
-    // No enclosing `Retry` action exists outside a run: the coordinator's
-    // default policy (3 attempts, exponential backoff) applies.
     let coordinator = RetryCoordinator::from_enclosing(None);
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        // Render FIRST, like the engine's leaf arm: a runner must see rendered
-        // values, and a render failure is a per-step error with
-        // workflow/node/field/ref attribution, never a run failure.
         let render_ctx = RenderContext::new(workflow, node);
         let value = match render_action(&step.action, trigger, outputs, &render_ctx) {
             Ok(action) => {
@@ -93,8 +88,6 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
                     workflow_digest,
                     node,
                     attempt,
-                    // Parity with the Context path: no enclosing `Retry`
-                    // action means a per-step policy of one attempt.
                     1,
                     iteration_key.as_deref(),
                 );
@@ -102,9 +95,6 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
                     ActionPartition::HostSink { sink } => {
                         dispatch_leaf(seams, &invocation, sink).await
                     }
-                    // Engine control and unsupported actions get the
-                    // boundary's own fail-closed value: a linear host does not
-                    // sequence, so it must refuse rather than pretend.
                     _ => invoke_compat(&invocation.action, |_| None),
                 }
             }
@@ -150,8 +140,6 @@ pub struct GraphNodeStep<'a> {
 /// invocation, partition, one dispatch — so a node reaches the same verdict on
 /// either substrate.
 pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) -> serde_json::Value {
-    // A foreach copy renders against the enclosing trigger plus its item,
-    // exactly like `run_foreach`'s per-iteration trigger copy.
     let mut iter_trigger;
     let trigger = match input.item {
         Some(item) => {
@@ -178,11 +166,6 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
         }
     }
 
-    // A `retry:` wrapper is a POLICY, not an action: this call is ONE attempt
-    // of the inner step, and the scheduler owns the attempts
-    // (bd-durable-retry-policy-rrck). The wrapper's guard already ran above;
-    // the inner step's own guard runs per attempt and its failure is a VALUE
-    // (Continue) so the wrapper's `on_error` decides exhaustion.
     let mut inner;
     let node_action = match &input.node.action {
         Action::Retry { step, .. } => {
@@ -226,9 +209,6 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
         );
     }
 
-    // The planning render in the fold is LENIENT; this one is strict, so an
-    // unresolvable ref fails HERE with workflow/node/field/ref attribution
-    // rather than reaching a runner as a verbatim placeholder.
     let render_ctx = RenderContext::new(input.workflow, input.node_name);
     let action = match render_action(node_action, trigger, input.inputs, &render_ctx) {
         Ok(action) => action,
@@ -247,8 +227,6 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
     );
     match partition(&invocation.action) {
         ActionPartition::HostSink { sink } => dispatch_leaf(seams, &invocation, sink).await,
-        // The graph model refuses these before any row; reaching one here is a
-        // routing bug, so answer with the boundary's own fail-closed value.
         _ => invoke_compat(&invocation.action, |_| None),
     }
 }
@@ -505,8 +483,6 @@ mod tests {
                 let counter = Arc::clone(&counter);
                 Box::pin(async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    // `retry_after_ms: 0` keeps the exponential backoff at zero
-                    // so the test exercises the bound, not the wall clock.
                     Ok(serde_json::json!({
                         "ok": false,
                         "error": "provider down",

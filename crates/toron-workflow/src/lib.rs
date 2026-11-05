@@ -32,7 +32,6 @@ pub mod mention;
 pub mod playbook_lint;
 pub mod schema;
 pub mod trigger_filter;
-// ADR-0032 Spec 2 + Spec 3 (bd-htoo): closed contracts + canonical identity.
 pub mod action_contract;
 pub mod identity;
 

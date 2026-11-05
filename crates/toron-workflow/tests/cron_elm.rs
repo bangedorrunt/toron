@@ -24,10 +24,8 @@ fn one_latest_tick_per_window_and_idempotent_replay() {
     assert_eq!(fires[0].key, format!("cron:digest:{T0}"));
     assert!(matches!(fires[0].outcome, StartOutcome::Started { .. }));
 
-    // The checkpoint advanced: no second firing at the same instant.
     assert!(cron.tick(T0).expect("second tick").is_empty());
 
-    // One catch-up, not four, after a quarter hour of downtime.
     let fires = cron.tick(T0 + minutes(15)).expect("catch-up");
     assert_eq!(fires.len(), 1);
     assert_eq!(fires[0].tick_ms, T0 + minutes(15));
@@ -69,7 +67,6 @@ fn pause_resume_replace_and_remove() {
         "fires at 08:00 UTC"
     );
 
-    // Replacing preserves pause state.
     assert!(cron.set_enabled("daily", false));
     cron.add(
         "daily",

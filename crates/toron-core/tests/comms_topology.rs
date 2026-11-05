@@ -184,7 +184,6 @@ async fn stale_topology_gen_writes_nothing() {
         .unwrap();
     assert_eq!(logs_after, logs, "stale gen writes no log row");
     assert!(s.lookup(&stale.msg).await.unwrap().is_none());
-    // The refused triple did not consume the seq: the same seq lands a higher gen.
     put(&s, &mut q, context_fact(m, OP, Topology::Open, 2)).await;
     let bumped = s.context_of(CTX).await.unwrap().unwrap();
     assert_eq!(bumped.topology, Topology::Open);
@@ -245,7 +244,6 @@ async fn supervisor_topology_send_is_not_yet_and_writes_nothing() {
         1,
         "the refused send did not touch the context row"
     );
-    // Same seq still free, and a higher context gen is how you leave supervisor.
     put(&s, &mut q, context_fact(m, OP, Topology::Swarm, 2)).await;
     let m = q.msg(CAP);
     put(&s, &mut q, task(m, CREW)).await;

@@ -29,7 +29,6 @@ pub struct HackerNight;
 
 #[allow(dead_code)]
 impl HackerNight {
-    // raw palette
     pub const VOID: Color = Color::Rgb(0x08, 0x08, 0x0e);
     pub const SURFACE: Color = Color::Rgb(0x12, 0x12, 0x2a);
     pub const OVERLAY: Color = Color::Rgb(0x1a, 0x1a, 0x3e);
@@ -42,7 +41,7 @@ impl HackerNight {
     pub const MINT: Color = Color::Rgb(0x73, 0xda, 0xca);
     pub const ICE: Color = Color::Rgb(0x89, 0xdd, 0xff);
     pub const AMBER: Color = Color::Rgb(0xe0, 0xaf, 0x68);
-    pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e); // AA on void (use 210/91 for bright)
+    pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
 
     /// Resolve `Color::Rgb` vs `Color::Indexed` vs `Color::Reset` based on capability.
     fn resolve(c: Color, idx256: u8, ansi16: Color) -> Color {
@@ -52,7 +51,6 @@ impl HackerNight {
         if truecolor() {
             return c;
         }
-        // 256color TERM → use indexed fallback
         let is_256 = std::env::var("TERM")
             .map(|t| t.contains("256color"))
             .unwrap_or(false);
@@ -62,8 +60,6 @@ impl HackerNight {
             ansi16
         }
     }
-
-    // — semantic Styles —
 
     pub fn bg_base() -> Style {
         Style::default().bg(Self::resolve(Self::VOID, 233, Color::Black))
@@ -110,7 +106,6 @@ impl HackerNight {
         s
     }
     pub fn header() -> Style {
-        // void bg + fg.default bold — used for header bar
         let bg = Self::resolve(Self::VOID, 233, Color::Black);
         let fg = Self::resolve(Self::FG, 189, Color::White);
         let mut s = Style::default().bg(bg).fg(fg);
@@ -169,13 +164,8 @@ mod tests {
 
     #[test]
     fn no_color_strips() {
-        // Env mutation is process-global — serialize via TEST env lock pattern
-        // used elsewhere (output.rs tests). Here we just assert shape without
-        // mutating env: resolve() with Color::Reset is the NO_COLOR contract.
         let s = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         let stripped = HackerNight::maybe_style(s);
-        // When NO_COLOR is not set in test env, maybe_style returns input unchanged
-        // — the important property is that it exists and is the NO_COLOR gate.
         assert!(stripped.fg.is_some() || std::env::var_os("NO_COLOR").is_some());
     }
 }

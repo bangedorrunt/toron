@@ -236,11 +236,6 @@ fn fold_attention(board: &Board) -> AgentStatus {
     if saw_working {
         return AgentStatus::Working;
     }
-    // bd-xgea: a failed record must never be masked by a finished sibling.
-    // `error` says the program stopped with a failure; it has the same
-    // lifetime as `done` in the protocol, so "a child finished" cannot turn
-    // it into Done. Failure outranks success for attention, and maps to
-    // Unknown (never Done, never Idle).
     if saw_error {
         return AgentStatus::Unknown;
     }
@@ -570,7 +565,6 @@ mod tests {
             "a failed child must not be hidden by a done root"
         );
 
-        // Working still outranks a failure: the terminal is still busy.
         child_failed.apply(&osc("state=working:id=live"));
         assert_eq!(fold(&child_failed, FoldPolicy::Attention), AgentStatus::Working);
     }

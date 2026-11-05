@@ -1,7 +1,4 @@
 // governed-by: ADR-0031
-// macOS supervision (bd-nc5d): verbatim move of the macos-gated blocks out
-// of `daemon.rs`. No signature or behavior changes — this module is only
-// compiled on macOS, so it carries zero cfg attributes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,7 +43,7 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
     let out = Command::new("launchctl")
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
-    let _ = out; // absent unit is fine
+    let _ = out;
     install_logrotate_agent(&dir, &uid)?;
     let out = Command::new("launchctl")
         .args([
@@ -57,7 +54,6 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
         .output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // "already bootstrapped" is fine (idempotent re-install).
         if !stderr.contains("already") && !stderr.contains("Bootstrap failed: 17") {
             anyhow::bail!("launchctl bootstrap failed: {stderr}");
         }
@@ -130,10 +126,6 @@ pub(crate) fn stop_supervised(args: &DaemonArgs, pidfile: &Path) -> anyhow::Resu
     if let Ok(o) = out
         && o.status.success()
     {
-        // launchd job booted out. The serve process needs a moment to
-        // release the port — probe with a grace window before deciding
-        // a stray unmanaged holder exists (a fresh-bootout socket still
-        // accepting is a teardown race, not a holder).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -345,12 +337,6 @@ mod tests {
         assert!(xml.contains("<string>--mcp-http</string>"), "http flag");
         assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
         assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
-        // bd-j2vo: launchd's default soft maxfiles for a job is 256
-        // and the daemon holds one fd per subscriber, so it died of EMFILE and
-        // stopped accepting connections. The unit must raise the budget — and
-        // it must use launchd's own key (SoftResourceLimits ->
-        // NumberOfFiles), because launchd ignores "LimitMaxFiles" and the
-        // job then ran with the domain's 256.
         assert!(
             xml.contains("<key>SoftResourceLimits</key>")
                 && xml.contains("<key>HardResourceLimits</key>")

@@ -21,7 +21,6 @@ async fn publish_subscribe_roundtrip_via_bus() {
     let daemon = TestDaemon::boot().await.expect("boot daemon");
     let key = Keys::generate();
 
-    // Kind-14 project event; send on the bus, receive via subscription.
     let event = EventBuilder::new(Kind::TextNote, "hello e2e")
         .tags([Tag::parse(["t", "demo"]).expect("tag")])
         .finalize(&key)
@@ -48,14 +47,12 @@ async fn publish_subscribe_roundtrip_via_bus() {
 #[tokio::test]
 async fn closed_subscription_terminates_collect() {
     let daemon = TestDaemon::boot().await.expect("boot daemon");
-    // A subscription for a kind that never arrives; EOSE/closed terminates
-    // collect_until_eose without hanging.
     let sub = daemon
         .subscribe(Filter::new().kinds([Kind::from(30010)]))
         .await
         .expect("subscribe");
     let events = daemon.collect_until_eose(sub, 5).await;
     assert!(events.is_empty(), "no events for empty filter");
-    let _ = SubscriptionEvent::Eose; // silence unused if shape changes
+    let _ = SubscriptionEvent::Eose;
     daemon.cleanup();
 }

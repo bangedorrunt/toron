@@ -99,8 +99,6 @@ pub fn tick(
             ConvergenceMsg::ReAdd { generation },
         ) => {
             if generation != held {
-                // Keep Pending|Committed held so a second ReAdd still fences
-                // (do not collapse to Fenced — that made the fence one-shot).
                 (
                     state.cloned(),
                     vec![ConvergenceEffect::FenceReAdd {
@@ -112,7 +110,6 @@ pub fn tick(
                 (state.cloned(), vec![])
             }
         }
-        // Belt: if a prior Fenced snapshot is held, keep fencing ReAdds.
         (
             Some(Convergence::Fenced {
                 held_generation: held,
@@ -126,7 +123,6 @@ pub fn tick(
                 held: *held,
             }],
         ),
-        // Fail-closed: commit/fail with no pending proposal refuses.
         (None, ConvergenceMsg::Commit) => (
             Some(Convergence::Rejected {
                 reason: "commit without pending authority".into(),
@@ -143,7 +139,6 @@ pub fn tick(
                 reason: reason.clone(),
             }],
         ),
-        // Idempotent / ignore elsewhere.
         (s, _) => (s.cloned(), vec![]),
     }
 }
@@ -219,12 +214,10 @@ mod tests {
                 held: 7
             }]
         );
-        // Prior Pending must stay held — not collapse to Fenced (one-shot bug).
         assert!(
             matches!(s2, Some(Convergence::Pending { generation: 7, .. })),
             "expected Pending held, got {s2:?}"
         );
-        // Second mismatched ReAdd still fences under held Pending.
         let (s3, fx2) = tick(s2.as_ref(), &ConvergenceMsg::ReAdd { generation: 9 });
         assert_eq!(
             fx2,

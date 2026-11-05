@@ -17,9 +17,6 @@ use super::{ToolOutput, ToolServer, nonneg_secs};
 
 #[tool_router(router = slot_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // BUILD SLOTS (3)
-    // ------------------------------------------------------------------
 
     /// `acquire_build_slot` (destructive): advisory slot lease.
     #[tool(
@@ -93,10 +90,6 @@ impl ToolServer {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct AcquireBuildSlotArgs {

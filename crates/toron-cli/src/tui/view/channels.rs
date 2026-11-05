@@ -16,8 +16,6 @@ use super::{split, widgets};
 
 /// Render the channels tab for the current layout mode.
 pub fn render(f: &mut Frame, area: Rect, model: &Model, mode: LayoutMode) {
-    // Phone width: one pane at a time, and the room list stays reachable with
-    // `h` (it is the only way to change rooms).
     if mode.single() {
         return match model.pane {
             Pane::Sidebar => render_room_list(f, area, model, true),
@@ -41,8 +39,6 @@ fn render_room_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         "channels"
     };
     if model.channels.channels.is_empty() {
-        // The command comes from the model, so it is the real one and carries
-        // this project and pin (the old string was hand-written prose).
         let text = if model.channels.loaded {
             format!(
                 "no channels in this project yet.\n\n  open the first one:\n    {}",
@@ -161,8 +157,6 @@ fn render_posts(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow:
                     HackerNight::info(),
                 ));
             }
-            // Phone width: the stamp is the first thing to go — the body text
-            // is the point of the row.
             if !narrow {
                 spans.push(Span::styled(format!("  {at}"), HackerNight::fg_muted()));
             }

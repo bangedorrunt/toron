@@ -259,7 +259,6 @@ impl DeliveryCursorStore {
             } else {
                 entry.delivered.insert(id.clone());
                 entry.cursor = entry.cursor.saturating_add(1);
-                // bd-aqvg: newly delivered = persist tick must save.
                 self.dirty.store(true, Ordering::SeqCst);
                 effects.push(DeliveryEffect::Deliver {
                     session: session.into(),
@@ -337,9 +336,6 @@ impl Drop for ReservationGuard<'_> {
 
 /// Pure helper: reject agent-key-as-seen heuristic — signing key ≠ delivery.
 pub const fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id: &str) -> bool {
-    // Intentionally always true as a documentation assertion for callers:
-    // delivery membership must come from DeliveryCursorStore, never from
-    // "this agent key signed the event".
     true
 }
 
@@ -355,7 +351,6 @@ mod tests {
             let _guard = store.inner.lock().unwrap();
             panic!("panic inside the cursor's critical section");
         }));
-        // The lock is poisoned now; the cursor must still answer.
         let cur = store.cursor("s");
         assert!(
             cur.delivered.is_empty(),
@@ -378,7 +373,6 @@ mod tests {
             cur.in_flight.is_empty(),
             "snapshot drops reservations by design"
         );
-        // Memory still holds the reservation: re-reserve hits in-flight.
         let (keep2, effects) = store.reserve_undelivered("s", ["b"]);
         assert!(keep2.is_empty());
         assert!(
@@ -396,7 +390,6 @@ mod tests {
             cur.in_flight.is_empty(),
             "in-flight at crash is retryable, never restored as delivered"
         );
-        // And the retried id is reservable again, not skipped.
         let (keep, _) = fresh.reserve_undelivered("s", ["b"]);
         assert_eq!(keep, vec!["b".to_string()]);
     }
@@ -421,7 +414,6 @@ mod tests {
         live.restore(stale);
         let cur = live.snapshot().remove("s").expect("session");
         assert!(cur.delivered.contains("new") && cur.delivered.contains("old"));
-        // Live reservations survive restore: re-reserve hits in-flight.
         let (keep3, effects3) = live.reserve_undelivered("s", ["flying"]);
         assert!(keep3.is_empty());
         assert!(
@@ -462,9 +454,7 @@ mod tests {
         let (keep, fx) = store.peek_undelivered("sess-1", ["e1", "e2", "e1"]);
         assert_eq!(keep, vec!["e1", "e2"]);
         assert!(matches!(fx[0], DeliveryEffect::SkipAlreadyDelivered { .. }));
-        // Peek must not advance — mark after "publish".
         store.mark_delivered("sess-1", ["e1", "e2"]);
-        // Same event, different session → deliver again (session-scoped).
         let (keep2, _) = store.peek_undelivered("sess-2", ["e1"]);
         assert_eq!(keep2, vec!["e1"]);
         store.mark_delivered("sess-2", ["e1"]);
@@ -484,7 +474,6 @@ mod tests {
         assert_eq!(store.cursor(session).cursor, 0);
         assert!(store.cursor(session).delivered.is_empty());
 
-        // Failed publish: do not mark — id remains undelivered.
         let (keep_retry, _) = store.peek_undelivered(session, [id]);
         assert_eq!(
             keep_retry,
@@ -492,13 +481,11 @@ mod tests {
             "failed publish must leave id undelivered for retry"
         );
 
-        // Successful path marks.
         let fx = store.mark_delivered(session, [id]);
         assert!(matches!(fx[0], DeliveryEffect::Deliver { cursor: 1, .. }));
         assert_eq!(store.cursor(session).cursor, 1);
         assert!(store.cursor(session).delivered.contains(id));
 
-        // Second attempt skips.
         let (keep2, fx2) = store.peek_undelivered(session, [id]);
         assert!(keep2.is_empty());
         assert!(matches!(
@@ -517,7 +504,6 @@ mod tests {
         let (keep, _) = store.peek_undelivered(session, parents);
         assert_eq!(keep, vec!["p1", "p2", "p3"]);
 
-        // First parent already delivered — siblings still undelivered.
         store.mark_delivered(session, ["p1"]);
         let (keep2, _) = store.peek_undelivered(session, parents);
         assert_eq!(
@@ -553,7 +539,6 @@ mod tests {
         );
         assert!(matches!(fx_b[0], DeliveryEffect::SkipInFlight { .. }));
 
-        // Transport failure releases — id becomes reservable again.
         store.release_reservation(session, [id]);
         assert!(!store.cursor(session).in_flight.contains(id));
         let (keep_c, _) = store.reserve_undelivered(session, [id]);
@@ -582,7 +567,6 @@ mod tests {
                 let (keep, _) = store.reserve_undelivered(session, [id]);
                 if !keep.is_empty() {
                     *winners.lock().expect("winners") += 1;
-                    // Simulate publish then mark.
                     store.mark_delivered(session, keep);
                 }
             }));
@@ -611,7 +595,6 @@ mod tests {
             "Drop must clear in_flight"
         );
         assert!(!store.cursor(session).delivered.contains(id));
-        // Reservable again after Drop.
         let (keep2, _) = store.reserve_undelivered(session, [id]);
         assert_eq!(keep2, vec![id]);
         let g = ReservationGuard::new(&store, session, keep2);

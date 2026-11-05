@@ -37,7 +37,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         scheme: toron_core::nostr::proof::ProofScheme::Schnorr,
     };
 
-    // Helper: build + verify an attestation for `att`.
     async fn verify(
         anchor: &Keys,
         gate: &ProofGate,
@@ -62,7 +61,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         signature: None,
     };
 
-    // --- 1. Wrong kind rejected (kind mismatch) ---
     let mut store = NonceStore::new(pool.clone());
     let wrong_kind = EventBuilder::new(Kind::TextNote, "nope")
         .finalize(&anchor)
@@ -76,7 +74,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         "wrong kind rejected"
     );
 
-    // --- 2. Untrusted anchor rejected ---
     let rogue = Keys::generate();
     let mut store = NonceStore::new(pool.clone());
     let rogue_evt = build_attestation_event(&rogue, &valid_att(), "demo", "PiAlpha", now).unwrap();
@@ -89,7 +86,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         "untrusted anchor rejected"
     );
 
-    // --- 3. Forged (mutated signature) rejected ---
     let mut store = NonceStore::new(pool.clone());
     let valid = build_attestation_event(&anchor, &valid_att(), "demo", "PiAlpha", now).unwrap();
     let mut forged = valid.clone();
@@ -103,7 +99,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         "forged rejected"
     );
 
-    // --- 4. Expired rejected ---
     let mut store = NonceStore::new(pool.clone());
     let mut expired = valid_att();
     expired.expires_at = Some(now.as_secs() - 60);
@@ -115,7 +110,6 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         ProofError::Expired
     );
 
-    // --- 5. Mismatched binding rejected ---
     let mut store = NonceStore::new(pool.clone());
     let mut mismatch = valid_att();
     mismatch.project = "other-project".into();
@@ -128,20 +122,16 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         "binding mismatch rejected"
     );
 
-    // --- 6. Valid attestation accepted once ---
     let mut store = NonceStore::new(pool.clone());
     verify(&anchor, &gate, &claim, valid_att(), &mut store, now)
         .await
         .expect("valid accepted");
 
-    // --- 7. Replay same nonce → rejected (in-session) ---
     let err = verify(&anchor, &gate, &claim, valid_att(), &mut store, now)
         .await
         .unwrap_err();
     assert_eq!(err, ProofError::Replayed, "same-session replay rejected");
 
-    // --- 8. "Restart": NEW NonceStore on the same DB → old nonce still
-    //        rejected (SQLite-persisted proof_nonces, ADR G1/SC-8). ---
     let mut restarted = NonceStore::new(pool.clone());
     let err = verify(&anchor, &gate, &claim, valid_att(), &mut restarted, now)
         .await

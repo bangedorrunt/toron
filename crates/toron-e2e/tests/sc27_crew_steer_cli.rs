@@ -62,21 +62,12 @@ fn toron_bin() -> PathBuf {
 /// program name so the "no flywheel binary invoked" assert is exact.
 fn run(data_dir: &Path, args: &[&str]) -> Output {
     SPAWNED.lock().unwrap().push("toron".to_string());
-    // bd-nepl: pin discovery to an absent sock for every child. Since
-    // `serve` holds the machine `$state/wake.sock`, an unpinned watch/wait
-    // child would attach to that FOREIGN daemon, spend its whole timeout on
-    // events this test dir never produces, and skip the in-process replay
-    // path the test actually asserts (was green pre-sidecar, red after).
     let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&absent);
     toron_core::testkit::toron_command(toron_bin())
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .env("TORON_WAKE_SOCK", &absent)
         .output()
@@ -208,7 +199,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         all_output.push_str(&String::from_utf8_lossy(&out.stderr));
     };
 
-    // 1. A creates the private channel.
     let out = run(
         &dir,
         &[
@@ -232,7 +222,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 2. B joins.
     let out = run(
         &dir,
         &["channel", "join", CHANNEL, "--project", PROJECT, "--as", B],
@@ -245,7 +234,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 3. A posts a kind-9 mention to B.
     let out = run(
         &dir,
         &[
@@ -282,7 +270,6 @@ async fn sc27_crew_steer_cli_no_captain() {
     );
     let post_id = post["event_id"].as_str().expect("event_id").to_string();
 
-    // 4. B's watch --once replays the stored kind-9 post (deterministic).
     let out = run(
         &dir,
         &[
@@ -313,7 +300,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         "watch --once must print an event object: {watched}"
     );
 
-    // 5. job list --state open: exactly one row for B (one 43001, not N).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let jobs_json: Value = loop {
         let out = run(
@@ -372,7 +358,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         .filter(|r| r.to_string().contains(B) || r.to_string().contains(&b_npub))
         .count();
     assert_eq!(b_rows, 1, "exactly one open job for B, got {jobs_json}");
-    // settle: still exactly one 43001 (not N)
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         store_kind_count(&pool, 43001).await,
@@ -380,7 +365,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         "exactly one 43001 in the shared store"
     );
 
-    // 6. B claims → won:true, first-claimer.
     let job_id = store_job_id(&pool).await;
     let out = run(
         &dir,
@@ -415,7 +399,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         "B claim won:true: {claim_b}"
     );
 
-    // 7. A's second claim → exit 1, won:false (first-claimer wins).
     let out = run(
         &dir,
         &["job", "claim", &job_id, "--project", PROJECT, "--as", A],
@@ -434,7 +417,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         "A claim won:false: {claim_a}"
     );
 
-    // 8. B reports the result.
     let out = run(
         &dir,
         &[
@@ -459,7 +441,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 9. A sees the terminal state.
     let out = run(&dir, &["job", "show", &job_id, "--project", PROJECT]);
     collect(&out);
     assert_eq!(
@@ -471,7 +452,6 @@ async fn sc27_crew_steer_cli_no_captain() {
     let shown = stdout_json(&out);
     assert!(json_is_done(&shown), "job show state must be done: {shown}");
 
-    // Plane S: the channel post is kind 9 (not 1059) and no gift-wrap exists.
     assert_eq!(
         store_kind_of(&pool, &post_id).await,
         Some(9),
@@ -483,8 +463,6 @@ async fn sc27_crew_steer_cli_no_captain() {
         "gift-wrap count for the channel post must be 0 (plane S never gift-wraps)"
     );
 
-    // No flywheel binary invoked (spawn log, not output text — the actors are
-    // NAMED flywheel-toron-coder* per ADR-0018), no worktree in logs.
     assert_no_foreign_binary_spawned();
     assert!(
         !all_output.to_lowercase().contains("worktree"),

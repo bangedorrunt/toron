@@ -240,20 +240,12 @@ impl ReceiptStore {
     /// a `resulted` row keeps its stored `result_path` unless the incoming
     /// row carries a new one.
     pub async fn upsert(&self, receipt: &Receipt) -> anyhow::Result<()> {
-        // Boundary parse (ADR-0035 Spec 6): corr is a `Corr`, non-empty.
         if Corr::from_str(&receipt.corr).is_err() {
             anyhow::bail!("corr must be non-empty");
         }
-        // Validate wake if present (ensures only standing|tasked ever lands)
         if let Some(w) = receipt.wake {
-            // Wake is already typed, so valid by construction; this is a no-op but
-            // documents the invariant.
             let _ = w.as_str();
         }
-        // Monotonic guard: never downgrade resulted, never drag acked to owed.
-        // bd-aku0: tombstones refuse first — a pruned corr stays dead no
-        // matter what the projection fold returns (get() hides pruned rows
-        // as None, which the old code read as "free to insert").
         if self.is_tombstoned(&receipt.corr).await? {
             anyhow::bail!(
                 "corr {} was pruned (tombstoned); refusing resurrection",
@@ -263,8 +255,6 @@ impl ReceiptStore {
         if let Some(existing) = self.get(&receipt.corr).await? {
             match (existing.state, receipt.state) {
                 (ReceiptState::Resulted, ReceiptState::Resulted) => {
-                    // Idempotent: keep stored row unless the incoming row
-                    // carries a new result_path.
                     if receipt.result_path.is_some() && receipt.result_path != existing.result_path
                     {
                         let mut merged = existing;
@@ -276,9 +266,6 @@ impl ReceiptStore {
                 }
                 (ReceiptState::Resulted, _) => return Ok(()),
                 (ReceiptState::Acked, ReceiptState::Owed) => return Ok(()),
-                // ADR-0010 D8: degraded is acked-unknown — never re-owed, and
-                // an ack is strictly more information than degraded, so an
-                // acked row must not be dragged down either.
                 (ReceiptState::Degraded, ReceiptState::Owed) => return Ok(()),
                 (ReceiptState::Acked, ReceiptState::Degraded) => return Ok(()),
                 _ => {}
@@ -317,12 +304,9 @@ impl ReceiptStore {
     /// conditional write's WHERE clause. False = skip (no write).
     const fn transition_allowed(current: ReceiptState, incoming: &Receipt) -> bool {
         match (current, incoming.state) {
-            // Idempotent re-stamp carries nothing new unless it brings a path.
             (ReceiptState::Resulted, ReceiptState::Resulted) => incoming.result_path.is_some(),
             (ReceiptState::Resulted, _) => false,
             (ReceiptState::Acked, ReceiptState::Owed) => false,
-            // ADR-0010 D8: degraded is acked-unknown — never re-owed, and
-            // an ack is strictly more information than degraded.
             (ReceiptState::Degraded, ReceiptState::Owed) => false,
             (ReceiptState::Acked, ReceiptState::Degraded) => false,
             _ => true,
@@ -348,8 +332,6 @@ impl ReceiptStore {
     async fn upsert_row(&self, receipt: &Receipt) -> anyhow::Result<bool> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
         for _ in 0..3 {
-            // Pre-tx read (no locks held): fast skip + expected-state
-            // snapshot. Re-read every attempt — a retry re-validates.
             if self.is_tombstoned(&receipt.corr).await? {
                 anyhow::bail!(
                     "corr {} was pruned (tombstoned); refusing resurrection",
@@ -371,7 +353,6 @@ impl ReceiptStore {
             }
             let mut tx = self.pool.begin().await?;
             let wake_s = receipt.wake.map(|w| w.as_str().to_string());
-            // Conditional act: the WHERE clause is the atomic guard.
             let wrote = match current {
                 None => sqlx::query(
                     "INSERT OR IGNORE INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
@@ -405,14 +386,9 @@ impl ReceiptStore {
                     == 1,
             };
             if !wrote {
-                // Lost the race: another writer moved the row first.
-                // Roll back and re-read — the next attempt re-validates.
                 tx.rollback().await?;
                 continue;
             }
-            // Re-check the tombstone AFTER holding the write lock: a prune
-            // that committed between our pre-read and this tx must refuse
-            // us (otherwise the insert above resurrected a pruned corr).
             if self.is_tombstoned(&receipt.corr).await? {
                 tx.rollback().await?;
                 anyhow::bail!(
@@ -474,7 +450,6 @@ impl ReceiptStore {
     /// rows). Per-corr index if this ever serves a hot path.
     async fn fold_projected(&self) -> anyhow::Result<BTreeMap<String, Receipt>> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
-        // bd-uc8m: only the receipts' own events, not the whole log.
         let events = log
             .read_kinds(&["receipt.stamped", "receipt.pruned"])
             .await?;
@@ -627,8 +602,6 @@ impl ReceiptStore {
                     result_path: stamped_path.clone(),
                     updated_at: *updated_at_ms,
                 };
-                // bd-aku0: the in-tx guard is the authority — a stale Stamp
-                // decision that lost its race skips instead of landing last.
                 if self.upsert_row(&stamped).await? {
                     Ok(stamped)
                 } else {
@@ -909,8 +882,6 @@ mod tests {
     }
     #[tokio::test]
     async fn receipt_prune_tombstone_blocks_resurrection() {
-        // bd-aku0: a pruned corr is tombstoned in the log. A later upsert
-        // for the same corr must NOT resurrect it — the guard refuses.
         let (pool, path) = test_pool("tombstone").await;
         let store = ReceiptStore::new(pool);
         let r = Receipt {
@@ -952,10 +923,6 @@ mod tests {
 
     #[tokio::test]
     async fn receipt_guard_in_tx_no_lost_update() {
-        // bd-aku0: the monotonic guard must live INSIDE the write tx.
-        // A stale owed write applied directly to the row writer must not
-        // drag a committed resulted row back — even when the outer
-        // check-then-act was bypassed.
         let (pool, path) = test_pool("intx").await;
         let store = ReceiptStore::new(pool);
         store
@@ -1091,14 +1058,12 @@ mod tests {
         }
         let (pool, path) = test_pool("trans-acked").await;
         let store = ReceiptStore::new(pool);
-        // missing -> no-op
         assert!(
             !store
                 .transition_acked(&c("missing"), 1000)
                 .await
                 .expect("transition missing")
         );
-        // owed -> acked
         store
             .upsert(&Receipt {
                 corr: "c-acked".into(),
@@ -1119,7 +1084,6 @@ mod tests {
         let got = store.get("c-acked").await.expect("get").expect("found");
         assert_eq!(got.state, ReceiptState::Acked);
         assert_eq!(got.updated_at, 1001, "host clock stamps the row");
-        // idempotent: acked -> acked no-op
         assert!(
             !store
                 .transition_acked(&c("c-acked"), 1002)
@@ -1128,7 +1092,6 @@ mod tests {
         );
         let got2 = store.get("c-acked").await.expect("get2").expect("found2");
         assert_eq!(got2.state, ReceiptState::Acked);
-        // resulted never downgrades
         store
             .upsert(&Receipt {
                 corr: "c-resulted".into(),
@@ -1164,7 +1127,6 @@ mod tests {
         let (pool, path) = test_pool("dual-write").await;
         let store = ReceiptStore::new(pool.clone());
         let log = crate::index::event_log::EventLog::new(pool);
-        // Every stamp lands an event; the fold matches the table exactly.
         store
             .set_resulted(&c("w1"), Some("/w.json".into()), 5000)
             .await
@@ -1180,7 +1142,6 @@ mod tests {
         assert_eq!(log.generation().await.expect("gen"), 1);
         let div = store.verify_against_log().await.expect("verify");
         assert!(div.is_empty(), "clean fold, no divergence: {div:?}");
-        // Prune tombstones: rebuild must not resurrect.
         store.prune_expired(9000, 1000).await.expect("prune");
         assert!(store.get("w1").await.expect("get").is_none(), "row pruned");
         let div = store.verify_against_log().await.expect("verify2");
@@ -1200,7 +1161,6 @@ mod tests {
         }
         let (pool, path) = test_pool("switch").await;
         let store = ReceiptStore::new(pool.clone());
-        // Two lanes stamp concurrently: both survive (no lost writes).
         let (s1, s2) = (store.clone(), store.clone());
         let (r1, r2) = tokio::join!(
             async move {
@@ -1219,7 +1179,6 @@ mod tests {
             }
         );
         let _ = (r1, r2);
-        // Readers serve the projection: all 20 visible via get/list.
         assert_eq!(store.list(None).await.expect("list").len(), 20);
         assert!(store.get("lane-a-3").await.expect("get").is_some());
         assert_eq!(
@@ -1230,9 +1189,7 @@ mod tests {
                 .len(),
             20
         );
-        // Backfill is a no-op on dual-written rows (idempotent).
         assert_eq!(store.backfill_from_table().await.expect("backfill"), 0);
-        // Export + import into a fresh pool: both lanes survive.
         let log = crate::index::event_log::EventLog::new(pool);
         let exported = log.read_since(0).await.expect("export");
         assert_eq!(exported.len(), 20);
@@ -1261,7 +1218,6 @@ mod tests {
         let (pool, path) = test_pool("diverged").await;
         let store = ReceiptStore::new(pool.clone());
         store.set_resulted(&c("v1"), None, 6000).await.expect("v1");
-        // Bypass the store: raw write the table behind the log's back.
         sqlx::query("UPDATE receipts SET state = 'owed' WHERE corr = 'v1'")
             .execute(&pool)
             .await
@@ -1281,14 +1237,12 @@ mod tests {
         }
         let (pool, path) = test_pool("set-resulted").await;
         let store = ReceiptStore::new(pool);
-        // create when missing
         let r = store
             .set_resulted(&c("new-corr"), Some("/tmp/a.json".into()), 2000)
             .await
             .expect("set new");
         assert_eq!(r.state, ReceiptState::Resulted);
         assert_eq!(r.result_path.as_deref(), Some("/tmp/a.json"));
-        // owed -> resulted
         store
             .upsert(&Receipt {
                 corr: "owed-1".into(),
@@ -1307,7 +1261,6 @@ mod tests {
         assert_eq!(r2.state, ReceiptState::Resulted);
         assert_eq!(r2.wake, Some(Wake::Standing));
         assert_eq!(r2.result_path.as_deref(), Some("/tmp/b.json"));
-        // acked -> resulted
         store
             .upsert(&Receipt {
                 corr: "acked-1".into(),
@@ -1324,7 +1277,6 @@ mod tests {
             .await
             .expect("acked->resulted");
         assert_eq!(r3.state, ReceiptState::Resulted);
-        // idempotent: resulted -> resulted (no downgrade, optional path update)
         let r4 = store
             .set_resulted(&c("acked-1"), Some("/tmp/c.json".into()), 2003)
             .await
@@ -1339,8 +1291,6 @@ mod tests {
         assert_eq!(r5.result_path.as_deref(), Some("/tmp/c.json"));
         let _ = std::fs::remove_file(&path);
     }
-
-    // ---- bd-v51i: the tombstone probe must not read the whole log ----
 
     /// bd-v51i: `is_tombstoned` read the ENTIRE event log on every call, and
     /// `upsert` calls it up to 7 times. This pins the replacement: the probe
@@ -1445,8 +1395,6 @@ mod tests {
             updated_at: at,
         };
         store.upsert(&r(100)).await.expect("stamp");
-        // The fold is a tri-state: Some(Some(ev)) = live row, Some(None) =
-        // tombstoned, None = corr absent from the log entirely.
         let (v, seen) = fold("mixed-1").await;
         assert!(
             matches!(v, Some(Some(_))),
@@ -1461,8 +1409,6 @@ mod tests {
             "prune is now the latest word, so the corr IS tombstoned; saw {seen}"
         );
 
-        // A raw log append re-stamps it AFTER the prune. The tombstone must stop
-        // applying, exactly as the whole-log fold would have decided.
         let ev = ReceiptEvent::stamped(&r(20_000));
         let payload = serde_json::to_string(&ev).unwrap_or_default();
         log.append(&ev.event_id(), ReceiptEvent::STAMPED, &payload, 20_000)

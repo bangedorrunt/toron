@@ -57,7 +57,6 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
     for (slug, body) in [
         (Some("alpha"), "lease-a1"),
         (Some("beta"), "lease-b1"),
-        // A lease with NO project scoping tags: visible to global subs.
         (None, "lease-orphan"),
     ] {
         let ev = lease_event(&keys, slug, body);
@@ -66,14 +65,12 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
 
     let unscoped: Filter = Filter::new().kinds([toron_kind(FILE_RESERVATION)]);
 
-    // Layer 1: raw storage read sees every row.
     assert_eq!(
         store.replay(&unscoped).await.expect("raw replay").len(),
         3,
         "store-level kinds-only replay is unfiltered by project"
     );
 
-    // Layer 2: a GLOBAL subscription receives only the unscoped row.
     let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
         .await
         .expect("bus");
@@ -81,7 +78,6 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
     assert_eq!(gated.len(), 1, "global subs get only non-project rows");
     assert_eq!(gated[0].content, "lease-orphan");
 
-    // The scoped path still sees its own subset through the same API.
     let alpha = collect_replay(
         &bus,
         kind_project_filter(toron_kind(FILE_RESERVATION), "alpha"),
@@ -91,7 +87,6 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
     assert_eq!(alpha.len(), 1);
     assert_eq!(alpha[0].content, "lease-a1");
 
-    // Trusted ingress bypasses the global gate (system consumers).
     let trusted = bus
         .subscribe_trusted(unscoped.clone())
         .await

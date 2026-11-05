@@ -44,10 +44,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .output()
         .expect("spawn toron")
@@ -124,7 +120,6 @@ async fn sc28_first_claimer_cli_exactly_one_wins() {
         .map(|(_, npub)| npub.clone())
         .unwrap();
 
-    // Channel + kind-9 mention → one 43001 (mirrors SC-27 setup).
     let out = run(
         &dir,
         &[
@@ -179,7 +174,6 @@ async fn sc28_first_claimer_cli_exactly_one_wins() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Wait for the single 43001 to be stamped by the dispatcher.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let job_id = loop {
         let out = run(
@@ -216,7 +210,6 @@ async fn sc28_first_claimer_cli_exactly_one_wins() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    // Two claims nearly together (threads). Exactly one won:true.
     let dir_b = dir.clone();
     let job_b = job_id.clone();
     let t_b = std::thread::spawn(move || claim(&dir_b, &job_b, B));

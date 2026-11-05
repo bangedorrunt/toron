@@ -18,9 +18,6 @@ use super::{ToolOutput, ToolServer};
 
 #[tool_router(router = product_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // PRODUCT BUS (5)
-    // ------------------------------------------------------------------
 
     /// `ensure_product`: idempotent product manifest (kind-30011).
     #[tool(
@@ -125,10 +122,6 @@ impl ToolServer {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct EnsureProductArgs {

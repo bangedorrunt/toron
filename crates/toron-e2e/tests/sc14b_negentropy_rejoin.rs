@@ -20,7 +20,6 @@ async fn temp_store(tag: &str) -> (BusEventStore, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("store.sqlite");
     let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
-    // event_store creates its own table; no migrations needed here.
     let store = BusEventStore::new(pool).await.expect("store");
     (store, dir)
 }
@@ -30,7 +29,6 @@ async fn sc14b_negentropy_rejoin_transfers_only_missing() {
     let (relay_store, _relay_dir) = temp_store("relay").await;
     let (node_store, node_dir) = temp_store("node").await;
 
-    // Relay holds 5 signed events.
     let key = Keys::generate();
     let mut events = Vec::new();
     for i in 0..5 {
@@ -41,12 +39,10 @@ async fn sc14b_negentropy_rejoin_transfers_only_missing() {
         events.push(evt);
     }
 
-    // Node lost state — it has only the first 2.
     for evt in &events[..2] {
         assert!(node_store.insert(evt).await.expect("node insert"));
     }
 
-    // Rejoin: node pulls the missing delta from the relay via negentropy.
     let stats = node_store
         .sync_delta(&relay_store)
         .await
@@ -57,11 +53,8 @@ async fn sc14b_negentropy_rejoin_transfers_only_missing() {
         "negentropy path used (not full replay)"
     );
 
-    // Consistency: node now holds all 5.
     assert_eq!(node_store.count().await.expect("count"), 5);
 
-    // Re-verification on rejoin: every event the node holds is a valid
-    // signed event with the expected content (verify_event on canonical id).
     let replayed = relay_store
         .replay(&toron_core::bus::Filter::new().kinds([Kind::TextNote]))
         .await
@@ -89,7 +82,6 @@ async fn sc14b_no_delta_when_consistent() {
         node_store.insert(&evt).await.expect("node");
     }
 
-    // Already consistent: delta sync transfers nothing.
     let stats = node_store
         .sync_delta(&relay_store)
         .await

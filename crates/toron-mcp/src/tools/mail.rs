@@ -24,9 +24,6 @@ use super::{ToJson, ToolOutput, ToolServer};
 
 #[tool_router(router = mail_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // MESSAGING (5)
-    // ------------------------------------------------------------------
 
     /// `send_message`: NIP-17 gift-wrapped fan-out.
     #[tool(
@@ -37,16 +34,11 @@ impl ToolServer {
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> ToolOutput {
         if args.broadcast == Some(true) {
-            // bd-mail-crew-fanout-xq6b: a rejection must name the supported
-            // path — explicit per-recipient sends, or flywheel's --crew
-            // spawn-registry expansion.
             return ToolOutput::err(
                 "broadcast=true is rejected (AM-Rust invariant: explicit recipients only) —                  send one addressed copy per recipient instead; flywheel crews: \
                  `flywheel mail send <project> --crew --subject S --body B` expands the live pins",
             );
         }
-        // Additive optional (ADR-0007 C3: names frozen, args may grow pre-1.0):
-        // CLI `reserve request-release` composes this existing tool.
         if let Some(reservation_id) = args.reservation_id.as_deref().filter(|s| !s.is_empty()) {
             let Some(target) = args.to.first().cloned() else {
                 return ToolOutput::err(
@@ -106,7 +98,6 @@ impl ToolServer {
         annotations(title = "Reply message", destructive_hint = true)
     )]
     async fn reply_message(&self, Parameters(args): Parameters<ReplyMessageArgs>) -> ToolOutput {
-        // Additive optional: CLI `reserve respond` composes this existing tool.
         if let Some(request_message_id) =
             args.request_message_id.as_deref().filter(|s| !s.is_empty())
         {
@@ -217,10 +208,6 @@ impl ToolServer {
         )
     }
 
-    // ------------------------------------------------------------------
-    // SEARCH (2)
-    // ------------------------------------------------------------------
-
     /// `search_messages` (read-only): FTS5 search over indexed messages.
     ///
     /// AM-parity envelope (bd-led.7.2 / live parity 2026-08-08): AM's
@@ -289,10 +276,6 @@ impl ToolServer {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct SendMessageArgs {

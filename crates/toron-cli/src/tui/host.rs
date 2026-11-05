@@ -85,10 +85,6 @@ impl LiveHost {
         })?;
         let agent = crate::plane::pane_agent(args.agent.as_deref());
 
-        // One mailbox, the same selector the plane commands use: a loopback
-        // daemon owns the durable root, so embedding here reads and writes the
-        // SAME store. A remote daemon is refused (bd-d41q) — never a shadow
-        // copy that the daemon would not see.
         let source = crate::mailbox_source::MailboxSource::resolve().await?;
         let (mailbox, kind, detail, daemon_loopback) = match source {
             crate::mailbox_source::MailboxSource::Embedded(mb) => (
@@ -190,8 +186,6 @@ impl LiveHost {
                 ..Default::default()
             })
             .await?;
-        // The receipt store is the only place "acked" is durable; join it
-        // here so the Needs-ack folder clears when the ack actually lands.
         let acked = self.acked_corrs().await.unwrap_or_default();
         Ok(rows.into_iter().map(|m| mail_row(m, &acked)).collect())
     }
@@ -229,7 +223,6 @@ impl LiveHost {
                 if c.closed && !self.settings.show_closed_channels {
                     return false;
                 }
-                // Private channels appear only to members (plane S rule).
                 !c.private || me.is_some_and(|pk| c.is_member(&pk))
             })
             .map(|c| {
@@ -316,8 +309,6 @@ impl LiveHost {
                 }
             })
             .collect();
-        // Live pins first, then alphabetical: the operator's eye lands on the
-        // fleet that is actually running.
         rows.sort_by(|a, b| {
             b.online
                 .cmp(&a.online)
@@ -350,8 +341,6 @@ impl LiveHost {
                 ReceiptState::Owed => counts.owed += 1,
                 ReceiptState::Acked => counts.acked += 1,
                 ReceiptState::Resulted => counts.resulted += 1,
-                // Durable enqueue happened, bookkeeping failed: visible, never
-                // folded into a healthy bucket.
                 ReceiptState::Degraded => counts.degraded += 1,
             }
         }
@@ -495,7 +484,6 @@ impl TuiHost for LiveHost {
                     },
                     Err(e) => failure(Op::Send, e),
                 },
-                // The runtime never asks a host to quit; it owns the loop.
                 Effect::Quit => Msg::Inflight(0),
             }
         }
@@ -522,8 +510,6 @@ pub fn composed_send(
     sender: &str,
     composed: &ComposedSend,
 ) -> anyhow::Result<SendMessage> {
-    // The same encoder the CLI verb uses: a second copy is how the console and
-    // the verb end up disagreeing about what `tasked` means on the wire.
     let extra_tags = crate::robot::build_send_tags(
         None,
         Some(composed.wake.to_string()),
@@ -800,9 +786,6 @@ pub mod fake {
                     verb: "ack",
                 }
             }
-            // The script answers with the message id a REAL send returns: the
-            // first delivery's event id, so the fold's status line and the
-            // live path say the same shape of thing.
             Effect::SendMail(composed) => Msg::MailSent {
                 to: composed.to.join(", "),
                 message_id: "e1".into(),

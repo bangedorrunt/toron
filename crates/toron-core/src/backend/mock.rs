@@ -1,9 +1,6 @@
 // governed-by: ADR-0003, ADR-0005
 #![forbid(unsafe_code)]
 
-// bd-led.6.1: in-memory `Backend` for unit/mailbox tests — no herdr socket.
-// ADR-0005 P1: reworked to the unified sync `Backend` trait surface.
-
 use std::sync::Arc;
 
 use parking_lot::Mutex;

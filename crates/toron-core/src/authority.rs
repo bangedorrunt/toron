@@ -166,16 +166,12 @@ const fn only(role: Role, class: Class, contract: &'static str) -> Grant {
 /// The table, redesign §6.1 transcribed. Default-deny: a pair not listed is
 /// refused.
 pub const STANDARD: &[Grant] = &[
-    // captain: any class.
     any(Role::Captain, Class::Notify),
     any(Role::Captain, Class::Request),
     any(Role::Captain, Class::Reply),
     any(Role::Captain, Class::Task),
     any(Role::Captain, Class::Control),
     any(Role::Captain, Class::Receipt),
-    // supervisor: task, steer, cancel, notify to its children; replies and
-    // requests; never an approval; a verdict only on a task it did not send
-    // (the `Relation` rule). `role` is further limited by `check_grant`.
     any(Role::Supervisor, Class::Notify),
     any(Role::Supervisor, Class::Request),
     any(Role::Supervisor, Class::Reply),
@@ -187,25 +183,18 @@ pub const STANDARD: &[Grant] = &[
     only(Role::Supervisor, Class::Control, "escalate"),
     only(Role::Supervisor, Class::Control, VERDICT_CONTRACT),
     only(Role::Supervisor, Class::Control, ROLE_CONTRACT),
-    // context@1: the topology fact. Captain already has every Control via
-    // the wildcard; a supervisor may set it too (Phase 4.2).
     only(Role::Supervisor, Class::Control, CONTEXT_CONTRACT),
-    // crew: reply, request to a peer, notify. No task. The one control
-    // they may send is an upward handoff (`escalate@1`).
     any(Role::Crew, Class::Notify),
     any(Role::Crew, Class::Request),
     any(Role::Crew, Class::Reply),
     only(Role::Crew, Class::Control, "escalate"),
-    // peer: request, reply, notify.
     any(Role::Peer, Class::Notify),
     any(Role::Peer, Class::Request),
     any(Role::Peer, Class::Reply),
-    // loop-self: task (to crew or itself), self-tick, its iteration notice.
     any(Role::LoopSelf, Class::Task),
     any(Role::LoopSelf, Class::Notify),
     any(Role::LoopSelf, Class::Receipt),
     only(Role::LoopSelf, Class::Control, "tick"),
-    // verifier: verdict, and nothing else.
     only(Role::Verifier, Class::Control, VERDICT_CONTRACT),
 ];
 
@@ -694,17 +683,12 @@ mod tests {
             assert_eq!(got, class);
             assert_eq!(contract, format!("{name}@1"));
             assert_eq!(expected, allow_list);
-            // Same invariant the own-task verdict test pins: a refusal never
-            // offers back the verb it just refused.
             let leaked = match class {
                 Class::Task => expected.contains(&"task/*".to_string()),
                 _ => expected.iter().any(|e| e == &format!("control/{name}")),
             };
             assert!(!leaked, "the attempted verb is offered back: {expected:?}");
         }
-        // The other half of the contract: the one control verb crew DOES
-        // hold. Without it a crew cannot report upward, and the captain push
-        // (escalate mail) rides this grant.
         assert!(send(Role::Crew, Class::Control, "escalate").is_ok());
     }
 
@@ -839,27 +823,22 @@ mod tests {
         use Role::*;
         use Standing::*;
         let g = Authority::may_grant;
-        // Bootstrap: only the operator, only captain.
         assert!(g(Operator, None, Captain, false));
         assert!(!g(Operator, None, Crew, false));
         assert!(!g(Holds(Captain), None, Captain, false));
         assert!(!g(Unroled, None, Captain, false));
-        // Operator outranks everyone.
         assert!(g(Operator, Some(Captain), Peer, true));
         assert!(g(Operator, None, Supervisor, true));
-        // Captain: not captain, not over a captain.
         assert!(g(Holds(Captain), None, Supervisor, true));
         assert!(g(Holds(Captain), Some(Crew), Verifier, true));
         assert!(!g(Holds(Captain), None, Captain, true));
         assert!(!g(Holds(Captain), Some(Captain), Peer, true));
-        // Supervisor: leaf roles over non-supervisors.
         assert!(g(Holds(Supervisor), None, Crew, true));
         assert!(g(Holds(Supervisor), Some(Peer), Verifier, true));
         assert!(!g(Holds(Supervisor), None, Supervisor, true));
         assert!(!g(Holds(Supervisor), None, Captain, true));
         assert!(!g(Holds(Supervisor), Some(Supervisor), Crew, true));
         assert!(!g(Holds(Supervisor), Some(Captain), Crew, true));
-        // Everyone else: nothing.
         for r in [Crew, Peer, LoopSelf, Verifier] {
             for n in Role::ALL {
                 assert!(!g(Holds(r), None, n, true), "{r} granting {n}");
@@ -929,7 +908,6 @@ mod tests {
         let op = Standing::Operator;
         let cap = Standing::Holds(Role::Captain);
         let lead = Some(("holder", 3));
-        // No lead row.
         for epoch in [0, 3] {
             assert_eq!(Authority::check_steer(None, "op", op, epoch, "ctx"), Ok(()));
         }
@@ -942,7 +920,6 @@ mod tests {
                 "{who:?}"
             );
         }
-        // A lead row.
         assert_eq!(
             Authority::check_steer(lead, "holder", cap, 3, "ctx"),
             Ok(())

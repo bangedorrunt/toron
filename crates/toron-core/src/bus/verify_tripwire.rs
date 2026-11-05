@@ -73,7 +73,6 @@ impl StageTrace {
 /// Source-level tripwire: `publish` must call `verify_publish_event` before
 /// store insert / fanout. Fails CI if someone reorders the body.
 pub fn publish_source_verify_before_side_effects(src: &str) -> Result<(), String> {
-    // Anchor on the Bus impl publish (skip earlier #[cfg(test)] helpers).
     let publish = src
         .split("impl Bus for InProcessBus")
         .nth(1)
@@ -87,7 +86,6 @@ pub fn publish_source_verify_before_side_effects(src: &str) -> Result<(), String
     let verify_at = publish
         .find("verify_publish_event")
         .ok_or_else(|| "verify_publish_event missing from publish".to_string())?;
-    // Store write sites: insert / insert_addressable.
     let insert_at = publish
         .find("insert(")
         .or_else(|| publish.find("insert_addressable"))

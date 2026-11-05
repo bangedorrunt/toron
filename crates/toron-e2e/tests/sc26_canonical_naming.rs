@@ -88,8 +88,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
     std::fs::create_dir_all(&dir).unwrap();
     let (mailbox, _bus, _pool) = boot(&dir).await;
 
-    // Pre-swarm state: the legacy identity exists before the flip (the
-    // one-time reconciliation scenario — legacy names demote, never delete).
     mailbox.ensure_project("toron").await.expect("ensure");
     let oc_npub = register(&mailbox, "toron", "flywheel-toron-oc").await;
     let oc2_npub = register(&mailbox, "toron", "flywheel-toron-oc2").await;
@@ -97,7 +95,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
     register(&mailbox, "toron", "DustySparrow").await;
     mailbox.set_identity_mode("toron", "swarm").await;
 
-    // --- whois: canonical + npub resolve; legacy fails with grammar error ---
     let w = mailbox
         .whois("toron", "flywheel-toron-oc2")
         .await
@@ -121,7 +118,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         "demotion named in error: {msg}"
     );
 
-    // --- registration: canonical accepted, legacy rejected ---
     mailbox
         .register_agent("toron", &AgentProfile::new("flywheel-toron-oc3"))
         .await
@@ -135,7 +131,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         "register rejects legacy names: {err}"
     );
 
-    // --- send: canonical + npub deliver; legacy fails the whole send ---
     mailbox
         .send_message(&send(
             "toron",
@@ -163,7 +158,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         "send rejects legacy recipients: {err}"
     );
 
-    // --- inbox shows the two deliveries (both landed) ---
     let inbox = mailbox
         .fetch_inbox(&FetchInbox {
             project_slug: "toron".into(),
@@ -180,7 +174,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         .expect("fetch");
     assert_eq!(inbox.len(), 2, "canonical + npub sends both delivered");
 
-    // --- legacy identities stay listed as display metadata ---
     let agents = mailbox
         .list_agents("toron", ListAgentsOptions::default())
         .await
@@ -205,19 +198,16 @@ async fn sc26_folded_alias_resolves_through_to_canonical_on_whois_and_send() {
     register(&mailbox, "toron", "DustySparrow").await;
     mailbox.set_identity_mode("toron", "swarm").await;
 
-    // Fold: DustySparrow → flywheel-toron-oc2 (pane binding discoverable).
     mailbox
         .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
         .await;
 
-    // whois on the folded alias resolves to the canonical npub.
     let w = mailbox
         .whois("toron", "DustySparrow")
         .await
         .expect("alias whois");
     assert_eq!(w.npub, oc2_npub, "folded alias → canonical npub");
 
-    // send to the folded alias delivers to the canonical identity.
     mailbox
         .send_message(&send(
             "toron",
@@ -256,8 +246,6 @@ async fn sc26_open_project_keeps_legacy_routing_parity() {
     std::fs::create_dir_all(&dir).unwrap();
     let (mailbox, _bus, _pool) = boot(&dir).await;
 
-    // No identity_mode row → open. Legacy names keep routing (AM-Rust
-    // parity, documented in known-divergences.md).
     mailbox.ensure_project("demo").await.expect("ensure");
     let blue_npub = register(&mailbox, "demo", "BlueLake").await;
     register(&mailbox, "demo", "GreenCastle").await;
@@ -299,7 +287,6 @@ async fn sc26_identity_mode_persists_across_mailbox_instances() {
         .await
         .expect("ensure swarm");
 
-    // A fresh mailbox over the same archive sees the persisted policy.
     let bus2 = InProcessBus::open(
         pool.clone(),
         InProcessBusConfig {
@@ -327,8 +314,6 @@ async fn sc26_identity_mode_persists_across_mailbox_instances() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- bd-pin-public-plane-s-easy.4: slug folds to pin, same npub, no second key ---
-
 #[tokio::test]
 async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
     let dir = std::env::temp_dir().join(format!("toron-sc26e-{}", uuid::Uuid::new_v4()));
@@ -340,14 +325,10 @@ async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
     let pin_npub = register(&mailbox, "toron", "BlueRidge").await;
     mailbox.set_identity_mode("toron", "swarm").await;
 
-    // Fold is slug → pin (ADR-0018 D1a: the pin is the routable mail
-    // identity; the slug is the terminal name and a fold alias — never a
-    // second identity).
     mailbox
         .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
         .await;
 
-    // whois(slug) and whois(pin) return the SAME npub (one holder).
     let w_slug = mailbox
         .whois("toron", "flywheel-toron-coder")
         .await
@@ -362,7 +343,6 @@ async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
     );
     assert_eq!(w_pin.npub, pin_npub, "whois(pin) is the pin");
 
-    // send to the slug delivers to the pin's inbox (fold is slug→pin).
     mailbox
         .send_message(&send(
             "toron",
@@ -392,8 +372,6 @@ async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
         "send to slug landed on the pin identity's inbox"
     );
 
-    // Registering the slug as a SECOND identity is refused — the fold is
-    // the only routing (bd-pin-public-plane-s-easy.1 refusal in swarm).
     let err = mailbox
         .register_agent("toron", &AgentProfile::new("flywheel-toron-coder"))
         .await

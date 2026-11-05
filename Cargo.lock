@@ -845,6 +845,7 @@ version = "0.4.1"
 dependencies = [
  "elm-effect",
  "elm-effect-journal",
+ "serde",
  "thiserror 1.0.69",
 ]
 

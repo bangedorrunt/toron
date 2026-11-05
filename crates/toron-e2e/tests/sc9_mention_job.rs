@@ -75,19 +75,15 @@ async fn sc9_mention_to_job_claim_to_result() {
     let oc_pk = register(&mailbox, "forge", "OCBeta").await;
     let grok_pk = register(&mailbox, "forge", "GrokGamma").await;
 
-    // OC-β subscribes to its own gift wraps BEFORE the mention (push path).
     let mut oc_sub = bus
         .subscribe(Filter::new().kinds([Kind::GiftWrap]).pubkey(oc_pk))
         .await
         .expect("OC subscribes to wraps");
-    // Grok-γ also subscribes (must NOT receive the job).
     let mut grok_sub = bus
         .subscribe(Filter::new().kinds([Kind::GiftWrap]).pubkey(grok_pk))
         .await
         .expect("Grok subscribes to wraps");
 
-    // 1. H posts "@OCβ fix the flaky test" → kind-14 DM to OC-β (the mention
-    //    triggers a job; the message is the job's parent).
     let sent = mailbox
         .send_message(&toron_core::mailbox::messaging::SendMessage {
             project_slug: "forge".into(),
@@ -102,9 +98,6 @@ async fn sc9_mention_to_job_claim_to_result() {
     assert_eq!(sent.count, 1, "one delivery to OC-β");
     let parent_id = EventId::from_hex(&sent.deliveries[0].payload.event_id).expect("parent id");
 
-    // OC-β receives the mention via bus push (<50ms) — the message body is the
-    // @mention; the kind-14 gift wrap unwraps to the rumor that carries the
-    // mention (parse after unwrap via the mailbox inbox).
     let t0 = Instant::now();
     let _push = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
@@ -124,8 +117,6 @@ async fn sc9_mention_to_job_claim_to_result() {
         t0.elapsed()
     );
 
-    // The @mention is present on the unwrapped rumor (channel-agnostic
-    // parser — p tag + @token in content).
     let inbox = mailbox
         .fetch_inbox(&toron_core::mailbox::messaging::FetchInbox {
             project_slug: "forge".into(),
@@ -141,8 +132,7 @@ async fn sc9_mention_to_job_claim_to_result() {
         .expect("mention message in OC inbox");
     assert!(mention_msg.body_md.contains("fix the flaky test"));
 
-    // Build the job request (kind-43001) referencing the parent mention.
-    let oc_keys = Keys::generate(); // OC-β signing key
+    let oc_keys = Keys::generate();
     let job_req = build_job_request(
         &oc_keys,
         parent_id,
@@ -163,11 +153,9 @@ async fn sc9_mention_to_job_claim_to_result() {
         .await
         .expect("publish job request");
 
-    // 2. OC-β claims it (kind-43002, signed). Grok-γ claims concurrently but
-    //    later → first-claimer wins.
     let oc_claim = build_job_claim(&oc_keys, job_req.id, Timestamp::now()).expect("OC claim");
     assert_eq!(oc_claim.kind.as_u16(), 43002, "claim signed");
-    let grok_keys = Keys::generate(); // Grok-γ signing key
+    let grok_keys = Keys::generate();
     let grok_claim = build_job_claim(
         &grok_keys,
         job_req.id,
@@ -177,7 +165,6 @@ async fn sc9_mention_to_job_claim_to_result() {
     bus.publish(oc_claim.clone()).await.expect("OC claims");
     bus.publish(grok_claim).await.expect("Grok claims later");
 
-    // First-claimer = OC-β (observed first on the InProcessBus total order).
     let all = bus
         .subscribe(Filter::new().kinds([Kind::from_u16(43002)]))
         .await
@@ -198,7 +185,6 @@ async fn sc9_mention_to_job_claim_to_result() {
     );
     assert_ne!(winner, grok_pk.to_hex(), "later claimer must lose");
 
-    // 3. OC-β posts the result (kind-43004) → lifecycle closes.
     let oc_result = build_job_result(
         &oc_keys,
         job_req.id,
@@ -236,8 +222,6 @@ async fn sc9_mention_to_job_claim_to_result() {
         "lifecycle reaches Done(ok)"
     );
 
-    // 4. Grok-γ does NOT receive the job (no gift wrap addressed to it), but
-    //    the trigger message is visible in the project (the thread).
     let grok_got_job = tokio::time::timeout(std::time::Duration::from_millis(50), async {
         loop {
             match grok_sub.next().await {
@@ -254,7 +238,6 @@ async fn sc9_mention_to_job_claim_to_result() {
         "Grok-γ (not mentioned) must NOT receive the job wrap"
     );
 
-    // The mention message is visible in the project (thread visibility).
     assert!(mention_msg.body_md.contains("@OCBeta"));
 
     let _ = std::fs::remove_dir_all(&dir);

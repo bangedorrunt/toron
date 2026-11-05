@@ -45,8 +45,6 @@ pub use msg::{Effect, Msg};
 /// taking the screen.
 #[tokio::main]
 pub async fn run_tui(args: &TuiArgs) -> anyhow::Result<()> {
-    // Flags first: a typo must be reported as a typo whether or not the caller
-    // has a TTY, and before any store is opened.
     let tab = Tab::parse(&args.tab).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown --tab {:?} (mail|channels|agents|dashboard|settings)",
@@ -63,8 +61,6 @@ pub async fn run_tui(args: &TuiArgs) -> anyhow::Result<()> {
         anyhow::bail!("toron tui requires a TTY (refusing to run on a pipe)");
     }
 
-    // Resolve before taking the screen: a bad project/pin/daemon must fail on
-    // the normal terminal, not inside the alternate screen.
     let host = LiveHost::connect(args).await?;
     let model = Model::seed(tab, folder, host.settings());
 
@@ -107,8 +103,6 @@ async fn run_loop<H: TuiHost>(
             }
             maybe = event_rx.recv() => {
                 let Some(event) = maybe else { break };
-                // Resize and focus events only need a redraw, which the loop
-                // does every iteration; keys go through the pure keymap.
                 if let crossterm::event::Event::Key(key) = event
                     && let Some(message) = keymap::translate(&model, key)
                 {
@@ -126,7 +120,6 @@ async fn run_loop<H: TuiHost>(
             }
         }
     }
-    // The scope owns its children: leaving the screen aborts every fetch.
     for handle in handles {
         handle.abort();
     }
@@ -143,7 +136,6 @@ fn dispatch<H: TuiHost>(
     effects: Vec<Effect>,
 ) {
     for effect in effects {
-        // Quit is the runtime's own job; the fold has already set should_quit.
         if effect == Effect::Quit {
             continue;
         }

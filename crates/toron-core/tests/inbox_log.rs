@@ -79,8 +79,6 @@ fn urgent_pending_reads_the_steer_priority_field() {
     assert!(!urgent_pending(&[item(note)]));
 }
 
-// --- L16 on the real store ---------------------------------------------
-
 /// Every upstream DurableLog law holds for ToronLog through the kernel port,
 /// called from a dedicated OS thread while the store runs on Tokio.
 #[test]
@@ -161,12 +159,10 @@ fn compact_before_drops_below_a_known_offset_only() {
         let rest = log.read_from(&kernel::Offset::Start).unwrap();
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[0].0, o1);
-        // The dropped offset is gone: reading from it is now unknown.
         assert!(matches!(
             log.read_from(&o0),
             Err(AppendError::UnknownOffset)
         ));
-        // Idempotent: compacting at the same offset drops nothing.
         assert_eq!(log.compact_before(&o1).unwrap(), 0);
     })
     .join()
@@ -201,7 +197,6 @@ async fn stale_epoch_append_is_rejected_and_writes_nothing() {
         ),
         "{zombie:?}"
     );
-    // Fencing beats dedupe: even a triple the log accepted before is fenced.
     let replay = s.append_envelope(&task(A, B, 0, 0)).await;
     assert!(
         matches!(
@@ -241,8 +236,6 @@ async fn seq_gap_and_bad_envelopes_are_refused() {
     assert!(s.read_stream(INBOX_STREAM, None).await.unwrap().is_empty());
 }
 
-// --- cursor, delivery, verbs ----------------------------------------------
-
 #[tokio::test]
 async fn another_npub_cannot_advance_the_recipients_cursor() {
     let s = store("cursor").await;
@@ -260,11 +253,9 @@ async fn another_npub_cannot_advance_the_recipients_cursor() {
         0,
         "the refused read moved nothing"
     );
-    // Negative control: A reading its own (empty) stream does not touch B's.
     let own = s.next(A, None, false).await.unwrap();
     assert!(own.items.is_empty());
     assert_eq!(s.cursor(B, B).await.unwrap(), 0);
-    // And the recipient's own read does advance it.
     let mine = s.next(B, None, false).await.unwrap();
     assert_eq!(mine.items.len(), 1);
     assert_eq!(s.cursor(B, B).await.unwrap(), mine.items[0].offset);
@@ -311,8 +302,6 @@ async fn ack_then_done_and_only_the_holder_may_finish() {
     let (_, done) = s.done(B, "t-0-0", &["commit:abc".into()]).await.unwrap();
     assert_eq!(done.phase, Phase::Acted);
 }
-
-// --- the loop: hosting, journaling, crash recovery ------------------------
 
 fn boot(journal: ToronLog, inbox: ToronLog, epoch: u64) -> Loop<Outbox, OutboxRun> {
     Loop::<Outbox, OutboxRun>::boot(
@@ -428,7 +417,6 @@ fn recover_and_count(db: &std::path::Path, epoch: u64) -> (usize, Vec<Option<Sen
     let inbox = ToronLog::spawn(s.clone(), INBOX_STREAM, rt.handle());
     let states = std::thread::spawn(move || {
         let intents = outbox::recover(&journal).unwrap();
-        // A restarted sender is a NEW epoch of its journal producer.
         let mut app = boot(journal, inbox, epoch);
         let keys: Vec<String> = intents.iter().map(|e| e.msg.key()).collect();
         for e in intents {
@@ -504,7 +492,7 @@ fn unreachable_inbox_parks_unknown_and_never_spins() {
     let inbox = ToronLog::spawn(s.clone(), INBOX_STREAM, dead.handle());
     let live = tokio::runtime::Runtime::new().unwrap();
     let journal = ToronLog::spawn(s.clone(), JOURNAL_STREAM, live.handle());
-    drop(dead); // the inbox store task dies with its runtime
+    drop(dead);
     let e = task(A, B, 0, 0);
     let key = e.msg.key();
     let state = std::thread::spawn(move || {

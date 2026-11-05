@@ -61,7 +61,6 @@ async fn sc6_build_slot_serialization_and_ttl() {
     register(&mailbox, "demo", "PiAlpha").await;
     register(&mailbox, "demo", "OCBeta").await;
 
-    // --- 1. Pi-α acquires `ci` exclusive → granted ---
     let first = mailbox
         .acquire_build_slot("demo", "PiAlpha", "ci", Some(3600), true)
         .await
@@ -70,7 +69,6 @@ async fn sc6_build_slot_serialization_and_ttl() {
     assert_eq!(first.conflicts.len(), 0);
     assert!(first.granted[0].expires_ts_us.is_some(), "NIP-40 TTL set");
 
-    // --- 2. OC-β acquire → conflict (exclusive serializes) ---
     let blocked = mailbox
         .acquire_build_slot("demo", "OCBeta", "ci", Some(3600), true)
         .await
@@ -79,7 +77,6 @@ async fn sc6_build_slot_serialization_and_ttl() {
     assert_eq!(blocked.conflicts.len(), 1, "conflict reported");
     assert_eq!(blocked.conflicts[0].slot, "ci");
 
-    // --- 3. Pi-α renews → TTL extended; releases → OC-β acquires ok ---
     let renewed = mailbox
         .renew_build_slot("demo", "PiAlpha", "ci", 7200)
         .await
@@ -103,15 +100,12 @@ async fn sc6_build_slot_serialization_and_ttl() {
         .expect("OCBeta re-acquire");
     assert_eq!(ok.granted.len(), 1, "OCBeta acquires after release");
 
-    // --- 4. TTL clears abandoned slot (expired lease not active) ---
-    // A lease with a past expiry is not active (index::slots rule).
     let active = active_slots(&pool, "demo").await.expect("active slots");
     for s in &active {
         if let Some(exp) = s.expires_ts_us {
             assert!(exp > now_us(), "active lease not expired");
         }
     }
-    // Direct store check: an expired lease is filtered out.
     let past = now_us() - 1000;
     let lease = toron_core::index::slots::SlotLease {
         project_slug: "demo".into(),

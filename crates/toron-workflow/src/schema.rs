@@ -804,12 +804,6 @@ pub fn parse_workflows(yaml: &str) -> Result<Vec<Workflow>, serde_yaml::Error> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// ADR-0012: cron is a DISTINCT type (not a workflow). CronSpec carries a
-// schedule + owner + scope + mode + policy + steps body; the steps use the
-// SAME Step/Action DSL as Workflow (one engine, two input types).
-// ---------------------------------------------------------------------------
-
 /// The cron run mode (ADR-0012 Spec 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1035,7 +1029,6 @@ steps:
         assert_eq!(spec.phase.as_deref(), Some("implement"));
         assert_eq!(spec.plan.as_deref(), Some("bd-1"));
         assert_eq!(spec.project.as_deref(), Some("toron"));
-        // Unknown keys survive in `extra` (polymorphic legacy payloads).
         assert_eq!(
             spec.extra.get("to").and_then(|v| v.as_str()),
             Some("oc-beta")
@@ -1044,7 +1037,6 @@ steps:
             spec.extra.get("msg").and_then(|v| v.as_str()),
             Some("hello")
         );
-        // Round trip keeps both halves of the contract.
         let value = serde_json::to_value(&wf.steps[0].action).expect("serialize");
         let Action::DispatchJob { spec: again, .. } =
             serde_json::from_value(value).expect("deserialize")
@@ -1077,7 +1069,6 @@ steps:
                 value
             );
         }
-        // Typo class: degrades LOUD at parse, never as an unknown-phase run.
         let err = serde_json::from_str::<DispatchSpec>(r#"{"phase":"shipp"}"#)
             .expect_err("unknown phase must fail parse");
         assert!(err.to_string().contains("unknown variant"), "{err}");
@@ -1150,15 +1141,11 @@ steps:
 
     #[test]
     fn triggerless_workflow_is_invoke_only() {
-        // No `trigger:` key → None (invoke-only, ADR-0005 Spec 2). The old
-        // required-trigger schema would reject this; now it parses and cannot
-        // auto-fire (the engine only runs it via invoke).
         let yaml = "name: invoke-only\ninputs:\n  - name: goal\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("trigger-less workflow parses");
         assert!(wf.trigger.is_none(), "no trigger -> invoke-only");
         assert_eq!(wf.inputs.len(), 1);
 
-        // Backward compat: a workflow WITH a trigger still parses as Some.
         let yaml = "name: reactive\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("triggered workflow parses");
         assert!(wf.trigger.is_some(), "triggered workflow -> Some");
@@ -1167,7 +1154,6 @@ steps:
     #[test]
     fn parse_all_seven_actions() {
         let step = |action_yaml: &str| {
-            // Indent continuation lines so they sit under the `- ` list item.
             let indented = action_yaml.replace('\n', "\n    ");
             parse_workflow(&format!(
                 "name: t\ntrigger:\n  type: webhook\nsteps:\n  - {indented}"
@@ -1264,7 +1250,6 @@ steps:
             ),
             Action::Spawn { .. }
         ));
-        // Bare spawn (no await) parses with defaults.
         assert!(matches!(
             step("action: spawn\nprofile: \"@scout\""),
             Action::Spawn { .. }
@@ -1274,12 +1259,10 @@ steps:
     /// P3.6: the `crew:` field parses — auto and explicit (ADR-0005 Spec 4c).
     #[test]
     fn parse_crew_auto_and_explicit() {
-        // crew: auto
         let yaml = "name: debate\ntrigger:\n  type: webhook\ncrew: auto\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("crew auto parses");
         assert_eq!(wf.crew, Some(CrewSpec::Auto));
 
-        // crew: { role: count }
         let yaml = "name: ship\ntrigger:\n  type: webhook\ncrew:\n  planner: 1\n  coder: 2\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("crew explicit parses");
         assert_eq!(
@@ -1291,7 +1274,6 @@ steps:
         );
         assert_eq!(wf.crew.unwrap().roles().len(), 2);
 
-        // omitted → None
         let yaml = "name: plain\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("no crew parses");
         assert_eq!(wf.crew, None);
@@ -1363,10 +1345,8 @@ steps:
             }
             other => panic!("expected Schedule trigger, got {other:?}"),
         }
-        // Omitted policy → None (cron manager uses defaults).
         assert!(wf.policy.is_none());
 
-        // Backward compat: bare cron (no owner/scope/policy) → defaults.
         let yaml = "name: bare\ntrigger:\n  type: schedule\n  cron: '* * * * *'\nsteps:\n  - name: a\n    action: send_dm\n    to: pi\n    body: x\n";
         let wf = parse_workflow(yaml).expect("bare cron parses");
         match &wf.trigger {
@@ -1381,8 +1361,6 @@ steps:
 
     #[test]
     fn on_error_typo_is_rejected() {
-        // The strict enum is the fail-stop: any spelling other than
-        // continue/fail_run fails to parse (ADR-0005 Spec 0 lint contract).
         let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - action: delay\n    secs: 1\n    on_error: failrun\n";
         let err = parse_workflow(yaml).expect_err("typo must fail parse");
         assert!(
@@ -1401,7 +1379,6 @@ steps:
         let wf = parse_workflow(yaml).expect("continue parses");
         assert_eq!(wf.steps[0].on_error, StepOnError::Continue);
 
-        // Default (omitted) = Continue.
         let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("omitted parses");
         assert_eq!(wf.steps[0].on_error, StepOnError::Continue);
@@ -1415,8 +1392,6 @@ steps:
         assert_eq!(wfs[0].name, "a");
         assert_eq!(wfs[1].name, "b");
     }
-
-    // ---- ADR-0012: CronSpec is a DISTINCT type (bd-25g7.1) ----
 
     /// The ADR-0012 Spec 3 example (weekly-upgrade) parses verbatim —
     /// schedule + owner + scope + mode + policy (incl. catchup) + steps body.
@@ -1528,8 +1503,6 @@ steps:
         let yaml = "name: p\nschedule: '* * * * *'\nowner: o\nsteps: []\n";
         let spec = parse_cron(yaml).expect("cron parses");
         assert_eq!(spec.steps.len(), 0);
-        // The cron YAML does not carry a workflow trigger — no trigger field
-        // exists on CronSpec (distinct type, ADR-0012).
         let _ = spec;
     }
 
@@ -1537,11 +1510,9 @@ steps:
     fn invalid_cron_yaml_fails() {
         assert!(parse_cron("name: [broken").is_err());
         assert!(parse_cron("").is_err());
-        // Missing required schedule/owner -> parse error (required fields).
         assert!(parse_cron("name: p\nsteps: []\n").is_err());
     }
 
-    // ---- ADR-0024 Spec 0: graph canonical ----
     #[test]
     fn graph_desugar_chain_preserves_order() {
         let wf = parse_workflow(
@@ -1556,7 +1527,6 @@ steps:
         assert_eq!(g.nodes["a"].needs, Vec::<String>::new());
         assert_eq!(g.nodes["b"].needs, vec!["a"]);
         assert_eq!(g.nodes["c"].needs, vec!["b"]);
-        // Existing graph is returned as-is (no desugar).
         let wf2 = parse_workflow(
             "name: t\ntrigger:\n  type: webhook\ngraph:\n  nodes:\n    x: { action: send_dm, to: a, body: b }\n",
         )

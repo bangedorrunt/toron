@@ -1,7 +1,5 @@
 // governed-by: ADR-0003, ADR-0009
 // SAFETY: no `unsafe` in this module — host supervision (uid, kill -0,
-// signals) shells out to `id -u` / `kill` instead of raw libc, keeping the
-// crate-level `#![forbid(unsafe_code)]` intact.
 
 //! Daemon lifecycle: `toron daemon start|stop|restart|status|install|uninstall`.
 //!
@@ -74,8 +72,6 @@ pub fn addr_alive(addr: &str) -> bool {
 
 /// Detect state: launchd (darwin) / systemd (linux) / pidfile + addr probe.
 pub fn detect_state(label: &str, pidfile: &Path, addr: &str) -> DaemonState {
-    // Supervisor probe lives in platform/<os>.rs (bd-nc5d); shared
-    // pidfile + addr probes stay here.
     if let Some(state) = crate::platform::detect_supervised(label) {
         return state;
     }
@@ -174,8 +170,6 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let addr = args.addr.clone();
     let label = args.label.clone();
 
-    // Supervised install lives in platform/<os>.rs (bd-nc5d); the prelude
-    // above is shared.
     let ctx = crate::platform::InstallCtx {
         label: &label,
         binary: &binary,
@@ -212,10 +206,6 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         DaemonState::RunningUnmanaged => {
-            // A start that starts NOTHING must not exit 0 — the caller
-            // asked for a supervised daemon and none exists (2026-08-17:
-            // the silent Ok here made `daemon restart` look like a no-op
-            // while a stray `toron serve` kept serving the old build).
             let pid = port_holder_pid(&args.addr);
             anyhow::bail!(
                 "{label} already serving {} (unmanaged pid {}) — stop it first, or \
@@ -227,7 +217,6 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         DaemonState::Stopped => {}
     }
 
-    // Supervised start lives in platform/<os>.rs (bd-nc5d).
     crate::platform::start_supervised(args, &pidfile)
 }
 
@@ -235,7 +224,6 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let pidfile = state.join("toron.pid");
-    // Supervised stop lives in platform/<os>.rs (bd-nc5d).
     crate::platform::stop_supervised(args, &pidfile)
 }
 
@@ -278,9 +266,6 @@ pub(crate) fn build_detail(
     serving_pid: Option<u32>,
     on_disk_built_at: Option<i64>,
 ) -> String {
-    // Times in the boot line are as the daemon saw them at boot; the replaced
-    // case additionally names what is on disk NOW, because "booted from a build
-    // written 20:29" reads as reassuring until you see the file is from 21:13.
     match verdict {
         BuildVerdict::Current => format!(
             "build — {} (booted {}, from a build written {})",
@@ -374,7 +359,6 @@ fn status_report(args: &super::cli::DaemonArgs) -> StatusReport {
             DaemonState::Stopped => ("stopped", "none", None, "stopped".to_string()),
         };
 
-    // Whoever holds the address is the only process a record can describe.
     let serving_pid = if state_word == "running" {
         detected_pid.or_else(|| port_holder_pid(&args.addr))
     } else {
@@ -553,8 +537,6 @@ mod tests {
             "a healthy daemon is offered no remedy: {current}"
         );
 
-        // The replaced line must carry BOTH the build the daemon booted from and
-        // the build now on disk: the first alone reads as fine.
         let rebuilt_at = snap.built_at_unix + 300;
         let replaced = build_detail(&snap, BuildVerdict::Replaced, Some(73527), Some(rebuilt_at));
         assert!(replaced.contains("REPLACED"));
@@ -572,8 +554,6 @@ mod tests {
             "and the one on disk now, which is the point: {replaced}"
         );
 
-        // An unreadable artifact time is named as unknown, never rendered as a
-        // wrong instant.
         let unknown = build_detail(&snap, BuildVerdict::Replaced, Some(73527), None);
         assert!(unknown.contains("unknown"), "{unknown}");
 

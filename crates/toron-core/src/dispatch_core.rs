@@ -134,8 +134,6 @@ impl Guard {
         Guard::Or(Box::new(a), Box::new(b))
     }
 
-    // Named combinator (not `std::ops::Not`): and/or/not stay symmetric
-    // constructors so tick arms read uniformly.
     #[allow(clippy::should_implement_trait)]
     pub fn not(a: Guard) -> Guard {
         Guard::Not(Box::new(a))
@@ -210,10 +208,6 @@ pub fn tick(model: &DispatchModel, msg: &DispatchMsg) -> (DispatchModel, Vec<Dis
             }
         }
         DispatchMsg::Release { assignee } => {
-            // bd-de4k: only a held permit frees one. A Release without
-            // in_flight membership moves NO counter — a blind decrement
-            // over-admits one job per stray release (used<max while all
-            // permits are actually held).
             match next.in_flight.get_mut(assignee) {
                 Some(count) if *count > 0 => {
                     *count -= 1;
@@ -271,8 +265,6 @@ fn can_admit_name() -> String {
     Guard::and(Guard::AgentFree, Guard::GlobalCapacity).name()
 }
 
-// ponytail: one test module covering fence + determinism + guards + kernel
-// parity with DispatchPool. New transitions bring their own cases here.
 #[cfg(test)]
 mod pure_cores_tests {
     use super::*;
@@ -284,8 +276,6 @@ mod pure_cores_tests {
     #[test]
     fn core_source_has_no_runtime_imports() {
         let src = include_str!("dispatch_core.rs");
-        // Fence the shipped module only: the test mod below legitimately
-        // uses `super::*`.
         let shipped = src
             .split("#[cfg(test)]")
             .next()
@@ -361,12 +351,6 @@ mod pure_cores_tests {
         let (b_model, b_fx) = replay(&log);
         assert_eq!(format!("{a_fx:?}"), format!("{b_fx:?}"));
         assert_eq!(a_model, b_model);
-        // And the log means what the pool does: j1 admitted, dup denied
-        // (agent-busy), poll dispatches j2? No — max 1, a holds it: poll
-        // skips j1 (busy a)? j1 was submitted not dispatched... trace:
-        // submit j1, submit j2, acquire a (admitted), acquire a (denied
-        // busy), poll (j1: a busy → skip; j2: b free but global cap 1 used
-        // → skip; no effect), release a, poll (j1 dispatched).
         assert_eq!(
             a_fx,
             vec![
@@ -404,7 +388,6 @@ mod pure_cores_tests {
                 assignee: "b".into(),
             },
         ]);
-        // max 1: b denied on global cap (agent b itself is free).
         let (_, fx) = tick(
             &m,
             &DispatchMsg::Acquire {
@@ -423,14 +406,13 @@ mod pure_cores_tests {
     #[test]
     fn guard_composition_truth_table() {
         let mut m = DispatchModel::new(1);
-        m.used = 1; // cap reached, agents free
+        m.used = 1;
         let free_and_cap = Guard::and(Guard::AgentFree, Guard::GlobalCapacity);
         assert!(!free_and_cap.eval(&m, "a"));
         assert!(Guard::or(Guard::AgentFree, Guard::GlobalCapacity).eval(&m, "a"));
         assert!(!Guard::not(Guard::AgentFree).eval(&m, "a"));
         assert!(Guard::not(Guard::GlobalCapacity).eval(&m, "a"));
         assert_eq!(free_and_cap.name(), "(agent_free and global_capacity)");
-        // Busy agent, free cap: deny names agent first (pool branch order).
         m.used = 0;
         m.in_flight.insert("a".into(), 1);
         assert!(!can_admit(&m, "a"));
@@ -439,9 +421,6 @@ mod pure_cores_tests {
 
     #[test]
     fn double_release_ignored_preserves_sum() {
-        // bd-de4k: max 1, a holds the only permit. A Release for stranger
-        // b must free nothing — otherwise b acquires while a still holds
-        // (used=1, held=2) and preservation breaks.
         let mut model = DispatchModel::new(1);
         let (next, fx) = tick(
             &model,
@@ -469,7 +448,6 @@ mod pure_cores_tests {
         assert!(!next.in_flight.contains_key("b"));
         let held: usize = next.in_flight.values().sum();
         assert_eq!(next.used, held, "preservation holds");
-        // The permit is still a's: b is denied on the global cap.
         let (_, fx) = tick(
             &next,
             &DispatchMsg::Acquire {
@@ -483,7 +461,6 @@ mod pure_cores_tests {
                 reason: DenyReason::GlobalCap,
             }]
         );
-        // The real release still works and frees exactly one permit.
         let (next, fx) = tick(
             &next,
             &DispatchMsg::Release {
@@ -510,8 +487,6 @@ mod pure_cores_tests {
     }
 }
 
-// ponytail: BFS + depth-capped DFS over tick-derived edges, one invariant
-// checker, one bite test. New transitions extend SCHEMATICS, nothing else.
 #[cfg(test)]
 mod model_paths_tests {
     use super::*;
@@ -608,7 +583,6 @@ mod model_paths_tests {
         let schematics = schematics();
         while let Some((model, path)) = work.pop() {
             for msg in &schematics {
-                // Finiteness bound only: the pool itself is unbounded.
                 if matches!(msg, DispatchMsg::Submit { .. }) && model.queue.len() >= 2 {
                     continue;
                 }
@@ -711,12 +685,6 @@ mod model_paths_tests {
 
     #[test]
     fn illegal_transition_is_caught_by_generated_path() {
-        // Transition cover: every shortest path plus one more schematic
-        // edge. BFS shortest paths alone collapse the tamper sequence
-        // (honest double-acquire is a self-loop, never a new state), so
-        // the cover re-adds exactly those collapsed edges — including
-        // acquire-after-acquire, which must trip one-in-flight under the
-        // guard-bypass core.
         let shortest = enumerate_reachable();
         let schematics = schematics();
         let mut cover = 0;

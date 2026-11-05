@@ -164,7 +164,6 @@ async fn the_head_is_what_toron_next_serves() {
         ok_json(&toron(&dir, Some(&key), &a))
     };
 
-    // `toron next --peek --urgent`: exit 0 printing `urgent`, or exit 1.
     let urgent_cli = || {
         let o = toron(
             &dir,
@@ -185,14 +184,12 @@ async fn the_head_is_what_toron_next_serves() {
         }
     };
 
-    // Empty: nothing served, no head, nothing urgent.
     let (c, s) = served(&next(true));
     assert_eq!(s, None);
     assert_eq!(head_in_process(&dir, c).await, None);
     assert!(!urgent_cli());
     assert_eq!(urgent_in_process(&dir, c).await, None);
 
-    // A lead (holder = the steering key), a notify, then an urgent steer.
     let lead = env(
         &op,
         0,
@@ -209,7 +206,6 @@ async fn the_head_is_what_toron_next_serves() {
         serde_json::json!({"text": "urgent, says the text"}),
     );
     append(&dir, &key, 1, &notice);
-    // A notify whose text says urgent: neither side calls it urgent.
     assert!(!urgent_cli());
     assert_eq!(urgent_in_process(&dir, 0).await, None);
     let steer = env(
@@ -221,7 +217,6 @@ async fn the_head_is_what_toron_next_serves() {
     );
     append(&dir, &key, 2, &steer);
 
-    // Peek: the head is the notify, and it is normal.
     let batch = next(true);
     let (c, s) = served(&batch);
     let h = head_in_process(&dir, c).await;
@@ -229,8 +224,6 @@ async fn the_head_is_what_toron_next_serves() {
     let h = h.unwrap();
     assert_eq!(h.contract, ContractId::new("notify", 1));
     assert_eq!(h.urgency, Urgency::Normal);
-    // The urgent steer behind it is pending: the binary says urgent, and the
-    // in-process read names the steer the binary would serve second.
     assert!(urgent_cli());
     let u = urgent_in_process(&dir, c).await.expect("pending urgent");
     assert_eq!(
@@ -240,7 +233,6 @@ async fn the_head_is_what_toron_next_serves() {
     );
     assert_eq!(u.contract, ContractId::new("steer", 1));
 
-    // The binary commits the cursor: nothing unread, on both sides.
     let read = next(false);
     let after = read["cursor_after"].as_u64().unwrap();
     assert_eq!(read["items"].as_array().unwrap().len(), 2);
@@ -251,7 +243,6 @@ async fn the_head_is_what_toron_next_serves() {
     assert!(!urgent_cli(), "read: not pending");
     assert_eq!(urgent_in_process(&dir, after).await, None);
 
-    // One more urgent steer: served and read alike, and urgent.
     let steer2 = env(
         SYS,
         1,

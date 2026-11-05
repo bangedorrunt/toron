@@ -63,9 +63,6 @@ pub async fn dispatch_leaf(
     invocation: &ActionInvocation,
     sink: &'static str,
 ) -> serde_json::Value {
-    // Only `verify` needs a second, carrier-bearing invocation, and only when a
-    // runner will observe it: the clone is avoided on the common path, and the
-    // no-runner branch below projects the sink itself exactly once.
     let with_verify_carrier = || match &invocation.action {
         Action::Verify { command } => {
             let mut journaled = invocation.clone();
@@ -128,9 +125,6 @@ fn without_journal_seam(
         invocation.action.type_name()
     );
     let mut value = match &invocation.action {
-        // `Recording` records instead of performs (bd-ctj7): the verify sink
-        // still projects (it already executed), every other HostSink leaf
-        // reports its missing sink — nothing performs here, ever.
         Action::Verify { command } => seams.verify_sink.project(command),
         _ => invoke_compat(&invocation.action, |_| None),
     };

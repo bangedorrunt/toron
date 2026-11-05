@@ -1,6 +1,4 @@
 // governed-by: ADR-0003
-// (not forbid(unsafe_code): this test sets no unsafe; it is a measurement
-// probe only.)
 
 //! P1 performance baseline (bd-p1-backpressure-baseline-6gmq).
 //!
@@ -86,10 +84,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     let sender = Keys::generate();
     let recipient = Keys::generate();
 
-    // Drainer runs CONCURRENTLY with the publisher on its OWN thread/runtime
-    // (sharing the publisher's runtime would starve the drainer during the
-    // CPU-bound gift-wrap burst — that's a measurement artifact, not bus lag).
-    // Receipts carry the receipt INSTANT so lag is timestamped at receipt.
     let (lag_tx, lag_rx) = std::sync::mpsc::channel::<(EventId, Instant)>();
     let drainer = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -106,8 +100,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
                         received += 1;
                     }
                     Ok(_) => {}
-                    // Only exit on silence AFTER the burst started (the
-                    // pre-publish wrap-build phase is legitimately quiet).
                     Err(_) if received > 0 => break,
                     Err(_) => {}
                 }
@@ -116,7 +108,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
         received
     });
 
-    // Phase 1: pre-build all wraps (NIP-44 cost measured separately from bus).
     let wrap_t0 = Instant::now();
     let mut wraps = Vec::with_capacity(N);
     for i in 0..N {
@@ -134,7 +125,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     }
     let build_elapsed = wrap_t0.elapsed();
 
-    // Phase 2: publish loop only (bus throughput).
     let t0 = Instant::now();
     let mut publish_starts = Vec::with_capacity(N);
     for wrap in &wraps {
@@ -143,8 +133,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     }
     let publish_elapsed = t0.elapsed();
 
-    // Lags: receipt_instant - publish-start (true ingest latency per event).
-    // Give the isolated drainer a beat to schedule, then drain its channel.
     std::thread::sleep(Duration::from_millis(200));
     let mut lags = Vec::new();
     while let Ok((id, receipt)) = lag_rx.try_recv() {
@@ -165,9 +153,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     let max = lags.iter().copied().max().unwrap_or_default();
     let throughput = N as f64 / publish_elapsed.as_secs_f64();
 
-    // Backpressure contract: the lossless mpsc drops publisher-side into the
-    // STORE when the channel is full (never lost) — a fresh subscription
-    // replays them. Count live + replayed = N proves nothing was lost.
     let mut replayed = 0usize;
     let mut recovered = bus
         .subscribe(Filter::new().kinds([Kind::GiftWrap]).limit(N + 10))
@@ -300,8 +285,6 @@ async fn kdf_single_key_cold_load() {
         .await
         .expect("register");
 
-    // Cold KDF load via the public fetch_inbox path (loads + decrypts the
-    // agent key with argon2 on first use).
     let t = Instant::now();
     let _ = mailbox
         .fetch_inbox(&toron_core::mailbox::messaging::FetchInbox {

@@ -111,7 +111,6 @@ pub fn prompt_wait(
     line: &str,
     timeout_ms: u64,
 ) -> WaitOutcome {
-    // Abort-first, mirroring waitFor (aborted signal rejects immediately).
     if host.aborted() {
         return WaitOutcome::Aborted;
     }
@@ -122,12 +121,8 @@ pub fn prompt_wait(
     if !host.observe_activity(target, ACTIVITY_GATE_MS) {
         return WaitOutcome::Stalled;
     }
-    // Occupant pinning: resolve the occupant now; only that occupant's
-    // settle counts. A replacement mid-wait leaves `current != pinned`.
     let pinned = PromptTarget::new(target.pane.clone(), host.occupant(target));
     let settled = host.await_settled(&pinned, timeout_ms);
-    // Mid-wait abort wins over settle/timeout (waitFor rejects on abort
-    // even when the predicate just matched).
     if host.aborted() {
         return WaitOutcome::Aborted;
     }
@@ -144,8 +139,6 @@ pub fn prompt_wait(
     }
 }
 
-// ponytail: scripted host + five tests, no framework. Add cases only for new
-// outcomes, never a second fake.
 #[cfg(test)]
 mod wait_for_tests {
     use super::*;
@@ -209,9 +202,6 @@ mod wait_for_tests {
             self.activity.pop_front().unwrap_or(false)
         }
         fn await_settled(&mut self, _t: &PromptTarget, _b: u64) -> Option<AgentStatus> {
-            // Pinned check happens in prompt_wait via occupant(); here pop
-            // the scripted settle and rotate the visible occupant so a
-            // mid-wait replacement is observable.
             match self.settles.pop_front().flatten() {
                 Some((state, occ)) => {
                     self.occupants.push_back(occ);
@@ -272,9 +262,6 @@ mod wait_for_tests {
 
     #[test]
     fn occupant_replacement_cannot_satisfy() {
-        // Settle arrives for a REPLACEMENT occupant → Timeout, not Settled.
-        // (The settle rotates the visible occupant PiAlpha -> PiBeta; the
-        // pinned target still names PiAlpha.)
         let mut h = Scripted::new(AgentStatus::Working, Some("PiAlpha"))
             .with_activity(true)
             .with_settle(AgentStatus::Done, Some("PiBeta"));
@@ -297,8 +284,6 @@ mod wait_for_tests {
 
     #[test]
     fn aborted_during_wait_wins_over_settle() {
-        // Entry check passes, settle is ready, but the mid-wait check
-        // aborts — outcome is Aborted, never Settled (waitFor semantics).
         let mut h = Scripted::new(AgentStatus::Working, Some("PiAlpha"))
             .with_abort(false)
             .with_activity(true)

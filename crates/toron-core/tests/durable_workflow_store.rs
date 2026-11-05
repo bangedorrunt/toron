@@ -146,7 +146,6 @@ async fn list_returns_every_model_newest_first() {
     assert_eq!(rows.len(), 2, "every persisted model: {rows:?}");
     assert_eq!(rows[0].0, "run-b", "newest first: {rows:?}");
 
-    // The restart sweep reads the same list through the sync handle.
     let handle = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
     let via_handle = tokio::task::spawn_blocking(move || handle.list())
         .await

@@ -56,10 +56,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .output()
         .expect("spawn toron")
@@ -190,7 +186,6 @@ async fn drain_reactions(
         let Ok(ev) = toron_core::nostr::Event::from_json(&raw) else {
             continue;
         };
-        // reaction_added: kind 7, e-tag = target, content = emoji, h = channel.
         let target = ev
             .tags
             .iter()
@@ -201,10 +196,8 @@ async fn drain_reactions(
         let author = ev.pubkey.to_hex();
         let key = format!("{target}|{emoji}|{author}");
         if !seen.insert(format!("key|{key}")) {
-            continue; // identical react → idempotent filter, no double-fire
+            continue;
         }
-        // Fire the reaction workflow on the durable host (stamped async
-        // runner, temp-pool stores): open → one step → terminal. No server.
         let seams = common::durable::seams(Arc::new(
             |inv: &toron_workflow::engine::ActionInvocation| {
                 let _ = stamp_workflow_emitted(vec![]);
@@ -234,7 +227,6 @@ async fn sc30_reaction_fires_workflow_once() {
     let dir = std::env::temp_dir().join(format!("toron-sc30-{}", uuid::Uuid::new_v4()));
     let pool = setup(&dir, PROJECT, &[A, B, OPERATOR]).await;
 
-    // Channel + post (kind 9) — the reaction target.
     let out = run(
         &dir,
         &[
@@ -278,7 +270,6 @@ async fn sc30_reaction_fires_workflow_once() {
         .expect("post event_id")
         .to_string();
 
-    // Reaction workflow: reaction_added → stamped send_message to operator.
     let wf_yaml = format!(
         "name: sc30-react\n\
          trigger:\n  type: reaction_added\n  channel: {CHANNEL}\n  emoji: \":+1:\"\n\
@@ -289,7 +280,6 @@ async fn sc30_reaction_fires_workflow_once() {
     let fired = Arc::new(AtomicUsize::new(0));
     let mut seen = std::collections::HashSet::new();
 
-    // First react → exactly one fired action.
     let out = run(
         &dir,
         &[
@@ -312,7 +302,6 @@ async fn sc30_reaction_fires_workflow_once() {
         "react must exit 0: {}",
         stderr_text(&out)
     );
-    // Give the CLI subprocess time to persist the kind-7 to the shared store.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while fired.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
         drain_reactions(&pool, &workflow, &fired, &mut seen).await;
@@ -325,7 +314,6 @@ async fn sc30_reaction_fires_workflow_once() {
         "exactly one stamped action after first react"
     );
 
-    // Second IDENTICAL react → no double-fire.
     let out = run(
         &dir,
         &[

@@ -1,7 +1,4 @@
 // governed-by: ADR-0007
-// R1 / D1 (ADR-0007): canonical message identity is a string — hex
-// event/rumor id on toron, decimal string on agent-mail. Never u64 in
-// shared request/response types; this newtype is the typed contract.
 
 use std::fmt;
 use std::str::FromStr;
@@ -44,10 +41,6 @@ impl FromStr for MessageId {
     }
 }
 
-// Wire ingress validates like every other construction (bd-r328): a JSON
-// `"message_id": ""` fails loud instead of deserializing into a silent
-// default. (No `From<String>`/`From<&str>` by design — those spellings
-// cannot fail, so they cannot validate; parse explicitly.)
 impl<'de> Deserialize<'de> for MessageId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -150,8 +143,6 @@ macro_rules! boundary_id {
             where
                 D: serde::Deserializer<'de>,
             {
-                // bd-05yr: Deserialize validates — never a silent bypass of
-                // FromStr (the old derive accepted any string).
                 let s = String::deserialize(deserializer)?;
                 s.parse().map_err(serde::de::Error::custom)
             }
@@ -255,8 +246,6 @@ mod tests {
 
     #[test]
     fn wire_ingress_rejects_bad_ids_bd_r328() {
-        // Serde ingress routes through FromStr: empty / whitespace ids fail
-        // loud instead of deserializing into a silent default.
         assert!(serde_json::from_str::<MessageId>("\"\"").is_err());
         assert!(serde_json::from_str::<MessageId>("\"ab cd\"").is_err());
         let ok: MessageId = serde_json::from_str("\"0badbeef\"").expect("valid");
@@ -310,7 +299,6 @@ mod tests {
         assert_eq!(ok.to_string(), "run-1");
         let c: Corr = "c1".parse().expect("valid corr");
         assert_eq!(c.into_inner(), "c1");
-        // Display names the boundary on loud rejection.
         assert!(
             BoundaryIdError::Empty("Corr").to_string().contains("Corr"),
             "error names the type"

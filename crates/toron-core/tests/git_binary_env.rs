@@ -1,9 +1,4 @@
 // governed-by: ADR-0003
-//
-// Env-dependent `TORON_GIT_BINARY` override behavior. Integration test (own
-// crate, not subject to the lib's `#![forbid(unsafe_code)]`): `set_var` /
-// `remove_var` are `unsafe` in edition 2024, so this cannot live in the lib's
-// unit tests. verify-gates only scans `src/{lib,main}.rs` roots.
 
 use toron_core::mailbox::guard::git_binary_override;
 

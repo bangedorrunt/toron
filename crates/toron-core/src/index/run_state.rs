@@ -325,16 +325,6 @@ pub fn parse_model(row: &RunStateCheckpoint) -> Result<Value> {
     Ok(serde_json::from_str(&row.model_json)?)
 }
 
-// ---------------------------------------------------------------------------
-// Read side (bd-7n8e)
-//
-// Everything below is either a PURE value or a PURE decision over one. The
-// only effect is [`RunStateStore::replay`], a read. There is deliberately no
-// writer here: `append` above is the only way a row comes into existence, and
-// [`RunStateReplay::install`] refuses, so the read half cannot become a
-// second seeding path (spec §3).
-// ---------------------------------------------------------------------------
-
 /// One boundary, rendered for a reader: the model plus the pending-write set.
 ///
 /// The pending-write set is the half a bare `model_json` cannot give you. A
@@ -512,7 +502,6 @@ pub fn plan_fork(boundary: &RunStateReplay, intent: &ForkIntent) -> ForkPlan {
     };
 
     if !boundary.effect_keys.is_empty() {
-        // Prepend: it is the one that decides whether Perform is even legal.
         refusals.insert(
             0,
             format!(

@@ -43,10 +43,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first),
-        // so the CLI would hit a live daemon instead of this scenario's
-        // store and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .env("TORON_PRESENCE_TTL_SECS", "1")
         .output()
@@ -108,7 +104,6 @@ async fn sc31_presence_list_sees_working_then_expires() {
     let dir = std::env::temp_dir().join(format!("toron-sc31-{}", uuid::Uuid::new_v4()));
     setup(&dir, PROJECT, &[A, B]).await;
 
-    // A publishes working.
     let out = run(
         &dir,
         &[
@@ -131,7 +126,6 @@ async fn sc31_presence_list_sees_working_then_expires() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // B lists within 1s → A working.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let out = run(&dir, &["presence", "list", "--project", PROJECT]);
@@ -151,7 +145,6 @@ async fn sc31_presence_list_sees_working_then_expires() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    // After broker expiry (TTL=1s), A disappears or is unknown.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let out = run(&dir, &["presence", "list", "--project", PROJECT]);
     assert_eq!(
@@ -162,7 +155,7 @@ async fn sc31_presence_list_sees_working_then_expires() {
     );
     let list = stdout_json(&out);
     match find_state(&list, A) {
-        None => {} // disappeared
+        None => {}
         Some(state) => {
             assert!(
                 state == "unknown" || state != "working",

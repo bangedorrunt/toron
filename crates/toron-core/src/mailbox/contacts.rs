@@ -110,7 +110,6 @@ impl Mailbox {
     /// [`BusPolicySource::load_roster`] (bd-gtqe: this is O(projects)
     /// full-store replays per npub).
     pub(crate) async fn project_for_npub(&self, npub: &PublicKey) -> String {
-        // Scan known projects on disk (data_dir/*).
         let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
             return String::new();
         };
@@ -145,7 +144,6 @@ impl Mailbox {
         };
         self.upsert_link(&link).await?;
 
-        // NIP-17 control message: toron-kind=contact-request + p to peer.
         let mut tags = vec![Tag::parse(["toron-kind", "contact-request"]).expect("kind")];
         tags.push(Tag::parse(["p", &to_npub.to_hex()]).expect("p"));
         if let Some(reason) = &args.reason {
@@ -189,7 +187,6 @@ impl Mailbox {
             );
         }
 
-        // NIP-17 control reply to the requester.
         let mut tags = vec![
             Tag::parse(["toron-kind", "contact-response"]).expect("kind"),
             Tag::parse(["p", &from_npub.to_hex()]).expect("p"),
@@ -291,9 +288,6 @@ impl Mailbox {
                     .newest()
                     .and_then(|e| match ContactPolicy::parse(&e.content) {
                         Ok(policy) => Some(policy),
-                        // bd-05yr: corrupt historic rows skip loudly, never
-                        // silently default mid-stream (default applies only
-                        // when NO row parses at all).
                         Err(err) => {
                             tracing::warn!(
                                 agent = %agent_npub.to_hex(),
@@ -448,7 +442,6 @@ impl BusPolicySource {
     /// [`UnwrapPipeline`]). `load` is a specialization for one npub.
     pub async fn load_many(mailbox: &Mailbox, npubs: &[&PublicKey]) -> Self {
         let source = Self::default();
-        // Per-npub policy from kind-30014 on the bus.
         for npub in npubs {
             let project = mailbox.project_for_npub(npub).await;
             if !project.is_empty() {
@@ -456,8 +449,6 @@ impl BusPolicySource {
                 source.policies.write().insert(npub.to_hex(), policy);
             }
         }
-        // Approved links touching any of the recipients (one query per npub,
-        // unioned into the shared approved set).
         if let Some(pool) = mailbox.index_pool() {
             for npub in npubs {
                 let rows = sqlx::query(
@@ -496,7 +487,6 @@ impl BusPolicySource {
         if roster.is_empty() {
             return source;
         }
-        // ONE policy replay per distinct project.
         let mut by_project: std::collections::BTreeMap<&str, Vec<&str>> =
             std::collections::BTreeMap::new();
         for (slug, _name, hex) in roster {
@@ -531,7 +521,6 @@ impl BusPolicySource {
                 }
             }
         }
-        // Approved links (one indexed query per agent — SQLite-local).
         if let Some(pool) = mailbox.index_pool() {
             for (_slug, _name, hex) in roster {
                 let rows = sqlx::query(
@@ -639,7 +628,6 @@ mod tests {
             .expect("set policy");
         assert!(!id.is_empty());
 
-        // The policy event is on the bus (kind-30014) with dual-emit scoping.
         let filter = kind_project_filter(toron_kind(CONTACT_POLICY), "demo");
         let events = collect_replay(mailbox.bus.as_ref(), filter)
             .await
@@ -681,7 +669,6 @@ mod tests {
         assert_eq!(link.status, LinkStatus::Pending);
         assert_eq!(link.from_pubkey, blue.to_hex());
 
-        // Not approved yet → contacts_only would drop; is_approved_contact false.
         assert!(
             !mailbox
                 .is_approved_contact(
@@ -713,7 +700,6 @@ mod tests {
         assert_eq!(links[0].status, LinkStatus::Approved);
         assert_eq!(links[0].from_name, "BlueLake");
 
-        // Approved → is_approved_contact true.
         let rose = mailbox
             .agent_keys_for("demo", "RoseDune")
             .unwrap()

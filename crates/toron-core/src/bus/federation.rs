@@ -137,7 +137,6 @@ mod tests {
 
     #[test]
     fn test_public_requires_auth() {
-        // Public without AUTH → doctor fails.
         let p = FederationPolicy {
             mode: FederationMode::Public,
             relays: vec!["wss://relay.example.com".into()],
@@ -197,11 +196,9 @@ mod tests {
         let keys = crate::keys::generate();
         let hex = keys.public_key().to_hex();
 
-        // Empty allowlist → all AUTH'd members allowed.
         let open = public_ok();
         assert!(open.author_allowed(&hex));
 
-        // Non-empty allowlist → only listed authors.
         let other = crate::keys::generate().public_key().to_hex();
         let strict = FederationPolicy {
             allowlist: vec![other.clone()],

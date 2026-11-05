@@ -92,8 +92,6 @@ async fn a_fenced_epoch_stays_readable_while_appends_are_refused() {
     let claim = s.claim_epoch(A, "recovery-run").await.unwrap();
     assert_eq!(claim.epoch, 1);
 
-    // The append path cannot be used to verify content any more: refused as
-    // stale before the payload is compared, even for the identical envelope.
     let refused = s.append_envelope(&old).await.unwrap_err();
     assert!(
         matches!(refused, InboxError::Append(AppendError::StaleEpoch { .. })),
@@ -151,7 +149,6 @@ async fn a_stranger_cannot_tell_a_stored_triple_from_an_unknown_one() {
     assert!(s.read_triple(&env.msg, C).await.unwrap().is_none());
     assert!(s.read_triple(&id(A, 9, 9), A).await.unwrap().is_none());
     assert!(s.read_triple(&id(A, 9, 9), C).await.unwrap().is_none());
-    // Control: the same triple is visible to the people it concerns.
     assert!(s.read_triple(&env.msg, A).await.unwrap().is_some());
     assert!(s.read_triple(&env.msg, B).await.unwrap().is_some());
 }

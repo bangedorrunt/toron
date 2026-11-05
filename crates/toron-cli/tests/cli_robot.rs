@@ -1,7 +1,4 @@
 // governed-by: ADR-0003
-// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
-// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
-// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-led.8.3 acceptance: robot CLI ↔ MCP tool JSON parity.
 //!
@@ -27,7 +24,6 @@ fn shared_data_dir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("toron-cli-robot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         // SAFETY: test process; set before any demo_mailbox construction in
-        // this process, and inherited by the shelled-out subprocess.
         unsafe {
             std::env::set_var("TORON_MCP_DATA_DIR", &d);
         }
@@ -38,15 +34,6 @@ fn shared_data_dir() -> std::path::PathBuf {
 
 fn toron() -> Command {
     let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
-    // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
-    // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
-    // checks the daemon URL first and returns before reading the data dir —
-    // so the shelled-out CLI would talk to a developer's live daemon and
-    // never see the keys registered into the temp dir, failing as
-    // "unknown recipient" / "has no local key". Drop it by default so the
-    // suite is hermetic on any machine with the daemon running. Tests that
-    // deliberately exercise the daemon set it per-command after this, and
-    // that later `env` wins (bd-5z0l).
     c.env_remove("TORON_MCP_URL");
     c
 }
@@ -60,8 +47,6 @@ fn run(args: &[&str]) -> Output {
 /// `toron_mcp::demo_mailbox`. Idempotent (re-registration upserts the existing
 /// key); serialized so parallel tests never race the first key write.
 fn register_test_agent() {
-    // Ensure the shared data dir env is set BEFORE demo_mailbox constructs
-    // (in-process) and before any shelled-out subprocess (inherited env).
     let _ = shared_data_dir();
     static REG: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = REG
@@ -110,8 +95,6 @@ fn inbox_since_rfc3339_filters_through_binary() {
         String::from_utf8_lossy(&sent.stderr)
     );
 
-    // Poll until the projection lands, then read the message's own
-    // created_ts_us back out of the inbox (the filter compares against it).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let created_us: i64 = loop {
         let out = run(&[
@@ -153,7 +136,6 @@ fn inbox_since_rfc3339_filters_through_binary() {
         .expect("created_us is a valid timestamp")
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
-    // Past since: the message is strictly newer → included.
     let past = run(&[
         "mail",
         "inbox",
@@ -179,7 +161,6 @@ fn inbox_since_rfc3339_filters_through_binary() {
         "past --since must include the message, got {past_value}"
     );
 
-    // Future since: the message is older → excluded.
     let future = run(&[
         "mail",
         "inbox",
@@ -206,7 +187,6 @@ fn inbox_since_rfc3339_filters_through_binary() {
         "future --since must exclude the message, got {future_value}"
     );
 
-    // Malformed since: hard error, never a silent pass-through.
     let malformed = run(&[
         "mail",
         "inbox",
@@ -240,8 +220,6 @@ fn request_release_roundtrip_through_binary() {
     let _guard = plane_guard();
     plane_register(&["HolderAgent", "AskerAgent"]);
 
-    // A (HolderAgent) holds src/a.rs exclusively — in-process mailbox on the
-    // same durable root the CLI subprocess will use.
     let lease_id = {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
@@ -261,7 +239,6 @@ fn request_release_roundtrip_through_binary() {
         })
     };
 
-    // B (AskerAgent) asks HolderAgent to release it — plane P via CLI.
     let out = plane_run(&[
         "reserve",
         "request-release",
@@ -305,7 +282,6 @@ fn request_release_roundtrip_through_binary() {
         .expect("request-release carries the message id")
         .to_string();
 
-    // Holder answers via the CLI (agreed) — the response resolves the ask.
     let resp = plane_run(&[
         "reserve",
         "respond",
@@ -330,7 +306,6 @@ fn request_release_roundtrip_through_binary() {
         "respond parity shape carries deliveries, got {resp_value}"
     );
 
-    // Unhappy path: unknown reservation id is a hard error naming it.
     let bad = plane_run(&[
         "reserve",
         "request-release",
@@ -357,7 +332,6 @@ fn request_release_roundtrip_through_binary() {
         String::from_utf8_lossy(&bad.stderr)
     );
 
-    // Unhappy path: malformed --ask is a usage error naming the grammar.
     let bad_ask = plane_run(&[
         "reserve",
         "request-release",
@@ -439,8 +413,6 @@ fn cross_process_binary_send_binary_receive() {
         String::from_utf8_lossy(&sent.stderr)
     );
 
-    // Binary B polls its inbox until the projection lands (the sender's own
-    // unwrap loop projects into the shared root; bounded poll).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let out = run(&[
@@ -492,7 +464,6 @@ fn cross_process_binary_send_binary_receive() {
 fn cross_process_mail_content_shares_durable_root() {
     register_test_agent();
 
-    // 1. In-process: send a marker message (self-addressed, gift-wrapped).
     let marker = format!("s3-shared-{}", std::process::id());
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -517,8 +488,6 @@ fn cross_process_mail_content_shares_durable_root() {
             .expect("in-process send_message");
         assert_eq!(sent.count, 1, "one delivery");
 
-        // 2. Wait for the projection/bus store to catch up (async unwrap
-        //    loop) before shelling out — bounded, then fail with context.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let inbox = mailbox
@@ -546,7 +515,6 @@ fn cross_process_mail_content_shares_durable_root() {
         }
     });
 
-    // 3. Shell out on the SAME TORON_MCP_DATA_DIR (inherited env).
     let out = run(&[
         "mail",
         "inbox",
@@ -564,7 +532,6 @@ fn cross_process_mail_content_shares_durable_root() {
     let value: Value =
         serde_json::from_slice(&out.stdout).expect("subprocess inbox must emit valid JSON");
 
-    // 4. Content assertion: the subprocess inbox CONTAINS the marker.
     let found = value
         .as_array()
         .map(|arr| {
@@ -657,8 +624,6 @@ fn reserve_list_board_and_release_by_reason() {
     std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
     let op_key = data_dir.join("operator.ncryptsec");
 
-    // Pin the root (embedded path beats the live-daemon probe) and set the
-    // operator key so `release-by-reason` is not "no operator key configured".
     let own_run = |args: &[&str]| {
         toron()
             .env("TORON_MCP_DATA_DIR", &data_dir)
@@ -676,7 +641,6 @@ fn reserve_list_board_and_release_by_reason() {
         })
     };
 
-    // Operator key + the pin, then one exclusive lease keyed to a bead id.
     let keygen = own_run(&[
         "key",
         "generate",
@@ -725,7 +689,6 @@ fn reserve_list_board_and_release_by_reason() {
         String::from_utf8_lossy(&acq.stderr)
     );
 
-    // The board shows the held lease with holder/reason/exclusive.
     let listed = own_run(&["reserve", "list", "--project", "demo", "--json"]);
     assert!(
         listed.status.success(),
@@ -743,7 +706,6 @@ fn reserve_list_board_and_release_by_reason() {
         "board must show the held lease, got {board}"
     );
 
-    // Filters: exact holder hit, and a stranger matches nothing.
     let by_holder = json(&own_run(&[
         "reserve",
         "list",
@@ -772,7 +734,6 @@ fn reserve_list_board_and_release_by_reason() {
         "holder filter must exclude a stranger, got {miss}"
     );
 
-    // Release-on-bead-close, then the board no longer carries that reason.
     let rel = own_run(&[
         "reserve",
         "release-by-reason",
@@ -904,7 +865,6 @@ fn reserve_sweep_releases_only_closed_reasons() {
         );
     }
 
-    // The audit marks ONLY the closed-reason lease as stale.
     let listed = own_run(&[
         "reserve",
         "list",
@@ -941,7 +901,6 @@ fn reserve_sweep_releases_only_closed_reasons() {
         "open reason not marked: {board}"
     );
 
-    // A bare sweep (no --closed-beads) refuses loud instead of sweeping blind.
     let bare = own_run(&[
         "reserve",
         "sweep",
@@ -956,7 +915,6 @@ fn reserve_sweep_releases_only_closed_reasons() {
         "sweep without --closed-beads must refuse"
     );
 
-    // The sweep releases exactly the closed-reason lease.
     let swept = own_run(&[
         "reserve",
         "sweep",
@@ -1022,11 +980,6 @@ fn reserve_sweep_releases_only_closed_reasons() {
 /// check` → a different store).
 #[test]
 fn guard_check_sees_lease_held_by_another_process() {
-    // Dedicated data dir (plane-test pattern): this test shells out multiple
-    // `toron` invocations, each opening its own mailbox on the SAME root.
-    // The shared cli-robot root races parallel tests' subprocesses (SQLite
-    // "database is locked" / migration UNIQUE flake); a private root makes
-    // the test hermetic.
     let data_dir = std::env::temp_dir().join(format!("toron-guard-own-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
@@ -1038,8 +991,6 @@ fn guard_check_sees_lease_held_by_another_process() {
             .expect("run toron on own data dir")
     };
 
-    // 1. Register GuardAgent (in-process, dedicated dir) then Process A
-    //    holds an EXCLUSIVE lease via the shelled-out binary.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         use std::sync::Arc;
@@ -1084,9 +1035,6 @@ fn guard_check_sees_lease_held_by_another_process() {
         String::from_utf8_lossy(&acq.stderr)
     );
 
-    // 2. Process B (fresh invocation, same data dir) runs the STRICT guard
-    //    against a repo staging src/guard.rs attributed to GuardAgent. The
-    //    held lease MUST be visible — the guard must NOT report Unreserved.
     let repo = std::env::temp_dir().join(format!("toron-guard-repo-{}", std::process::id()));
     let _ = std::fs::create_dir_all(repo.join("src"));
     let git = |args: &[&str]| {
@@ -1137,7 +1085,6 @@ fn guard_check_sees_lease_held_by_another_process() {
         "guard must see the OTHER-process held lease as own coverage, got {value}"
     );
 
-    // 3. Release + cleanup.
     let rel = own_run(&[
         "reserve",
         "release",
@@ -1178,22 +1125,6 @@ fn inbox_missing_required_arg_exits_2() {
         "missing required --agent must be a usage error (exit 2)"
     );
 }
-
-// ---------------------------------------------------------------------------
-// ADR-0020 Spec 2 — two-plane shared surface: channel / react (plane S),
-// job (plane J), presence (plane N), watch (plane W).
-//
-// Cross-process contract: every shelled-out `toron` invocation opens the
-// same durable root (its own TORON_MCP_DATA_DIR), so channel lifecycle
-// events (kind 39000/39002), posts (kind 9), jobs (43001-43006) and presence
-// (projection file) survive across processes — the SC-27 shape.
-//
-// The plane suite uses a DEDICATED data dir (not the shared cli-robot one)
-// so its extra subprocesses never contend with the pre-existing parity
-// tests on the same SQLite root. Registration is serialized and the plane
-// tests share one mutex: the mailbox builds + KDF key scans are heavy, and
-// parallel plane tests would stall each other's unwrap loops.
-// ---------------------------------------------------------------------------
 
 /// Dedicated data dir for the two-plane tests.
 fn plane_data_dir() -> std::path::PathBuf {
@@ -1271,7 +1202,6 @@ fn channel_create_post_read_react_roundtrip() {
     let _g = plane_guard();
     plane_register(&["TestAgent"]);
 
-    // create (process 1) → kind-39000 group metadata persisted.
     let id = channel_id("rt");
     let created = plane_run(&[
         "channel",
@@ -1293,7 +1223,6 @@ fn channel_create_post_read_react_roundtrip() {
     let created_json: Value = serde_json::from_slice(&created.stdout).expect("create emits JSON");
     assert_eq!(created_json["channel_id"], serde_json::json!(id));
 
-    // post (process 2) → kind 9, binding shape {event_id, kind:9, channel, mentions}.
     let posted = plane_run(&[
         "channel",
         "post",
@@ -1320,7 +1249,6 @@ fn channel_create_post_read_react_roundtrip() {
         .expect("post event_id")
         .to_string();
 
-    // read (process 3) → the post is visible cross-process.
     let read = plane_run(&[
         "channel",
         "read",
@@ -1346,7 +1274,6 @@ fn channel_create_post_read_react_roundtrip() {
         .unwrap_or(false);
     assert!(found, "read must contain the posted event, got {rows}");
 
-    // react (process 4) → kind 7 with e=target.
     let reacted = plane_run(&[
         "react",
         "--to",
@@ -1394,7 +1321,6 @@ fn channel_post_mention_dispatches_one_job() {
         "create: {}",
         String::from_utf8_lossy(&created.stderr)
     );
-    // TestAgent2 must join so the mention can target a member of the room.
     let joined = plane_run(&[
         "channel",
         "join",
@@ -1411,7 +1337,6 @@ fn channel_post_mention_dispatches_one_job() {
         String::from_utf8_lossy(&joined.stderr)
     );
 
-    // @mention post → p-tag + one 43001 via the mention dispatcher.
     let posted = plane_run(&[
         "channel",
         "post",
@@ -1435,7 +1360,6 @@ fn channel_post_mention_dispatches_one_job() {
     let mentions = post["mentions"].as_array().expect("mentions array");
     assert_eq!(mentions.len(), 1, "one mention p-tag");
 
-    // job list (new process) sees exactly one 43001 for the mention.
     let listed = plane_run(&[
         "job",
         "list",
@@ -1513,7 +1437,6 @@ fn channel_nonmember_post_exits_1() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    // TestAgent2 never joined → membership gate rejects the post (exit 1).
     let out = plane_run(&[
         "channel",
         "post",
@@ -1554,10 +1477,6 @@ fn help_lists_two_plane_commands() {
         assert!(jt.contains(sub), "job --help must list {sub}, got: {jt}");
     }
 }
-
-// ---------------------------------------------------------------------------
-// plane J — jobs 43001-43006 (bd-36qf.4)
-// ---------------------------------------------------------------------------
 
 /// A job in project `demo` ready to claim: a mention post dispatches one
 /// 43001 for TestAgent2. Returns the job id from `job list`.
@@ -1645,7 +1564,6 @@ fn job_claim_first_wins_second_exits_1() {
     let _g = plane_guard();
     let job_id = make_open_job("claim");
 
-    // First claimer (TestAgent2) → won:true.
     let first = plane_run(&[
         "job",
         "claim",
@@ -1670,7 +1588,6 @@ fn job_claim_first_wins_second_exits_1() {
     );
     assert_eq!(first_json["claimer"], serde_json::json!("TestAgent2"));
 
-    // Second claimer (TestAgent) → won:false, exit 1.
     let second = plane_run(&[
         "job",
         "claim",
@@ -1736,7 +1653,6 @@ fn job_result_sets_done_visible_to_show() {
         String::from_utf8_lossy(&result.stderr)
     );
 
-    // job show (new process) reads the terminal state.
     let shown = plane_run(&["job", "show", &job_id, "--project", "demo", "--json"]);
     assert!(
         shown.status.success(),
@@ -1756,7 +1672,6 @@ fn job_cancel_requester_only() {
     let _g = plane_guard();
     let job_id = make_open_job("cancel");
 
-    // Non-requester (TestAgent2) cannot cancel → exit 1.
     let denied = plane_run(&[
         "job",
         "cancel",
@@ -1774,7 +1689,6 @@ fn job_cancel_requester_only() {
         String::from_utf8_lossy(&denied.stderr)
     );
 
-    // Requester (TestAgent, who posted the mention) can cancel.
     let ok = plane_run(&[
         "job",
         "cancel",
@@ -1813,10 +1727,6 @@ fn job_show_unknown_job_exits_1() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// plane N + W — presence 20001, watch (bd-36qf.5)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn presence_publish_then_list_cross_process() {
     let _g = plane_guard();
@@ -1844,7 +1754,6 @@ fn presence_publish_then_list_cross_process() {
     assert_eq!(p["state"], serde_json::json!("working"));
     assert_eq!(p["name"], serde_json::json!("TestAgent"));
 
-    // A separate process lists the heartbeat from the projection file.
     let listed = plane_run(&["presence", "list", "--project", "demo", "--json"]);
     assert!(
         listed.status.success(),
@@ -1890,19 +1799,9 @@ fn watch_once_catches_cross_process_post() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    // bd-nepl harness (mirrors toron-e2e sc32, bd-hs8y): the test process
-    // holds a WakeServer over the SHARED plane bus and the watch child
-    // connects to it via TORON_WAKE_SOCK (socket-first, wave 4). The post
-    // goes through the harness bus: a CLI post child's in-process bus dies
-    // with the process — the wave-3 sqlite pump that bridged it is deleted —
-    // so only the socket half can be cross-process, which is production's
-    // shape (watch children consume the daemon-held socket, never a peer's
-    // ephemeral bus).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let (server, watch, post_err) = rt.block_on(async {
         let mailbox = plane_mailbox().await.expect("plane mailbox");
-        // UDS paths must fit SUN_LEN: short pid-keyed socket beside temp.
-        // Stale files are taken over by WakeServer, never blindly deleted.
         let sock =
             std::env::temp_dir().join(format!("toron-cli-watch-{}.sock", std::process::id()));
         let server = toron_core::bus::wake::WakeServer::new(
@@ -1914,7 +1813,6 @@ fn watch_once_catches_cross_process_post() {
         .await
         .expect("harness wake.sock");
 
-        // Process 1: watch --once (socket-first at the harness socket).
         let watch = toron()
             .env("TORON_MCP_DATA_DIR", plane_data_dir())
             .env("TORON_WAKE_SOCK", &sock)
@@ -1937,12 +1835,8 @@ fn watch_once_catches_cross_process_post() {
             .spawn()
             .expect("spawn watch");
 
-        // Give the watcher time to connect + subscribe.
         std::thread::sleep(std::time::Duration::from_millis(800));
 
-        // Process 2's post, through the harness-held bus: the same kind-9
-        // event `channel post` signs (t = project, h = channel id), so the
-        // watch gate sees a real channel post, not a test-shaped frame.
         let keys = toron_core::keys::generate();
         let ev = toron_core::nostr::event::build_event(
             &keys,
@@ -1973,8 +1867,6 @@ fn watch_once_catches_cross_process_post() {
         serde_json::json!("seen by watch"),
         "watched the posted content"
     );
-    // Held across the child's wait on purpose: dropping the handle removes
-    // the socket file (RAII), and the watcher must die on its own first.
     drop(server);
 }
 
@@ -2050,11 +1942,6 @@ fn presence_help_lists_commands() {
     assert!(text.contains("list"), "presence --help lists list");
 }
 
-// ---------------------------------------------------------------------------
-// bd-pin-public-plane-s-easy.14: one mailbox — the guard reads reservations
-// from the daemon when a URL is set, never a second in-process demo_mailbox.
-// ---------------------------------------------------------------------------
-
 /// Boot a real `toron serve --mcp-http` daemon on a free port with its own
 /// data dir. Returns (child, port). The caller must kill the child.
 /// bd-yolv: a daemon that is RELEASED, not merely spawned.
@@ -2072,20 +1959,9 @@ fn presence_help_lists_commands() {
 /// the guard not being on this path.
 struct DaemonGuard(Option<std::process::Child>);
 
-// bd-x4qw: this impl had `kill()` (a bare SIGKILL) and `pid()`, and NOTHING
-// called either. `kill()` was worse than dead — `Drop` below releases
-// GRACEFULLY (SIGTERM, bounded escalation, then reap) because `toron serve`
-// holds a sqlite store and a listening socket, so a hard kill would strand
-// both. A `kill()` that silently bypasses the only correct release path is a
-// trap for whoever wires it up next, not a convenience. Deleted, not allowed.
-
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            // SIGTERM first, then reap: `toron serve` holds a sqlite store and
-            // a listening socket, and SIGKILL leaves both for the next run.
-            // The escalation is bounded, so a wedged daemon cannot hang the
-            // suite — the wait is `try_wait` in a loop, never a blocking one.
             let pid = child.id();
             let _ = std::process::Command::new("kill")
                 .arg("-TERM")
@@ -2110,7 +1986,6 @@ impl Drop for DaemonGuard {
 }
 
 fn boot_daemon(data_dir: &std::path::Path) -> (DaemonGuard, u16) {
-    // Pick a free port: bind, note it, drop the listener.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
@@ -2124,7 +1999,6 @@ fn boot_daemon(data_dir: &std::path::Path) -> (DaemonGuard, u16) {
         .spawn()
         .map(|c| DaemonGuard(Some(c)))
         .expect("spawn toron serve");
-    // Wait for the port to accept (the daemon mounts /mcp at bind time).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -2138,10 +2012,6 @@ fn boot_daemon(data_dir: &std::path::Path) -> (DaemonGuard, u16) {
     }
     (child, port)
 }
-
-// ---------------------------------------------------------------------------
-// ADR-0036 Spec 2: `serve` IS the sidecar (bd-ewsi).
-// ---------------------------------------------------------------------------
 
 /// The serving process must bind `wake.sock` at the SAME path every
 /// consumer's discovery derives (`$XDG_STATE_HOME/toron/wake.sock`) and
@@ -2177,7 +2047,6 @@ fn serve_binds_wake_sock_for_consumers() {
         .expect("spawn serve");
 
     let sock = state.join("toron").join("wake.sock");
-    // Serve must come up at all first (port probe mirrors boot_daemon).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(
@@ -2186,8 +2055,6 @@ fn serve_binds_wake_sock_for_consumers() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    // Then the handshake: subscribe -> EOSE, bounded (a bare file is not
-    // the contract — the frame is).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut answered = String::new();
     while std::time::Instant::now() < deadline {
@@ -2213,7 +2080,6 @@ fn serve_binds_wake_sock_for_consumers() {
         sock.display()
     );
 
-    // Dead serve refuses the path — stale file or gone, both read as absent.
     let _ = child.kill();
     let _ = child.wait();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -2279,7 +2145,6 @@ fn channel_post_reaches_daemon_wake_sidecar() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    // Register + room via the CLI (second process, shared store).
     let boot = cli(&[
         "agent",
         "bootstrap",
@@ -2311,9 +2176,6 @@ fn channel_post_reaches_daemon_wake_sidecar() {
         "create: {}",
         String::from_utf8_lossy(&created.stderr)
     );
-    // Subscribe FIRST (drain the handshake), THEN post: only live fanout
-    // — the store-delta poll — can deliver it. A replay-only path would
-    // never see a post published after EOSE on an open tail.
     let sock = state.join("toron").join("wake.sock");
     let mut tail: Option<BufReader<UnixStream>> = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -2341,8 +2203,6 @@ fn channel_post_reaches_daemon_wake_sidecar() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let mut reader = tail.expect("wake.sock handshake (EOSE) before post");
-    // Post AFTER the tail is open: the pump's live fanout never observes
-    // this second process, so only the store-delta poll delivers it.
     let posted = cli(&[
         "channel",
         "post",
@@ -2419,7 +2279,6 @@ fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
             .await
             .expect("daemon connect");
 
-        // Register the agent on the daemon (its keys live in the daemon root).
         let reg = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("register_agent".to_string())
@@ -2438,7 +2297,6 @@ fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
             .expect("register_agent over daemon");
         assert!(!reg.is_error.unwrap_or(false), "register failed: {reg:?}");
 
-        // Acquire the exclusive lease through the daemon.
         let acq = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("file_reservation_paths".to_string())
@@ -2529,9 +2387,6 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
 
     acquire_lease_via_daemon(port, "demo", "TestAgent", "src/a.rs");
 
-    // Guard check AS the holder with the daemon URL set + an EMPTY data dir:
-    // must pass (own reservation visible from the daemon). If the guard used
-    // demo_mailbox (empty dir) it would see no reservations → Unreserved → 1.
     let out = toron()
         .args([
             "guard",
@@ -2545,8 +2400,6 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
             "--strict",
         ])
         .env("TORON_MCP_URL", &url)
-        // bd-qpm0: TORON_MCP_DATA_DIR deliberately NOT set. With it set, the
-        // selector refuses the contradiction (see the doc above).
         .env_remove("TORON_MCP_DATA_DIR")
         .output()
         .expect("guard check via daemon");
@@ -2563,9 +2416,6 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
         "no blocked paths for the holder: {value}"
     );
 
-    // The SAME check WITHOUT the URL (embedded on the empty dir) must FAIL —
-    // proving the URL is what made the lease visible (demo_mailbox is not the
-    // guard's source when a URL is set).
     let out_embedded = toron()
         .args([
             "guard",
@@ -2828,24 +2678,12 @@ async fn daemon_mcp_client(
         .expect("daemon connect")
 }
 
-// ---------------------------------------------------------------------------
-// bd-sdzw: guard hatch + shared self-holds + committer npub derivation.
-// ---------------------------------------------------------------------------
-
 /// TDD red (bd-sdzw defect 1): TORON_GUARD_STRICT=0 must exit 0 even when
 /// staged paths are unreserved — the hatch is the operator escape, it must
 /// not fall through to the blocking path.
 #[test]
 fn strict_hatch_exits_zero_when_disabled() {
-    // A repo with an unreserved staged path.
     let repo = staged_git_repo("hatch");
-    // bd-yolv: pin a mailbox root. Without it this test has NO source
-    // configured, so the selector falls through to the default-port probe — and
-    // on any machine running a real toron daemon (:18080) that probe succeeds
-    // and `RefuseSecondStore` fires, so the test fails for a reason that has
-    // nothing to do with the guard hatch it is testing. It was passing only
-    // because this machine happened to have nothing on :18080 at the time.
-    // A test that only passes on an idle machine is not a test.
     let root = std::env::temp_dir().join(format!("toron-hatch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("pinned root");
@@ -2891,10 +2729,8 @@ fn guard_daemon_resolves_committer_to_registered_npub() {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let repo = staged_git_repo("npub");
 
-    // Hold an exclusive lease as CoralFinch via the daemon.
     acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
 
-    // Guard check AS CoralFinch with the daemon URL: own npub must match.
     let out = toron()
         .args([
             "guard",
@@ -2946,7 +2782,6 @@ fn strict_hatch_exits_zero_when_held_by_other() {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let repo = staged_git_repo("hatch-other");
 
-    // Another agent (CoralFinch) holds the path — non-strict would block.
     acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
 
     let out = toron()
@@ -2993,10 +2828,7 @@ fn guard_embedded_committer_resolves_via_daemon_npub() {
     let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
 
-    // Local repo root with a DIFFERENT CoralFinch key (the witness: repo-local
-    // passphrase-encrypted key cannot match the daemon's).
     std::fs::create_dir_all(local_dir.join("agents/CoralFinch")).expect("local agents dir");
-    // A repo whose project root is local_dir (staged under local_dir/src).
     std::fs::create_dir_all(local_dir.join("src")).expect("local src");
     std::fs::write(local_dir.join("src/a.rs"), "pub fn a() {}\n").expect("write a.rs");
     let init = Command::new("git")
@@ -3014,12 +2846,8 @@ fn guard_embedded_committer_resolves_via_daemon_npub() {
         .expect("git add");
     assert!(add.status.success());
 
-    // Daemon holds the lease for CoralFinch (its OWN npub).
     acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
 
-    // Guard from the local repo AS CoralFinch with the daemon URL: the
-    // committer must resolve to the DAEMON's CoralFinch npub, so the
-    // daemon-held lease is own coverage.
     let out = toron()
         .args([
             "guard",
@@ -3070,7 +2898,6 @@ fn strict_shared_self_hold_covers_path_embedded() {
             .expect("run toron on own data dir")
     };
 
-    // Register + hold a SHARED (non-exclusive) lease.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         use std::sync::Arc;
@@ -3106,7 +2933,7 @@ fn strict_shared_self_hold_covers_path_embedded() {
         "demo",
         "--as",
         "SharedAgent",
-        "--json", // NO --exclusive → shared
+        "--json",
     ]);
     assert!(
         acq.status.success(),
@@ -3114,7 +2941,6 @@ fn strict_shared_self_hold_covers_path_embedded() {
         String::from_utf8_lossy(&acq.stderr)
     );
 
-    // Staged repo with src/a.rs.
     let repo = staged_git_repo("shared");
     let out = toron()
         .args([
@@ -3158,7 +2984,6 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
 
-    // Register the committing agent on a private root (own-process pattern).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         use std::sync::Arc;
@@ -3198,15 +3023,10 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         .to_path_buf();
     let path_var = std::env::var("PATH").unwrap_or_default();
     let with_env = |c: &mut Command| {
-        // The hooks run `toron`, so git runs under the harness too.
         toron_core::testkit::apply_test_env(c);
         c.current_dir(&repo)
             .env("TORON_MCP_DATA_DIR", &data_dir)
             .env("AGENT_NAME", "HunkAgent")
-            // The installed hooks shell out to `toron`, and an ambient
-            // TORON_MCP_URL would send them to a developer's live daemon
-            // instead of this fixture's store, so the guard would judge the
-            // wrong lease table (bd-5z0l).
             .env_remove("TORON_MCP_URL")
             .env(
                 "PATH",
@@ -3223,17 +3043,12 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     };
 
     assert!(git(&["init", "-q"]).status.success(), "git init");
-    // CI runners have no global git identity — the fixture must carry its
-    // own or every `git commit` below fails with "tell me who you are"
-    // (GS-018: build-job red on toron-only runners).
     assert!(
         git(&["config", "user.email", "ci@toron.invalid"])
             .status
             .success()
     );
     assert!(git(&["config", "user.name", "toron-ci"]).status.success());
-    // Lease covers the file so the pre-commit sweep passes; only the
-    // bead-hunk check may block.
     let mut acq = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     acq.env("TORON_MCP_DATA_DIR", &data_dir)
         .env_remove("TORON_MCP_URL")
@@ -3251,7 +3066,6 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         ])
         .output()
         .expect("acquire lease");
-    // Install BOTH guard hooks into the temp repo.
     let mut inst = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     inst.env("TORON_MCP_DATA_DIR", &data_dir)
         .env_remove("TORON_MCP_URL")
@@ -3265,7 +3079,6 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         "install must write the commit-msg hook"
     );
 
-    // 1. Foreign bead token in the diff, absent from the message -> blocked.
     std::fs::write(
         repo.join("src/hunk.rs"),
         "// governed-by: bd-swept-foreign\n",
@@ -3289,7 +3102,6 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         "rejection must name the offending token, got: {err}"
     );
 
-    // 2. Same change, token named in the message -> passes.
     let ok = git(&[
         "commit",
         "-m",
@@ -3301,7 +3113,6 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         String::from_utf8_lossy(&ok.stderr)
     );
 
-    // 3. Hatch open (TORON_GUARD_STRICT=0): violation warns, commit passes.
     std::fs::write(
         repo.join("src/hunk.rs"),
         "// governed-by: bd-swept-foreign\n// more bd-hatch-token\n",
@@ -3343,8 +3154,6 @@ fn agent_prune_absorbs_folded_slug_leftovers_through_binary() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");
-        // No `ensure_project`: the demo mailbox has no operator key to sign a
-        // project manifest, and registration + folds only need the index pool.
         mailbox
             .register_agent(&project, &AgentProfile::new(slug))
             .await
@@ -3353,13 +3162,11 @@ fn agent_prune_absorbs_folded_slug_leftovers_through_binary() {
             .register_agent(&project, &AgentProfile::new("CliPrunePin"))
             .await
             .expect("canonical pin");
-        // Record the fold WITHOUT absorbing — the legacy leftover shape.
         mailbox
             .fold_agent_name_alias_no_absorb(&project, slug, "CliPrunePin")
             .await;
     });
 
-    // Global --dry-run previews; nothing is absorbed.
     let preview = run(&[
         "agent",
         "prune",
@@ -3396,7 +3203,6 @@ fn agent_prune_absorbs_folded_slug_leftovers_through_binary() {
         "report names the absorbed slug"
     );
 
-    // Idempotent: a second sweep finds nothing left to do.
     let again = run(&["agent", "prune", "--project", &project, "--json"]);
     assert!(again.status.success(), "re-prune must exit 0");
     let again_json: Value = serde_json::from_slice(&again.stdout).expect("re-prune JSON");
@@ -3419,11 +3225,6 @@ fn the_daemon_guard_releases_even_when_the_test_panics() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("data dir");
 
-    // The daemon's PORT is the only thing observable from outside: `boot_daemon`
-    // passes the data dir as an ENV var, so it never appears in `ps` output.
-    // My first fence grepped the process table for the fixture's directory, and
-    // removing the Drop left it GREEN — a detector that can never fire is worse
-    // than none, because it reads as coverage. The port cannot lie.
     let mut port = 0u16;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (_daemon, p) = boot_daemon(&dir);
@@ -3440,12 +3241,6 @@ fn the_daemon_guard_releases_even_when_the_test_panics() {
         "the fixture must have booted a daemon to be worth leaking"
     );
 
-    // `boot_daemon` already waited for the port to accept, so the daemon WAS
-    // serving; all that is left to prove is that the unwind released it. My
-    // first version asserted the OPPOSITE as a precondition — "still serving
-    // after the panic" — which is the leak, not the fix, so the fence failed
-    // when the guard worked correctly. An inverted assertion is worse than none:
-    // it makes correct code look broken.
     let still_serving = |p: u16| {
         std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{p}").parse().expect("addr"),
@@ -3464,13 +3259,6 @@ fn the_daemon_guard_releases_even_when_the_test_panics() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ---------------------------------------------------------------------------
-// bd-reserve-with-lease-2lvt: `reserve with-lease` — one scoped command,
-// acquired before it runs and ALWAYS released after (success, failure,
-// signal). Each test pins its own data dir, mirroring the reserve list/sweep
-// tests, so parallel tests never share a lease board or a live-daemon probe.
-// ---------------------------------------------------------------------------
 
 /// Dedicated data dir per with-lease test.
 fn with_lease_dir(tag: &str) -> std::path::PathBuf {
@@ -3755,7 +3543,6 @@ fn reserve_with_lease_scoped_command_serializes_concurrent_calls() {
     with_lease_bootstrap(&dir, "LeaseMarlin");
     let log = dir.join("order.log");
     let gate = dir.join("go");
-    // Bounded hold (max ~30s) so a panicking test can never leak a holder.
     let script_a = format!(
         "echo A-start >> '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; echo A-end >> '{}'",
         log.display(),
@@ -3787,7 +3574,6 @@ fn reserve_with_lease_scoped_command_serializes_concurrent_calls() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn with-lease A");
-    // A-start proves A holds the lease (acquire happens before the child).
     with_lease_wait_for(&log, "A-start", std::time::Duration::from_secs(15));
     let b = toron()
         .env("TORON_MCP_DATA_DIR", &dir)
@@ -3813,9 +3599,6 @@ fn reserve_with_lease_scoped_command_serializes_concurrent_calls() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn with-lease B");
-    // B's startup is ~a tenth of a second; 5s is 30x margin for its first
-    // acquire to hit A's hold. The `acquire_attempts` assertion below is what
-    // refuses a vacuous pass if it ever did not.
     std::thread::sleep(std::time::Duration::from_secs(5));
     std::fs::write(&gate, b"").expect("release A's hold");
     let a_out = a.wait_with_output().expect("wait A");
@@ -3834,9 +3617,6 @@ fn reserve_with_lease_scoped_command_serializes_concurrent_calls() {
             String::from_utf8_lossy(&b_out.stderr)
         )
     });
-    // The acquire may block in one long attempt or retry; either way the
-    // ORDER below is the proof of serialization. Keep a floor so a vacuous
-    // zero-acquire summary cannot pass.
     let attempts = b_summary["acquire_attempts"].as_u64().unwrap_or(0);
     assert!(
         attempts >= 1,
@@ -3915,12 +3695,6 @@ fn reserve_with_lease_scoped_command_releases_on_signal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------------------
-// bd-release-dry-run-mutates-ri7o: `-n/--dry-run` must be strictly read-only
-// for every mutating reserve command. Measured bug: `reserve release -n`
-// reported `released: N` AND released for real.
-// ---------------------------------------------------------------------------
-
 /// The board row for this reason, if any (holder included).
 fn with_lease_board_row(data_dir: &std::path::Path, reason: &str) -> Option<Value> {
     let out = with_lease_run(
@@ -3947,8 +3721,6 @@ fn release_dry_run_is_read_only() {
     with_lease_bootstrap(&dir, "DryRidge");
     with_lease_bootstrap(&dir, "DryMarlin");
 
-    // Release (the measured case): a real hold survives a dry-run release,
-    // and the following real release removes it.
     let acq = with_lease_run(
         &dir,
         &[
@@ -4028,7 +3800,6 @@ fn release_dry_run_is_read_only() {
         "the real release must remove the hold"
     );
 
-    // Audit 1 — acquire: a dry run must not lease.
     let dry_acq = with_lease_run(
         &dir,
         &[
@@ -4056,7 +3827,6 @@ fn release_dry_run_is_read_only() {
         "a dry-run acquire must not lease"
     );
 
-    // Audit 2 — transfer: a dry run must not move a held lease.
     let held = with_lease_run(
         &dir,
         &[
@@ -4106,8 +3876,6 @@ fn release_dry_run_is_read_only() {
         "a dry-run transfer must not move the lease: {row}"
     );
 
-    // Audit 3 — sweep: a dry run must not release a closed-reason lease and
-    // must not need the operator key (it performs no signed mutation).
     let repo = dir.join("tracker");
     std::fs::create_dir_all(repo.join(".beads")).expect("mkdir tracker");
     std::fs::write(
@@ -4171,7 +3939,6 @@ fn reserve_acquire_normalizes_space_separated_paths_and_auto_reuses_pin() {
         std::env::temp_dir().join(format!("toron-reserve-spaces-reuse-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    // 1. First, register ReusedPin in proj_a so it has a known key and roster entry.
     let boot = with_lease_run(
         &dir,
         &[
@@ -4192,8 +3959,6 @@ fn reserve_acquire_normalizes_space_separated_paths_and_auto_reuses_pin() {
         String::from_utf8_lossy(&boot.stderr)
     );
 
-    // 2. Now acquire in proj_b WITHOUT prior bootstrap in proj_b,
-    // and using space-separated paths in --paths:
     let acq_b = with_lease_run(
         &dir,
         &[

@@ -90,8 +90,6 @@ pub struct RelayBus {
 impl RelayBus {
     /// Open a RelayBus: build the nostr-sdk client, add relays, connect.
     pub async fn open(config: RelayBusConfig) -> Result<Self, BusError> {
-        // Doctor gate: misconfigured public federation (public mode without
-        // AUTH / relays / POW floor) fails at construction, never silently.
         let issues = config.federation.doctor();
         if !issues.is_empty() {
             return Err(BusError::Publish(format!(
@@ -109,8 +107,6 @@ impl RelayBus {
         }
         client.connect().await;
 
-        // rust-nostr 0.45: `handle_notifications` is gone. `notifications()`
-        // is a Stream of ClientNotification from this moment forward.
         let (notify_tx, _) = tokio::sync::broadcast::channel(1024);
         let client_for_task = client.clone();
         let notify_tx_for_task = notify_tx.clone();
@@ -154,14 +150,8 @@ impl RelayBus {
     > {
         let (tx, rx) = mpsc::channel(256);
 
-        // Subscribe to the notification broadcast BEFORE opening the client
-        // subscription: the relay can answer REQ (replay + EOSE) before the
-        // client.subscribe future resolves, and any notification emitted in
-        // that window must not be lost (broadcast drops pre-subscribe sends).
         let mut notify_rx = self.notify_tx.subscribe();
 
-        // Open the subscription on the client; map NIP-01 frames to our
-        // SubscriptionEvent shape.
         let output = self
             .client
             .subscribe(filter.clone())
@@ -169,8 +159,6 @@ impl RelayBus {
             .map_err(|e| BusError::Subscription(format!("client.subscribe: {e}")))?;
         let sub_id = output.id().clone();
 
-        // Background task: broadcast notifications → mpsc. Filters match
-        // against the original filter; EOSE maps to SubscriptionEvent::Eose.
         let sub_id_clone = sub_id.clone();
         let lag_counter = self.lag_skips.clone();
         tokio::spawn(async move {
@@ -207,10 +195,6 @@ impl RelayBus {
                         Some(SubscriptionEvent::Closed("relay bus shutdown".into()))
                     }
                     Ok(_) => None,
-                    // F1.LAG-SWALLOW (batch-fix): surface, never swallow. The
-                    // broadcast out-ran this subscriber (mpsc 256 filled while
-                    // the producer kept publishing); the skipped events are
-                    // gone, but the operator must SEE the gap on health.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         lag_counter.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
@@ -227,7 +211,6 @@ impl RelayBus {
                     }
                 };
                 if let Some(item) = item {
-                    // Subscriber dropped its receiver → stop this task.
                     if tx.send(item).await.is_err() {
                         return;
                     }
@@ -242,11 +225,8 @@ impl RelayBus {
 #[async_trait::async_trait]
 impl Bus for RelayBus {
     async fn publish(&self, event: Event) -> Result<PublishOk, BusError> {
-        // Verify (reject forged/mutated). F23.BUS-DEDUP (batch-fix): shared
-        // canonical mapping in bus/common.rs.
         crate::bus::common::verify_publish_event(&event)?;
 
-        // Phase-1 federation policy gate.
         if !self.federation_policy_allows(&event) {
             return Err(BusError::Publish(format!(
                 "federation policy: kind {} is not federated in Phase 1 (only gift-wrapped NIP-17 crosses relays)",
@@ -254,7 +234,6 @@ impl Bus for RelayBus {
             )));
         }
 
-        // Publish to write relays (full NIP-01 EVENT/OK frames).
         self.client
             .send_event(&event)
             .await
@@ -281,7 +260,6 @@ impl Bus for RelayBus {
     }
 
     async fn health(&self) -> Result<Health, BusError> {
-        // nostr-sdk Client tracks connected relays; we count configured relays.
         let configured = self.config.relays.len();
         let lag = self.lag_skips.load(std::sync::atomic::Ordering::Relaxed);
         if configured == 0 {
@@ -292,16 +270,12 @@ impl Bus for RelayBus {
         }
         let mut message = format!("relay bus: {configured} relay(s) configured");
         if lag > 0 {
-            // F1.LAG-SWALLOW: a non-zero count is an observable gap — dropped
-            // relay notifications (workflow triggers / mailbox events). Never
-            // silent.
             let _ = write!(message, "; {lag} notification(s) dropped to broadcast lag");
         }
         Ok(Health { ok: true, message })
     }
 }
 
-// Allow constructing a bus for tests without exposing internals.
 impl RelayBus {
     /// Config relays.
     pub fn relay_count(&self) -> usize {
@@ -326,14 +300,10 @@ mod tests {
             federation_policy_enabled: true,
             ..Default::default()
         };
-        // Build the struct without network: use a helper that only needs
-        // the config (policy check is pure).
         let _ = bus_config;
 
-        // Gift wrap (1059) → allowed.
         assert!(is_metadata_hiding_kind(Kind::GiftWrap));
 
-        // Agent profile (30013) → NOT metadata-hiding → blocked by policy.
         assert!(!is_metadata_hiding_kind(crate::nostr::kinds::toron_kind(
             AGENT_PROFILE
         )));
@@ -385,7 +355,6 @@ mod tests {
         .expect("build");
         assert!(crate::nostr::event::verify_event(&ev).is_ok());
 
-        // Forged event (mutated content, kept sig) fails verify.
         let forged = Event::new(
             ev.id,
             ev.pubkey,
@@ -408,8 +377,6 @@ mod tests {
             federation_policy_enabled: true,
             ..Default::default()
         };
-        // open() with zero relays: add_relay loop is a no-op, connect() is a
-        // no-op with no relays. Health reports "no relays configured".
         let bus = RelayBus::open(config).await.expect("open");
         let h = bus.health().await.expect("health");
         assert!(h.ok);
@@ -425,7 +392,6 @@ mod tests {
         let relay = crate::bus::mock_relay::MockRelay::start().await;
         let url = relay.url().to_string();
 
-        // Build two buses on the same relay: subscriber + publisher.
         let subscriber = RelayBus::open(RelayBusConfig {
             relays: vec![RelayConfig {
                 url: url.clone(),
@@ -449,16 +415,13 @@ mod tests {
         .await
         .expect("open publisher");
 
-        // Give the WS connections a moment to establish.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Subscribe to ALL events (global filter).
         let mut sub = subscriber
             .subscribe(crate::bus::Filter::new())
             .await
             .expect("subscribe");
 
-        // Publish a gift-wrapped event (allowed by federation policy).
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -473,7 +436,6 @@ mod tests {
         let ok = publisher.publish(wrapped.clone()).await.expect("publish");
         assert!(ok.stored);
 
-        // Wait for the event to flow back via the live forward path.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut received = false;
         while tokio::time::Instant::now() < deadline {
@@ -489,7 +451,6 @@ mod tests {
             }
         }
         assert!(received, "subscriber must receive the event over WS");
-        // The relay itself stored the event (real EVENT/OK path).
         assert_eq!(relay.stored_count(), 1, "relay stored the event");
         relay.shutdown();
     }
@@ -514,7 +475,6 @@ mod tests {
         .expect("open publisher");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Publish a gift-wrapped event first.
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -528,7 +488,6 @@ mod tests {
             .expect("wrap");
         publisher.publish(wrapped.clone()).await.expect("publish");
 
-        // Subscriber joins AFTER publish → replay path.
         let subscriber = RelayBus::open(RelayBusConfig {
             relays: vec![RelayConfig {
                 url,
@@ -639,8 +598,6 @@ mod tests {
         .expect("open publisher");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Sub A: drained by a background task → the broadcast producer never
-        // blocks. Sub B: held undrained → bridge blocks on its mpsc (256 cap).
         let mut sub_a = bus
             .subscribe(crate::bus::Filter::new())
             .await
@@ -651,8 +608,6 @@ mod tests {
             .expect("subscribe b");
         let drain_a = tokio::spawn(async move { while sub_a.next().await.is_some() {} });
 
-        // Burst: 1500 gift-wraps > 256 (mpsc) + 1024 (broadcast) + margin, so
-        // sub_b's bridge MUST lag once the mpsc fills.
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let mut published = 0usize;
@@ -671,9 +626,6 @@ mod tests {
             published += 1;
         }
 
-        // Now drain sub_b: the bridge unblocks, recv() returns Lagged, and —
-        // post-fix — the lag must be observable. Give the relay forward loop
-        // time to flush before draining.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let mut received_b = 0usize;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -686,13 +638,11 @@ mod tests {
         }
         drain_a.abort();
 
-        // Diagnostic: lag MUST have occurred (silent loss today).
         assert!(
             received_b < published,
             "test setup broken: sub_b received all {published} events — no lag was forced"
         );
 
-        // RED contract: the lag must be surfaced on the health surface.
         let h = bus.health().await.expect("health");
         assert!(
             h.message.to_lowercase().contains("lag"),

@@ -72,7 +72,6 @@ impl PresenceBroker {
         let live_for_task = live_tx.clone();
         let bus_for_task = bus.clone();
         let handle = tokio::spawn(async move {
-            // Subscribe to presence events on the bus.
             let filter =
                 crate::bus::Filter::new().kinds([crate::nostr::kinds::toron_kind(PRESENCE)]);
             let mut sub = match bus_for_task.subscribe(filter).await {
@@ -81,8 +80,6 @@ impl PresenceBroker {
             };
             let mut gc = tokio::time::interval(ttl);
             gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Drain replay/EOSE then live events. GC so the HashMap cannot
-            // grow with every pubkey that ever heartbeated.
             loop {
                 tokio::select! {
                     ev = sub.next() => {
@@ -95,8 +92,6 @@ impl PresenceBroker {
                                         status: payload.status,
                                         ts: payload.ts,
                                     };
-                                    // Last heartbeat wins — keyed by pubkey so a newer
-                                    // heartbeat for the same agent replaces the old.
                                     state_for_task
                                         .write()
                                         .insert(ev.pubkey.to_hex(), presence.clone());
@@ -231,8 +226,6 @@ mod tests {
         let broker = PresenceBroker::start(bus.clone(), Duration::from_secs(60));
         let mut rx = broker.subscribe_live();
 
-        // Retry-publish until the broker's bus sub is attached (ephemeral,
-        // no replay), then send the two heartbeats and wait for both.
         let idle = heartbeat(&keys, PresenceState::Idle, 1_700_000_000);
         for _ in 0..20 {
             let _ = bus.publish(idle.clone()).await;
@@ -263,8 +256,6 @@ mod tests {
         let broker = PresenceBroker::start(bus.clone(), Duration::from_secs(60));
         let mut rx = broker.subscribe_live();
 
-        // Publish + retry until the broker's bus subscription has attached and
-        // delivered (presence is ephemeral: no replay to catch a missed event).
         let ev = heartbeat(&keys, PresenceState::Working, 1_700_000_000);
         let mut delivered = false;
         for _ in 0..20 {
@@ -279,9 +270,7 @@ mod tests {
         }
         assert!(delivered, "broker must receive the live presence heartbeat");
 
-        // Fresh now → present.
         assert!(broker.current(&keys.public_key(), 1_700_000_050).is_some());
-        // Stale now → expired.
         assert!(broker.current(&keys.public_key(), 1_700_000_200).is_none());
         assert!(broker.live_agents(1_700_000_200).is_empty());
         broker.expire_stale(1_700_000_200);
@@ -297,8 +286,6 @@ mod tests {
         let broker = PresenceBroker::start(bus.clone(), Duration::from_secs(60));
         let mut rx = broker.subscribe_live();
 
-        // Publish + retry until the broker's bus subscription is attached and
-        // the live broadcast fires (ephemeral: no replay fallback).
         let ev = heartbeat(&keys, PresenceState::Done, 1_700_000_000);
         let mut got = None;
         for _ in 0..20 {

@@ -58,7 +58,6 @@ async fn sc5_force_release_staleness_gate_and_revocation() {
         .with_agent_passphrase("toron-dev")
         .with_index_pool(pool.clone());
 
-    // Pi-α registers + reserves src/** (fresh — NOT stale).
     mailbox
         .register_agent("demo", &AgentProfile::new("PiAlpha"))
         .await
@@ -76,7 +75,6 @@ async fn sc5_force_release_staleness_gate_and_revocation() {
         .expect("PiAlpha reserve");
     assert_eq!(acquire.granted.len(), 1);
 
-    // --- Staleness gate: fresh holder → force-release DENIED ---
     let denied = mailbox
         .force_release_file_reservation("demo", "OCBeta", "src/**", None, Some("test"), false)
         .await;
@@ -90,13 +88,8 @@ async fn sc5_force_release_staleness_gate_and_revocation() {
         "deny reason is the staleness heuristic: {msg}"
     );
 
-    // --- The staleness threshold is the documented const ---
     assert_eq!(STALE_AFTER_SECS, 30 * 60, "AM-Rust 30-min inactivity");
 
-    // --- Revocation is detectable WITHOUT NIP-09: a kind-30031
-    //     status:revoked event is `is_revocation`, and the projection
-    //     key-priority rule resolves it (no cross-key NIP-09). ---
-    // Build the operator revocation shape exactly as the mailbox does.
     let d = format!("demo:{}", "src/**");
     let revoke = build_event(
         &operator,

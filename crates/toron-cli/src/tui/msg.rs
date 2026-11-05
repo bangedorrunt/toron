@@ -57,7 +57,6 @@ impl Op {
 /// One message into the fold.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
-    // --- data (fetched by the runtime, never by the fold) ----------------
     /// Start: the runtime kicks the first fetches.
     Init,
     /// A refresh interval elapsed. Wall time rides as a payload.
@@ -122,7 +121,6 @@ pub enum Msg {
         thread: Option<String>,
     },
 
-    // --- intents (keys, decoded by `keymap`) -----------------------------
     /// Leave the alternate screen and exit.
     Quit,
     /// Open/close the keybinding overlay.
@@ -169,7 +167,6 @@ pub enum Msg {
     /// `c` — show/hide closed channels.
     ToggleClosedChannels,
 
-    // --- the compose form ------------------------------------------------
     /// `c` — open the send form. The fold decides whether it is a REPLY or a
     /// new message from what is on screen, so the key means one thing.
     OpenCompose,

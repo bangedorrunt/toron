@@ -244,22 +244,11 @@ impl BusEventStore {
             heal_lock: Arc::new(tokio::sync::Mutex::new(())),
             heal_inserts: Arc::new(AtomicU64::new(0)),
         };
-        // bd-dtua: the arrival log persists, so the marker does too. Seeding
-        // it from the store is what stops a restart from re-inserting every
-        // event (100,000 rows on the live bus) - and with a fleet of
-        // subscribers each triggering the heal, that insert buried the pool
-        // and the daemon stopped answering.
         let durable = store.durable_healed_rowid().await;
         store
             .healed_rowid
             .store(durable, std::sync::atomic::Ordering::Release);
-        // Number every row that predates the arrival log, in arrival
-        // (rowid) order, so a resume cursor can reach all of them.
         store.heal_arrivals().await?;
-        // bd-cgyh: an open is the one moment a drifted store is guaranteed to
-        // be seen after it may have run unwatched (a daemon restart), and the
-        // check is one count plus one stat read. Loud on failure, never a
-        // refused boot: a store that cannot analyze is not a store to die on.
         if store.planner_stats_are_stale().await? {
             let mutations = store.current_mutations().await;
             if let Err(e) = store.analyze_bus_tables(mutations).await {
@@ -275,12 +264,6 @@ impl BusEventStore {
     /// the same file. Cost is proportional to rows past the last heal.
     pub(crate) async fn heal_arrivals(&self) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
-        // bd-dtua: one heal at a time. The drain is called by every
-        // subscriber, and each drain heals the log first, so without this
-        // lock a fleet of subscribers reads the same marker and all runs the
-        // same insert before the marker advances - 230 copies of a 100,000-row
-        // insert, with the pool buried under them while the MCP endpoint
-        // times out.
         let _guard = self.heal_lock.lock().await;
         let max_rowid: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(rowid), 0) FROM bus_events")
             .fetch_one(&self.pool)
@@ -298,8 +281,6 @@ impl BusEventStore {
         .await?;
         self.heal_inserts.fetch_add(1, Ordering::AcqRel);
         self.healed_rowid.fetch_max(max_rowid, Ordering::AcqRel);
-        // The marker is durable: the arrival log persists, so the next open
-        // must not insert the same rows again.
         self.persist_healed_rowid(max_rowid).await?;
         Ok(())
     }
@@ -353,8 +334,6 @@ impl BusEventStore {
         for (seq, raw) in rows {
             match Event::from_json(&raw) {
                 Ok(ev) => out.push((seq as u64, ev)),
-                // A row we cannot parse is still an arrival: surface it in
-                // the log rather than pretend it never came.
                 Err(e) => tracing::warn!(seq, "unparseable stored event skipped: {e}"),
             }
         }
@@ -470,10 +449,6 @@ impl BusEventStore {
     pub async fn insert(&self, event: &Event) -> anyhow::Result<bool> {
         let expires = event.tags.expiration().map(|t| t.as_secs() as i64);
         let d_tag = crate::bus::AddressableKey::from_event(event).map(|k| k.d);
-        // One transaction: the row, its arrival seq and its tag index commit
-        // together, so a reader never sees a stored event without its place
-        // in arrival order, and seq order is commit order (the write lock is
-        // held from the first statement to commit).
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
@@ -490,8 +465,6 @@ impl BusEventStore {
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 1 {
-            // A re-insert after a delete is a new arrival: drop any stale
-            // seq so the event gets a fresh one past every live cursor.
             sqlx::query("DELETE FROM bus_arrivals WHERE event_id = ?1")
                 .bind(event.id.to_hex())
                 .execute(&mut *tx)
@@ -502,12 +475,9 @@ impl BusEventStore {
                 .await?;
         }
 
-        // p/e tag index (bd-replay-tag-pushdown-lurm): written unconditionally
-        // so a duplicate insert still converges (ON CONFLICT DO NOTHING).
         Self::index_tag_values(&mut tx, &event.id.to_hex(), event).await?;
         tx.commit().await?;
 
-        // ON CONFLICT DO NOTHING reports 0 affected rows for duplicates.
         if result.rows_affected() == 1 {
             self.hot_put(event);
             self.bump_mutations().await;
@@ -538,16 +508,9 @@ impl BusEventStore {
                 if let Ok(existing) = Event::from_json(raw)
                     && event.created_at.as_secs() < existing.created_at.as_secs()
                 {
-                    // Older replay must not overwrite a newer coordinate.
-                    // Same-second upserts last-write-win: `Timestamp::now()` is
-                    // 1s granularity and 30013/30031 renewals land in-process
-                    // in the same second. Lowest-id ties live in projection
-                    // (`nip01_replaceable_cmp`), not the write path.
                     return Ok(false);
                 }
             }
-            // Evict the superseded events from the hot memo BEFORE the delete
-            // (bd-py9o: stale memo entries must never outlive their rows).
             if !incumbents.is_empty() {
                 let mut hot = self.hot.lock();
                 for (id, _) in &incumbents {
@@ -589,11 +552,6 @@ impl BusEventStore {
     pub async fn replay(&self, filter: &crate::bus::Filter) -> anyhow::Result<Vec<Event>> {
         let limit = filter.limit.unwrap_or(1000).min(MAX_STORED_EVENTS as usize);
 
-        // Predicate pieces, composed inside scan_ids (bd-bus-scan): ?1 expiry,
-        // then a kind list (`kind IN (…)`, single combined query) OR a
-        // per-kind split (`kind = ?2`, index-served), then p values, then e
-        // values, then the trailing limit. Placeholders are renumbered inside
-        // scan_ids per branch, so only the tag VALUES are passed here.
         let expiry_pred = "(expires_at IS NULL OR expires_at > ?1)".to_string();
         let mut kinds_binds: Vec<i64> = Vec::new();
 
@@ -618,19 +576,6 @@ impl BusEventStore {
             .map(|vals| vals.iter().cloned().collect())
             .unwrap_or_default();
 
-        // bd-cumj newest-tail semantics: the scan takes the NEWEST `limit` of
-        // the matched set (never truncating the latest state), and re-emits
-        // it in ASC envelope order. The matched set is never materialized
-        // beyond `limit` rows.
-        //
-        // LIMIT is pushed only when the SQL predicate set FULLY decides the
-        // match (expiry + kinds + #p/#e). Filters carrying non-pushed
-        // predicates (#t project tags, since/until, authors, ids, search)
-        // must NOT push the limit: SQL would truncate CANDIDATES before
-        // match_event runs, silently dropping older matched rows (a project
-        // replay whose newest same-kind rows belong to other projects).
-        // Those filters keep the post-parse drain over the prefiltered
-        // candidate set (still shrunk by kinds/#p/#e, per the bead).
         let sql_exact = filter.ids.as_ref().is_none_or(BTreeSet::is_empty)
             && filter.authors.as_ref().is_none_or(BTreeSet::is_empty)
             && filter.search.is_none()
@@ -641,10 +586,6 @@ impl BusEventStore {
                     && (tag == &SingleLetterTag::LOWERCASE_P
                         || tag == &SingleLetterTag::LOWERCASE_E)
             });
-        // bd-3gwy: snapshot memo key — every input that decides the phase-1
-        // result. Non-pushed predicates ride in `extra` (they change which
-        // rows `match_event` accepts, so distinct values must never share a
-        // memo entry).
         let mut extra_tags: Vec<(String, Vec<String>)> = filter
             .generic_tags
             .iter()
@@ -674,13 +615,6 @@ impl BusEventStore {
             h.finish()
         };
 
-        // bd-3gwy / bd-741i: snapshot memo — identical filter + unchanged
-        // store version ⇒ reuse the matched-id list and skip phase-1 SQL.
-        // Expired rows are NOT a memo-bypass: scan_ids already drops them
-        // (`expires_at IS NULL OR expires_at > now`) and hydrate skips
-        // `expiration() <= now`. Prune (60s) bumps the version. Bypassing
-        // the memo for any stale TTL row forced every fleet poll / `toron
-        // watch` onto a full scan and spilled 128GB RSS overnight.
         let current = self.current_mutations().await;
         let memo_ids = self
             .snaps
@@ -752,9 +686,6 @@ impl BusEventStore {
                 self.parsed_rows
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(ev) = Event::from_json(&raw) {
-                    // Tight per-row guard (significant-drop): the JSON parse
-                    // above runs lock-free; only the cap check + insert hold
-                    // the map, so readers never wait out 500 parses.
                     {
                         let mut hot = self.hot.lock();
                         if hot.len() >= HOT_CACHE_CAP {
@@ -915,8 +846,6 @@ impl BusEventStore {
             return Ok(0);
         }
         let mut total: u64 = 0;
-        // Chunk to bound SQL bind params; channel lifecycles are small but a
-        // purge must not blow the parameter limit on a busy bus.
         for chunk in ids.chunks(500) {
             let ph = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -943,9 +872,6 @@ impl BusEventStore {
 
     /// Prune expired envelopes + the oldest beyond the cap. Best-effort.
     pub async fn prune(&self) -> anyhow::Result<()> {
-        // bd-cgyh: prune is the store's own periodic tick, so the planner's
-        // picture is refreshed here rather than on the poll path. It declines
-        // on two small reads when the mutation count has not moved far.
         if let Err(e) = self.refresh_planner_stats_if_stale().await {
             tracing::warn!("bus planner stats refresh failed: {e}");
         }
@@ -953,24 +879,6 @@ impl BusEventStore {
             .bind(Timestamp::now().as_secs() as i64)
             .execute(&self.pool)
             .await?;
-        // bd-eifs: evict FIFO BY ARRIVAL (rowid), never by `created_at`.
-        // NIP-17/NIP-59 gift wraps carry a randomized created_at up to 2 days
-        // in the past for metadata privacy — timestamp-ordered eviction made
-        // a just-arrived mail wrap the OLDEST row in a full store and pruned
-        // it before any reader saw it, while send had already reported
-        // success. Storage age is arrival order; created_at is protocol
-        // metadata only.
-        // bd-fxzv: cap victims are the oldest NON-DURABLE arrivals (rowid).
-        // Durable coordination state (39000/39002 rooms, 30010 manifests,
-        // 30013 profiles, 30031 reservations) never dates the cap — a
-        // kind-9 flood would otherwise evict the rooms first. If the store
-        // is over cap with nothing but durable rows, it stays over cap:
-        // losing the rooms is worse than breaching the bound.
-        //
-        // bd-wake-live-burst-loss-j86v: cap eviction is the one way a stored
-        // event leaves before every reader saw it. Record the highest evicted
-        // arrival seq in the SAME transaction as the delete, so a wake cursor
-        // behind it is told `events_lost` instead of silently skipping rows.
         self.heal_arrivals().await?;
         const VICTIMS: &str = "SELECT event_id FROM bus_events
                 WHERE kind NOT IN (?2, ?3, ?4, ?5, ?6)
@@ -1005,29 +913,18 @@ impl BusEventStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        // Arrival rows of events no longer stored (evicted, expired,
-        // superseded, purged) can never be served again. AUTOINCREMENT keeps
-        // their numbers retired.
         sqlx::query(
             "DELETE FROM bus_arrivals WHERE event_id NOT IN (SELECT event_id FROM bus_events)",
         )
         .execute(&self.pool)
         .await?;
-        // Orphaned p/e tag rows of pruned events (they could never match a
-        // bus_events join again; keep the index store bounded).
         sqlx::query(
             "DELETE FROM bus_event_tags WHERE event_id NOT IN (SELECT event_id FROM bus_events)",
         )
         .execute(&self.pool)
         .await?;
-        // bd-py9o: drop memo entries wholesale — SQL is the source of truth,
-        // and this keeps hot memory from drifting past the live row set.
-        // Next replay repopulates incrementally (cold parse per new id only).
         self.hot.lock().clear();
-        // bd-3gwy: pruned rows must never be served from a stale snapshot.
         self.bump_mutations().await;
-        // Storage-leak guard: checkpoint WAL after prune so the -wal file
-        // doesn't grow unbounded (prior 4 MB wal survived until reboot).
         let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await;
@@ -1086,8 +983,6 @@ impl BusEventStore {
         sql_exact: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        // p/e subquery parts, placeholder-numbered per branch (bind order:
-        // ?1 expiry, then [?2 kind], then p values, then e values, then limit).
         let p_part = |start: usize| -> (String, usize) {
             if p_vals.is_empty() {
                 return (String::new(), start);
@@ -1129,12 +1024,9 @@ impl BusEventStore {
         };
         let now = Timestamp::now().as_secs() as i64;
 
-        // (event_id, created_at) rows in DESC order (the merge input).
         let mut rows: Vec<(String, i64)> = Vec::new();
         match kind_in_pred {
             None => {
-                // No kind filter: single combined query. Kinds-empty filters
-                // are rare, so the un-splittable plan is acceptable here.
                 let (p_part, after_p) = p_part(2);
                 let (e_part, after_e) = e_part(after_p);
                 let next = after_e;
@@ -1157,13 +1049,6 @@ impl BusEventStore {
                 rows = q.fetch_all(&self.pool).await?;
             }
             Some(_) => {
-                // Per-kind split: each kind gets its own index-served query
-                // (`kind = ?2`, still filtered by expiry + p/e), so no row of
-                // a non-requested kind is ever walked and ORDER BY is served
-                // by bus_events_kind_created without a temp sort. Per-kind
-                // LIMIT n is safe for exact pushdown: a row outside its own
-                // kind's top-n is beaten by n rows of that kind, so it can
-                // never be in the global top-n.
                 for kind in kinds {
                     let (p_part, after_p) = p_part(3);
                     let (e_part, after_e) = e_part(after_p);
@@ -1191,9 +1076,6 @@ impl BusEventStore {
             }
         }
 
-        // Merge with the exact comparator SQLite used (ORDER BY created_at
-        // DESC, event_id DESC), keep the newest `limit` when exact, then
-        // re-emit ASC — the order the caller's drain relies on.
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
         if sql_exact && rows.len() > limit {
             rows.truncate(limit);
@@ -1276,10 +1158,6 @@ mod tests {
             "the marker is written to the store, not only to memory"
         );
 
-        // A restart: the marker comes back from the store, so the heal does
-        // not insert the same rows again. The marker is the witness - the
-        // insert is OR IGNORE, so a re-insert changes no row and only the
-        // marker shows that the work was done again.
         let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
         assert_eq!(
             reopened
@@ -1304,7 +1182,6 @@ mod tests {
             "a restart must not re-insert the events into the arrival log"
         );
 
-        // Concurrent drains: the heal runs once, not once per caller.
         for i in 50..80 {
             store
                 .insert(&sample_event(&keys, &format!("e{i}")))
@@ -1339,18 +1216,12 @@ mod tests {
     /// a plan at prepare time, before it sees the values.
     async fn poll_plan(pool: &sqlx::SqlitePool) -> String {
         let mut sql = BusEventStore::arrivals_after_sql(7);
-        // ?1 cursor, ?2 now, ?3 limit, then one kind per ?4..
         let binds = [
             "1", "0", "512", "9", "14", "1", "30010", "30013", "30023", "30031",
         ];
-        // ?1..?N with N >= 10: replace longest-first, so `?1` never eats
-        // the `?1` inside `?10` (bd-sd5w: that corruption silently tested
-        // kind 10 instead of 30031 and skewed the plan economics).
         for (i, lit) in binds.iter().enumerate().rev() {
             sql = sql.replace(&format!("?{}", i + 1), lit);
         }
-        // The substitution above is load-bearing: a surviving `?` would
-        // EXPLAIN a different query than the daemon runs.
         debug_assert!(
             !sql.contains('?'),
             "every placeholder must be substituted: {sql}"
@@ -1391,9 +1262,6 @@ mod tests {
     #[tokio::test]
     async fn planner_stats_follow_the_store_and_the_poll_never_sorts_the_bus() {
         let (store, pool, path) = temp_store().await;
-        // Seed both tables directly: the witness is about the planner's
-        // statistics, and thousands of signed events would only slow it down.
-        // 20k is the size where a healed planner walks arrivals at a LIMIT.
         sqlx::raw_sql(
             "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 20000)
              INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, expires_at)
@@ -1410,9 +1278,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("analyze");
-        // Poison the statistics the way turnover does: index rows describing
-        // an older, smaller store, and no `bus_arrivals` row at all — the live
-        // shape, verbatim.
         sqlx::raw_sql(
             "DELETE FROM sqlite_stat1;
              INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_expires','9630 11');
@@ -1426,9 +1291,6 @@ mod tests {
         .await
         .expect("poison");
 
-        // Premise: the store's own check reads that as drifted (9,630 vs
-        // 20,000). Without this the rewrite below could pass for the wrong
-        // reason, e.g. by analyzing on every open.
         assert!(
             store
                 .planner_stats_are_stale()
@@ -1437,9 +1299,6 @@ mod tests {
             "poisoned statistics must read as stale"
         );
 
-        // Opening the store is when a drifted store is first seen (a daemon
-        // restart): the plausibility check heals it. Before the fix the
-        // recorded 9,630 was never questioned and the poll kept its plan.
         let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
         let recorded: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(CAST(substr(stat, 1, instr(stat, ' ') - 1) AS INTEGER))
@@ -1463,27 +1322,8 @@ mod tests {
             Some(1),
             "bus_arrivals is analyzed too: PRAGMA optimize alone left it writable but the poll unplanned"
         );
-        // The widened filter the daemon's subscriber runs (seven kinds): a
-        // two-kind filter legitimately sorts a small bus, which is neither the
-        // live shape nor the pathology.
-        //
-        // bd-sd5w: the plan SHAPE is intentionally not pinned. The choice
-        // between the arrivals walk and the kind-index sort flips run to run
-        // on byte-identical `sqlite_stat1` and byte-identical substituted SQL
-        // (measured: the same hermetic store plans both shapes across runs,
-        // and `IN`-list plans always render `(kind=?)` even with literals, so
-        // that marker is EXPLAIN notation, not a surviving placeholder). No
-        // plan-shape assertion — strict or tolerant — is stable here, and a
-        // tolerant one would bless the pathology this test was written to
-        // catch. What stays pinned: the stale premise, the refresh mechanics,
-        // and the rate-limit. Production note: a fresh-stats daemon can still
-        // draw the materialise-and-sort plan, so forcing the walk (e.g. with
-        // `+e.kind` to hide the kind index from this query) is a separate
-        // production change with its own perf proof.
         let _ = poll_plan(&pool).await;
 
-        // The urgent path is rate-limited: right after a refresh there is
-        // nothing due, and turnover is what makes it due again.
         assert!(
             !reopened
                 .refresh_planner_stats_if_stale()
@@ -1551,7 +1391,6 @@ mod tests {
             )
             .expect("build")
         }
-        // Hydrate the hot memo so the purge must also clear memo entries.
         let all = crate::bus::Filter::new();
         let replayed = store.replay(&all).await.expect("replay");
         assert_eq!(replayed.len(), 3);
@@ -1564,14 +1403,12 @@ mod tests {
         assert_eq!(after.len(), 1, "only the survivor remains");
         assert_eq!(after[0].id, keep.id);
 
-        // Tag rows went with them.
         let tag_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_event_tags")
             .fetch_one(&store.pool)
             .await
             .expect("tag count");
         assert_eq!(tag_rows, 1, "purged events carry no tag residue");
 
-        // Re-publishing a purged id is NOT blocked (no dedup residue).
         assert!(
             store.insert(&gone).await.expect("re-insert"),
             "a purged id may be stored again"
@@ -1608,7 +1445,6 @@ mod tests {
         let k2 = crate::nostr::kinds::toron_kind(crate::nostr::kinds::AGENT_PROFILE);
         let t = |secs: u64| Timestamp::from(secs);
 
-        // Interleaved created_at across two kinds, inserted out of order.
         let mut evs = Vec::new();
         let mut push = |kind: crate::nostr::Kind, secs: u64, content: &str| {
             let ev = build_event(
@@ -1622,19 +1458,18 @@ mod tests {
             evs.push(ev.clone());
             ev
         };
-        push(k1, 100, "a"); // kind 1 @100
-        push(k2, 150, "b"); // kind 2 @150
-        push(k1, 200, "c"); // kind 1 @200
-        push(k2, 250, "d"); // kind 2 @250
-        push(k1, 300, "e"); // kind 1 @300
-        push(k2, 350, "f"); // kind 2 @350
-        push(k1, 400, "g"); // kind 1 @400
-        push(k2, 450, "h"); // kind 2 @450
+        push(k1, 100, "a");
+        push(k2, 150, "b");
+        push(k1, 200, "c");
+        push(k2, 250, "d");
+        push(k1, 300, "e");
+        push(k2, 350, "f");
+        push(k1, 400, "g");
+        push(k2, 450, "h");
         for ev in &evs {
             store.insert(ev).await.expect("insert");
         }
 
-        // A NIP-40-expired row must never surface (prune may not have run).
         let expired = build_event(
             &keys,
             k1,
@@ -1648,8 +1483,6 @@ mod tests {
         .expect("build");
         store.insert(&expired).await.expect("insert expired");
 
-        // Newest-tail across kinds: top-3 = @450 (k2), @400 (k1), @350 (k2),
-        // re-emitted in ASC envelope order.
         let filter = crate::bus::Filter::new().kinds([k1, k2]).limit(3);
         let replayed = store.replay(&filter).await.expect("replay");
         let ids: Vec<u64> = replayed.iter().map(|e| e.created_at.as_secs()).collect();
@@ -1659,7 +1492,6 @@ mod tests {
             "newest-tail across kinds, ASC order"
         );
 
-        // No expiry leakage with a limit that would otherwise include it.
         let all = crate::bus::Filter::new().kinds([k1, k2]).limit(100);
         let replayed = store.replay(&all).await.expect("replay all");
         let secs: Vec<u64> = replayed.iter().map(|e| e.created_at.as_secs()).collect();
@@ -1669,7 +1501,6 @@ mod tests {
             "expired event must never surface"
         );
 
-        // #p narrowing still applies inside the split scan.
         let target = Keys::generate();
         let p_ev = build_event(
             &keys,
@@ -1690,7 +1521,6 @@ mod tests {
         assert_eq!(replayed.len(), 1, "only the p-tagged event matches");
         assert_eq!(replayed[0].id, p_ev.id);
 
-        // Same-created_at tie-break: DESC by event_id hex, then ASC re-emit.
         let tie_a = build_event(
             &keys,
             k1,
@@ -1714,7 +1544,7 @@ mod tests {
         let ids: Vec<String> = replayed.iter().map(|e| e.id.to_hex()).collect();
         assert_eq!(ids.len(), 2);
         let mut sorted = ids.clone();
-        sorted.sort(); // ASC envelope = smaller event_id first on the tie
+        sorted.sort();
         assert_eq!(ids, sorted);
         assert!(ids.contains(&tie_a.id.to_hex()) && ids.contains(&tie_b.id.to_hex()));
 
@@ -1734,7 +1564,6 @@ mod tests {
         }
         let filter = crate::bus::project_filter("demo");
 
-        // Warm instance: inserts memoized each event on arrival.
         let w1 = store.replay(&filter).await.expect("warm replay 1");
         assert_eq!(w1.len(), 5);
         let p_warm = store.parsed_rows();
@@ -1748,8 +1577,6 @@ mod tests {
             "the second warm replay served every row from the memo"
         );
 
-        // Cold instance over the same pool (the daemon-restart shape): the
-        // first replay pays one parse per row; the second pays ZERO.
         let cold = BusEventStore::new(pool.clone()).await.expect("cold store");
         let c1 = cold.replay(&filter).await.expect("cold replay 1");
         assert_eq!(c1.len(), 5);
@@ -1768,8 +1595,6 @@ mod tests {
             "SECOND identical replay must parse ZERO rows (bd-py9o)"
         );
 
-        // A row inserted by ANOTHER process instance (daemon-restart shape)
-        // is cold here: parsed exactly once, then memoized.
         let other = BusEventStore::new(pool.clone()).await.expect("other store");
         other
             .insert(&sample_event(&Keys::generate(), "fresh"))
@@ -1813,7 +1638,6 @@ mod tests {
             r1.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>()
         );
 
-        // A mutation invalidates: next replay scans again, sees the new row.
         let other = BusEventStore::new(pool.clone()).await.expect("other");
         other
             .insert(&sample_event(&Keys::generate(), "new"))
@@ -1826,7 +1650,6 @@ mod tests {
             s1 + 1,
             "mutation forces exactly one fresh scan"
         );
-        // And the post-mutation state is memoized too.
         let r4 = store.replay(&filter).await.expect("replay 4");
         assert_eq!(r4.len(), 5);
         assert_eq!(
@@ -1836,12 +1659,6 @@ mod tests {
         );
 
         // TTL safety: a future TTL must NOT disable the memo (90-day
-        // reservation TTLs used to pin every fleet poll to a TEMP B-TREE
-        // scan). Already-expired rows must also keep the memo: scan_ids
-        // already drops them, hydrate skips expiration(), and prune (60s)
-        // bumps the version. Bypassing the memo while any stale row existed
-        // is what turned overnight fleet polls + `toron watch` into a 128GB
-        // RSS / 84-swapfile watchdog panic (bd-741i).
         let still_valid = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -1863,7 +1680,6 @@ mod tests {
             "future TTL must NOT disable memo — second replay is a hit"
         );
 
-        // Already-expired row: insert is a mutation (one scan) then memo hits.
         let expiring = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -1890,7 +1706,6 @@ mod tests {
             "expired rows never surface even when the memo stays hot"
         );
 
-        // Correctness under the memo: an EXPIRED event is never returned.
         let expired = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -1955,7 +1770,6 @@ mod tests {
     async fn test_replay_keeps_newest_when_over_limit() {
         let (store, _pool, path) = temp_store().await;
         let keys = Keys::generate();
-        // Distinct ascending created_at so the newest are well-defined.
         for i in 0..5u64 {
             let ev = build_event(
                 &keys,
@@ -1972,7 +1786,6 @@ mod tests {
             .await
             .expect("replay");
         assert_eq!(replayed.len(), 2, "limit respected");
-        // The two newest (i=3, i=4) are kept; the oldest three are dropped.
         let contents: Vec<String> = replayed.iter().map(|e| e.content.clone()).collect();
         assert_eq!(
             contents,
@@ -2007,9 +1820,6 @@ mod tests {
         let (store, pool, path) = temp_store().await;
         let keys = Keys::generate();
 
-        // Pin the store at the cap with filler rows whose created_at is
-        // NEWER than the backdated arrival below — under created_at-ordering
-        // these all outrank it for survival.
         sqlx::query(
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 100000) \
              INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at) \
@@ -2019,9 +1829,6 @@ mod tests {
         .await
         .expect("seed fillers");
 
-        // First arrival: punctual timestamp. Second arrival: BACKDATED
-        // created_at (what gift_wrap_with_urgency produces — NIP-17 jitter
-        // up to 2 days back). Arrival order: early → backdated.
         let early = build_event(
             &keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -2046,9 +1853,6 @@ mod tests {
         assert_eq!(store.count().await.expect("count"), 100_002);
         store.prune().await.expect("prune");
 
-        // Cap holds (100_000), and BOTH arrivals survive: the eviction
-        // victims are the earliest-ARRIVED filler rows, not the row whose
-        // protocol timestamp happens to look oldest.
         let n = store.count().await.expect("count after prune");
         assert!(n <= super::MAX_STORED_EVENTS, "cap holds: {n}");
         for (name, ev) in [("backdated", &backdated), ("early", &early)] {
@@ -2080,7 +1884,6 @@ mod tests {
         };
         let (store, pool, path) = temp_store().await;
         let keys = Keys::generate();
-        // Durable rows arrive FIRST (oldest rowid — today's victims).
         let mut durable_ids = Vec::new();
         for kind in [
             CHANNEL_GROUP,
@@ -2100,7 +1903,6 @@ mod tests {
             durable_ids.push(ev.id.to_hex());
             store.insert(&ev).await.expect("insert durable");
         }
-        // Flood past the cap with kind-9 rows (same CTE as the FIFO test).
         sqlx::query(
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 100000) \
              INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at) \
@@ -2133,7 +1935,6 @@ mod tests {
         let (store, _pool, path) = temp_store().await;
         let keys = Keys::generate();
 
-        // Expired envelope (past expiration) + live envelope (no expiration).
         let expired = build_event(
             &keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -2224,7 +2025,6 @@ mod tests {
             Timestamp::from(1_700_000_001_u64),
         )
         .expect("build");
-        // Operator revocation for the same coordinate.
         let revoke = build_event(
             &operator,
             crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
@@ -2241,12 +2041,9 @@ mod tests {
                 .await
                 .expect("v2 supersedes")
         );
-        // Same author's v1 is gone (author isolation); v2 remains.
         assert_eq!(store.count().await.expect("count"), 1);
         assert_eq!(store.all_events().await.expect("all")[0].id, lease_v2.id);
 
-        // Operator revoke lands (different author) — both co-exist in the
-        // store (raw relay view), projection resolves operator>agent.
         assert!(store.insert_addressable(&revoke).await.expect("revoke"));
         assert_eq!(store.count().await.expect("count after revoke"), 2);
 
@@ -2254,7 +2051,6 @@ mod tests {
         assert!(all.iter().any(|e| e.id == lease_v2.id));
         assert!(all.iter().any(|e| e.id == revoke.id && is_revocation(e)));
 
-        // Projection: operator revocation wins over the agent lease (A1).
         let resolved =
             resolve_coordinate(all.iter(), Some(&operator.public_key())).expect("resolved");
         assert_eq!(resolved.id, revoke.id);
@@ -2359,7 +2155,6 @@ mod tests {
         tx.commit().await.expect("commit");
         assert_eq!(store.count().await.expect("count"), N as i64);
 
-        // EXPLAIN: the p predicate is served by the tag index.
         let plan_rows = sqlx::query(
             "EXPLAIN QUERY PLAN SELECT raw_json FROM (
                  SELECT raw_json, created_at, event_id FROM bus_events
@@ -2387,9 +2182,6 @@ mod tests {
             details.join("\n")
         );
 
-        // bd-py9o: inserts warm the writer's hot memo, so the parse counter
-        // is measured through a COLD reader over the same pool — exactly the
-        // daemon-restart shape the prefilter property protects.
         let reader = BusEventStore::new(pool.clone()).await.expect("cold reader");
         let replayed = reader
             .replay(&Filter::new().pubkey(target.public_key()).limit(10))
@@ -2453,7 +2245,6 @@ mod tests {
         }
         tx.commit().await.expect("commit");
 
-        // bd-py9o: cold reader (see gate #1) so parses measure SQL work.
         let reader = BusEventStore::new(pool.clone()).await.expect("cold reader");
         let replayed = reader
             .replay(&Filter::new().pubkey(target.public_key()).limit(5))
@@ -2614,13 +2405,11 @@ mod tests {
             assert!(store.insert(&ev).await.expect("insert"));
         }
 
-        // Simulate a pre-index store: drop the tag table (and its index).
         sqlx::raw_sql("DROP TABLE bus_event_tags")
             .execute(&pool)
             .await
             .expect("drop");
 
-        // Reopen: the table is recreated and backfilled from raw_json.
         let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
         use crate::nostr::Filter;
         let replayed = reopened
@@ -2650,8 +2439,6 @@ mod tests {
         let (store, _pool, path) = temp_store().await;
         let author = Keys::generate();
         let kind = crate::nostr::kinds::toron_kind(PROJECT_MANIFEST);
-        // The project's events are OLDER than 10 other-project events; with
-        // limit=5 the SQL pushdown would keep only the newest 5 (all other).
         for i in 0..2 {
             let ev = build_event(
                 &author,
@@ -2685,8 +2472,6 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
-
-    // ---- arrival log (bd-wake-live-burst-loss-j86v, bd-wake-replay-cap-qk8n)
 
     fn profile(keys: &Keys, d: &str, at: u64) -> Event {
         build_event(
@@ -2724,7 +2509,6 @@ mod tests {
             .expect("replacement has a seq");
         assert!(s2 > s1, "supersede got seq {s2}, not past {s1}");
 
-        // Control: a duplicate publish is not a new arrival.
         assert!(!store.insert(&second).await.expect("dup"));
         assert_eq!(
             store
@@ -2740,10 +2524,6 @@ mod tests {
             "the superseded row is gone; the live one is listed once"
         );
 
-        // The reuse trap proper: the NEWEST arrival leaves the store
-        // (purge, then prune drops its arrival row) and a new event lands.
-        // A plain INTEGER PRIMARY KEY would hand the newcomer the retired
-        // number, and a cursor parked on it would skip the newcomer.
         let newest = sample_event(&keys, "newest");
         store.insert(&newest).await.expect("newest");
         let s_newest = store
@@ -2824,7 +2604,6 @@ mod tests {
         let b = sample_event(&keys, "b");
         store.insert(&a).await.expect("a");
         store.insert(&b).await.expect("b");
-        // Heal numbers the fillers 1..=100000 in rowid order; a and b follow.
         let second_filler = store
             .arrival_seq_of("filler-2")
             .await
@@ -2845,7 +2624,6 @@ mod tests {
                 .is_some()
         );
 
-        // Control: at the cap, nothing is evicted and the mark stays.
         store.prune().await.expect("prune again");
         assert_eq!(
             store.arrivals_evicted_through().await.expect("mark"),

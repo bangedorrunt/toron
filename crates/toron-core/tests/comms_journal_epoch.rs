@@ -122,7 +122,6 @@ async fn the_reported_epoch_is_the_one_the_log_holds() {
         Some(sent.journal_epoch)
     );
 
-    // The journal's claims never touch the sender's own inbox epoch.
     assert_eq!(s.producer_epoch(A).await.unwrap(), Some(0));
 
     let after = outbox::send_and_recover(s.clone(), A.into(), Vec::new())

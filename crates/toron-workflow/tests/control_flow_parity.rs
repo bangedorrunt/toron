@@ -163,7 +163,6 @@ async fn runtime_graph_cycle_fails_when_lint_bypassed() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
         .expect("engine");
-    // parse_workflow does not validate the graph; engine.run must.
     let wf = parse_workflow(
         r##"
 name: cyclic
@@ -423,9 +422,6 @@ steps:
         )
         .await
         .expect("run returns");
-    // The durable model refuses nested retry wrappers outright: the outer
-    // policy is the only coordinator, so attempts cannot multiply. The old
-    // engine ran the pair and pinned the count; the refusal is stronger.
     assert_eq!(
         output["status"], "failed",
         "nested retry wrappers refuse the run: {output}"

@@ -20,9 +20,6 @@ use super::{ToolOutput, ToolServer, generate_agent_name, nonneg_secs};
 
 #[tool_router(router = workflow_router, vis = "pub(crate)")]
 impl ToolServer {
-    // ------------------------------------------------------------------
-    // MACROS (4)
-    // ------------------------------------------------------------------
 
     /// `macro_start_session`: ensure_project + register + reserve + inbox.
     #[tool(
@@ -144,10 +141,6 @@ impl ToolServer {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// WireArgs — AM-Rust arg parity (field names + Option-ness), one per tool.
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct MacroStartSessionArgs {

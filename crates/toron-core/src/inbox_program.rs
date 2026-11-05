@@ -431,10 +431,6 @@ impl Program for InboxProgram {
                 verified_by,
             } => {
                 let r = next.recipients.entry(recipient.clone()).or_default();
-                // A different pane is a new incarnation (a supervisor
-                // restart, a new session): it gets a fresh ring budget.
-                // Re-verifying the same pane (after `events_lost`, say)
-                // must not, or a deaf agent would be rung again each time.
                 let new_pane = r.binding.as_ref().is_none_or(|b| b.pane_id != *pane_id);
                 if new_pane {
                     r.rings_since_advance = 0;

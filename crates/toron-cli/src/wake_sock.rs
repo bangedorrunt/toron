@@ -42,12 +42,6 @@ fn env_ms(name: &str, fallback: Duration) -> Duration {
 /// Where the daemon sidecar listens (ADR-0036 Spec 7). Env read only —
 /// no I/O, safe to call anywhere.
 pub fn discover_sock_path() -> PathBuf {
-    // bd-nepl test seam: unit tests pin an absent path here so they never
-    // attach to a real machine daemon now that `serve` holds the state-dir
-    // socket (their own-bus wakes would never arrive on a foreign socket).
-    // The OnceLock is dormant in production — only the cfg(test) setter
-    // (parked just above the test module) can set it — and the crate's
-    // `forbid(unsafe_code)` rules out env mutation as the alternative.
     if let Some(p) = WAKE_SOCK_TEST_PIN.get() {
         return p.clone();
     }
@@ -366,15 +360,10 @@ impl WakeSockConn {
             match frame {
                 SockFrame::Event(ev) => return Ok(ConnEvent::Event(ev)),
                 SockFrame::Eose(e) => {
-                    // Replay complete; the stream continues live on the
-                    // same socket (replay-then-live, one connection).
                     self.last_cursor = e.cursor;
                     return Ok(ConnEvent::Eose);
                 }
                 SockFrame::Heartbeat(h) => {
-                    // Quiet-bus proof: the arrival itself resets the
-                    // idle clock. The stamp is the server's, kept for
-                    // skew inspection, never trusted as our clock.
                     let _ = h.ts_ms;
                     return Ok(ConnEvent::Heartbeat);
                 }
@@ -508,13 +497,10 @@ mod wake_tail_tests {
             conn.write_all(frame.as_bytes()).await.expect("write frame");
             conn.write_all(b"\n").await.expect("newline");
         }
-        // Hold briefly so the tail drains, then close (Done path).
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     fn sock_path(tag: &str) -> PathBuf {
-        // Short names: macOS UDS paths must fit SUN_LEN (~104 bytes) and
-        // TMPDIR is already long. Counter, not uuid.
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!("wt-{tag}-{n}-{}.sock", std::process::id()))
@@ -532,7 +518,7 @@ mod wake_tail_tests {
             serde_json::json!({"event": a}).to_string(),
             serde_json::json!({"eose": {"cursor": "c1"}}).to_string(),
             serde_json::json!({"event": b}).to_string(),
-            serde_json::json!({"event": a}).to_string(), // replay/live overlap dup
+            serde_json::json!({"event": a}).to_string(),
         ];
         let server = tokio::spawn(fake_server(listener, script));
         let tail = WakeSockTail::new(WakeSockConfig::new(path.clone(), vec![9]));
@@ -540,8 +526,6 @@ mod wake_tail_tests {
         let mut seen: HashSet<String> = HashSet::new();
         let outcome = tail
             .run(&mut |ev| {
-                // Dedup lives in the caller's gate; the tail only stops
-                // on explicit false (the `--once` contract).
                 if seen.insert(ev.id.clone()) {
                     order.push(ev.id.clone());
                 }
@@ -653,7 +637,6 @@ mod wake_tail_tests {
             ),
             "foreign channel filtered"
         );
-        // Un-scoped events (no t tag) stay project-agnostic, like in-process.
         let bare: Vec<Vec<String>> = vec![vec!["h".into(), "steer-adr35".into()]];
         assert!(crate::plane::watch_gate(
             &mut HashSet::new(),

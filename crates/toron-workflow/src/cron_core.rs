@@ -285,9 +285,6 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
                 );
             }
             if !no_in_flight(next.in_flight) {
-                // Overlap: a tick is still executing. Skip (never stack a
-                // second execution), say so loudly, and re-ask after the
-                // next candidate — or the bounded idle interval.
                 let skipped =
                     select_fireable(model.catchup, model.last_fired, *now_secs, candidates);
                 let wake = next_future(model.last_fired, *now_secs, candidates)
@@ -300,9 +297,6 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
             }
             match select_fireable(model.catchup, model.last_fired, *now_secs, candidates) {
                 Some(tick) => {
-                    // Backoff gate: an overdue fire under a failing streak
-                    // waits out the storm spacing. Future ticks are
-                    // unaffected — the schedule never shifts.
                     if next.consecutive > 0 {
                         let gate_until =
                             now_secs.saturating_add(backoff_for_streak(next.consecutive));
@@ -336,8 +330,6 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
                 next.in_flight = None;
             }
             next.consecutive = 0;
-            // Checkpoint is monotonic: a stale report for an older tick
-            // never drags it backward.
             if next.last_fired.is_none_or(|l| *tick > l) {
                 next.last_fired = Some(*tick);
             }
@@ -355,8 +347,6 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
             if next.in_flight == Some(*tick) {
                 next.in_flight = None;
             }
-            // Checkpoint is monotonic (see above): a failed tick still
-            // fired, but only forward — never backward.
             if next.last_fired.is_none_or(|l| *tick > l) {
                 next.last_fired = Some(*tick);
             }
@@ -483,8 +473,6 @@ mod kernel_paths_tests {
     #[test]
     fn bfs_reachable_paths_obey_kernel_invariants() {
         use std::collections::{HashSet, VecDeque};
-        // Small integer universe: ticks at 10s boundaries, decisions at
-        // offsets. Times are DATA here (deterministic fakes), never read.
         let ticks: Vec<i64> = vec![100, 110, 120, 130];
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<(CronModel, usize)> = VecDeque::new();
@@ -498,9 +486,6 @@ mod kernel_paths_tests {
             if !visited.insert(key) {
                 continue;
             }
-            // Alphabet: timer decisions across the window, starts, and both
-            // terminal reports — including adversarial orders (success for a
-            // tick never started, double reports, overlap).
             let mut msgs = Vec::new();
             for now in [105, 115, 125, 135] {
                 msgs.push(CronMsg::Tick {
@@ -522,15 +507,9 @@ mod kernel_paths_tests {
             for msg in &msgs {
                 let (next, fx) = tick(&model, msg);
                 transitions += 1;
-                // Invariant 1: at most one tick in flight, always —
-                // structural (in_flight is Option<i64>, one slot by type),
-                // so there is nothing to assert at runtime.
-                // Invariant 2: last_fired never moves backward.
                 if let (Some(a), Some(b)) = (model.last_fired, next.last_fired) {
                     assert!(b >= a, "checkpoint monotonic: {a} -> {b}");
                 }
-                // Invariant 3: a FireTick never names a tick at-or-before
-                // last_fired (no refire), and SkipOverlap only names due ones.
                 for e in &fx {
                     match e {
                         CronEffect::FireTick { tick } => {
@@ -572,8 +551,6 @@ mod kernel_paths_tests {
                         CronEffect::PolicyAction { .. } => {}
                     }
                 }
-                // Invariant 4: terminal reports always clear in-flight for
-                // the reported tick (no stranded overlap).
                 if let CronMsg::TickSucceeded { tick } | CronMsg::TickFailed { tick } = msg
                     && model.in_flight == Some(*tick)
                 {
@@ -596,13 +573,11 @@ mod kernel_paths_tests {
     /// backoff gate spaces refires without shifting the schedule.
     #[test]
     fn dfs_catchup_storm_path_replays_and_spaces_refires() {
-        // Downtime from 1000 to 1360 (six missed 60s ticks), Latest.
         let downtime: Vec<i64> = vec![1060, 1120, 1180, 1240, 1300, 1360];
         let run_once = || {
             let mut model = CronModel::test_new();
             let mut fired = Vec::new();
             let mut fx_log = Vec::new();
-            // Wake after downtime: exactly ONE catch-up fire (the latest).
             let (m, fx) = tick(
                 &model,
                 &CronMsg::Tick {
@@ -623,7 +598,6 @@ mod kernel_paths_tests {
             assert_eq!(fire, vec![1360], "one catch-up tick, the latest");
             fired.push(1360);
             model = tick(&model, &CronMsg::TickStarted { tick: 1360 }).0;
-            // It fails persistently: streak grows, policy escalates per data.
             for _ in 0..3 {
                 let (m, fx) = tick(&model, &CronMsg::TickFailed { tick: 1360 });
                 model = m;
@@ -635,9 +609,6 @@ mod kernel_paths_tests {
         let (m1, f1, _) = run_once();
         let (m2, f2, _) = run_once();
         assert_eq!((m1.clone(), f1), (m2, f2), "storm replays");
-        // Backoff gate: the next overdue decision waits out the spacing
-        // instead of hot-looping — and fires the NEXT due tick (1420),
-        // never refiring the failed one (1360 already checkpointed).
         let (m3, fx3) = tick(
             &m1,
             &CronMsg::Tick {

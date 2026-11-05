@@ -127,7 +127,6 @@ pub async fn near_duplicate_identities(
             .bind(project_slug)
             .fetch_all(pool)
             .await?;
-    // BTreeMap so the grouping key is ordered and the output is stable.
     let mut groups: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
         std::collections::BTreeMap::new();
     for (name, pubkey) in rows {
@@ -370,17 +369,8 @@ impl Mailbox {
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         self.check_swarm_name(project_slug, &profile.name).await?;
-        // bd-0tbg W1: refuse a second identity for one name IN THIS PROJECT.
-        // The pin grammar is enforced in the CLI (`agent bootstrap`) and
-        // nowhere else, so the MCP surface, `create_agent_identity` and any
-        // workflow step can register a spelling the CLI refuses — which is
-        // how one project ended up with two keys for the same words. This is
-        // a COLLISION check, not a grammar check: ADR-0018's
-        // `flywheel-<project>-<role><seq>` fold grammar is kebab-case on
-        // purpose and must keep registering. Applied to the dry-run preview
-        // too, because that preview promises the SAME decision inputs.
         if let Some((existing_name, existing_pubkey)) = self
             .name_collision_in_project(project_slug, &profile.name)
             .await?
@@ -404,13 +394,11 @@ impl Mailbox {
                 name = profile.name,
             );
         }
-        // ADR-0037 W2: a pin known in another project never gets a second key.
         self.refuse_second_key(project_slug, &profile.name).await?;
         let result = ident::create_agent_identity(project_slug, profile, Timestamp::now())?;
         let created = self
             .persist_and_publish(project_slug, profile, result)
             .await?;
-        // ADR-0010 F1: same first-registration auto-bind as `register_agent`.
         self.ensure_captain_alias_on_first_registration(project_slug, &profile.name)
             .await;
         Ok(created)
@@ -436,12 +424,6 @@ impl Mailbox {
         name: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
         let Some(pool) = self.index_pool.as_ref() else {
-            // No pool means no `agents` table, so there is nothing recorded to
-            // collide with and nothing to defer TO — reporting Ok(None) here
-            // is "no index to check", not "checked and clean". Every
-            // production path attaches one (`build_mailbox`,
-            // toron-mcp/src/server.rs:362); this arm is reached only by
-            // pool-less test harnesses.
             return Ok(None);
         };
         let key = name_collision_key(name);
@@ -460,17 +442,8 @@ impl Mailbox {
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         self.check_swarm_name(project_slug, &profile.name).await?;
-        // bd-0tbg W1: refuse a second identity for one name IN THIS PROJECT.
-        // The pin grammar is enforced in the CLI (`agent bootstrap`) and
-        // nowhere else, so the MCP surface, `create_agent_identity` and any
-        // workflow step can register a spelling the CLI refuses — which is
-        // how one project ended up with two keys for the same words. This is
-        // a COLLISION check, not a grammar check: ADR-0018's
-        // `flywheel-<project>-<role><seq>` fold grammar is kebab-case on
-        // purpose and must keep registering. Applied to the dry-run preview
-        // too, because that preview promises the SAME decision inputs.
         if let Some((existing_name, existing_pubkey)) = self
             .name_collision_in_project(project_slug, &profile.name)
             .await?
@@ -487,18 +460,12 @@ impl Mailbox {
                 &existing_pubkey[..8.min(existing_pubkey.len())]
             );
         }
-        // Existing local key? (ncryptsec at agents/{name}/key.ncryptsec)
-        // ADR-0017 migration: a pre-canonicalization key under an alternate
-        // (path-slug) root is adopted — re-registering under the canonical
-        // slug REUSES the legacy identity instead of minting a second one.
         let key_path = self.agent_key_path(project_slug, &profile.name);
         let existing = self
             .load_agent_key(&key_path)
             .or_else(|| self.alt_agent_key(project_slug, &profile.name));
         let created = existing.is_none();
         if created {
-            // ADR-0037 W2: minting is only for a pin no project knows yet;
-            // a known pin reuses its key through `register_agent_reusing`.
             self.refuse_second_key(project_slug, &profile.name).await?;
         }
         let result =
@@ -506,8 +473,6 @@ impl Mailbox {
         let mut agent = self
             .persist_and_publish(project_slug, profile, result)
             .await?;
-        // ADR-0010 F1: first registration auto-binds `captain` (best-effort;
-        // registration still succeeds if the alias cannot persist).
         self.ensure_captain_alias_on_first_registration(project_slug, &profile.name)
             .await;
         agent.created = created;
@@ -527,7 +492,7 @@ impl Mailbox {
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<AgentRegistrationPlan> {
-        let project_slug = self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = self.canonical_project(project_slug).await;
         self.check_swarm_name(&project_slug, &profile.name).await?;
         let key_path = self.agent_key_path(&project_slug, &profile.name);
         let existing = self
@@ -665,7 +630,6 @@ impl Mailbox {
         .await
         .ok()
         .flatten() else {
-            // No fold recorded or no canonical registration — absorb nothing.
             return SlugAbsorption::default();
         };
         let removed = sqlx::query(
@@ -779,9 +743,6 @@ impl Mailbox {
         if old_name == new_name {
             anyhow::bail!("{old_name} already has that name in project {canonical}");
         }
-        // The new name must be a name this project can ROUTE: the same
-        // grammar gate a registration passes. A rename that lands on an
-        // unroutable name would move the problem, not fix it.
         self.check_swarm_name(&canonical, new_name).await?;
         let pool = self
             .index_pool
@@ -801,7 +762,6 @@ impl Mailbox {
                 "no identity named {old_name} in project {canonical} — there is nothing to rename"
             );
         };
-        // The key, from wherever it lives (the canonical path or a legacy root).
         let old_key_path = self.agent_key_path(&canonical, old_name);
         let existing = self
             .load_agent_key(&old_key_path)
@@ -812,10 +772,6 @@ impl Mailbox {
                  renamed into a routable identity"
             );
         };
-        // The new name must be free: a second identity under it splits the name.
-        // Two checks, because they catch different collisions: an EXACT name
-        // already registered, and a name that FOLDS to the same words (a
-        // second spelling of one pin is one identity, not two).
         let taken: Option<String> =
             sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 AND name = ?2")
                 .bind(&canonical)
@@ -835,7 +791,6 @@ impl Mailbox {
                  name (bd-0tbg); pick a name that is free"
             );
         }
-        // Move the key directory so the new name's path holds the SAME key.
         let new_key_path = self.agent_key_path(&canonical, new_name);
         if new_key_path.exists() {
             anyhow::bail!(
@@ -853,8 +808,6 @@ impl Mailbox {
             std::fs::rename(old_dir, new_dir)?;
         }
         self.forget_alt_key_paths();
-        // Register under the new name with the SAME key: the npub is unchanged
-        // and the kind-30013 profile is re-published with the new name.
         let profile = AgentProfile {
             name: new_name.to_string(),
             program,
@@ -866,14 +819,11 @@ impl Mailbox {
             ident::register_agent(&canonical, &profile, Some(&existing), Timestamp::now())?;
         self.persist_and_publish(&canonical, &profile, result)
             .await?;
-        // One name, one identity: the old roster row goes with the old name.
         sqlx::query("DELETE FROM agents WHERE project_slug = ?1 AND name = ?2")
             .bind(&canonical)
             .bind(old_name)
             .execute(pool)
             .await?;
-        // The leases follow the identity, so the board keeps addressing it.
-        // The count below is the report; this statement only moves the rows.
         let _ = sqlx::query(
             "UPDATE file_reservations SET agent_name = ?1 \
              WHERE project_slug = ?2 AND agent_name = ?3 AND status = 'active'",
@@ -922,8 +872,6 @@ impl Mailbox {
                  pin or list_agents to find identities (ADR-0018 D1a/D3)"
             );
         }
-        // Fail fast: the fold must land on a routable identity, else every
-        // later "mail the captain" bounces with an unhelpful name error.
         let who = self.whois(&canonical, pin).await.map_err(|e| {
             anyhow::anyhow!(
                 "captain must be a REGISTERED adjective+noun pin in project \
@@ -1022,9 +970,6 @@ impl Mailbox {
             anyhow::bail!("no index pool attached — cannot persist role alias");
         };
         upsert_role_alias(pool, &canonical, role, &who.name).await?;
-        // Publish 30013 with role= tag (the signed charter source). Best-effort
-        // — the alias table is the durable truth for whois/mail, the event is
-        // the charter. Failure to publish does not fail the alias write.
         if let Ok(keys) = self.agent_keys_for(&canonical, &who.name) {
             let profiles = self.project_profiles(&canonical).await.unwrap_or_default();
             let want_d = crate::nostr::identity::profile_d_tag(&canonical, &who.name);
@@ -1162,9 +1107,6 @@ impl Mailbox {
         project_slug: &str,
         target: &str,
     ) -> bool {
-        // Fresh registrations carry created_ts_us with a NULL last_active
-        // (the upsert only stamps last_active on re-register), so recency
-        // falls back to creation — a just-registered pin is live.
         let last_active: Option<i64> = sqlx::query_scalar(
             "SELECT COALESCE(last_active_ts_us, created_ts_us) FROM agents WHERE project_slug = ?1 AND name = ?2",
         )
@@ -1202,9 +1144,6 @@ impl Mailbox {
         name: &str,
     ) -> anyhow::Result<String> {
         let canonical = self.canonical_project(project_slug).await;
-        // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
-        // a role name like "wheelhouse" is never a registered pin, it must
-        // fold via the alias table even in Open mode. Check alias first.
         if let Some(folded) = self.agent_name_alias(&canonical, name).await {
             return Ok(folded);
         }
@@ -1213,22 +1152,12 @@ impl Mailbox {
             return Ok(name.to_string());
         }
         if let Some(folded) = self.agent_name_alias(&canonical, name).await {
-            // bd-6wfv: the fold precedes the pin-pattern match — an explicit
-            // fold is the authoritative mapping and must win over any shape
-            // match (a folded slug is a canonical-shaped name AND a folded
-            // legacy name may pattern-match as a pin).
             return Ok(folded);
         }
         if super::naming::is_canonical_name(name, &canonical) || super::naming::is_adjnoun_pin(name)
         {
             return Ok(name.to_string());
         }
-        // bd-pin-public-plane-s-easy.8: a host OS username ($USER) is NOT a
-        // mailbox identity — name the class + the recovery instead of the
-        // generic grammar error. Callers who type their own OS username
-        // think it is their mailbox name; telling them to register it would
-        // mint an identity for a non-identity. (Canonical/pin/fold shapes
-        // already returned above — this is the residual reject path only.)
         if super::naming::is_username_class(name) {
             anyhow::bail!(
                 "{name} looks like a host OS username ($USER), not a mailbox \
@@ -1257,7 +1186,7 @@ impl Mailbox {
         profile: &AgentProfile,
         result: IdentityResult,
     ) -> anyhow::Result<RegisteredAgent> {
-        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let project_slug = &self.canonical_project(project_slug).await;
         let key_path = self.agent_key_path(project_slug, &profile.name);
         if !key_path.exists() {
             crate::keys::write_encrypted_key(
@@ -1266,22 +1195,15 @@ impl Mailbox {
                 self.agent_passphrase(),
                 crate::keys::DEFAULT_LOG_N,
             )?;
-            // A new key can make a memoized alternate-root miss resolvable.
             self.forget_alt_key_paths();
         }
         let ok = self.bus.publish(result.event.clone()).await?;
         if !ok.stored {
-            // NIP-01: same-second addressable upsert with a higher id does
-            // not replace. The existing profile on this coordinate stays.
             tracing::debug!(
                 event_id = %result.event.id,
                 "profile event not stored (NIP-01 replaceable no-op)"
             );
         }
-        // Index the registration (search-scoped identity table). Stores the
-        // VERBATIM project slug so the unwrap-loop projection can attribute
-        // inbound wraps to a project exactly (leading-separator forms
-        // round-trip — path archaeology cannot).
         if let Some(pool) = &self.index_pool {
             let now_us = result.event.created_at.as_secs() as i64 * 1_000_000;
             sqlx::query(
@@ -1387,7 +1309,6 @@ impl Mailbox {
                 if let Some(keys) = self.load_agent_key(&path) {
                     return Some(keys);
                 }
-                // Deleted (or unreadable) since the walk: forget and re-walk.
                 self.alt_key_paths.pin().remove(&memo_key);
             }
             Some(None) => {
@@ -1460,16 +1381,11 @@ impl Mailbox {
                 {
                     candidates.push(slug);
                 }
-                // Descend regardless: a project root may nest deeper roots.
                 stack.push(p);
             }
         }
         candidates.sort();
         for slug in candidates {
-            // Verbatim nested path, NOT agent_key_path: the legacy key lives
-            // under its own path-slug tree (`{data}/srv/legacy/toron/...`);
-            // agent_key_path canonicalizes to the basename root and would
-            // miss it (ADR-0017 migration read path).
             let legacy = self
                 .data_dir
                 .join(slug)
@@ -1618,8 +1534,6 @@ impl Mailbox {
         let mut npub: Option<crate::nostr::PublicKey> = None;
         let mut profiles: Vec<crate::nostr::Event> = Vec::new();
 
-        // ADR-0018: npub input resolves by pubkey (the read-side twin of npub
-        // routing). Works in both modes — an npub is always a routing address.
         if super::naming::is_npub(name) {
             for slug in &set {
                 let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
@@ -1650,10 +1564,6 @@ impl Mailbox {
             return self.whois_build(name.to_string(), npub, profiles, pane);
         }
 
-        // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
-        // check alias first even in Open, so `whois wheelhouse` folds to the
-        // live pin via the alias table. Then fall back to mode-specific
-        // resolution.
         if let Some(folded) = self.agent_name_alias(canonical, name).await {
             let target = folded;
             for slug in &set {
@@ -1669,11 +1579,6 @@ impl Mailbox {
             let pane = panes.remove(&target);
             return self.whois_build(target, npub, profiles, pane);
         }
-        // ADR-0018: swarm mode resolves canonical names, folded aliases, or
-        // pins ONLY; display names are non-routable profile metadata.
-        // bd-pin-public-plane-s-easy.1: ONE resolver — the fold precedes the
-        // shape match (a slug folded to a pin resolves as the pin, not as
-        // its canonical shape — whois(slug) must hit the pin's npub).
         let mode = self.project_identity_mode(canonical).await;
         let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
             self.resolve_agent_name(canonical, name).await?
@@ -1705,7 +1610,6 @@ impl Mailbox {
         profiles: Vec<crate::nostr::Event>,
         pane: Option<PaneRef>,
     ) -> anyhow::Result<WhoIs> {
-        // Profile fields + last-active provenance (latest signed profile event).
         let profile_ev = profiles
             .iter()
             .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
@@ -1714,11 +1618,6 @@ impl Mailbox {
         let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
         let last_active_ts_us = profile_ev.created_at.as_secs() as i64 * 1_000_000;
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        // bd-zoir: the pane comes from the caller's sweep — a stamp or
-        // `agent.list` binding, backstopped by the flywheel spawn registry.
-        // bd-u31k: identity health — the stamp's npub vs the registry npub.
-        // A pane that stamps an npub other than this row's means mail to the
-        // name reaches a key the pane does not read (invisible, not lost).
         let npub_hex = npub.to_hex();
         let pane_npub = pane.as_ref().and_then(|p| p.npub.clone());
         let identity_divergent = pane_npub
@@ -1792,7 +1691,6 @@ impl Mailbox {
             };
             let npub = ev.pubkey.to_hex();
             let ts_us = ev.created_at.as_secs() as i64 * 1_000_000;
-            // Latest wins per name (addressable latest-wins per author).
             let entry = by_name.entry(name.to_string()).or_insert_with(|| WhoIs {
                 name: name.to_string(),
                 npub: npub.clone(),
@@ -1819,9 +1717,6 @@ impl Mailbox {
         }
 
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        // ADR-0010 F2: flag time-dead rows on the same prune cadence the
-        // dead-pane cleanup consumers apply — covers both the insert and
-        // the latest-wins update path above.
         for entry in by_name.values_mut() {
             entry.stale = roster_entry_stale(entry.last_active_ts_us, now_us);
         }
@@ -1831,8 +1726,6 @@ impl Mailbox {
             agents.retain(|a| a.last_active_ts_us >= cutoff);
         }
         agents.sort_by_key(|b| std::cmp::Reverse(b.last_active_ts_us));
-        // bd-u4e2: attach each pin's LIVE pane when herdr can be reached
-        // (advisory; an unreachable backend leaves the fields `None`).
         let mut panes = Self::live_pin_pane_map(&canonical);
         for agent in &mut agents {
             if let Some(pane) = panes.remove(&agent.name) {
@@ -1890,7 +1783,6 @@ impl Mailbox {
         let Ok(agents) = client.agent_list() else {
             return std::collections::HashMap::new();
         };
-        // hc has no workspaces: terminals are the panes.
         let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
         let mut map = pin_pane_map(&panes, &agents);
         augment_pane_map_with_registry(
@@ -1937,8 +1829,6 @@ impl Mailbox {
             let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
             (agents, panes)
         };
-        // bd-0sbf: a pin stamped on a live pane is live even when the
-        // `agent.list` occupant name has rolled over to someone else.
         let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();
         let live_panes: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
         Ok(agents
@@ -1963,8 +1853,6 @@ pub fn pin_pane_map(
     agents: &[AgentInfo],
 ) -> std::collections::HashMap<String, PaneRef> {
     let mut out: std::collections::HashMap<String, PaneRef> = std::collections::HashMap::new();
-    // Token-first: the display-only `toron:mail-identity` stamp is
-    // authoritative (bd-0sbf).
     for pane in panes {
         if let Some(pin) = pane_token_pin(pane) {
             out.entry(pin.to_string()).or_insert_with(|| PaneRef {
@@ -1975,10 +1863,6 @@ pub fn pin_pane_map(
             });
         }
     }
-    // Fallback: the pane's `agent.list` occupant name — only for UNSTAMPED
-    // panes, so a rolled-over occupant never becomes a second mapping beside
-    // the pin the pane actually carries (the same token-first rule as
-    // [`resolve_pin_for_pane`]).
     let pane_by_id: std::collections::HashMap<&str, &PaneInfo> =
         panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
     for agent in agents {
@@ -2131,7 +2015,7 @@ pub fn augment_pane_map_with_registry(
             continue;
         }
         let Some(pane) = pane_by_id.get(binding.pane_id.as_str()) else {
-            continue; // the bound pane is not live — nothing to attach
+            continue;
         };
         map.insert(
             binding.pin.clone(),
@@ -2424,7 +2308,6 @@ mod tests {
             plan.key_path
         );
 
-        // After a REAL registration the plan reports reuse, never a second mint.
         mailbox
             .register_agent("demo-plan", &profile("QuietHeron"))
             .await
@@ -2557,8 +2440,6 @@ mod tests {
             "unstamped panes keep the name fallback"
         );
         assert_eq!(resolve_pin_for_pane(&panes, &agents, "w1:p9"), None);
-        // A stamped pin keeps its pane live for cleanup even when the
-        // occupant name rolled over.
         assert_eq!(pane_token_pin(&panes[0]), Some("DustySparrow"));
         assert_eq!(pane_token_pin(&panes[1]), None);
     }
@@ -2599,7 +2480,6 @@ mod tests {
         );
     }
 
-    // --- bd-legacy-slug-inbox-onoj: folded slugs must not keep a second inbox ---
     /// The defect scenario: a slug registered STANDALONE pre-fold keeps its
     /// own agents row beside the pin; mail sealed to the orphan npub is
     /// unreadable forever and lingers as unread. Recording the fold must
@@ -2614,8 +2494,6 @@ mod tests {
             .register_agent(project, &profile("flywheel-p-absorb-oc9"))
             .await
             .expect("legacy slug registers (open mode)");
-        // Canonicalization: the registry stores the EXPANDED slug — every
-        // raw-SQL assertion below must bind THAT spelling, not my literal.
         let project = legacy.project_slug.clone();
         let pin = mailbox
             .register_agent(&project, &profile("TanFern"))
@@ -2626,8 +2504,6 @@ mod tests {
             .register_agent(&project, &profile("PinkGorge"))
             .await
             .expect("sender");
-        // The production scenario is a SWARM project (ADR-0018) — only there
-        // does the fold precede every other resolution path.
         mailbox.set_identity_mode(&project, "swarm").await;
         for subject in ["[assign] high work", "fyi"] {
             mailbox
@@ -2650,10 +2526,6 @@ mod tests {
                 .expect("send to slug");
         }
 
-        // Pre-fold: the orphan inbox is REAL and unread — project it by
-        // fetching as the slug (its key still exists at this point). The
-        // `messages` projection is written at unwrap time, so this fetch is
-        // also what makes the SQL count below meaningful.
         let pre = mailbox
             .fetch_inbox(&crate::mailbox::messaging::FetchInbox {
                 project_slug: project.clone(),
@@ -2678,7 +2550,6 @@ mod tests {
             .fold_agent_name_alias(&project, "flywheel-p-absorb-oc9", "TanFern")
             .await;
 
-        // Roster: the standalone row is gone.
         let rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM agents WHERE project_slug = ?1 AND name = 'flywheel-p-absorb-oc9'",
         )
@@ -2687,17 +2558,12 @@ mod tests {
         .await
         .expect("agent row count");
         assert_eq!(rows, 0, "standalone slug registration absorbed");
-        // The orphan npub is no longer an inbox: routing folds to the pin,
-        // and no surface keys off the dead pubkey (projection carries no
-        // recipient column; cross-key delete is forbidden — nothing to mark).
-        // Routing: the fold still resolves — to the PIN's key.
         let w = mailbox
             .whois(&project, "flywheel-p-absorb-oc9")
             .await
             .expect("folded slug routable");
         assert_eq!(w.npub, pin.npub, "alias resolves to the pin identity");
 
-        // Idempotent: re-folding changes nothing and never errors.
         mailbox
             .fold_agent_name_alias(&project, "flywheel-p-absorb-oc9", "TanFern")
             .await;
@@ -2747,17 +2613,14 @@ mod tests {
             .register_agent(project, &profile("flywheel-p-oc5"))
             .await
             .expect("legacy slug");
-        // Registry's own slug spelling for the raw assertions below.
         let project = legacy.project_slug.clone();
         mailbox
             .fold_agent_name_alias_no_absorb(&project, "flywheel-p-oc5", "SomePin")
             .await;
-        // The absorbing fold needs a LIVE canonical target (spare-row rule).
         mailbox
             .register_agent(&project, &profile("SomePin"))
             .await
             .expect("canonical pin");
-        // Raw unread mail addressed to the slug.
         let ts = 1_785_726_000_000i64;
         sqlx::query(
             "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, \
@@ -2781,7 +2644,6 @@ mod tests {
         assert_eq!(hit.canonical, "SomePin");
         assert_eq!(hit.pubkey, legacy.npub);
 
-        // Absorbing clears the listing.
         mailbox
             .fold_agent_name_alias(&project, "flywheel-p-oc5", "SomePin")
             .await;
@@ -2807,8 +2669,6 @@ mod tests {
         let (mailbox, pool, _db, data) = test_mailbox_with_pool("rename-in-place").await;
         let project = "p-rename";
         mailbox.ensure_project(project).await.expect("ensure");
-        // A slug name — the shape the pin convention forbids and the one
-        // that left an identity unroutable.
         let before = mailbox
             .register_agent(project, &profile("quiet-slug"))
             .await
@@ -2823,17 +2683,14 @@ mod tests {
             .await
             .expect("rename");
 
-        // The npub did NOT move: the key IS the identity.
         assert_eq!(
             report.pubkey, npub_before,
             "a rename must not mint a second key"
         );
         assert_eq!(report.new_name, "QuietCedar");
-        // The key lives under the new name now.
         let new_key = mailbox.agent_key_path(&before.project_slug, "QuietCedar");
         assert!(new_key.exists(), "the key must move to the new name");
         assert!(!old_key.exists(), "the old name must not keep a key");
-        // One name, one identity: the old roster row is gone.
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 AND pubkey = ?2")
                 .bind(&before.project_slug)
@@ -2883,7 +2740,6 @@ mod tests {
             .register_agent(project, &profile("flywheel-p-prune-oc1"))
             .await
             .expect("absorbable slug");
-        // Registry's own slug spelling for the raw assertions below.
         let project = absorbable.project_slug.clone();
         let stranded = mailbox
             .register_agent(&project, &profile("flywheel-p-prune-oc2"))
@@ -2893,8 +2749,6 @@ mod tests {
             .register_agent(&project, &profile("RealPin"))
             .await
             .expect("canonical pin");
-        // Records the folds WITHOUT absorbing — the legacy leftover shape a
-        // pre-absorb registry left behind.
         mailbox
             .fold_agent_name_alias_no_absorb(&project, "flywheel-p-prune-oc1", "RealPin")
             .await;
@@ -2902,7 +2756,6 @@ mod tests {
             .fold_agent_name_alias_no_absorb(&project, "flywheel-p-prune-oc2", "GhostPin")
             .await;
 
-        // `--dry-run` preview: sees both, mutates nothing.
         let preview = mailbox
             .folded_slug_leftovers_for(&project)
             .await
@@ -2923,7 +2776,6 @@ mod tests {
         assert_eq!(report.kept[0].slug, "flywheel-p-prune-oc2");
         assert_eq!(report.kept[0].pubkey, stranded.npub);
 
-        // Roster: only the stranded row survives beside the pin.
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 ORDER BY name")
                 .bind(&project)
@@ -2933,7 +2785,6 @@ mod tests {
         assert!(rows.iter().any(|n| n == "flywheel-p-prune-oc2"));
         assert!(!rows.iter().any(|n| n == "flywheel-p-prune-oc1"));
 
-        // Idempotent: a second sweep has nothing left to remove.
         let again = mailbox
             .prune_folded_slugs(&project)
             .await
@@ -2941,7 +2792,6 @@ mod tests {
         assert!(again.removed.is_empty(), "nothing left to remove");
         assert_eq!(again.kept.len(), 1, "stranded row stays reported");
 
-        // The absorbed slug still routes — folds to the pin's key.
         let w = mailbox
             .whois(&project, "flywheel-p-prune-oc1")
             .await
@@ -2978,7 +2828,6 @@ mod tests {
             .fold_agent_name_alias_no_absorb(&project, "flywheel-p-0tbg-oc1", "RealPin")
             .await;
 
-        // The holder is mid-work when the sweep runs.
         mailbox
             .file_reservation_paths(
                 &project,
@@ -3012,7 +2861,6 @@ mod tests {
                 .any(|l| l == "src/cmd/workflow.rs")
         );
 
-        // The row survives, so both leases stay addressable by their holder.
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1")
                 .bind(&project)
@@ -3023,9 +2871,6 @@ mod tests {
             rows.iter().any(|n| n == "flywheel-p-0tbg-oc1"),
             "the holder row must survive the sweep: {rows:?}"
         );
-        // Name routing still folds to the canonical pin (unchanged), and the
-        // leases are still readable under the leftover's own key — which is
-        // the point of keeping the row.
         let who = mailbox
             .whois(&project, "flywheel-p-0tbg-oc1")
             .await
@@ -3037,7 +2882,6 @@ mod tests {
             .expect("leases still readable");
         assert_eq!(still.len(), 2, "and both leases remain addressable");
 
-        // Release the leases; now the sweep is allowed to finish the job.
         mailbox
             .release_file_reservations(
                 &project,
@@ -3083,7 +2927,6 @@ mod tests {
             .await
             .expect("first identity");
 
-        // The bead's exact pair. Same project, same words, different key.
         let err = mailbox
             .register_agent(project, &profile("brash-otter"))
             .await
@@ -3102,7 +2945,6 @@ mod tests {
             "and shows the key that would have been orphaned: {msg}"
         );
 
-        // Case-only splits are the same defect, not an exemption.
         mailbox
             .register_agent(project, &profile("brashotter"))
             .await
@@ -3148,7 +2990,6 @@ mod tests {
         .await
         .expect("legacy path-form roster row");
 
-        // The short key finds it.
         let profiles = mailbox
             .project_profiles("toron")
             .await
@@ -3157,7 +2998,6 @@ mod tests {
             profiles.iter().any(|e| e.pubkey == keys.public_key()),
             "the short key must reach the identity registered under the path key"
         );
-        // And the path key reaches the same identity (one project).
         let via_path = mailbox
             .project_profiles(path_project)
             .await
@@ -3170,9 +3010,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_exact_re_registration_stays_idempotent() {
-        // The collision check must not break the ordinary re-register path,
-        // which is how ADR-0017 adopts a pre-canonicalization key. Same name
-        // is not a collision with itself.
         let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("0tbg-idem").await;
         let project = "p-idem";
         mailbox.ensure_project(project).await.expect("ensure");
@@ -3191,9 +3028,6 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_names_and_the_fold_grammar_are_untouched() {
-        // The negative control. If this fails, the check is over-broad and is
-        // rejecting identities it must leave alone — including ADR-0018's
-        // fold grammar, which is kebab-case on purpose.
         let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("0tbg-ok").await;
         let project = "p-ok";
         mailbox.ensure_project(project).await.expect("ensure");
@@ -3225,19 +3059,6 @@ mod tests {
                 .await
                 .expect("seed the registered identities");
         }
-        // The colliding row is inserted directly, NOT through
-        // `register_agent` — because registration now refuses it, which is
-        // the point. This is exactly how the live board got into this state:
-        // `brash-otter` was registered before the check existed. A report
-        // surface that could only be exercised by the bug it reports would
-        // be untestable, and untestable surfaces are the ones that are wrong
-        // in production and right in the test.
-        //
-        // ADR-0037 W1: since migration 0018 the database refuses this row
-        // too, so the legacy board is reproduced as it was written: before
-        // the trigger existed. The trigger is restored afterwards, and the
-        // report must still see the legacy split (triggers never rewrite
-        // existing rows).
         sqlx::raw_sql("DROP TRIGGER agents_same_name_one_key_insert")
             .execute(&pool)
             .await
@@ -3273,8 +3094,6 @@ mod tests {
             found[0].pubkeys
         );
     }
-
-    // --- ADR-0037 W1: one name -> one pubkey per project, in the database ---
 
     const W1_MIGRATION: &str = include_str!("../../migrations/0018_agents_same_name_one_key.sql");
     const KEY_A: &str = "aaaa000000000000000000000000000000000000000000000000000000000001";
@@ -3315,7 +3134,6 @@ mod tests {
                 "{other}: refusal names the constraint: {err}"
             );
         }
-        // Moving a row onto the colliding spelling is refused as well.
         raw_agent(&pool, "p", "IvoryRidge", KEY_B)
             .await
             .expect("unrelated pin");
@@ -3336,12 +3154,9 @@ mod tests {
         raw_agent(&pool, "p", "BrashOtter", KEY_A)
             .await
             .expect("first");
-        // Same words, SAME key: an alias row, not a split.
         raw_agent(&pool, "p", "brash-otter", KEY_A)
             .await
             .expect("same key is allowed");
-        // Same words in ANOTHER project: allowed by W1. Under W2 (0020) it
-        // must REUSE the pin's key; a second key is refused there.
         raw_agent(&pool, "q", "brash-otter", KEY_A)
             .await
             .expect("other project, same key, is allowed");
@@ -3349,13 +3164,9 @@ mod tests {
             .await
             .expect_err("a second key for a known pin is refused (W2)");
         assert!(w2.to_string().contains("agents_one_key_per_pin"), "{w2}");
-        // Different words, different key.
         raw_agent(&pool, "p", "IvoryRidge", KEY_B)
             .await
             .expect("different pin is allowed");
-        // Re-keying one spelling via the registration upsert path is allowed
-        // only if no other spelling holds the old words: here `brash-otter`
-        // still holds KEY_A, so re-keying `BrashOtter` alone would split them.
         let err = sqlx::query(
             "UPDATE agents SET pubkey = ?1 WHERE project_slug = 'p' AND name = 'BrashOtter'",
         )
@@ -3406,13 +3217,9 @@ mod tests {
         );
     }
 
-    // --- ADR-0018: swarm-mode whois + registration hardening ---
-
     #[tokio::test]
     async fn swarm_mode_whois_rejects_non_canonical_names() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-whois").await;
-        // Pre-ADR-0018 state: the legacy identity exists BEFORE the project
-        // flips to swarm (the reconciliation scenario — nothing is deleted).
         mailbox.ensure_project("toron").await.expect("ensure");
         mailbox
             .register_agent("toron", &profile("flywheel-toron-oc2"))
@@ -3424,14 +3231,12 @@ mod tests {
             .expect("legacy identity registered pre-swarm");
         mailbox.set_identity_mode("toron", "swarm").await;
 
-        // Canonical name resolves.
         let w = mailbox
             .whois("toron", "flywheel-toron-oc2")
             .await
             .expect("canonical whois");
         assert_eq!(w.name, "flywheel-toron-oc2");
 
-        // ADR-0018 D1a: a pin REGISTERED post-swarm is routable natively.
         let pin = mailbox
             .register_agent("toron", &profile("DustySparrow"))
             .await
@@ -3445,7 +3250,6 @@ mod tests {
             "registered pin resolves to its own npub"
         );
 
-        // Non-canonical name fails with an actionable grammar error.
         let err = mailbox
             .whois("toron", "lane-1-bootstrap")
             .await
@@ -3460,11 +3264,9 @@ mod tests {
             "error names the routing rule: {msg}"
         );
 
-        // npub always resolves (the read-side twin of npub routing).
         let by_npub = mailbox.whois("toron", &w.npub).await.expect("npub whois");
         assert_eq!(by_npub.npub, w.npub);
 
-        // list_agents still shows the legacy identity (metadata preserved).
         let agents = mailbox
             .list_agents("toron", ListAgentsOptions::default())
             .await
@@ -3504,7 +3306,6 @@ mod tests {
     #[tokio::test]
     async fn swarm_mode_folded_alias_resolves_through_to_canonical() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-alias").await;
-        // Reconciliation order: legacy identity first (open), then swarm.
         mailbox.ensure_project("toron").await.expect("ensure");
         let canonical = mailbox
             .register_agent("toron", &profile("flywheel-toron-oc2"))
@@ -3516,8 +3317,6 @@ mod tests {
             .expect("legacy identity registered");
         mailbox.set_identity_mode("toron", "swarm").await;
 
-        // Fold: lane-1-bootstrap → flywheel-toron-oc2 (pane binding
-        // discoverable). Non-pin legacy names need the fold to resolve.
         mailbox
             .fold_agent_name_alias("toron", "lane-1-bootstrap", "flywheel-toron-oc2")
             .await;
@@ -3529,14 +3328,12 @@ mod tests {
             Some("flywheel-toron-oc2")
         );
 
-        // whois on the legacy alias resolves through to the canonical npub.
         let w = mailbox
             .whois("toron", "lane-1-bootstrap")
             .await
             .expect("alias whois");
         assert_eq!(w.npub, canonical.npub, "folded alias resolves to canonical");
 
-        // The alias is append-only: a second fold is a no-op.
         mailbox
             .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
             .await;
@@ -3560,7 +3357,6 @@ mod tests {
             .await
             .expect("ensure swarm");
 
-        // Canonical names register fine.
         mailbox
             .register_agent("toron", &profile("flywheel-toron-oc"))
             .await
@@ -3570,7 +3366,6 @@ mod tests {
             .await
             .expect("canonical create");
 
-        // ADR-0018 D1a: adjective+noun PIN SHAPES register fine in swarm mode.
         mailbox
             .register_agent("toron", &profile("DustySparrow"))
             .await
@@ -3580,7 +3375,6 @@ mod tests {
             .await
             .expect("pin create (D1a)");
 
-        // Non-canonical, non-pin names are rejected with an actionable error.
         let err = mailbox
             .register_agent("toron", &profile("lane-4-catalog"))
             .await
@@ -3606,7 +3400,6 @@ mod tests {
             "create error names the grammar: {err}"
         );
 
-        // Open mode (default) still accepts any name — legacy parity.
         let (open, _p, db_path2, data_dir2) = test_mailbox_with_pool("open-register").await;
         open.register_agent("demo", &profile("BlueLake"))
             .await
@@ -3625,13 +3418,11 @@ mod tests {
     async fn identity_mode_persists_and_defaults_open() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("mode-persist").await;
 
-        // Default (no row) is open.
         assert_eq!(
             mailbox.project_identity_mode("toron").await,
             crate::mailbox::naming::IdentityMode::Open
         );
 
-        // ensure_project_with_mode persists swarm.
         mailbox
             .ensure_project_with_mode("toron", Some("swarm"))
             .await
@@ -3641,7 +3432,6 @@ mod tests {
             crate::mailbox::naming::IdentityMode::Swarm
         );
 
-        // set_identity_mode upserts (open → swarm → open).
         mailbox.set_identity_mode("toron", "open").await;
         assert_eq!(
             mailbox.project_identity_mode("toron").await,
@@ -3653,7 +3443,6 @@ mod tests {
             crate::mailbox::naming::IdentityMode::Swarm
         );
 
-        // ensure_project (no mode) does not clobber an existing mode.
         mailbox.ensure_project("toron").await.expect("ensure plain");
         assert_eq!(
             mailbox.project_identity_mode("toron").await,
@@ -3689,7 +3478,6 @@ mod tests {
             a.key_path
         );
 
-        // whois resolves the name → npub.
         let w = mailbox.whois("demo", "BlueLake").await.expect("whois");
         assert_eq!(w.npub, a.npub);
         assert_eq!(w.program.as_deref(), Some("opencode"));
@@ -3702,8 +3490,6 @@ mod tests {
     #[tokio::test]
     async fn test_create_always_different_npub_or_refuses_collision() {
         let (mailbox, db_path, data_dir) = test_mailbox("fresh").await;
-        // AM-Rust parity: create_agent_identity with an unavailable name must
-        // FAIL (a name_hint collision is refused), not mint a colliding key.
         let a = mailbox
             .create_agent_identity("demo", &profile("A"))
             .await
@@ -3716,7 +3502,6 @@ mod tests {
             err.to_string().contains("already exists"),
             "collision refused: {err}"
         );
-        // The original identity is untouched (whois still resolves to `a.npub`).
         let w = mailbox.whois("demo", "A").await.expect("whois after");
         assert_eq!(w.npub, a.npub, "collision must not rotate the npub");
         let _ = std::fs::remove_file(&db_path);
@@ -3784,7 +3569,6 @@ mod tests {
         assert!(all.iter().any(|a| a.name == "RoseDune"));
         assert!(all.iter().all(|a| a.npub.len() == 64));
 
-        // active-within filter: profiles are fresh (created now) → visible.
         let active = mailbox
             .list_agents(
                 "demo",
@@ -3796,7 +3580,6 @@ mod tests {
             .expect("active");
         assert_eq!(active.len(), 2, "fresh agents active within 7d");
 
-        // Impossible cutoff → none.
         let none = mailbox
             .list_agents(
                 "demo",
@@ -3858,28 +3641,18 @@ mod tests {
         assert!(w2.stale, "explicit stale survives");
     }
 
-    // ---- bd-cmgu → ADR-0017: MCP vs CLI project-key unification ----
-    //
-    // The flywheel CLI keys projects by ABSOLUTE PATH slug
-    // ("/Users/.../workspace/toron"), the MCP surface by the short key
-    // ("toron") — two roots under one data dir. An agent registered via one
-    // surface was invisible to the other ("no local key"). ADR-0017 makes the
-    // canonical short slug the ONE root: every spelling resolves to the same
-    // key file under `{data_dir}/{canonical}/agents/`.
-
     /// Incident shape (CLI-registered -> MCP lookup): register under the
     /// PATH-style slug, look the key up via the SHORT slug — the key lands
     /// in the canonical root and both spellings resolve it.
     #[tokio::test]
     async fn test_agent_keys_for_short_key_finds_path_slug_registered_agent() {
         let (mailbox, db_path, data_dir) = test_mailbox("cmgu-short").await;
-        let path_slug = "tmp/x/workspace/demo"; // relative path form (leading / stripped)
+        let path_slug = "tmp/x/workspace/demo";
         let agent = mailbox
             .register_agent(path_slug, &profile("RustHeron"))
             .await
             .expect("register under path slug");
         assert_eq!(agent.project_slug, "demo", "canonical root, ADR-0017");
-        // ADR-0017: the key lands in the CANONICAL root — no split.
         let short_path = mailbox.agent_key_path("demo", "RustHeron");
         assert!(short_path.exists(), "canonical-root key exists");
         let keys = mailbox
@@ -3900,8 +3673,6 @@ mod tests {
             .await
             .expect("register under short slug");
         let path_slug = "tmp/x/workspace/demo";
-        // ADR-0017: the path-form spelling resolves to the canonical root —
-        // the key path IS the short-slug path (no separate root exists).
         assert_eq!(
             mailbox.agent_key_path(path_slug, "BlueLake"),
             mailbox.agent_key_path("demo", "BlueLake"),
@@ -3925,8 +3696,6 @@ mod tests {
             .register_agent("demo", &profile("BlueLake"))
             .await
             .expect("register");
-        // Re-registering via a basename-colliding path slug UPSERTS the same
-        // canonical identity — never a second keypair.
         let other = mailbox
             .register_agent("tmp/x/workspace/demo", &profile("BlueLake"))
             .await
@@ -4053,15 +3822,11 @@ mod tests {
     #[tokio::test]
     async fn test_alt_agent_key_descends_into_shadowing_root() {
         let (mailbox, db_path, data_dir) = test_mailbox("f5tt-shadow").await;
-        // Register under the NESTED path slug.
         let nested = "tmp/x/workspace/demo";
         let agent = mailbox
             .register_agent(nested, &profile("DustyWren"))
             .await
             .expect("register nested root");
-        // Create the SHADOWING root: a project root at the PARENT path
-        // (has agents/) whose basename is NOT the wanted one. Under the
-        // non-descending walk this hid the nested root.
         mailbox
             .register_agent("tmp/x/workspace", &profile("ShadowRoot"))
             .await
@@ -4073,8 +3838,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-
-    // --- bd-pin-public-plane-s-easy.1: resolve_agent_name (one resolver) ---
 
     #[tokio::test]
     async fn resolve_agent_name_folds_slug_to_pin() {
@@ -4089,21 +3852,18 @@ mod tests {
             .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
             .await;
 
-        // whois(slug) must resolve to the PIN's npub after a fold exists.
         let w = mailbox
             .whois("toron", "flywheel-toron-coder")
             .await
             .expect("slug whois resolves via fold");
         assert_eq!(w.npub, pin.npub, "whois(slug) resolves to the pin's npub");
 
-        // whois(pin) still resolves natively.
         let w_pin = mailbox
             .whois("toron", "BlueRidge")
             .await
             .expect("pin whois");
         assert_eq!(w_pin.npub, pin.npub);
 
-        // resolve_agent_name returns the pin for the slug and the pin itself.
         assert_eq!(
             mailbox
                 .resolve_agent_name("toron", "flywheel-toron-coder")
@@ -4123,8 +3883,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // --- bd-captain-alias-0g8a: `captain` folds onto the orchestrator pin ---
-
     #[tokio::test]
     async fn captain_alias_set_resolves_and_routes() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-set").await;
@@ -4141,14 +3899,12 @@ mod tests {
             .expect("set captain");
         assert_eq!(folded, "BlueRidge");
 
-        // The fence surface: whois(project, "captain") hits the pin's npub.
         let w = mailbox
             .whois("toron", "captain")
             .await
             .expect("whois captain resolves via fold");
         assert_eq!(w.npub, pin.npub);
 
-        // The send path shares the ONE resolver.
         assert_eq!(
             mailbox
                 .resolve_agent_name("toron", "captain")
@@ -4184,7 +3940,6 @@ mod tests {
             .await
             .expect("repoint captain");
 
-        // Upsert semantics: the CURRENT orchestrator wins, not first-fold.
         assert_eq!(
             mailbox
                 .resolve_agent_name("toron", "captain")
@@ -4255,16 +4010,13 @@ mod tests {
                 .as_deref(),
             Some("BlueRidge")
         );
-        // Clear
         let previous = mailbox.clear_project_captain("toron").await.expect("clear");
         assert_eq!(previous.as_deref(), Some("BlueRidge"));
         assert_eq!(mailbox.agent_name_alias("toron", "captain").await, None);
-        // whois captain should now fail (non-routable)
         assert!(
             mailbox.whois("toron", "captain").await.is_err(),
             "whois captain after clear should fail"
         );
-        // Clearing again when already cleared returns None
         let again = mailbox
             .clear_project_captain("toron")
             .await
@@ -4283,9 +4035,6 @@ mod tests {
     async fn captain_alias_stale_target_pruned_and_rebound() {
         let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("captain-stale").await;
         mailbox.ensure_project("toron").await.expect("ensure");
-        // Swarm mode so the send-path resolver shape-checks (Open mode
-        // passes unknown names through by legacy design; the send fold in
-        // resolve_recipients is covered by open_mode_send_to_captain_*).
         mailbox.set_identity_mode("toron", "swarm").await;
         mailbox
             .register_agent("toron", &profile("BlueRidge"))
@@ -4303,7 +4052,6 @@ mod tests {
             Some("BlueRidge")
         );
 
-        // Age the target past the F2 cadence (8d > 7d).
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let stale_us = now_us - 8 * 86_400 * 1_000_000;
         sqlx::query(
@@ -4316,7 +4064,6 @@ mod tests {
         .await
         .expect("age target past F2");
 
-        // The dead fold is pruned from every resolution surface at once.
         assert_eq!(
             mailbox.agent_name_alias("toron", "captain").await,
             None,
@@ -4334,7 +4081,6 @@ mod tests {
             "send-path resolver agrees the dead fold is absent"
         );
 
-        // The next registration rebinds instead of keeping the dead pin.
         mailbox
             .register_agent("toron", &profile("AmberPlateau"))
             .await
@@ -4439,8 +4185,6 @@ mod tests {
             .register_agent("toron", &profile("BlueRidge"))
             .await
             .expect("fresh pin");
-        // Backdated session artifact (the live-use `captain-session`
-        // class): a profile event signed 9 days ago, published to the bus.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -4556,7 +4300,6 @@ mod tests {
             .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
             .await;
 
-        // Registering the folded slug must be refused (no second identity).
         let err = mailbox
             .register_agent("toron", &profile("flywheel-toron-coder"))
             .await
@@ -4565,7 +4308,6 @@ mod tests {
             err.to_string().contains("fold"),
             "register refuses folded slug: {err}"
         );
-        // create_agent_identity likewise.
         let err = mailbox
             .create_agent_identity("toron", &profile("flywheel-toron-coder"))
             .await
@@ -4608,7 +4350,6 @@ mod tests {
             "error names the recovery (pin / list_agents): {msg}"
         );
 
-        // The same class rejects through resolve_agent_name (send path too).
         let err = mailbox
             .resolve_agent_name("toron", "bangedorrunt")
             .await
@@ -4618,8 +4359,6 @@ mod tests {
             "resolve_agent_name names the username class: {err}"
         );
 
-        // A registered pin still resolves (the username path did not break
-        // normal routing).
         let w = mailbox
             .whois("toron", "BlueRidge")
             .await
@@ -4635,8 +4374,6 @@ mod tests {
     #[tokio::test]
     async fn test_project_slug_aliases_covers_both_spellings() {
         let (mailbox, db_path, data_dir) = test_mailbox("f5tt-alias").await;
-        // ADR-0017: fresh registrations land in the canonical root only — a
-        // path-form registration creates NO split root on disk.
         mailbox
             .register_agent("tmp/x/workspace/demo", &profile("AliasA"))
             .await
@@ -4645,8 +4382,6 @@ mod tests {
             .register_agent("demo", &profile("AliasB"))
             .await
             .expect("register short root");
-        // The walk-based alias still folds a LEGACY path-slug root left by a
-        // pre-ADR-0017 daemon (the migration read path).
         let legacy = mailbox.data_dir().join("tmp/legacy/workspace/demo");
         std::fs::create_dir_all(legacy.join("agents")).unwrap();
         let aliases = mailbox.project_slug_aliases("demo");
@@ -4658,7 +4393,6 @@ mod tests {
             aliases.contains(&"tmp/legacy/workspace/demo".to_string()),
             "legacy path-slug root found via basename: {aliases:?}"
         );
-        // The fresh path-form spelling exists only as the canonical root.
         let fresh = mailbox.project_slug_aliases("tmp/x/workspace/demo");
         assert!(
             fresh.contains(&"demo".to_string()),
@@ -4668,8 +4402,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // ---- bd-lmcy: role= tags + alias + mail --to role: (E4) ----
-
     #[tokio::test]
     async fn role_toron_pin_and_whois_resolves() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("role-pin").await;
@@ -4677,19 +4409,16 @@ mod tests {
             .register_agent("demo", &profile("DustySparrow"))
             .await
             .expect("register");
-        // Pin role wheelhouse -> DustySparrow
         let pinned = mailbox
             .set_role_pin("demo", "wheelhouse", "DustySparrow")
             .await
             .expect("set role pin");
         assert_eq!(pinned, "DustySparrow");
-        // whois wheelhouse prints charter + live pin
         let who = mailbox
             .whois("demo", "wheelhouse")
             .await
             .expect("whois role");
         assert_eq!(who.name, "DustySparrow");
-        // Profile carries role= tag
         let profiles = mailbox.project_profiles("demo").await.expect("profiles");
         let want_d = crate::nostr::identity::profile_d_tag("demo", "DustySparrow");
         let ev = profiles
@@ -4705,7 +4434,6 @@ mod tests {
             roles.contains(&"wheelhouse".to_string()),
             "profile must carry role=wheelhouse tag: {roles:?}"
         );
-        // list_role_pins shows it
         let list = mailbox.list_role_pins("demo").await.expect("list");
         assert!(
             list.iter()
@@ -4735,7 +4463,6 @@ mod tests {
             .set_role_pin("demo", "wheelhouse", "DustySparrow")
             .await
             .expect("pin");
-        // Mail to role:wheelhouse resolves to DustySparrow's npub
         let msg = crate::mailbox::SendMessage {
             project_slug: "demo".into(),
             sender_name: "SenderOne".into(),
@@ -4747,7 +4474,6 @@ mod tests {
         let res = mailbox.send_message(&msg).await.expect("send to role");
         assert_eq!(res.count, 1);
         assert_eq!(res.deliveries[0].payload.recipient, "DustySparrow");
-        // Inbox for DustySparrow has it
         let inbox = mailbox
             .fetch_inbox(&crate::mailbox::FetchInbox {
                 project_slug: "demo".into(),
@@ -4811,14 +4537,12 @@ mod tests {
 
     #[tokio::test]
     async fn role_toron_rebind_after_pane_death() {
-        // S3: role outlives pane — after pane death, next pin claims same role
         let (mailbox, db_path, data_dir) = test_mailbox("role-rebind").await;
         let pool = crate::index::schema::connect(db_path.to_str().unwrap())
             .await
             .expect("connect");
         crate::index::schema::migrate(&pool).await.expect("migrate");
         let mailbox = mailbox.with_index_pool(pool.clone());
-        // First generation
         mailbox
             .register_agent("demo", &profile("DustySparrow"))
             .await
@@ -4831,7 +4555,6 @@ mod tests {
             .set_role_pin("demo", "wheelhouse", "DustySparrow")
             .await
             .expect("pin old");
-        // Mail to role goes to old pin
         let msg1 = crate::mailbox::SendMessage {
             project_slug: "demo".into(),
             sender_name: "SenderOne".into(),
@@ -4842,8 +4565,6 @@ mod tests {
         };
         let r1 = mailbox.send_message(&msg1).await.expect("send1");
         assert_eq!(r1.deliveries[0].payload.recipient, "DustySparrow");
-        // Simulate pane death: wipe key and re-register as new pin (seq>=2 new npub)
-        // For test, register a new pin RedDune and rebind role to it
         mailbox
             .register_agent("demo", &profile("RedDune"))
             .await
@@ -4852,13 +4573,11 @@ mod tests {
             .set_role_pin("demo", "wheelhouse", "RedDune")
             .await
             .expect("rebind");
-        // whois wheelhouse now resolves to RedDune
         let who = mailbox
             .whois("demo", "wheelhouse")
             .await
             .expect("whois after rebind");
         assert_eq!(who.name, "RedDune");
-        // Mail to role now goes to RedDune
         let msg2 = crate::mailbox::SendMessage {
             project_slug: "demo".into(),
             sender_name: "SenderOne".into(),
@@ -4972,7 +4691,6 @@ mod tests {
         assert_eq!(pane.pane_id, "w3S:p1");
         assert_eq!(pane.workspace_id, "w1");
         assert_eq!(pane.npub.as_deref(), Some(slate.as_str()));
-        // The stamped pin keeps its own binding.
         assert_eq!(
             map.get("SlateHerder").map(|p| p.pane_id.as_str()),
             Some("w3S:p1")
@@ -4999,12 +4717,10 @@ mod tests {
             &mut map,
             &panes,
             &[
-                // Stale row: the pin is live on w1:p1; the registry must not move it.
                 SpawnRegistryBinding {
                     pin: "QuietHeron".into(),
                     pane_id: "w1:p2".into(),
                 },
-                // Dead pane: nothing to bind.
                 SpawnRegistryBinding {
                     pin: "GhostPin".into(),
                     pane_id: "w9:p9".into(),
@@ -5056,7 +4772,6 @@ mod tests {
         let mut pins: Vec<&str> = rows.iter().map(|r| r.pin.as_str()).collect();
         pins.sort_unstable();
         assert_eq!(pins, vec!["EmberOtter", "SilverPond"]);
-        // Missing dir reads empty, never an error.
         assert!(spawn_registry_bindings_in(&dir.join("nope"), "elm-effect-rs").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

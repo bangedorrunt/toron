@@ -29,7 +29,6 @@ pub struct SyncStats {
 /// Load every stored event (id + created_at) for building the negentropy
 /// storage.
 async fn all_entries(store: &BusEventStore) -> anyhow::Result<Vec<(u64, negentropy::Id)>> {
-    // Query raw id hex + created_at.
     let rows = sqlx::query("SELECT event_id, created_at FROM bus_events")
         .fetch_all(&store.pool)
         .await?;
@@ -85,7 +84,6 @@ impl BusEventStore {
 
     /// Run the negentropy client/server exchange in-process.
     async fn negentropy_exchange(&self, remote: &BusEventStore) -> anyhow::Result<usize> {
-        // Build both storages from the same universe.
         let local_entries = all_entries(self).await?;
         let remote_entries = all_entries(remote).await?;
 
@@ -100,14 +98,12 @@ impl BusEventStore {
         }
         remote_vec.seal()?;
 
-        // Client initiates; server reconciles; client resolves have/need ids.
         let mut client = negentropy::Negentropy::owned(local_vec, 1_000_000)?;
         let mut server = negentropy::Negentropy::owned(remote_vec, 1_000_000)?;
 
         let init = client.initiate()?;
         let resp = server.reconcile(&init)?;
 
-        // Collect ids the remote has that we do not.
         let mut have_ids = Vec::new();
         let mut need_ids = Vec::new();
         let _ = client.reconcile_with_ids(&resp, &mut have_ids, &mut need_ids)?;
@@ -116,7 +112,6 @@ impl BusEventStore {
             return Ok(0);
         }
 
-        // Fetch the missing events from the remote and insert locally.
         let missing = fetch_by_ids(remote, &need_ids).await?;
         let mut synced = 0usize;
         for ev in &missing {
@@ -204,20 +199,17 @@ mod tests {
         let (store_b, pb) = temp_store().await;
         let keys = Keys::generate();
 
-        // A has 5, B has 5 shared + 3 extra.
         insert_n(&store_a, &keys, 5, "shared").await;
         insert_n(&store_b, &keys, 8, "shared").await;
 
         assert_eq!(store_a.count().await.unwrap(), 5);
         assert_eq!(store_b.count().await.unwrap(), 8);
 
-        // A syncs delta from B: only the 3 missing.
         let stats = store_a.sync_delta(&store_b).await.expect("sync");
         assert_eq!(stats.synced, 3, "only the missing delta is pulled");
         assert!(stats.used_negentropy, "negentropy path used");
         assert_eq!(store_a.count().await.unwrap(), 8, "converged");
 
-        // Idempotent: syncing again pulls nothing.
         let again = store_a.sync_delta(&store_b).await.expect("sync again");
         assert_eq!(again.synced, 0);
         let _ = std::fs::remove_file(&pa);
@@ -234,7 +226,6 @@ mod tests {
         insert_n(&store_a, &keys, 3, "a").await;
         insert_n(&store_b, &keys, 7, "b").await;
 
-        // B syncs from A: pulls the 3 A-only events.
         let stats = store_b.sync_delta(&store_a).await.expect("sync");
         assert_eq!(stats.synced, 3);
         assert!(stats.used_negentropy);

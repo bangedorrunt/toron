@@ -1,13 +1,5 @@
 // governed-by: ADR-0007
 // governed-by: ADR-0017 (project-root canonicalization)
-// R1 / D2 (ADR-0007): `MailSurface` — the coordination-fabric trait living
-// next to `Mailbox`. Operation-shaped (send → inbox → ack → reply, contacts,
-// agents, infra) — NOT the raw 38-tool surface. `&self` receivers, string ids
-// ([`MessageId`]) end-to-end, machine-coded [`MailError`]. Flywheel can
-// path-dep and re-export this later (ADR-0007 R1.5 deletes its local
-// `MailBackend` in favor of this trait).
-//
-// Shared request/response types defined here carry NO u64 (ADR-0007 D1).
 
 use async_trait::async_trait;
 
@@ -31,9 +23,6 @@ use crate::nostr::identity::AgentProfile;
 /// Effect-oriented: pure predicate, clock + history in, bool out. The caller
 /// supplies history + now; this fn never reads env/TTY/time.
 /// Window `(now_ms - LOOP_WINDOW_MS, now_ms]`, allow while count < LOOP_MAX.
-// shortcut: in-process HashMap tracker (not at-most-once across processes;
-// under-refusal under concurrency is the accepted residual — document, don't promise).
-// Upgrade to a durable claim table when cross-process bursts need exactness.
 pub const LOOP_WINDOW_MS: i64 = 600_000;
 pub const LOOP_MAX: usize = 12;
 
@@ -278,9 +267,6 @@ pub struct MailItem {
 }
 
 impl TryFrom<InboxMessage> for MailItem {
-    // Rows are a validated writer's output, but ids still parse loud
-    // (bd-r328): a corrupt row errors as Malformed instead of riding
-    // through as a silent default.
     type Error = MailError;
 
     fn try_from(m: InboxMessage) -> Result<Self, MailError> {
@@ -438,7 +424,6 @@ impl From<&ContactResponse> for RespondContact {
 /// identity helpers — every op flywheel's coordination loop needs.
 #[async_trait]
 pub trait MailSurface: Send + Sync {
-    // --- meta ---
     /// Stable backend identifier ("toron" | "agentmail" | …).
     fn name(&self) -> &'static str;
     /// The agent identity this surface sends AS / reads the inbox for.
@@ -446,7 +431,6 @@ pub trait MailSurface: Send + Sync {
     /// as an empty identity.
     fn agent_name(&self) -> &str;
 
-    // --- messaging ---
     /// Send a message; returns the primary delivered event id.
     async fn send(&self, req: &SendMail) -> Result<SendReceipt, MailError>;
     /// Reply inside an existing thread.
@@ -458,11 +442,9 @@ pub trait MailSurface: Send + Sync {
     /// Mark a message read (idempotent).
     async fn mark_read(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError>;
 
-    // --- search ---
     /// FTS5 search over a project's indexed messages.
     async fn search(&self, req: &SearchQuery) -> Result<Vec<MailItem>, MailError>;
 
-    // --- contacts ---
     /// Request contact with another agent.
     async fn request_contact(&self, req: &ContactRequest) -> Result<ContactLink, MailError>;
     /// Approve or deny a pending contact request.
@@ -481,7 +463,6 @@ pub trait MailSurface: Send + Sync {
         policy: ContactPolicy,
     ) -> Result<(), MailError>;
 
-    // --- agents ---
     /// List a project's registered agents (most-recently-active first).
     async fn list_agents(
         &self,
@@ -491,13 +472,11 @@ pub trait MailSurface: Send + Sync {
     /// Resolve an agent name to its profile.
     async fn whois(&self, project: &str, agent: &str) -> Result<WhoIs, MailError>;
 
-    // --- infra ---
     /// Health report (never fails; machine codes for unhealthy components).
     async fn health(&self) -> Result<HealthReport, MailError>;
     /// Idempotently ensure a project exists.
     async fn ensure_project(&self, human_key: &str) -> Result<ProjectState, MailError>;
 
-    // --- agents ---
     /// Register (upsert) an agent identity; mint a fresh keypair when absent.
     async fn register_agent(
         &self,
@@ -505,7 +484,6 @@ pub trait MailSurface: Send + Sync {
         profile: &AgentProfile,
     ) -> Result<RegisteredAgent, MailError>;
 
-    // --- reservations (ADR-0007 D8.1) ---
     /// Acquire advisory file-reservation leases on `paths` (kind-30031).
     async fn reserve(
         &self,
@@ -563,7 +541,6 @@ pub trait MailSurface: Send + Sync {
         notify_previous: bool,
     ) -> Result<ReleaseResult, MailError>;
 
-    // --- build slots ---
     /// Acquire an advisory build-slot lease (kind-30032).
     async fn slot_acquire(
         &self,
@@ -586,7 +563,6 @@ pub trait MailSurface: Send + Sync {
     async fn slot_release(&self, project: &str, agent: &str, slot: &str)
     -> Result<bool, MailError>;
 
-    // --- products (G6) ---
     /// Idempotent product manifest (kind-30011).
     async fn ensure_product(&self, product_key: &str, name: &str)
     -> Result<ProductInfo, MailError>;
@@ -619,7 +595,6 @@ pub trait MailSurface: Send + Sync {
         include_examples: bool,
     ) -> Result<ThreadSummary, MailError>;
 
-    // --- threads ---
     /// Deterministic digest of one thread.
     async fn summarize_thread(
         &self,
@@ -628,7 +603,6 @@ pub trait MailSurface: Send + Sync {
         include_examples: bool,
     ) -> Result<ThreadSummary, MailError>;
 
-    // --- pane identity helpers (D8.1) ---
     /// Resolve a herdr pane_id to its agent name (G9). `Ok(None)` = no
     /// mapping.
     async fn resolve_pane_identity(
@@ -763,9 +737,6 @@ impl MailSurface for ToronMailSurface {
     }
 
     async fn inbox(&self, req: &InboxQuery) -> Result<Vec<MailItem>, MailError> {
-        // F11 / c3b.3 (bd-mcp-inbox-filter-qyyq): urgent/since filtering now
-        // lives INSIDE `Mailbox::fetch_inbox` (the shared core inbox query) —
-        // this surface path and the MCP tool path inherit the same filter.
         let fetched = self
             .mailbox
             .fetch_inbox(&FetchInbox::from(req))
@@ -1184,8 +1155,6 @@ mod tests {
         let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
             .with_agent_passphrase(PASSPHRASE)
             .with_index_pool(pool);
-        // The unwrap loop feeds the projection (index sink) — without it the
-        // index-backed ops (search/summarize/slots/product fan) see nothing.
         mailbox.spawn_unwrap_loop();
         (ToronMailSurface::new(mailbox), db_path, data_dir)
     }
@@ -1246,7 +1215,6 @@ mod tests {
         assert_eq!(sent.count, 1, "one recipient");
         assert_eq!(sent.deliveries[0].recipient, "BlueLake");
 
-        // Inbox: the recipient sees the message with a typed MessageId.
         let inbox = surface
             .inbox(&InboxQuery {
                 project: "demo".into(),
@@ -1258,14 +1226,11 @@ mod tests {
             .expect("inbox");
         assert_eq!(inbox.len(), 1);
         let item = &inbox[0];
-        // G2 / D8.5: the projection resolves the sender NAME, not the npub —
-        // agents never need to know npubs.
         assert_eq!(item.sender, "GreenCastle");
         assert_eq!(item.body_md, "please review");
         assert!(item.ack_required, "ack_required flag projected");
         assert!(!item.id.as_str().is_empty(), "typed message id present");
 
-        // Ack (idempotent receipt).
         let ack = surface
             .acknowledge(&ReceiptOp {
                 project: "demo".into(),
@@ -1286,7 +1251,6 @@ mod tests {
             .expect("ack again");
         assert!(ack_again.acknowledged, "ack is idempotent");
 
-        // Reply threads to the original.
         let reply = surface
             .reply(&ReplyMail {
                 project: "demo".into(),
@@ -1337,7 +1301,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Future bound (now + 1h): the just-sent message is older → empty.
         let future = (now + chrono::Duration::hours(1)).to_rfc3339();
         let future_inbox = surface
             .inbox(&query(Some(future)))
@@ -1349,7 +1312,6 @@ mod tests {
             "future since_ts must exclude the message"
         );
 
-        // Past bound (now − 1h): the message is newer → present.
         let past = (now - chrono::Duration::hours(1)).to_rfc3339();
         let past_inbox = surface.inbox(&query(Some(past))).await.expect("past inbox");
         assert_eq!(
@@ -1359,7 +1321,6 @@ mod tests {
         );
         assert_eq!(past_inbox[0].subject, "since-conformance");
 
-        // Malformed bound → Malformed error, never a silent ignore.
         let err = surface.inbox(&query(Some("not-a-timestamp".into()))).await;
         assert!(matches!(
             err,
@@ -1376,7 +1337,6 @@ mod tests {
     #[tokio::test]
     async fn ensure_project_and_health_are_operation_shaped() {
         let (surface, db_path, data_dir) = test_surface("infra").await;
-        // ADR-0017: a path-form key resolves to its canonical short slug.
         let state = surface
             .ensure_project("some/human/key")
             .await
@@ -1421,7 +1381,6 @@ mod tests {
         assert_eq!(agent.name, "GreenCastle");
         assert!(!agent.npub.is_empty());
         assert!(!agent.key_path.is_empty(), "ncryptsec persisted");
-        // Idempotent upsert: same npub, `created` flips to false.
         let again = surface
             .register_agent(
                 "demo",
@@ -1461,7 +1420,6 @@ mod tests {
         assert_eq!(ok.granted.len(), 2, "both paths granted");
         assert!(ok.conflicts.is_empty());
 
-        // Conflicts: BlueLake collides on the src/** glob.
         let report = surface
             .check_conflicts("demo", "BlueLake", &["src/lib.rs".to_string()])
             .await
@@ -1469,16 +1427,10 @@ mod tests {
         assert!(!report.conflict_free);
         assert_eq!(report.conflicts[0].holders, vec!["GreenCastle".to_string()]);
 
-        // Renew: only the docs lease.
         let renewed = surface
             .renew_reservations("demo", "GreenCastle", &["docs/*.md".to_string()], 60)
             .await
             .expect("renew");
-        // bd-evqs renewal cap + bd-mbh0 contract: a fresh lease (remaining
-        // TTL ≈ 3600s) is NOT republished for a 60s extension — zero events,
-        // no churn (the 1218-event storm). But it IS counted as renewed:
-        // its expiry already guarantees more runway than requested, so
-        // `renewed` equals the live lease set instead of reading as failure.
         assert_eq!(
             renewed.renewed, 1,
             "healthy lease counts as renewed without a republish (bd-mbh0)"
@@ -1492,7 +1444,6 @@ mod tests {
             "capped renewal leaves the lease active (not released)"
         );
 
-        // Release all.
         let released = surface
             .release_reservations("demo", "GreenCastle", &[])
             .await
@@ -1520,7 +1471,7 @@ mod tests {
                 "demo",
                 "GreenCastle",
                 &["src/**".to_string()],
-                Some(60), // near expiry relative to the 300s extension
+                Some(60),
                 true,
                 Some("near-expiry"),
             )
@@ -1533,7 +1484,6 @@ mod tests {
             .await
             .expect("renew");
         assert_eq!(renewed.renewed, 1, "near-expiry lease IS renewed");
-        // The extension ratchets from the OLD absolute expiry + extend.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1612,8 +1562,6 @@ mod tests {
     async fn products_link_search_and_inbox_fan_out_across_members() {
         let (surface, db_path, data_dir) = test_surface("prod").await;
         let green_npub = register_agent(&surface, "alpha", "GreenCastle").await;
-        // ADR-0037 W2: the pin is known in alpha, so beta REUSES its key
-        // behind a proof of possession (one pin, one key).
         let proof = surface
             .mailbox
             .prove_pin_possession("alpha", "GreenCastle", "beta")
@@ -1747,9 +1695,6 @@ mod tests {
             })
             .await
             .expect("send low");
-        // Rumor timestamps are second-granularity (nostr Timestamp), so a
-        // `since` bound can only separate sends in different seconds. Sleep
-        // across a boundary so the urgent send is strictly newer.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         surface
             .send(&SendMail {
@@ -1787,9 +1732,6 @@ mod tests {
         assert_eq!(urgent.len(), 1);
         assert_eq!(urgent[0].subject, "urgent");
 
-        // Anchor `since` on the low row's own timestamp (second-granularity
-        // rumor time — the sleep above guarantees the urgent send is a later
-        // second).
         let low_ts = all
             .iter()
             .find(|m| m.subject == "low")
@@ -2002,8 +1944,6 @@ mod tests {
     #[tokio::test]
     async fn send_burst_past_twelve_is_refused() {
         let (surface, db_path, data_dir) = test_surface("burst").await;
-        // Unique pins: no other test's sends share this guard key, so the
-        // thirteen sends below are exactly the window under test.
         let _ = register_agent(&surface, "demo", "BurstSender").await;
         let _ = register_agent(&surface, "demo", "BurstReceiver").await;
         for i in 0..12 {
@@ -2044,8 +1984,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // ADR-0019 D8 (bd-q6vx): loop-guard unit tests. Pure predicate, clock as
-    // argument — advance fake time past the window edge, no wall time.
     const T1: i64 = 1_793_174_000_000;
 
     #[test]
@@ -2059,11 +1997,9 @@ mod tests {
 
     #[test]
     fn loop_ok_oldest_stamp_aging_out_reopens() {
-        // Oldest stamp exactly on the window edge is excluded (`> lo`).
         let mut stamps: Vec<i64> = (0..11).map(|i| T1 - i * 1_000).collect();
         stamps.push(T1 - LOOP_WINDOW_MS);
         assert!(loop_ok(&stamps, T1, Exempt::None));
-        // One ms inside the window closes it again.
         stamps[11] += 1;
         assert!(!loop_ok(&stamps, T1, Exempt::None));
     }
@@ -2096,8 +2032,6 @@ mod tests {
         for g in ["*", "repo:flywheel", "pin/abc", "chan/general"] {
             assert!(is_group_target(g), "{g}");
         }
-        // The bare captain alias resolves to the one bound captain through
-        // the normal alias path — refusing it would break captain delivery.
         for p in ["MistyCreek", "grok-1", "captain", ""] {
             assert!(!is_group_target(p), "{p}");
         }

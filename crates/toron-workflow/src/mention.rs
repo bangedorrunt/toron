@@ -58,14 +58,13 @@ pub fn wire_mention_dispatch_with_cursor(
 ) -> Vec<Event> {
     let mut jobs = Vec::new();
     for m in parse_mentions(event) {
-        // Honesty: agent-key-signed ≠ delivery proof (call-site assertion).
         let _ = agent_key_is_not_delivery_proof(&m.target.to_hex(), &m.message_id.to_hex());
         let delivery_id = m.message_id.to_hex();
-        let session = m.name.as_str(); // assignee / dispatch session id
+        let session = m.name.as_str();
         if let Some(store) = delivery {
             let (keep, _) = store.peek_undelivered(session, [delivery_id.clone()]);
             if keep.is_empty() {
-                continue; // already delivered / in-flight for this session
+                continue;
             }
         }
         let decision = coalescer.submit(
@@ -79,13 +78,9 @@ pub fn wire_mention_dispatch_with_cursor(
         if let CoalesceDecision::FlushNow(batch) = decision {
             match build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now()) {
                 Ok(ev) => {
-                    // Peek-only: do NOT mark_delivered here. Cursor advance is
-                    // the caller's responsibility after successful publish
-                    // (host peek→publish→mark / with_cursor).
                     jobs.push(ev);
                 }
                 Err(_) => {
-                    // Failed build — nothing to publish; cursor untouched.
                 }
             }
         }
@@ -135,7 +130,6 @@ pub const MENTION_PREFIX: char = '@';
 /// Parse `@name` mentions from content, returning the first `@token` that
 /// matches a `p`-tagged recipient.
 pub fn parse_mentions(event: &Event) -> Vec<Mention> {
-    // The `p` tags carry the mentioned recipients (kind-14 DM or kind-9).
     let mut mentions = Vec::new();
     for tag in event.tags.iter() {
         if tag.kind() != "p" {
@@ -145,9 +139,6 @@ pub fn parse_mentions(event: &Event) -> Vec<Mention> {
         let Some(npub) = parts.get(1).and_then(|s| PublicKey::from_hex(s).ok()) else {
             continue;
         };
-        // Match the first @token in content against this p-tagged npub. The
-        // name is the token without the @; name→npub authoritative mapping is
-        // the project profile index (the p tag is the wire truth here).
         if let Some(name) = content_mentions(&event.content, &npub) {
             mentions.push(Mention {
                 target: npub,
@@ -167,7 +158,6 @@ pub fn content_mentions(content: &str, _npub: &PublicKey) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == MENTION_PREFIX as u8 {
-            // Collect the token: alphanumeric + `_`/`-`.
             let start = i + 1;
             let mut end = start;
             while end < bytes.len()
@@ -256,7 +246,6 @@ mod tests {
         const TS: u64 = 1_700_000_000;
         let requester = keys();
         let bob = keys();
-        // A kind-9 channel post: `@Bob take the repro` + p tag for Bob.
         let post = EventBuilder::new(Kind::from_u16(9), "@Bob take the repro")
             .tags(vec![
                 Tag::parse(["h", "steer-1"]).expect("h"),
@@ -268,7 +257,6 @@ mod tests {
         assert!(is_mention(&post), "@Bob + p tag is a mention");
 
         let mut coalescer = MentionCoalescer::with_defaults();
-        // Sub-window not elapsed → buffered, no immediate flush.
         let jobs = wire_mention_dispatch(&post, &mut coalescer, &requester, Some("toron"), 0);
         assert!(jobs.is_empty(), "single mention buffers until sub-window");
 
@@ -277,7 +265,6 @@ mod tests {
         let job = build_job_from_coalesced(&batch, &requester, Some("toron"), Timestamp::from(TS))
             .expect("build 43001");
         assert_eq!(job.kind.as_u16(), 43001, "one 43001 per coalesced batch");
-        // e-tags the kind-9 post.
         assert!(
             job.tags
                 .iter()
@@ -286,7 +273,6 @@ mod tests {
             "43001 e-tags the post, tags={:?}",
             job.tags
         );
-        // assignee = canonical name; #t = project slug only.
         assert!(
             job.tags.iter().any(
                 |t| t.as_slice().first().map(String::as_str) == Some("assignee")
@@ -324,15 +310,12 @@ mod tests {
                 .finalize(&requester)
                 .expect("post")
         };
-        // Force content to contain @token matching — parse_mentions needs @name
-        // matching p-tag; content_mentions may need the name. Use wire with cursor.
         let store = DeliveryCursorStore::new();
         let coalescer = MentionCoalescer::new(
             std::time::Duration::from_millis(0),
             std::time::Duration::from_millis(0),
             64,
         );
-        // Exercise peek / mark at the call site (advance only after success).
         let session = "OCBeta";
         let id = post.id.to_hex();
         assert!(agent_key_is_not_delivery_proof(
@@ -342,10 +325,8 @@ mod tests {
         let (keep1, _) = store.peek_undelivered(session, [id.clone()]);
         assert_eq!(keep1, vec![id.clone()]);
         assert_eq!(store.cursor(session).cursor, 0, "peek must not advance");
-        // Simulate failed build/publish: no mark → still undelivered.
         let (keep_fail, _) = store.peek_undelivered(session, [id.clone()]);
         assert_eq!(keep_fail, vec![id.clone()]);
-        // Successful path marks.
         store.mark_delivered(session, [id.clone()]);
         let (keep2, fx) = store.peek_undelivered(session, [id.clone()]);
         assert!(keep2.is_empty(), "second delivery skipped after mark");
@@ -353,7 +334,6 @@ mod tests {
             fx[0],
             crate::delivery_cursor::DeliveryEffect::SkipAlreadyDelivered { .. }
         ));
-        // Different session still delivers.
         let (keep3, _) = store.peek_undelivered("other-session", [id]);
         assert_eq!(keep3.len(), 1);
         let _ = (post, coalescer, requester);
@@ -365,17 +345,12 @@ mod tests {
     fn wire_dispatch_peek_only_does_not_mark_on_build() {
         let requester = Keys::generate();
         let agent = Keys::generate();
-        // Cap-1 coalescer so first mention FlushNow-builds immediately.
         let mut coalescer = MentionCoalescer::new(
             std::time::Duration::from_millis(0),
             std::time::Duration::from_millis(0),
             1,
         );
         let store = DeliveryCursorStore::new();
-        // Build a kind-9 with @name matching content_mentions + p tag.
-        // parse_mentions needs @token in content; use a simple post and
-        // drive via InboundMention path indirectly: if parse finds nothing,
-        // jobs stay empty and we still assert cursor unchanged via direct peek.
         let post = {
             use nostr::prelude::{EventBuilder, Kind, Tag};
             EventBuilder::new(Kind::from_u16(9), "@agent please fix")
@@ -393,7 +368,6 @@ mod tests {
             0,
             Some(&store),
         );
-        // Whether or not parse produced a FlushNow job, build must not mark.
         assert_eq!(
             store.cursor(session).cursor,
             0,
@@ -403,7 +377,6 @@ mod tests {
             store.cursor(session).delivered.is_empty(),
             "delivered set must stay empty until caller marks after publish"
         );
-        // If a job was built, caller would publish then mark — simulate mark.
         if !jobs.is_empty() {
             store.mark_delivered(session, [id.clone()]);
             let (keep, _) = store.peek_undelivered(session, [id]);

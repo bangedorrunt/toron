@@ -156,12 +156,8 @@ const DELAY: ActionContract = ActionContract {
 const PARK: ActionContract = ActionContract {
     type_name: "park",
     class: ActionClass::DurableControl,
-    // The park itself is a control step, but it DOES journal an intent before
-    // waiting: that row is what makes the wait resumable after a crash.
     effect: EffectKind::Parked { sink: "park_until" },
     template_fields: &["until_ms", "reason"],
-    // Distinct from Unit: a park's value carries `parked`/`resumed` and the
-    // re-drive key, so a caller can tell a park from a completed step.
     output: OutputKind::AnyNonNull,
     supported: true,
 };
@@ -298,8 +294,6 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
         }
     };
     match action {
-        // bd-ynef: a park with no cap is an unbounded wait and a non-integer
-        // literal wake time is a silent mis-park. Both fail closed here.
         Action::Park {
             until_ms,
             max_wait_secs,
@@ -410,7 +404,6 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
             ..
         } => {
             push(&mut out, non_empty("over", over, "reduce"));
-            // Join folds through its template, never a key.
             if *op == crate::schema::ReduceOp::Join {
                 match template {
                     Some(t) if !t.trim().is_empty() => {}
@@ -421,8 +414,6 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
                     )),
                 }
             }
-            // The accumulator is a literal: templates belong in `over` and
-            // join `template`, so a `{{...}}` here would silently persist.
             if let Some(init) = init {
                 if init.to_string().contains("{{") {
                     out.push(violation(

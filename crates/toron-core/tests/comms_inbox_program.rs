@@ -108,7 +108,6 @@ fn unread_mail_rings_once_with_the_constant_line_by_pane_id() {
         }
         other => panic!("{other:?}"),
     }
-    // Same tick again inside the backoff: nothing. A hint is the same.
     let (_, again) = fold(
         &m,
         &[
@@ -125,18 +124,15 @@ fn unread_mail_rings_once_with_the_constant_line_by_pane_id() {
 #[test]
 fn mail_after_a_read_rings_at_once_but_mail_after_an_unanswered_ring_waits() {
     let (m, _) = fold(&ready(A), &[head(A, 7), tick(1_000)]);
-    // More mail while the first ring is unanswered: no new ring now ...
     let (m2, c) = fold(&m, &[head(A, 9), tick(1_001)]);
     assert_eq!(
         rings(&c),
         0,
         "an unanswered ring is not repeated per message"
     );
-    // ... the backoff rings the newest mark.
     let (_, c) = fold(&m2, &[tick(1_001 + FAR)]);
     assert_eq!(rings(&c), 1);
     assert!(matches!(&c[0], InboxCmd::Ring { wm: 9, .. }));
-    // After a read, fresh mail rings at once, inside any backoff.
     let (m3, _) = fold(&m, &[cursor(A, 7), head(A, 11)]);
     let (_, c) = fold(&m3, &[tick(1_002)]);
     assert_eq!(rings(&c), 1);
@@ -153,10 +149,8 @@ fn a_ring_is_not_a_delivery_only_the_cursor_resets_the_count() {
         now += FAR;
     }
     assert_eq!(m.recipients[A].rings_since_advance, 3);
-    // herdr says idle again, mail re-announced, a stale cursor value: no reset.
     let (m2, _) = fold(&m, &[pane(A, PaneState::Done), cursor(A, 0), head(A, 7)]);
     assert_eq!(m2.recipients[A].rings_since_advance, 3);
-    // The cursor advancing resets it.
     let (m3, _) = fold(&m2, &[cursor(A, 7)]);
     assert_eq!(m3.recipients[A].rings_since_advance, 0);
     assert_eq!(m3.recipients[A].deaf, None);
@@ -187,12 +181,9 @@ fn a_recipient_that_never_reads_goes_deaf_after_exactly_the_budget() {
     assert_eq!(total_rings, MAX_RINGS as usize);
     assert_eq!(deafs, vec![(A.to_string(), 7, DeafCause::NoAnswer)]);
     assert_eq!(other.len(), 2, "one supervisor notify, one captain notify");
-    // New mail to a deaf recipient: one more deaf fact for the new mark,
-    // and still no ring.
     let (m, c) = fold(&m, &[head(A, 9), tick(now)]);
     assert_eq!(rings(&c), 0);
     assert_eq!(deaf(&c), vec![(A.to_string(), 9, DeafCause::NoAnswer)]);
-    // Reading clears it; fresh mail rings again.
     let (m, _) = fold(&m, &[cursor(A, 9)]);
     assert_eq!(m.recipients[A].deaf, None, "reading clears the deaf mark");
     assert_eq!(m.recipients[A].rings_since_advance, 0);
@@ -259,7 +250,6 @@ fn an_unverified_binding_is_never_rung_it_is_reverified_then_escalated() {
     }
     assert_eq!(reverify, 10);
     assert_eq!(deafs, vec![(A.to_string(), 4, DeafCause::Unbound)]);
-    // A verified binding arrives: it rings.
     let (_, c) = fold(&m, &[bound(A, 0, true), tick(11 * FAR)]);
     assert_eq!(rings(&c), 1);
 }
@@ -297,7 +287,6 @@ fn events_lost_stales_every_binding_before_any_ring() {
     );
     assert_eq!(m.events_lost, 1);
     assert_eq!(m.generation, 1);
-    // Only the one that re-verified at the new generation is rung.
     let (_, c) = fold(&m, &[bound(A, 1, true), tick(2 * FAR)]);
     assert_eq!(rings(&c), 1);
     assert!(matches!(&c[0], InboxCmd::Ring { recipient, binding_gen: 1, .. } if recipient == A));
@@ -310,7 +299,6 @@ fn a_deaf_recipient_is_not_rung_again_until_a_new_pane_binds() {
         m = fold(&m, &[tick(i * FAR)]).0;
     }
     assert_eq!(m.recipients[A].deaf, Some(7));
-    // Re-verifying the same pane after events_lost does not reset the budget.
     let (m2, c) = fold(
         &m,
         &[
@@ -321,7 +309,6 @@ fn a_deaf_recipient_is_not_rung_again_until_a_new_pane_binds() {
     );
     assert_eq!(rings(&c), 0);
     assert_eq!(m2.recipients[A].deaf, Some(7));
-    // A different pane (restarted incarnation) gets a fresh budget.
     let (_, c) = fold(
         &m2,
         &[
@@ -392,8 +379,6 @@ fn restart_from_a_serialized_model_decides_the_same() {
 
 #[test]
 fn a_flood_of_hints_through_a_tiny_channel_loses_nothing() {
-    // 10k heads over 8 recipients, every hint beyond the first 64 dropped
-    // (the hint channel is tiny); ticks still read the durable heads.
     let names: Vec<String> = (0..8).map(|i| format!("r{i}")).collect();
     let mut m = InboxModel::default();
     for n in &names {
@@ -403,8 +388,6 @@ fn a_flood_of_hints_through_a_tiny_channel_loses_nothing() {
     let mut delivered_hints = 0;
     for i in 1..=10_000u64 {
         let r = &names[(i % 8) as usize];
-        // Durable fact (the log's head) is always recorded; only the hint
-        // that would trigger an early evaluation is dropped.
         let (n2, _) = fold(&m, &[head(r, i)]);
         m = n2;
         if delivered_hints < 64 {
@@ -419,7 +402,6 @@ fn a_flood_of_hints_through_a_tiny_channel_loses_nothing() {
             m = n3;
         }
     }
-    // The flood alone must not have spent anyone's ring budget.
     for (n, r) in &m.recipients {
         assert!(
             r.rings_since_advance <= 1,
@@ -427,7 +409,6 @@ fn a_flood_of_hints_through_a_tiny_channel_loses_nothing() {
         );
         assert_eq!(r.deaf, None, "{n}: declared deaf by a flood");
     }
-    // Half the recipients read when rung; the rest are deaf.
     let mut now = 1_000_000;
     let mut seen_deaf = std::collections::BTreeSet::new();
     for _ in 0..40 {
@@ -480,10 +461,6 @@ fn the_model_round_trips_and_the_binding_wire_name_is_gen() {
 
 #[test]
 fn old_records_with_herdr_names_still_read() {
-    // The `herdr_session` -> `plane_session` / `HerdrRestarted` ->
-    // `PlaneRestarted` rename keeps wire compat through serde aliases:
-    // a journal written before the rename deserializes into the new
-    // model unchanged.
     let b: Binding = serde_json::from_str(
         r#"{"pane_id":"w1:p","herdr_session":"s","gen":3,"verified":true,"verified_by":"env"}"#,
     )
@@ -498,10 +475,6 @@ fn old_records_with_herdr_names_still_read() {
         InboxMsg::Bound { plane_session, .. } => assert_eq!(plane_session, "s1"),
         other => panic!("unexpected {other:?}"),
     }
-    // Old wire name is snake_case (`rename_all`); the Rust-case alias is
-    // belt-and-braces for records written by other producers. The old
-    // envelope is derived from the live one so the test tracks the real
-    // journal shape, not a hand-written guess.
     let live = serde_json::to_string(&InboxMsg::Invalidate(Invalidate::PlaneRestarted)).unwrap();
     assert!(live.contains("plane_restarted"), "{live}");
     for old in ["herdr_restarted", "HerdrRestarted"] {
@@ -509,8 +482,6 @@ fn old_records_with_herdr_names_still_read() {
         assert_eq!(back, InboxMsg::Invalidate(Invalidate::PlaneRestarted));
     }
 }
-
-// ---- properties -----------------------------------------------------
 
 fn arb_msg() -> impl Strategy<Value = InboxMsg> {
     let who = prop_oneof![Just(A.to_string()), Just(B.to_string())];
@@ -618,8 +589,6 @@ proptest! {
         for (n, r) in &m.recipients {
             let caught_up = r.cursor >= r.head;
             if readers {
-                // A reader is caught up, unless history had already spent its
-                // budget (deaf recipients are not rung again).
                 prop_assert!(caught_up || r.deaf.is_some(), "{n}: reader neither caught up nor deaf: {r:?}");
             } else {
                 prop_assert!(caught_up || deafs.contains(n) || r.deaf.is_some(),

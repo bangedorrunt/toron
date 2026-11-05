@@ -71,15 +71,11 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     register(&mailbox, "demo", "PiAlpha").await;
     register(&mailbox, "demo", "OCBeta").await;
 
-    // --- Reactive trigger: subscribe to kind-30031 (reservation) events,
-    //     filter for status:released. This is the `reservation_released`
-    //     workflow trigger, delivered by BUS PUSH (zero polling). ---
     let mut trigger_sub = bus
         .subscribe(Filter::new().kinds([Kind::from(30031)]).hashtag("demo"))
         .await
         .expect("subscribe reservation events");
 
-    // --- 1. Pi-α reserves src/** then releases (finishes) ---
     let acquire = mailbox
         .file_reservation_paths(
             "demo",
@@ -99,8 +95,6 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
         .expect("PiAlpha release");
     assert!(released.released >= 1, "lease released");
 
-    // --- 2. Trigger fires on the BUS EVENT (not poll): the reactive
-    //        subscriber receives the release push. ---
     let released_event = tokio::time::timeout(Duration::from_millis(200), async {
         loop {
             match trigger_sub.next().await {
@@ -121,8 +115,6 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     .expect("reservation_released event on bus");
     assert_eq!(released_event.kind.as_u16(), 30031, "kind-30031 release");
 
-    // --- Trigger matched the schema's `reservation_released` trigger ---
-    // (the schema names the trigger the embedding uses to dispatch).
     assert_eq!(
         Trigger::ReservationReleased {
             project: "demo".into(),
@@ -132,9 +124,6 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
         "reservation_released"
     );
 
-    // --- 3. dispatch_job: build kind-43001 for OC-β, enqueue to A7 pool ---
-    // Sign with fresh keys (the flow's identity; the mailbox persistence is
-    // exercised by the reservation leg above).
     let pi_keys = Keys::generate();
     let oc_keys = Keys::generate();
     let job_req = build_job_request(
@@ -161,10 +150,6 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     });
     assert_eq!(depth, 1, "job queued");
 
-    // kind-43001 for OC-β: assignee tag present (ADR-0003 A3/G6: the `t` tag
-    // is RESERVED for project scoping — using it for the assignee would make
-    // global bus subscribers drop the job at the access_gate, so the job uses
-    // a free-form `assignee` tag; jobs.rs:93-98).
     assert_eq!(job_req.kind.as_u16(), 43001, "kind-43001");
     assert!(
         job_req.tags.iter().any(
@@ -174,11 +159,9 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
         "job targeted at OC-β"
     );
 
-    // --- Dispatch bounded: one-in-flight-per-agent (A7) ---
     let permit = pool.try_acquire("OCBeta").expect("first permit");
     assert!(pool.try_acquire("OCBeta").is_none(), "one-in-flight");
 
-    // --- OC-β claims (kind-43002, first-claimer wins) ---
     let claim = build_job_claim(&oc_keys, job_req.id, Timestamp::now()).expect("build claim");
     assert_eq!(claim.kind.as_u16(), 43002, "kind-43002 claim");
     let events = vec![claim];
@@ -188,7 +171,6 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
         "OC-β is the first claimer"
     );
 
-    // Cleanup: release the permit.
     drop(permit);
 
     let _ = std::fs::remove_dir_all(dir);

@@ -113,8 +113,6 @@ async fn subscribe(fx: &Fixture, kinds: &[u16]) -> BufReader<tokio::net::unix::O
     })
     .to_string();
     req.push('\n');
-    // A refused subscriber's socket is already closed: the write failing IS
-    // the refusal, so it must not fail the test.
     let _ = writer.write_all(req.as_bytes()).await;
     BufReader::new(reader)
 }
@@ -144,7 +142,6 @@ async fn the_cap_refuses_a_subscriber_and_the_plane_keeps_serving() {
     fx.serve(1, 100).await;
     let h = fx.handle.as_ref().expect("handle");
 
-    // One subscriber inside the cap is served.
     let mut first = subscribe(&fx, &[9]).await;
     let eose = read_frame(&mut first)
         .await
@@ -156,8 +153,6 @@ async fn the_cap_refuses_a_subscriber_and_the_plane_keeps_serving() {
         h.aggregate_stats()
     );
 
-    // The next subscriber is refused: its connection is dropped, so it reads
-    // EOF instead of a frame.
     let mut refused = subscribe(&fx, &[9]).await;
     assert!(
         read_frame(&mut refused).await.is_none(),
@@ -172,8 +167,6 @@ async fn the_cap_refuses_a_subscriber_and_the_plane_keeps_serving() {
         "the refused subscriber took no slot: {stats:?}"
     );
 
-    // The plane still serves: once the first subscriber leaves, a new one is
-    // served normally. The daemon survived the refusal.
     drop(first);
     assert!(wait_live(h, 0).await, "the first subscriber left");
     let mut third = subscribe(&fx, &[9]).await;
@@ -200,8 +193,6 @@ async fn a_dead_subscriber_is_reclaimed_while_the_bus_rings() {
     assert!(eose.contains("eose"), "expected eose, got {eose:?}");
     assert!(wait_live(h, 1).await, "the subscriber is live");
 
-    // A busy bus: rings faster than the heartbeat interval, so the quiet
-    // tick never wins.
     let publisher = {
         let bus = fx.bus.clone();
         tokio::spawn(async move {
@@ -220,11 +211,8 @@ async fn a_dead_subscriber_is_reclaimed_while_the_bus_rings() {
         })
     };
 
-    // The subscriber's peer goes away.
     drop(reader);
 
-    // The reclaim bound is one heartbeat interval: the daemon's next
-    // heartbeat write fails and the fd is released.
     let mut released = false;
     for _ in 0..200 {
         let stats = h.aggregate_stats();

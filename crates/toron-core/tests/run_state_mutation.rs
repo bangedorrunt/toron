@@ -244,8 +244,6 @@ fn violations(source: &str) -> Vec<String> {
         .collect()
 }
 
-// --- 1. the real source breaks nothing ------------------------------------
-
 #[test]
 fn the_store_breaks_no_invariant_this_file_pins() {
     assert_eq!(
@@ -256,14 +254,8 @@ fn the_store_breaks_no_invariant_this_file_pins() {
     );
 }
 
-// --- 2. every detector's anchor is still present -------------------------
-
 #[test]
 fn every_detector_still_finds_what_it_claims_to_check() {
-    // VACUITY GUARD. A detector whose anchor has been renamed matches nothing
-    // and reports nothing, so it would "pass" forever. Each signature must
-    // still exist in the source, or this file is guarding a building that
-    // moved.
     for (sig, name) in [
         ("pub async fn latest(", "latest_orders_by_seq"),
         ("pub async fn history(", "history_is_bounded_and_ordered"),
@@ -290,8 +282,6 @@ fn every_detector_still_finds_what_it_claims_to_check() {
         );
     }
 }
-
-// --- 3. the mutations ----------------------------------------------------
 
 /// A mutation: the anchor it lands inside, the invariant it must break, the
 /// text it replaces, and what the change would mean if it shipped.
@@ -402,9 +392,6 @@ fn every_mutation_is_caught_by_the_detector_that_guards_it() {
 
 #[test]
 fn a_mutation_to_one_invariant_does_not_trip_the_others() {
-    // The converse direction, and the one that catches a detector written so
-    // loosely it fires on everything. If a single mutation reported every
-    // invariant, "it caught it" would prove nothing about which pin did it.
     for (anchor, name, find, replace, what) in mutations() {
         let mutated = mutate(SOURCE, anchor, find, replace).expect("mutation applies");
         let broken = violations(&mutated);

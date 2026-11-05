@@ -132,7 +132,6 @@ async fn mention_outcome(
     coalescer: Option<&std::sync::Mutex<MentionCoalescer>>,
 ) -> ProviderOutcome {
     match decision {
-        // T1: CapMention Buffered must NOT Settled-Delivered before tick/wire publish.
         CoalesceDecision::Buffered { .. } => ProviderOutcome::Deferred(serde_json::json!({
             "ok": true,
             "coalesced": true,
@@ -140,19 +139,11 @@ async fn mention_outcome(
             "buffered": true,
             "effect_key": key,
         })),
-        // GS-062: FlushNow shares peek→publish→mark with the trigger-loop
-        // timer flush via publish_coalesced_job_with_cursor (never delivery=None
-        // when the host owns a DeliveryCursorStore). Captain C: also acquire
-        // on this arm (timer flush already did) — completeness for kind-43001.
         CoalesceDecision::FlushNow(coalesced) => {
             let permit = if let Some(pool) = pool {
                 match host_acquire_for_assignee(pool, &coalesced.assignee, now_ms()).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        // Do not drop the already-flushed burst — Transient
-                        // requeue with backoff (TRANSPORT-REQUEUE-HOT-SPIN).
-                        // T1: Deferred (Accepted), not Delivered{deferred} Settled,
-                        // not Ambiguous→Unknown dual-publish.
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             let assignee = coalesced.assignee.clone();
@@ -167,7 +158,6 @@ async fn mention_outcome(
                                     }));
                                 }
                                 RequeueOutcome::Exhausted => {
-                                    // T2: requeue already parked whole batch on DLQ.
                                     g.clear_retry(&assignee);
                                     return ProviderOutcome::ProvenFailed(format!(
                                         "dispatch acquire retry budget exhausted: {e}"
@@ -199,8 +189,6 @@ async fn mention_outcome(
                         }))
                     }
                     Err(CoalescePublishError::NoSigner) => {
-                        // GS-062 NOSIGNER + T3: terminal ProvenFailed, park DLQ
-                        // (never Failed+requeue; never silent drop).
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             g.park_dlq(coalesced, DlqReason::NoSigner);
@@ -210,8 +198,6 @@ async fn mention_outcome(
                         ProviderOutcome::ProvenFailed("no job signer configured".to_string())
                     }
                     Err(CoalescePublishError::AlreadyDelivered) => {
-                        // Cursor proves delivered → Delivered/Settled.
-                        // Mirror timer AlreadyDelivered: clear Transient retry map.
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             g.clear_retry(&coalesced.assignee);
@@ -226,8 +212,6 @@ async fn mention_outcome(
                         }))
                     }
                     Err(CoalescePublishError::InFlight) => {
-                        // Concurrent reserve — NOT Settled. FreshWindow requeue
-                        // (no Transient budget) + Ambiguous/retry.
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             let _ = g.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
@@ -239,10 +223,6 @@ async fn mention_outcome(
                         )
                     }
                     Err(CoalescePublishError::Transport(e)) => {
-                        // GS-062 T1: Transient requeue + Deferred (Accepted) —
-                        // NOT Delivered{deferred} Settled, NOT Ambiguous→Unknown
-                        // dual-publish via DispatchJob force-retry.
-                        // T2 Exhausted: DLQ park (in requeue) + ProvenFailed.
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             let assignee = coalesced.assignee.clone();
@@ -258,10 +238,6 @@ async fn mention_outcome(
                                 }
                                 RequeueOutcome::Exhausted => {
                                     g.clear_retry(&assignee);
-                                    // bd-x4qw: release the coalescer lock before
-                                    // building the outcome. Holding it across the
-                                    // rest of the block serialized every other
-                                    // publisher on the same coalescer.
                                     drop(g);
                                     ProviderOutcome::ProvenFailed(format!(
                                         "transport retry budget exhausted: {e}"
@@ -286,8 +262,6 @@ async fn mention_outcome(
 fn fenced_outcome(key: &str, result: anyhow::Result<DispatchResult>) -> serde_json::Value {
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
-        // T1 Deferred → Accepted: runner sees hand-off payload; journal stays
-        // non-Settled (not Delivered/Settled before wire publish).
         Ok(res) if res.state == EffectState::Accepted => res.outcome,
         Ok(res) => serde_json::json!({
             "ok": false,
@@ -474,9 +448,6 @@ pub fn mailbox_async_effect_runner_with_delivery(
         let dispatch_pool = dispatch_pool.clone();
         let inv = inv.clone();
         Box::pin(async move {
-            // The `invoke` contract over an async provider: partition
-            // first, then normalize the awaited provider result with the
-            // same functions, so sync and async paths classify identically.
             let outcome = match toron_workflow::engine::partition(&inv.action) {
                 ActionPartition::EngineControl => {
                     Err(Box::new(failure_for_control_misdispatch(&inv.action)))
@@ -512,9 +483,6 @@ pub fn mailbox_async_effect_runner_with_delivery(
 /// fenced journaling when a dispatcher is attached, direct classified sends
 /// otherwise. Every await is inline — the caller drives this future on the
 /// engine's runtime.
-// bd-x4qw: 8 config/Arc params and ONE call site. Grouping them into a struct
-// would be a plumbing refactor of a 7000-line host for zero behavioural gain, so
-// this takes the same reasoned allow control_flow.rs uses for the same shape.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_host_sink(
     mailbox: Arc<Mailbox>,
@@ -585,11 +553,6 @@ async fn dispatch_host_sink(
                 spec: serde_json::to_value(&spec).expect("DispatchSpec is JSON-serializable"),
             };
             let now = now_ms();
-            // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
-            // Mutex poison — a panic inside the guard must not brick
-            // every subsequent flush (panic-in-panic = dead service).
-            // The guard is scoped to submit ONLY — the coalesced job is
-            // owned, the guard drops, THEN the async publish runs.
             let decision = {
                 let mut c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
                 c.submit(mention, now)
@@ -602,8 +565,6 @@ async fn dispatch_host_sink(
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let Some(disp) = disp else {
-                // No journal: direct hand-off; failures return Err
-                // so the normalization classifies them (I5) identically.
                 return match mention_outcome(
                     bus.as_ref(),
                     job_signer.as_ref(),
@@ -621,13 +582,6 @@ async fn dispatch_host_sink(
                     }
                 };
             };
-            // bd-1kr2 / GS-062 T1: fenced @mention hand-off. Buffered is
-            // Deferred→Accepted (non-Settled) until tick/wire publish;
-            // Settled only on FlushNow publish success / AlreadyDelivered.
-            // In-memory coalescer crash-loss window unchanged and documented.
-            // A coalesced 43001 merges N effects into one job, so no
-            // single corr rides it — per-effect corr lives in the
-            // journal's transport_corr projection (linked by dispatch).
             let key_out = key.clone();
             Ok(fenced_outcome(
                 &key_out,
@@ -654,18 +608,7 @@ async fn dispatch_host_sink(
                 .await,
             ))
         }
-        // `verify` (bd-engine-run-path-journaling-fwlx): the engine
-        // already executed the embedding's `VerifySink` and handed the
-        // observed result over on the invocation (ADR-0024 Spec 2), so
-        // this journals an effect that already happened — the provider
-        // re-runs nothing. Journaling here is what keeps the host's
-        // Enforced contract honest: without it a sink this runner did
-        // not cover would perform a real command with NO journal row.
         Action::Verify { .. } => {
-            // No `engine.verify_sink()` is attached on this host, so the
-            // observed value is normally the sink's own
-            // `{ok:false, error:"verify sink missing"}` — a typed
-            // failure naming the real cause, not a generic one.
             let observed = inv.run.provider_result.clone().unwrap_or_else(
                 || serde_json::json!({ "ok": false, "error": "verify sink missing" }),
             );
@@ -676,8 +619,6 @@ async fn dispatch_host_sink(
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let Some(disp) = disp else {
-                // No journal attached: hand the observation straight
-                // through; the normalization classifies it (I5) identically.
                 return Ok(observed);
             };
             let key_out = key;
@@ -687,8 +628,6 @@ async fn dispatch_host_sink(
                     .await,
             ))
         }
-        // Any other HostSink has no sink on this mailbox-only runner —
-        // fail loud, never silently succeed.
         _ => Err(anyhow::anyhow!(
             "effect runner has no sink for '{}'",
             inv.action.type_name()
@@ -706,8 +645,6 @@ async fn dispatch_host_sink(
 fn armored_send_request(mailbox: Arc<Mailbox>, msg: SendMessage) -> SendRequest {
     SendRequest {
         send: Arc::new(move || {
-            // Cloned per call: the armor never re-fires, but the closure
-            // must stay callable (tower services are `Clone`).
             let msg = msg.clone();
             let mailbox = mailbox.clone();
             Box::pin(async move {
@@ -734,8 +671,6 @@ async fn send_via_dispatch(
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let Some(disp) = disp else {
-        // Direct path: armored send, pre-journal value shape preserved
-        // ({ok,count} / Err) so dry embeddings read identically.
         return match armor.send(armored_send_request(mailbox, msg)).await {
             Ok(sent) => match sent {
                 Ok(count) => Ok(serde_json::json!({ "ok": true, "count": count })),
@@ -757,9 +692,6 @@ async fn send_via_dispatch(
             async move {
                 match armor.send(armored_send_request(mailbox, msg)).await {
                     Ok(sent) => mail_outcome(sent, key),
-                    // Storm fail-fast is a DETERMINED refusal (the send did
-                    // not happen): settle Failed, never Unknown — reconcile
-                    // must not retry what was deliberately refused.
                     Err(ArmorError::BreakerOpen) => ProviderOutcome::ProvenFailed(
                         "send refused: breaker open (storm fail-fast)".to_string(),
                     ),
@@ -815,8 +747,6 @@ pub async fn host_acquire_for_assignee<'a>(
     assignee: &str,
     now_ms: u64,
 ) -> Result<DispatchPermit<'a>, String> {
-    // Retry across the full hold_bound window (DEFAULT_HOLD_BOUND_MS=10_000).
-    // Truncating sleep to 5s amplified HoldContinued/HoldExpired drops.
     let hold_bound = pool.hold_bound_ms().max(1);
     let deadline = now_ms.saturating_add(hold_bound);
     let mut attempt_now = now_ms;
@@ -827,7 +757,6 @@ pub async fn host_acquire_for_assignee<'a>(
             DispatchAcquire::Park {
                 until_ms, effects, ..
             } => {
-                // Journal/park SleepUntilDeadline (settlement ≠ provider done).
                 tracing::debug!(
                     assignee,
                     until_ms,
@@ -836,7 +765,6 @@ pub async fn host_acquire_for_assignee<'a>(
                     "host DispatchAcquire::Park — sleep full park window then deadline_wake"
                 );
                 let wait_ms = until_ms.saturating_sub(attempt_now).max(1);
-                // Align with hold_bound — never truncate (was .min(5_000)).
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                 attempt_now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -902,30 +830,21 @@ pub async fn publish_coalesced_job_with_cursor(
 ) -> Result<EventId, CoalescePublishError> {
     let parent_ids = coalesced.parent_ids();
     let session = coalesced.assignee.as_str();
-    // GS-062 INFLIGHT-RESERVATION-LEAK: RAII guard clears in_flight on
-    // cancel/panic/early return between reserve and mark.
     let mut reservation: Option<toron_workflow::ReservationGuard<'_>> = None;
-    // GS-062 PARTIAL-KEEP-FULL-SPEC: when keep ⊂ parents, publish only reserved.
     let mut filtered: Option<Coalesced> = None;
-    // DispatchJob / synthetic bursts may carry empty parents — no delivery id
-    // to dedup, so the cursor gate does not apply (do not treat keep=[] as skip).
     if let Some(store) = delivery
         && !parent_ids.is_empty()
     {
         let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
         let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
-        // Reserve all parents under the lock — do not advance delivered yet.
         let (keep, effects) = store.reserve_undelivered(session, parent_ids.clone());
         if keep.is_empty() {
-            // Distinguish true already-delivered from concurrent in-flight
-            // empty-keep (SkipInFlight). In-flight must NOT Settled.
             let any_inflight = effects
                 .iter()
                 .any(|e| matches!(e, toron_workflow::DeliveryEffect::SkipInFlight { .. }));
             if any_inflight {
                 return Err(CoalescePublishError::InFlight);
             }
-            // All SkipAlreadyDelivered (cursor proves delivered).
             return Err(CoalescePublishError::AlreadyDelivered);
         }
         if keep.len() != parent_ids.len() {
@@ -937,19 +856,15 @@ pub async fn publish_coalesced_job_with_cursor(
     let event = match build_coalesced_job_event(signer, to_publish) {
         Some(ev) => ev,
         None => {
-            // reservation Drop releases in_flight
             return Err(CoalescePublishError::NoSigner);
         }
     };
     match bus.publish(event.clone()).await {
         Ok(_) => {}
         Err(e) => {
-            // reservation Drop releases in_flight
             return Err(CoalescePublishError::Transport(format!("bus publish: {e}")));
         }
     }
-    // Mark only after successful publish (reserved keep, or all parents when
-    // no cursor gate applied).
     if let Some(guard) = reservation.take() {
         guard.commit();
     } else if let Some(store) = delivery
@@ -1116,8 +1031,6 @@ pub fn durable_route(
     if let Some(reason) = unsupported_reason(workflow) {
         return Err(reason);
     }
-    // Capability, not shape: a spawn workflow on a host with no launcher
-    // would park on a launch nobody can perform.
     if !spawn_capable && let Some(reason) = spawn_launcher_refusal(workflow) {
         return Err(reason);
     }
@@ -1224,11 +1137,6 @@ impl WorkflowHost {
             let _ = lifecycle.register(w.name.clone());
         }
         let job_signer = mailbox.operator().cloned();
-        // bd-cnr5 + bd-1kr2: production touches the durable journal — when
-        // the mailbox carries the index pool, run states + terminal dedupe
-        // persist in workflow_runs / workflow_terminal_events instead of
-        // dying with the host process, and the effect arms dispatch
-        // through the fenced EffectDispatcher (Spec 5.3).
         let store = mailbox
             .index_pool()
             .map(|pool| WorkflowEffectStore::new(pool.clone()));
@@ -1238,10 +1146,6 @@ impl WorkflowHost {
         let pending = store.map_or_else(PendingDrain::new, |store| {
             PendingDrain::new().with_store(store)
         });
-        // bd-qdup: one shared tower armor (timeout inner, bulkhead,
-        // breaker, explicit fallback) guards every mailbox send below.
-        // bd-ctj7: no sync runner exists anymore — the engine computes pure
-        // leaves itself and awaits the async seam for the rest.
         let dispatch_pool = Arc::new(DispatchPool::new(DispatchConfig::default()));
         let async_effect_runner = mailbox_async_effect_runner_with_delivery(
             mailbox.clone(),
@@ -1256,20 +1160,9 @@ impl WorkflowHost {
             Some(delivery.clone()),
             Some(dispatch_pool.clone()),
         );
-        // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
-        // really dispatches, so its engine is Enforced — an effectful leaf
-        // with no journal seam fails loud instead of running unjournaled.
-        // bd-mi9n: the engine also reports its OWN run lifecycle through the
-        // same store, so an engine-driven run's `workflow_runs` row exists
-        // without the host calling `track_run_durable` — and both go through
-        // the one `apply_run_status` path (no double-write).
         let async_run_journal = pending
             .store()
             .map(|store| async_run_journal(store.clone()));
-        // ADR-0043: the engine is the in-process durable driver. There is no
-        // server to probe; a store-backed host attaches its SQLite so the
-        // engine's own runs survive a restart, and a store-less host gets the
-        // in-memory kernel.
         let seams_runner = async_effect_runner.clone();
         let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
             WorkflowEngine::default_resolver(),
@@ -1284,7 +1177,6 @@ impl WorkflowHost {
             None => engine,
         };
         let bus = mailbox.bus().clone();
-        // bd-host-cut-pqkg: context-free seams over the same runner + sink.
         let seams = LeafSeams {
             async_runner: Some(seams_runner),
             sync_runner: None,
@@ -1297,8 +1189,6 @@ impl WorkflowHost {
             engine: Arc::new(engine),
             bus,
             workflows: Arc::new(std::sync::Mutex::new(workflows)),
-            // bd-x4qw: both are last-used here (lifecycle already registered
-            // inside the match arms above), so the clone was pure extra Arc traffic.
             lifecycle,
             delivery,
             coalescer,
@@ -1324,7 +1214,6 @@ impl WorkflowHost {
     ) -> Result<Self> {
         let engine = WorkflowEngine::local_with_async_effect_runner(effect.clone())
             .context("workflow engine")?;
-        // bd-host-cut-pqkg: journal-less embeddings run Recording, like the arm above.
         let seams = LeafSeams {
             journal_mode: if effect.is_some() {
                 EffectJournalMode::Enforced
@@ -1381,7 +1270,6 @@ impl WorkflowHost {
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
             dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
-            // bd-host-cut-pqkg: inert without a store (the router never selects it).
             seams: LeafSeams::default(),
             durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_seams: SpawnSeams::default(),
@@ -1448,9 +1336,6 @@ impl WorkflowHost {
     /// Register an additional workflow (idempotent by name).
     /// GS-062: also registers with [`WorkflowLifecycle`] under one lock.
     pub fn add_workflow(&mut self, workflow: Workflow) {
-        // GS-062 lock order: NEVER call lifecycle.register while holding
-        // workflows — soft_delete takes lifecycle then workflows; opposite
-        // order on Arc Clone deadlocks. Register first, then workflows.
         let name = workflow.name.clone();
         {
             let defs = self
@@ -1460,13 +1345,12 @@ impl WorkflowHost {
             if defs.iter().any(|w| w.name == name) {
                 return;
             }
-        } // release workflows before lifecycle.register
+        }
         let _ = self.lifecycle.register(name.clone());
         let mut defs = self
             .workflows
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // Re-check under lock so concurrent add_workflow cannot duplicate.
         if !defs.iter().any(|w| w.name == name) {
             defs.push(workflow);
         }
@@ -1536,8 +1420,6 @@ impl WorkflowHost {
             "evidence_hash": entry.evidence_hash,
             "deadline_secs": entry.deadline_secs,
         });
-        // Graph parks carry the full evidence payload; the linear body stays
-        // byte-identical because the key is only inserted when present.
         if let (Some(payload), Some(obj)) = (&entry.payload, body.as_object_mut()) {
             obj.insert("payload".into(), payload.clone());
         }
@@ -1599,8 +1481,6 @@ impl WorkflowHost {
         node: &str,
         evidence: &str,
     ) -> Result<TerminalNote> {
-        // bd-cnr5: parse the status LOUD before any side effect —
-        // unrecognized strings never silently become Failed.
         let terminal_state = RunState::parse_status(status)
             .map_err(|e| anyhow::anyhow!("refusing terminal with {e}"))?;
         if !terminal_state.is_terminal() {
@@ -1613,9 +1493,6 @@ impl WorkflowHost {
             status: status.to_string(),
             node: node.to_string(),
         };
-        // bd-cnr5: durable dedupe is authoritative when a store is
-        // attached; memory mirrors it. Duplicate short-circuits before
-        // any bus write.
         let has_store = self.pending.lock().await.store().is_some();
         let note = if has_store {
             self.pending
@@ -1633,10 +1510,6 @@ impl WorkflowHost {
             .job_signer
             .as_ref()
             .context("no signer: cannot publish kind-46012 terminal")?;
-        // bd-terminal-shape-tbik: kind-46012 carries the run OUTCOME, never a
-        // wrapper around it. The durable settle path passes the outcome as
-        // JSON (the graph outputs map on success, the enriched bundle on
-        // failure); a bare string is legacy and becomes a minimal object.
         let mut outcome: serde_json::Value = serde_json::from_str(evidence)
             .ok()
             .filter(serde_json::Value::is_object)
@@ -1646,7 +1519,6 @@ impl WorkflowHost {
                 .or_insert_with(|| serde_json::json!(status));
             obj.entry("run_id")
                 .or_insert_with(|| serde_json::json!(run_id));
-            // The old success body has no failed_step at all.
             if status == "failed" && !node.is_empty() {
                 obj.entry("failed_step")
                     .or_insert_with(|| serde_json::json!(node));
@@ -1659,9 +1531,6 @@ impl WorkflowHost {
             .await
             .map_err(|e| anyhow::anyhow!("publish 46012: {e}"))?;
         if has_store {
-            // Journal the publication; a crash between bus publish and
-            // this mark retries the same digest (idempotent, never a
-            // second semantic terminal).
             let store = self.pending.lock().await.store().cloned();
             if let Some(store) = store {
                 let _ = store.mark_terminal_published(&digest).await;
@@ -1722,8 +1591,6 @@ impl WorkflowHost {
     /// then resolve or reject the exact promise. Mismatches are recorded in
     /// the drain and returned as errors — they never touch a promise.
     pub async fn resolve_parked(&self, res: Resolution) -> Result<PendingEntry> {
-        // bd-host-cut-pqkg: durable parks carry no promise id; the run id is
-        // the correlation key and the decision lands through the state store.
         let park = {
             let parks = self
                 .durable_parks
@@ -1811,12 +1678,9 @@ impl WorkflowHost {
     /// re-draining until the run is terminal, so parks created after the
     /// first await point are picked up without waiting for bus traffic.
     async fn spawn_run_and_drain(&self, run_id: String, workflow: Workflow, input: RunInput) {
-        // GS-062: refuse soft-deleted / non-executable definitions (Buzz #7735).
         match self.lifecycle.try_start(&workflow.name) {
             LifecycleEffect::StartAdmitted { .. } => {}
             LifecycleEffect::NotFound { .. } => {
-                // Definitions loaded at construct may predate lifecycle register —
-                // admit once by registering lazily, then proceed.
                 let _ = self.lifecycle.register(workflow.name.clone());
             }
             other => {
@@ -1829,7 +1693,6 @@ impl WorkflowHost {
                 return;
             }
         }
-        // bd-cnr5: durable track — the workflow_runs row outlives the host.
         if let Err(e) = self
             .pending
             .lock()
@@ -1839,8 +1702,6 @@ impl WorkflowHost {
         {
             warn!(run_id = %run_id, "durable run track failed (memory still tracked): {e:#}");
         }
-        // bd-host-cut-pqkg: linear workflows run on the durable host; the
-        // router refuses before any engine or model row exists.
         let has_store = self.pending.lock().await.store().is_some();
         if durable_route(&workflow, has_store, self.spawn_capable()).is_ok() {
             let me = self.clone();
@@ -1917,8 +1778,6 @@ impl WorkflowHost {
                 return;
             }
         };
-        // bd-durable-parallel-53um: a `steps:` fan-out runs on the graph model
-        // too — the lowering happens at open, this is only the routing.
         if needs_graph_model(&workflow) {
             self.run_durable_graph_loop(run_id, workflow, input).await;
             return;
@@ -1949,10 +1808,6 @@ impl WorkflowHost {
                 return;
             }
             Ok(Err(e)) => {
-                // Only an unrepairable open settles the run: a corrupt model
-                // cannot resume, and a terminal engine row is already an
-                // outcome. A store/engine error is transient — the model is
-                // still resumable, so the sweep retries it.
                 match &e {
                     HostError::Corrupt(_) | HostError::Finished { .. } => {
                         warn!(run_id = %run_id, "durable open failed: {e}; settling the run");
@@ -1969,9 +1824,6 @@ impl WorkflowHost {
                 return;
             }
         };
-        // bd-host-cut-pqkg: the same digest helper the old path uses
-        // (`control_flow` feeds it into every invocation), computed once per
-        // run so every step's effect key is stable across restarts.
         let digest = workflow_digest(&workflow);
         self.drive_tracked(run, effects, run_id, workflow, input.trigger, digest)
             .await;
@@ -2211,9 +2063,6 @@ impl WorkflowHost {
                             &self.seams,
                         )
                         .await;
-                        // One carrier: the fold applies is_failure_value +
-                        // on_error, so a `continue` failure keeps its full
-                        // value (Captain addendum, failure carrier).
                         let then = move |mut run: HostDurableRun| {
                             run.step_done(value, durable_now_ms()).map(|eff| (run, eff))
                         };
@@ -2226,10 +2075,6 @@ impl WorkflowHost {
                         follow.append(&mut eff);
                     }
                     RunEffect::ParkUntil { until_ms, .. } => {
-                        // A park whose deadline already passed re-wakes inside
-                        // the same `apply` that emitted it, so the model is
-                        // already Running and this effect is stale: skip it
-                        // instead of calling `woke` out of phase.
                         if !matches!(run.model().phase, ModelPhase::Parked { .. }) {
                             continue;
                         }
@@ -2263,18 +2108,10 @@ impl WorkflowHost {
                         return;
                     }
                     RunEffect::StartSpawn { node, spec } => {
-                        // The model already persisted `AwaitingSpawn` (model
-                        // first). kind-43001 is EVIDENCE; the launch itself
-                        // goes through the host's own seam, because the
-                        // embedded bus never reaches the process that owns the
-                        // pane (Captain addendum, 2026-11-02).
                         if let Err(e) = self.publish_durable_spawn(&spec).await {
                             warn!(run_id = %run_id, "durable spawn publication failed (launch continues): {e:#}");
                         }
                         let Some(launcher) = self.spawn_seams.launcher.clone() else {
-                            // The router and `open_with_seams` both refuse this
-                            // shape without a launcher; reaching here means the
-                            // host changed under a live run.
                             error!(
                                 run_id = %run_id,
                                 "INVARIANT VIOLATION: durable StartSpawn with no launcher; stopping"
@@ -2301,10 +2138,6 @@ impl WorkflowHost {
                                             .map(|eff| (run, eff))
                                     })
                                 }
-                                // The fold owns the canonical timeout text.
-                                // The fold owns the canonical timeout text. The
-                                // wake is stamped at the deadline so clock
-                                // granularity cannot put it just under and re-park.
                                 SpawnLaunch::TimedOut => {
                                     let now = durable_now_ms().max(deadline.unwrap_or(0));
                                     Box::new(move |mut run| run.woke(now).map(|eff| (run, eff)))
@@ -2322,9 +2155,6 @@ impl WorkflowHost {
                         if let Err(e) = self.publish_durable_spawn(&spec).await {
                             warn!(run_id = %run_id, "durable detached spawn publication failed: {e:#}");
                         }
-                        // `await: false` means the run does not wait for the
-                        // JOB; the child must still start before the run moves
-                        // past this effect, so the launch is awaited.
                         if let Some(launcher) = self.spawn_seams.launcher.clone() {
                             match launcher(spec.clone()).await {
                                 Ok(_) => debug!(run_id = %run_id, "detached spawn launched"),
@@ -2342,8 +2172,6 @@ impl WorkflowHost {
                         return;
                     }
                     RunEffect::Fail { step, output } => {
-                        // The addendum's carrier: the settle evidence is the
-                        // whole enriched bundle, not a bare error string.
                         self.settle_durable(&run_id, "failed", &step, &output.to_string())
                             .await;
                         return;
@@ -2354,11 +2182,6 @@ impl WorkflowHost {
                         return;
                     }
                     RunEffect::Unsupported { reason } => {
-                        // The router refused unsupported shapes BEFORE any row,
-                        // so reaching here means the durable model already
-                        // exists. Starting the old engine on the same id would
-                        // give the sweep a second run to drive: an invariant
-                        // violation, not a fallback.
                         error!(
                             run_id = %run_id,
                             "INVARIANT VIOLATION: durable drive reached Unsupported ({reason}) \
@@ -2501,8 +2324,6 @@ impl WorkflowHost {
             }
             let mut follow: Vec<GraphEffect> = Vec::new();
             let mut parks: Vec<GraphEffect> = Vec::new();
-            // Nodes first, then parks: a wave's leaves must not be delayed
-            // behind a sibling's delay deadline.
             for effect in std::mem::take(&mut effects) {
                 match effect {
                     GraphEffect::ExecuteNode {
@@ -2512,11 +2333,6 @@ impl WorkflowHost {
                         inputs,
                         item,
                     } => {
-                        // bd-durable-foreach-jpgx: the model's workflow is the
-                        // lowered/expanded one (a `steps:` fan-out gains nodes
-                        // at open, a foreach gains them when it is ready), so
-                        // the definition must come from the MODEL, not the
-                        // authored workflow this loop was started with.
                         let Some(node_def) = run
                             .model()
                             .workflow
@@ -2562,11 +2378,6 @@ impl WorkflowHost {
                     other @ (GraphEffect::ParkUntil { .. } | GraphEffect::AwaitApproval { .. }) => {
                         parks.push(other)
                     }
-                    // bd-durable-call-workflow-mg6y: this host opens graph runs
-                    // WITHOUT a child resolver (the callee registry seam lands
-                    // with the child coordinator), so the open refuses a
-                    // `call_workflow` graph and it stays on the old engine.
-                    // Reaching these is a routing bug, not a fallback.
                     GraphEffect::ChildJoin { node, child_run_id } => {
                         debug!(
                             run_id = %run_id,
@@ -2609,10 +2420,6 @@ impl WorkflowHost {
                     }
                 }
             }
-            // Every approval in the wave is registered and published — a
-            // second same-wave approval must be operator-visible and
-            // resolvable, not swallowed by the first. The engine park is
-            // already one per transition (DurableGraphRun::engine_verb).
             let mut parked_for_human = false;
             for effect in parks {
                 match effect {
@@ -2703,9 +2510,6 @@ impl WorkflowHost {
         match tokio::task::spawn_blocking(|| verb(run)).await {
             Ok(Ok(pair)) => Some(pair),
             Ok(Err(e)) => {
-                // The model was persisted before the verb ran, so a failed
-                // verb leaves a resumable phase, not a lost run. Do not write
-                // Failed over an outcome the sweep can still repair.
                 warn!(run_id = %run_id, "durable verb failed: {e}; leaving the model resumable for the sweep");
                 None
             }
@@ -2854,8 +2658,6 @@ impl WorkflowHost {
                 anyhow::bail!("spawn verdict on a durable approval park: {}", res.run_id);
             }
         };
-        // Take THIS node's entry so a duplicate resolution finds nothing to
-        // settle while a sibling approval stays parked.
         self.durable_parks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2869,8 +2671,6 @@ impl WorkflowHost {
         let workflow = park.workflow.clone();
         let trigger = park.trigger.clone();
         if workflow.graph.is_some() {
-            // A graph run lands the decision on ONE node; the model owns the
-            // alias and the next wave.
             let node = park.node.clone();
             let approved = tokio::task::spawn_blocking(move || {
                 let engine = OurEngine::with_journal(engine_store, journal);
@@ -3006,8 +2806,6 @@ impl WorkflowHost {
             if let Err(e) = me.run_trigger_loop().await {
                 warn!("workflow trigger loop exited: {e}");
             }
-            // bd-8x2o: loop end is a clean stop — persist marks set after the
-            // final tick (SIGTERM death keeps the tick-bounded window).
             me.persist_delivery_cursors().await;
         })
     }
@@ -3023,7 +2821,6 @@ impl WorkflowHost {
         let me = self.clone();
         tokio::spawn(async move {
             while let Some(mail) = rx.recv().await {
-                // Skip workflow-emitted rumors (loop prevention belt).
                 let stamped = mail.rumor.tags.iter().any(|t| {
                     t.as_slice().first().map(String::as_str) == Some("t")
                         && t.as_slice().get(1).map(String::as_str)
@@ -3042,7 +2839,6 @@ impl WorkflowHost {
                     let Some(trigger) = &workflow.trigger else {
                         continue;
                     };
-                    // MessagePosted matches kind 14/15 (DM) after unwrap.
                     let ok = match trigger {
                         Trigger::MessagePosted { .. } => kind == 14 || kind == 15,
                         _ => false,
@@ -3081,14 +2877,11 @@ impl WorkflowHost {
                         trigger: payload,
                         run_id: None,
                     };
-                    // bd-asx3: detached run + drain, same contract as the bus loop.
                     me.spawn_run_and_drain(run_id, workflow.clone(), input)
                         .await;
                 }
                 me.drain_all_known().await;
             }
-            // bd-8x2o: channel closed is a clean stop — persist marks set after
-            // the final tick (SIGTERM death keeps the tick-bounded window).
             me.persist_delivery_cursors().await;
         })
     }
@@ -3152,8 +2945,6 @@ impl WorkflowHost {
     /// Called by the flush tick when dirty; warn-only — persistence must
     /// never fail delivery. Crash window = marks since the last saved tick.
     async fn persist_delivery_cursors(&self) {
-        // Dirty-gated: no marks since the last save, no writes. Callers
-        // (flush tick, loop exits) invoke unconditionally.
         if !self.delivery.take_dirty() {
             return;
         }
@@ -3185,12 +2976,7 @@ impl WorkflowHost {
     }
 
     async fn flush_coalesced_bursts(&self) {
-        // bd-aqvg: boot load once, then publish; the tick is the shared path
-        // for timer + bus arms, so every mark set anywhere persists here.
         self.ensure_cursors_loaded().await;
-        // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std Mutex poison.
-        // P1 (F3.COALESCER-LOCK): guard scoped to tick() ONLY — flushed values
-        // are owned, guard drops, THEN each publish runs.
         let flushed = {
             let mut c = self
                 .coalescer
@@ -3202,7 +2988,6 @@ impl WorkflowHost {
             debug!("coalescer flushed {} assignee(s)", flushed.len());
         }
         for coalesced in flushed {
-            // GS-062 captain C: live host DispatchAcquire before publish.
             let tick_now = now_ms();
             let permit = match host_acquire_for_assignee(
                 self.dispatch_pool.as_ref(),
@@ -3213,7 +2998,6 @@ impl WorkflowHost {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    // Transient requeue + backoff (not flush_ready forever).
                     let assignee = coalesced.assignee.clone();
                     let mut c = self
                         .coalescer
@@ -3227,7 +3011,6 @@ impl WorkflowHost {
                             "coalesced burst deferred (dispatch acquire): {e} — requeue"
                         ),
                         RequeueOutcome::Exhausted => {
-                            // T2: requeue parked whole batch on DLQ (not silent drop).
                             c.clear_retry(&assignee);
                             warn!(
                                 assignee = %assignee,
@@ -3235,13 +3018,10 @@ impl WorkflowHost {
                             );
                         }
                     }
-                    // bd-x4qw: the lock is dead from here to `continue`; the log
-                    // above must not hold it against the next acquire.
                     drop(c);
                     continue;
                 }
             };
-            // GS-062: session delivery-cursor before kind-43001 publish.
             match publish_coalesced_job_with_cursor(
                 self.bus.as_ref(),
                 self.job_signer.as_ref(),
@@ -3256,7 +3036,7 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.clear_retry(&coalesced.assignee);
-                    drop(c); // bd-x4qw: release before logging, not after.
+                    drop(c);
                     debug!(
                         assignee = %coalesced.assignee, %id,
                         "kind-43001 published for coalesced burst"
@@ -3268,14 +3048,13 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.clear_retry(&coalesced.assignee);
-                    drop(c); // bd-x4qw: release before logging, not after.
+                    drop(c);
                     debug!(
                         assignee = %coalesced.assignee,
                         "kind-43001 skipped (already delivered to session)"
                     );
                 }
                 Err(CoalescePublishError::InFlight) => {
-                    // Concurrent reserve — FreshWindow (no Transient budget).
                     warn!(
                         assignee = %coalesced.assignee,
                         "kind-43001 in-flight (concurrent reserve) — requeue"
@@ -3285,25 +3064,22 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     let _ = c.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
-                    drop(c); // bd-x4qw: nothing below reads the coalescer.
+                    drop(c);
                 }
                 Err(CoalescePublishError::NoSigner) => {
-                    // GS-062 T3: durable DLQ (align FlushNow ProvenFailed) —
-                    // NOT intentional warn!+silent drop.
                     let assignee = coalesced.assignee.clone();
                     let mut c = self
                         .coalescer
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.park_dlq(coalesced, DlqReason::NoSigner);
-                    drop(c); // bd-x4qw: release before the DLQ log.
+                    drop(c);
                     warn!(
                         assignee = %assignee,
                         "coalesced burst NOT published (no job signer) — parked DLQ"
                     );
                 }
                 Err(CoalescePublishError::Transport(e)) => {
-                    // Transient backoff requeue (TRANSPORT-REQUEUE-HOT-SPIN).
                     let assignee = coalesced.assignee.clone();
                     let mut c = self
                         .coalescer
@@ -3317,7 +3093,6 @@ impl WorkflowHost {
                             "coalesced burst publish transport failed: {e} — requeue"
                         ),
                         RequeueOutcome::Exhausted => {
-                            // T2: requeue parked whole batch on DLQ (not silent drop).
                             c.clear_retry(&assignee);
                             warn!(
                                 assignee = %assignee,
@@ -3325,35 +3100,24 @@ impl WorkflowHost {
                             );
                         }
                     }
-                    // bd-x4qw: dead from here to the arm's end; the logs above
-                    // must not hold the coalescer against the next publish.
                     drop(c);
                 }
             }
-            drop(permit); // release busy holder after publish CS
+            drop(permit);
         }
-        // bd-aqvg: persist cursor marks set by this tick or the dispatch path
-        // since the last tick (gate lives inside persist).
         self.persist_delivery_cursors().await;
     }
 
     /// Drive the trigger loop to completion (until the subscription closes).
     pub async fn run_trigger_loop(&self) -> Result<()> {
-        // TRUSTED ingress (P11.1): a plain global `subscribe` would be gated
-        // from every project-scoped event (A3: global subs never see `#t`
-        // scoped events) — reservations (30031) and reactions (7) carry
-        // project scoping, so the reactive ingress MUST bypass the gate.
         let mut sub = self
             .bus
             .subscribe_trusted(toron_core::bus::Filter::new())
             .await
             .map_err(|e| anyhow::anyhow!("bus subscribe_trusted: {e}"))?;
-        // GS-062 REQUEUE-EVENT-STARVATION: timer tick so InFlight/Transport
-        // requeues flush without depending solely on the next bus event.
         let mut flush_tick =
             tokio::time::interval(std::time::Duration::from_millis(COALESCE_FLUSH_TICK_MS));
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume the immediate first tick so we do not flush before subscribe settles.
         flush_tick.tick().await;
         loop {
             let event = tokio::select! {
@@ -3362,8 +3126,6 @@ impl WorkflowHost {
                     let SubscriptionEvent::Event(event) = ev else {
                         continue;
                     };
-                    // Tick coalescer on every bus Event (even filtered) so
-                    // windowed bursts do not stall on ingress rejects.
                     self.flush_coalesced_bursts().await;
                     event
                 }
@@ -3372,8 +3134,6 @@ impl WorkflowHost {
                     continue;
                 }
             };
-            // ADR-0004 Ship 2: loop prevention at ingress — reject
-            // workflow/job/gift-wrap emissions + the workflow-emitted tag.
             if !should_evaluate_trigger_event(&event) {
                 debug!(kind = event.kind.as_u16(), "event filtered at ingress");
                 continue;
@@ -3391,9 +3151,6 @@ impl WorkflowHost {
                 if !matches_trigger(trigger, &event) {
                     continue;
                 }
-                // ADR-0004 Ship 4: bounded guard evaluation at trigger gate.
-                // Build the guard vars from the trigger payload the same way
-                // the engine's branch-guard path does (`trigger_<field>`).
                 if let Some(guard) = &workflow.guard {
                     let payload = trigger_payload(&event);
                     let mut vars = std::collections::HashMap::new();
@@ -3425,30 +3182,14 @@ impl WorkflowHost {
                     trigger: trigger_payload(&event),
                     run_id: None,
                 };
-                // bd-asx3: detached run + immediate drain — a parked run
-                // never holds this loop, and its parks are structured at once.
                 self.spawn_run_and_drain(run_id, workflow.clone(), input)
                     .await;
             }
-            // bd-asx3: re-drain every tracked run per tick, so parks created
-            // after a spawn are picked up independently of any one await.
             self.drain_all_known().await;
         }
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Host-owned pending lifecycle (ADR-0032 Spec 6, bd-asx3).
-//
-// The engine parks on promises and pushes bare ids into its sinks; this host
-// drains those ids into structured [`PendingEntry`] records, publishes the
-// pending events (kind-46011 approval-pending, kind-43001 spawn-await job),
-// validates resolutions, and publishes one semantic terminal (kind-46012)
-// per digest. Runs execute detached from the ingress await so a parked run
-// never holds the trigger loop, and a suspended run is tracked as
-// [`RunState::Suspended`] — never logged as failed.
-// ---------------------------------------------------------------------------
 
 /// Park observation context: the run whose new sink ids are being drained,
 /// with the schema candidate nodes that may have parked, in order.
@@ -3661,10 +3402,6 @@ impl PendingDrain {
     /// first, then the `workflow_runs` row (restart recovery).
     pub async fn run_state_durable(&self, run_id: &str) -> RunState {
         if let Some(state) = self.runs.get(run_id).copied() {
-            // Memory wins only when it actually observed the run; a fresh
-            // drain after restart has no entry and must read the journal.
-            // `Running` is also the never-observed default, so fall through
-            // to the store when memory holds just the default.
             if state != RunState::Running || self.store.is_none() {
                 return state;
             }
@@ -3727,7 +3464,6 @@ impl PendingDrain {
                 evidence: None,
             })
             .await?;
-        // Mirror into memory so the fast path converges.
         let _ = self.ledger.note(record);
         Ok(match outcome {
             TerminalOutcome::New => TerminalNote::New,
@@ -3753,7 +3489,6 @@ impl PendingDrain {
         if fresh.is_empty() {
             return Vec::new();
         }
-        // Fresh sink ids exist: the run parked, even before attribution.
         self.runs.insert(ctx.run_id.clone(), RunState::Suspended);
         let attributed = attribute_parks(&ctx.candidates, &fresh);
         if attributed.is_empty() {
@@ -3783,17 +3518,6 @@ impl PendingDrain {
                 ctx.kind,
             );
             let observed = self.registry.observe(entry.clone());
-            // Wave-3 (bd-o21n): persist the observed park — the Parked
-            // effect row plus its pending resume row. The host owns the
-            // store; the leaf only side-channeled the promise id, so this
-            // drain is the one place with all three key parts. A failed
-            // write warns and retries next drain (the id stays out of
-            // `known`); the entry still publishes, so a store outage
-            // parks visibly instead of sticking the run silent.
-            // Re-processing is idempotent on both keys. The effect key
-            // names the promise (host-side scheme); the leaf-side scheme
-            // names the wake time — both unique per wait, both resume by
-            // re-drive rather than re-dispatch.
             if let Some(store) = self.store.clone() {
                 let kind = match ctx.kind {
                     ParkKind::Approval => PendingKind::Approval,
@@ -3873,8 +3597,6 @@ impl PendingDrain {
     /// parked entry for the caller to settle; a mismatch is recorded and
     /// returned (never resumes anything).
     pub fn resolve(&mut self, res: Resolution) -> Result<PendingEntry, ResolutionMismatch> {
-        // Look up by (run, promise) at the newest generation: a claimed
-        // older generation must surface as StaleGeneration, not UnknownPromise.
         let found = self.registry.get_latest(&res.run_id, &res.promise_id);
         match validate_resolution(found, &res) {
             Ok(()) => Ok(self
@@ -3912,17 +3634,6 @@ impl PendingDrain {
         self.ignored.len()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Fenced effect dispatch (ADR-0032 Spec 5.3, bd-v139.2).
-//
-// [`EffectDispatcher`] executes the [`toron_workflow::engine`] reconciliation
-// policy against [`WorkflowEffectStore`]: commit prepared intent before any
-// provider call, keep one effect key across attempts, fence every attempt
-// with a claim token, settle only with the current token, journal ambiguous
-// outcomes as `unknown` (never inferred absence), and link mailbox `corr`
-// by projection without touching the receipt store.
-// ---------------------------------------------------------------------------
 
 use toron_core::index::workflow_effects::{
     ClaimAttempt, EffectState, NewAttempt, NewEffect, NewPark, NewRun, PendingKind, RunStatus,
@@ -3972,8 +3683,6 @@ fn classify_outcome(
             None,
         ),
         ProviderOutcome::Delivered(v) => (EffectState::Settled, None, Some(v.clone())),
-        // T1: Deferred → Accepted (non-Settled). Default CapMention capability
-        // refuses blind retry — no Ambiguous→Unknown dual-publish storm.
         ProviderOutcome::Deferred(v) => (EffectState::Accepted, None, Some(v.clone())),
         ProviderOutcome::ProvenFailed(msg) => (
             EffectState::Failed,
@@ -4097,9 +3806,6 @@ impl EffectDispatcher {
             return Ok(ClaimOutcome::Done(Ok(self.result_from_row(&row))));
         }
         let now = now_us();
-        // Live means an owner may be dispatching right now: a token pinned
-        // by an unexpired lease. A token with no lease (classified outcome)
-        // still fences at claim time but does not block planning.
         let lease_live = matches!(row.lease_expires_at, Some(expires) if expires > now);
         let view = effect_view(row.state, row.attempt, lease_live);
         let attempt_no = match plan_attempt(Some(&view), &req.capability) {
@@ -4114,15 +3820,8 @@ impl EffectDispatcher {
                     req.effect_key
                 ))));
             }
-            // bd-ynef: a parked row resumes at its wake time under the SAME
-            // key. It re-enters the normal claim path with the same attempt
-            // number, so a re-drive is a resume rather than a new dispatch —
-            // and crucially it is NOT a failure: nothing here returns Err.
             DispatchPlan::ResumeParked { attempt } => attempt,
         };
-        // Fencing identity is deterministic per (key, attempt): unique
-        // across attempts without a randomness dependency (the fence
-        // defeats stale writers via the journal, not via token secrecy).
         let token = format!("tok-{}-a{}", req.effect_key, attempt_no);
         let attempt_id = format!("att-{}-a{}", req.effect_key, attempt_no);
         let claimed = self
@@ -4359,13 +4058,11 @@ mod tests {
     #[test]
     fn stamped_workflow_event_is_rejected_at_ingress() {
         let keys = Keys::generate();
-        // A user kind-14 (no stamp) → evaluated.
         let user = kind14("hello", vec![]);
         assert!(
             should_evaluate_trigger_event(&user),
             "user message evaluates"
         );
-        // The same kind-14 carrying the workflow-emitted stamp → rejected.
         let stamped = kind14(
             "hello",
             vec![
@@ -4432,7 +4129,6 @@ mod tests {
             },
             &react
         ));
-        // A schedule trigger is never event-driven.
         assert!(!matches_trigger(
             &Trigger::Schedule {
                 cron: "* * * * *".into(),
@@ -4467,7 +4163,6 @@ mod tests {
                 .expect("bus"),
         );
 
-        // Recording runner: each dispatched action records the workflow name.
         let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fired2 = fired.clone();
         let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
@@ -4570,7 +4265,6 @@ mod tests {
         let keys = Keys::generate();
         let t_demo = Tag::parse(["t", "demo"]).expect("t");
 
-        // 1. A plain acquire (status-less content) → on-acquire only.
         let acquire = EventBuilder::new(Kind::from_u16(30031), r#"{"exclusive":true}"#)
             .tags(vec![
                 Tag::parse(["d", "demo:src/**"]).expect("d"),
@@ -4583,7 +4277,6 @@ mod tests {
             wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
             "acquire fired the reservation_acquired workflow: {fired:?}"
         );
-        // Disambiguation: the acquire must NOT have fired on-release.
         assert!(
             fired
                 .lock()
@@ -4595,8 +4288,6 @@ mod tests {
             "exactly one workflow fired on acquire: {fired:?}"
         );
 
-        // 2. A release marker (status:released content) → on-release fires,
-        //    and does NOT re-fire on-acquire.
         fired.lock().unwrap().clear();
         let release = EventBuilder::new(Kind::from_u16(30031), r#"{"status":"released"}"#)
             .tags(vec![
@@ -4616,7 +4307,6 @@ mod tests {
             "release fires ONLY reservation_released (no acquired): {fired:?}"
         );
 
-        // 3. A kind-7 reaction → reaction_added fires.
         fired.lock().unwrap().clear();
         let react = EventBuilder::new(Kind::from_u16(7), "+")
             .finalize(&keys)
@@ -4627,8 +4317,6 @@ mod tests {
             "reaction fired the reaction_added workflow: {fired:?}"
         );
 
-        // 4. Loop prevention end-to-end: a WORKFLOW-EMITTED (stamped) kind-14
-        //    does NOT fire message_posted; a user kind-14 does.
         fired.lock().unwrap().clear();
         let stamped = EventBuilder::new(Kind::from_u16(14), "workflow ack")
             .tags(vec![
@@ -4697,8 +4385,6 @@ mod tests {
             let out = drive_async(&afx, action(i), "run-coal-buffer").await;
             assert!(out["ok"].as_bool() == Some(true), "dispatch {i} ok");
         }
-        // All five @mentions are buffered in the coalescer (window open),
-        // NOT emitted as five separate jobs — one buffered batch.
         let buffered = {
             let c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
             c.buffered_for("oc-beta")
@@ -4736,8 +4422,6 @@ mod tests {
             Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
         );
 
-        // The workflow sender + a recipient in project "demo" (sender_for →
-        // "workflow-demo").
         mailbox
             .register_agent(
                 "demo",
@@ -4769,7 +4453,6 @@ mod tests {
             .await
             .expect("subscribe");
 
-        // Awaited inline on this runtime — no thread spawn, no bridge.
         let send = |action: Action| {
             let afx = afx.clone();
             async move {
@@ -4791,7 +4474,6 @@ mod tests {
         })
         .await;
 
-        // Two wraps arrive (one per send); both rumors must carry the stamp.
         for _ in 0..2 {
             let wrap = loop {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
@@ -4801,14 +4483,12 @@ mod tests {
                     Err(_) => panic!("timed out waiting for wrap event"),
                 }
             };
-            // The wrap envelope stays metadata-hiding: no stamp on kind-1059.
             let wrap_has_stamp = wrap.tags.iter().any(|t| {
                 t.as_slice().first().map(String::as_str) == Some("t")
                     && t.as_slice().get(1).map(String::as_str)
                         == Some(toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG)
             });
             assert!(!wrap_has_stamp, "gift wrap must not carry the stamp");
-            // The rumor inside carries it.
             let unsigned = unwrap_for_recipient(&recv_keys, &wrap)
                 .expect("unwrap")
                 .rumor;
@@ -4818,9 +4498,6 @@ mod tests {
                         == Some(toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG)
             });
             assert!(has_stamp, "workflow-originated rumor carries the stamp");
-            // 0.45 UnsignedEvent::finalize signs the rumor's existing pubkey;
-            // the recipient key cannot finalize a sender rumor. Rebuild so
-            // the filter sees the same kind + stamp tags.
             let rumor = EventBuilder::new(unsigned.kind, unsigned.content.clone())
                 .tags(unsigned.tags)
                 .custom_created_at(unsigned.created_at)
@@ -4861,8 +4538,6 @@ mod tests {
             None,
         ));
 
-        // Cap-3 coalescer: the third DispatchJob mention flushes NOW through
-        // the runner (the host's tick never sees it).
         let signer = Keys::generate();
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
             std::time::Duration::from_secs(2),
@@ -4876,8 +4551,6 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             test_armor(),
         );
-        // Global sub: assignee is NOT a project slug (`assignee` tag, not `#t`).
-        // Stamped `t=toron:workflow-emitted` is ignored by access_gate.
         let mut sub = bus
             .subscribe(toron_core::bus::Filter::new())
             .await
@@ -4971,7 +4644,6 @@ mod tests {
             None,
         ));
 
-        // Default window semantics (2s window, 500ms sub-window, cap 64).
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
         let afx = mailbox_async_effect_runner(
             mailbox,
@@ -4981,7 +4653,6 @@ mod tests {
             test_armor(),
         );
 
-        // Fire 100 DispatchJob mentions from 8 tasks (barrier-synced).
         let barrier = Arc::new(tokio::sync::Barrier::new(8));
         let mut handles = Vec::new();
         for t in 0..8 {
@@ -5007,8 +4678,6 @@ mod tests {
             h.await.expect("burst task");
         }
 
-        // Count the published 43001s (cap-flush path publishes inline; the
-        // window flushes are exercised by the coalescer itself in unit tests).
         let replay = toron_core::mailbox::collect_replay(
             bus.as_ref(),
             toron_core::bus::Filter::new().kinds([Kind::from_u16(43001)]),
@@ -5052,7 +4721,6 @@ mod tests {
                 .expect("bus"),
         );
 
-        // Recording runner: counts how many times each action fires.
         let ran = Arc::new(AtomicUsize::new(0));
         let ran2 = ran.clone();
         let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
@@ -5083,11 +4751,9 @@ steps:
         let host = WorkflowHost::over_bus(bus.clone(), vec![wf], Some(afx)).expect("host");
         let handle = host.spawn_trigger_loop();
 
-        // Publish a matching kind-14 event → the loop must invoke the workflow.
         let ev = kind14("triage me", vec![]);
         bus.publish(ev).await.expect("publish");
 
-        // Let the loop process + run.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert!(
             ran.load(Ordering::Relaxed) >= 1,
@@ -5148,8 +4814,6 @@ steps:
             test_armor(),
         );
 
-        // All N tasks fire at once (barrier) — maximal contention through
-        // the async runner, awaited inline on the shared runtime.
         let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
         let handles: Vec<_> = (0..CONCURRENCY)
             .map(|i| {
@@ -5180,7 +4844,6 @@ steps:
         }
         assert_eq!(ok, CONCURRENCY, "all {CONCURRENCY} sends delivered");
 
-        // Every send landed on the bus as a stamped gift wrap.
         let replay =
             toron_core::mailbox::collect_replay(bus.as_ref(), toron_core::bus::Filter::new())
                 .await
@@ -5268,7 +4931,6 @@ steps:
                 .with_agent_passphrase("coalesce-lock-pass"),
         );
 
-        // cap=3 → the THIRD mention to an assignee flushes NOW (publish path).
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
             std::time::Duration::from_millis(2_000),
             std::time::Duration::from_millis(500),
@@ -5282,7 +4944,6 @@ steps:
             test_armor(),
         );
 
-        // Prime oc's buffer (two mentions buffered, no flush).
         let _ = drive_async(
             &afx,
             Action::DispatchJob {
@@ -5304,8 +4965,6 @@ steps:
         )
         .await;
 
-        // A: third oc mention → cap flush → slow publish (the guard must
-        // already be dropped: it scoped to submit only).
         let afx_a = afx.clone();
         let a = tokio::spawn(async move {
             drive_async(
@@ -5320,7 +4979,6 @@ steps:
             .await
         });
 
-        // B: an unrelated flush must NOT wait for A's slow publish.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let afx_b = afx.clone();
         let t0 = std::time::Instant::now();
@@ -5386,8 +5044,6 @@ steps:
             test_armor(),
         );
 
-        // Poison the coalescer: panic while holding the guard (std Mutex
-        // poisoning semantics — the guard's Drop during unwind poisons).
         let c2 = coalescer.clone();
         let panicked = std::panic::catch_unwind(move || {
             let _g = c2.lock().expect("pre-poison lock");
@@ -5399,9 +5055,6 @@ steps:
             "precondition: std Mutex is poisoned"
         );
 
-        // Survivability: a subsequent flush through the REAL runner arm must
-        // not panic (recover the poison, keep serving) — driven on a task
-        // so a runner panic surfaces as a join error, never a test panic.
         let out = tokio::spawn(async move {
             drive_async(
                 &afx,
@@ -5494,7 +5147,6 @@ steps:
         };
         let fresh = drain.drain(&engine, &ctx).await;
         assert_eq!(fresh.len(), 1, "the observed park publishes");
-        // Parked effect row under the host-side re-drive key.
         let row = store
             .get_effect("park:run-hitl:gate:promise-hitl-1")
             .await
@@ -5502,7 +5154,6 @@ steps:
             .expect("parked row");
         assert_eq!(row.state, EffectState::Parked);
         assert!(row.state.is_resumable());
-        // Pending resume row under the same triple.
         let pending = store.list_pending("run-hitl").await.expect("list");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].promise_id, "promise-hitl-1");
@@ -5510,7 +5161,6 @@ steps:
             pending[0].effect_key.as_deref(),
             Some("park:run-hitl:gate:promise-hitl-1")
         );
-        // Re-drive plans resume, never failure.
         let view = effect_view(row.state, row.attempt, false);
         let cap = ProviderCapability {
             supports_idempotency_key: true,
@@ -5523,7 +5173,6 @@ steps:
             ),
             "a Parked row resumes"
         );
-        // Second drain: idempotent, no duplicate rows.
         assert!(drain.drain(&engine, &ctx).await.is_empty());
         assert_eq!(store.list_pending("run-hitl").await.expect("list").len(), 1);
         let _ = std::fs::remove_file(&db);
@@ -5551,7 +5200,6 @@ steps:
         let a = first.drain(&engine, &ctx).await;
         assert_eq!(a.len(), 1);
         drop(first);
-        // Restart: brand-new drain, same live sinks.
         let mut second = PendingDrain::new();
         let b = second.drain(&engine, &ctx).await;
         assert_eq!(b.len(), 1, "recovery re-observes the live park");
@@ -5699,7 +5347,6 @@ steps:
             "pending published as 46011: {kinds:?}"
         );
 
-        // Terminal: same digest twice → one semantic terminal on the bus.
         let note1 = host
             .publish_terminal("run-1", "digest-1", "succeeded", "gate", "ev-1")
             .await
@@ -5874,7 +5521,6 @@ steps:
                 "two parks + no node is ambiguous: never pick one"
             );
         }
-        // Resolving one node removes only that node's park.
         host.durable_parks
             .lock()
             .unwrap()
@@ -5923,7 +5569,6 @@ steps:
             .await
             .expect("subscribe");
 
-        // Success: the graph outputs map, no failed_step.
         host.publish_terminal(
             "run-term-ok",
             "digest-ok",
@@ -5933,7 +5578,6 @@ steps:
         )
         .await
         .expect("publish success");
-        // Failure: the enriched bundle, parsed and passed through.
         host.publish_terminal(
             "run-term-bad",
             "digest-bad",
@@ -6082,7 +5726,6 @@ steps:
         use toron_core::index::schema;
         use toron_workflow::engine::ResolutionVerdict;
 
-        // No server: the engine is the in-process durable façade.
         let db = std::env::temp_dir().join(format!("wf-lifee2e-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db.to_str().unwrap())
             .await
@@ -6109,7 +5752,6 @@ steps:
         host.spawn_run_and_drain("run-e2e-1".to_string(), wf, input)
             .await;
 
-        // The run parks: Suspended, structured, and NOT failed.
         let mut parked = false;
         for _ in 0..150 {
             let pending = host.pending().lock().await;
@@ -6131,7 +5773,6 @@ steps:
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].node_path, "gate");
 
-        // Operator approves through the validated host path.
         let res = toron_workflow::engine::Resolution {
             run_id: "run-e2e-1".into(),
             node: None,
@@ -6143,7 +5784,6 @@ steps:
         };
         host.resolve_parked(res).await.expect("resolve parked");
 
-        // The parked run resumes and completes.
         let mut done = false;
         for _ in 0..150 {
             if host.pending().lock().await.run_state("run-e2e-1") == RunState::Succeeded {
@@ -6293,7 +5933,6 @@ steps:
             .expect("park as unknown");
         let row = store.get_effect("ek-1").await.unwrap().unwrap();
         let live_token = row.claim_token.clone().unwrap();
-        // New owner rotates the claim (expired-lease recovery path).
         assert!(
             store
                 .claim_attempt(
@@ -6316,7 +5955,6 @@ steps:
                     .claim_token
                     .is_some()
         );
-        // Stale owner settles with the old token: refused.
         let settled = dispatcher
             .settle_with_presented(
                 "ek-1",
@@ -6376,7 +6014,6 @@ steps:
                 .unwrap_or("")
                 .contains("relay 403")
         );
-        // Fixed cleanup (lease release by bead reason) journals separately.
         let mut cleanup = recon_req("ek-1/cleanup:release-reservation");
         cleanup.action_type = "release_reservation".into();
         dispatcher
@@ -6541,8 +6178,6 @@ steps:
         use toron_core::index::workflow_effects::{ClaimAttempt, EffectState, NewEffect};
         use toron_workflow::engine::CleanupKind;
         let (dispatcher, store) = cleanup_dispatcher("interrupt").await;
-        // Simulate a crash between claim and classification: prepared intent
-        // plus a live-looking claim with an already-expired lease.
         store
             .prepare_effect(NewEffect {
                 effect_key: "ek-p/cleanup:release-reservations".into(),
@@ -6609,7 +6244,6 @@ steps:
             redacted_action: None,
             retention_until: Some(retention),
         };
-        // Settled + expired retention: prunable, with its attempts.
         store
             .prepare_effect(seed_effect("ek-old", "run-old", old))
             .await
@@ -6638,7 +6272,6 @@ steps:
             })
             .await
             .unwrap();
-        // Unknown + expired retention: uncertainty survives.
         store
             .prepare_effect(seed_effect("ek-unk", "run-old", old))
             .await
@@ -6656,7 +6289,6 @@ steps:
             )
             .await
             .unwrap();
-        // Settled + live retention: survives.
         store
             .prepare_effect(seed_effect("ek-new", "run-old", future))
             .await
@@ -6669,7 +6301,6 @@ steps:
             .transition_effect("ek-new", EffectState::Settled, None, None)
             .await
             .unwrap();
-        // In-flight: survives regardless.
         store
             .prepare_effect(seed_effect("ek-fly", "run-old", old))
             .await
@@ -6687,7 +6318,6 @@ steps:
             )
             .await
             .unwrap();
-        // Pending: never auto-pruned.
         store
             .upsert_pending(NewPending {
                 run_id: "run-old".into(),
@@ -6703,7 +6333,6 @@ steps:
             })
             .await
             .unwrap();
-        // A fully quiesced run (terminal, no live effects) IS prunable.
         store
             .create_run(toron_core::index::workflow_effects::NewRun {
                 run_id: "run-old".into(),
@@ -7007,7 +6636,6 @@ steps:
             .await
             .expect("set durable");
         drop(first);
-        // Restart: brand-new drain over the SAME store recovers the state.
         let second = PendingDrain::new().with_store(store);
         assert_eq!(
             second.run_state_durable("run-restart-1").await,
@@ -7101,7 +6729,6 @@ steps:
                 std::env::temp_dir().join(format!("wf-flushok-data-{}", uuid::Uuid::new_v4())),
                 None,
             ));
-            // Cap-1 coalescer: the FIRST mention flushes NOW with no signer.
             let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(60),
@@ -7276,7 +6903,6 @@ steps:
             serde_json::json!(true),
             "same-key retry attaches: {out2}"
         );
-        // Exactly one gift wrap on the wire — the retry dispatched nothing.
         let replay = toron_core::mailbox::collect_replay(
             bus.as_ref(),
             toron_core::bus::Filter::new().kinds([nostr::prelude::Kind::GiftWrap]),
@@ -7284,7 +6910,6 @@ steps:
         .await
         .expect("replay");
         assert_eq!(replay.len(), 1, "one wrap for two same-key sends");
-        // The rumor projects corr == effect_key (Spec 5.4).
         let rumor = unwrap_for_recipient(&recv_keys, &replay[0])
             .expect("unwrap")
             .rumor;
@@ -7295,7 +6920,6 @@ steps:
                 .any(|t| t.as_slice() == ["corr", key.as_str()]),
             "rumor carries corr == effect_key"
         );
-        // The journal agrees: settled with transport_corr == key.
         let row = dispatcher
             .store()
             .get_effect(&key)
@@ -7367,7 +6991,6 @@ steps:
             assert_eq!(out["ok"], serde_json::json!(true));
             drop(afx);
         }
-        // "Restart": brand-new mailbox + runner over the SAME pool/bus.
         {
             let mailbox = Arc::new(
                 Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
@@ -7422,7 +7045,6 @@ steps:
         ));
         let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
         let dispatcher = EffectDispatcher::new(store);
-        // Cap-1: every mention flushes NOW, with no signer to publish it.
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60),
@@ -7595,10 +7217,8 @@ steps:
         };
         let out_a1 = call(&afx, inv("run-A", "gate")).await;
         assert_eq!(out_a1["ok"], serde_json::json!(true));
-        // Same logical invocation retries attach (one wire send).
         let out_a2 = call(&afx, inv("run-A", "gate")).await;
         assert_eq!(out_a2["ok"], serde_json::json!(true));
-        // Identical payload, different run: a DIFFERENT effect (rescoped).
         let out_b = call(&afx, inv("run-B", "gate")).await;
         assert_eq!(out_b["ok"], serde_json::json!(true));
         let replay = toron_core::mailbox::collect_replay(
@@ -7612,8 +7232,6 @@ steps:
             2,
             "run-scoped keys: A×2 attaches (1 wrap), B sends again"
         );
-        // The journal holds two run-scoped rows, keyed by
-        // derive_effect_key — not the compat content hash.
         let rendered = serde_json::to_value(&inv("run-A", "gate").action).expect("action json");
         let action_digest = toron_workflow::identity::action_digest_of(
             &toron_workflow::identity::redact_value(&rendered).0,
@@ -7676,8 +7294,6 @@ steps:
         let action = Action::Verify {
             command: "cargo test".into(),
         };
-        // A distinct run per observation: the effect key is run-scoped, so
-        // reusing one run would attach to the first row instead of dispatching.
         let invocation = |run: &str, observed: Option<serde_json::Value>| ActionInvocation {
             action: action.clone(),
             run: RunContext {
@@ -7725,9 +7341,6 @@ steps:
             "a returned non-zero exit is a PROVEN failure, not transport \
              ambiguity (nothing to reconcile): {red}"
         );
-        // The host attaches no `VerifySink` of its own, so the engine hands
-        // over the sink's own missing-sink projection: name the real cause,
-        // and journal it (an unjournaled verify is the bypass this closes).
         let missing = call(invocation("run-verify-missing", None)).await;
         assert!(
             missing.to_string().contains("verify sink missing"),
@@ -7785,7 +7398,6 @@ steps:
             project: Some("demo".into()),
         };
         let (_, key, _) = test_invocation(action.clone(), "run-async-fx-1");
-        // Awaited INLINE on this runtime — no thread spawn, no bridge.
         let out1 = drive_async(&afx, action.clone(), "run-async-fx-1").await;
         assert_eq!(out1["ok"], serde_json::json!(true), "first send ok: {out1}");
         let out2 = drive_async(&afx, action.clone(), "run-async-fx-1").await;
@@ -7862,8 +7474,6 @@ steps:
         assert!(store.cursor(session).delivered.contains("parent-a"));
         assert!(store.cursor(session).delivered.contains("parent-b"));
 
-        // Later batch: first parent already delivered, sibling new — must NOT
-        // skip the whole batch (silent sibling loss hazard).
         let batch2 = Coalesced {
             assignee: session.into(),
             mentions: vec![
@@ -7887,7 +7497,6 @@ steps:
         assert_ne!(id1, id2);
         assert!(store.cursor(session).delivered.contains("parent-c"));
 
-        // All parents delivered → skip.
         let err =
             publish_coalesced_job_with_cursor(bus.as_ref(), Some(&signer), &batch2, Some(&store))
                 .await
@@ -7925,7 +7534,6 @@ steps:
                 .await;
             h
         }
-        // Journal-less twin skips both silently (no dispatcher, no panic).
         let bus0: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
                 .await
@@ -7934,14 +7542,11 @@ steps:
         let h0 = WorkflowHost::over_bus(bus0, vec![], None).expect("host");
         h0.ensure_cursors_loaded().await;
         h0.persist_delivery_cursors().await;
-        // Host 1: mark + persist.
         let h1 = mk_host(&pool).await;
         h1.delivery.mark_delivered("sess", ["id-1"]);
         assert!(h1.delivery.take_dirty(), "new mark dirties");
-        // Fresh mark after the take: persist is dirty-gated since bd-8x2o.
         h1.delivery.mark_delivered("sess-aux", ["x"]);
         h1.persist_delivery_cursors().await;
-        // Host 2 on the same pool: boot load restores delivered ids.
         let h2 = mk_host(&pool).await;
         h2.ensure_cursors_loaded().await;
         let (keep, _) = h2.delivery.reserve_undelivered("sess", ["id-1", "id-2"]);
@@ -7950,9 +7555,7 @@ steps:
             vec!["id-2".to_string()],
             "restart must not re-deliver id-1"
         );
-        // Second load is a race-safe no-op.
         h2.ensure_cursors_loaded().await;
-        // The flush tick persists dirty marks itself (hook, not just helper).
         h1.delivery.mark_delivered("sess", ["id-2"]);
         h1.flush_coalesced_bursts().await;
         assert!(!h1.delivery.take_dirty(), "tick consumed the dirty flag");
@@ -7960,7 +7563,6 @@ steps:
         h4.ensure_cursors_loaded().await;
         let (keep4, _) = h4.delivery.reserve_undelivered("sess", ["id-1", "id-2"]);
         assert!(keep4.is_empty(), "tick-persisted marks survive restart");
-        // Corrupt row skips without failing the load.
         sqlx::query(
             "INSERT INTO delivery_cursors (session, delivered_json, cursor, updated_us) \
              VALUES ('bad', 'not-json', 0, 0)",
@@ -8002,7 +7604,6 @@ steps:
         let h1 = mk(&pool).await;
         h1.delivery.mark_delivered("sess", ["stop-1"]);
         let h2 = mk(&pool).await;
-        // Journal-less host: saves nothing, fails nothing.
         let bus0: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
                 .await
@@ -8040,7 +7641,6 @@ steps:
         let h = WorkflowHost::over_bus(bus, vec![], None).expect("host");
         h.with_effect_store(WorkflowEffectStore::new(pool.clone()))
             .await;
-        // Marks set with no tick running: only the stop hook can save them.
         h.delivery.mark_delivered("sess", ["stop-1"]);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = h.spawn_mail_trigger_loop(rx);
@@ -8108,7 +7708,6 @@ steps:
             delivery.cursor(session).delivered.contains("fn-parent-1"),
             "FlushNow must mark via with_cursor"
         );
-        // Second FlushNow for same parent → Ambiguous skip (transport skip msg).
         let out2 = mention_outcome(
             bus.as_ref(),
             Some(&signer),
@@ -8193,8 +7792,6 @@ steps:
             .count();
         assert_eq!(wins, 1, "exactly one publish wins, got r1={r1:?} r2={r2:?}");
         assert_eq!(skips, 1, "exactly one skips as already in-flight/delivered");
-        // Loser must be InFlight (concurrent reserve) or AlreadyDelivered
-        // (winner marked first) — never a silent Transport conflation.
         let loser = if r1.is_err() { &r1 } else { &r2 };
         match loser {
             Err(CoalescePublishError::InFlight) | Err(CoalescePublishError::AlreadyDelivered) => {}
@@ -8228,7 +7825,6 @@ steps:
         let signer = Keys::generate();
         let session = "oc-inflight";
         let parent = "inflight-parent";
-        // Simulate concurrent reserve holding in_flight.
         let (keep, _) = store.reserve_undelivered(session, [parent]);
         assert_eq!(keep, vec![parent.to_string()]);
 
@@ -8250,7 +7846,6 @@ steps:
             "must be InFlight not AlreadyDelivered, got {err:?}"
         );
 
-        // FlushNow / mention_outcome must Ambiguous (not Settled/Delivered).
         let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
         let out = mention_outcome(
             bus.as_ref(),
@@ -8273,7 +7868,6 @@ steps:
                 panic!("in-flight FlushNow must Ambiguous (not Settled/Delivered), got {other:?}")
             }
         }
-        // Requeued for retry (flush_ready=false → buffered).
         assert!(
             coalescer
                 .lock()
@@ -8283,7 +7877,6 @@ steps:
             "in-flight must requeue burst"
         );
 
-        // After mark proves delivered → AlreadyDelivered → Settled OK.
         store.mark_delivered(session, [parent]);
         let err2 =
             publish_coalesced_job_with_cursor(bus.as_ref(), Some(&signer), &batch, Some(&store))
@@ -8316,7 +7909,6 @@ steps:
         );
         let batch = c.force_flush("oc").expect("flushed");
         assert_eq!(c.buffered_for("oc"), 0);
-        // Simulate trigger-loop acquire Err path (Transient attempt 0 = immediate).
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert!(
             matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }),
@@ -8332,7 +7924,6 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_acquire_sleep_covers_full_hold_bound() {
         use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPool};
-        // hold_bound > 5_000 would have been truncated by the old .min(5_000).
         let pool = DispatchPool::new(DispatchConfig {
             max_concurrency: 2,
             hold_bound_ms: 80,
@@ -8462,8 +8053,6 @@ steps:
         );
         let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
         let host_a = host.clone();
-        // bd-x4qw: `host` and `barrier` are dead after their second handle, so
-        // the second clone was pure Arc traffic.
         let host_b = host;
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
@@ -8685,7 +8274,6 @@ steps:
                 >= 1,
             "FlushNow Transport must requeue burst"
         );
-        // Reservation released (RAII) so retry can reserve again.
         assert!(
             store.cursor(session).in_flight.is_empty(),
             "in_flight must clear after Transport"
@@ -8711,7 +8299,6 @@ steps:
             0,
         );
         let batch = c.force_flush("oc").expect("flushed");
-        // Simulate trigger-loop Transport arm (Transient attempt 0 = immediate).
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert!(
             matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }),
@@ -8748,7 +8335,6 @@ steps:
         let store = DeliveryCursorStore::new();
         let signer = Keys::generate();
         let session = "oc-partial";
-        // Parent "already" is delivered — keep only "fresh".
         store.mark_delivered(session, ["already"]);
         let batch = Coalesced {
             assignee: session.into(),
@@ -8778,7 +8364,7 @@ steps:
         assert_eq!(published[0].id, id);
         let payload: serde_json::Value =
             serde_json::from_str(&published[0].content).expect("job json");
-        drop(published); // bd-x4qw: last read above; stop holding it across the asserts.
+        drop(published);
         let mentions = payload["spec"]["mentions"]
             .as_array()
             .expect("mentions array");
@@ -8830,7 +8416,6 @@ steps:
                 .expect("bus"),
         );
         let delivery = DeliveryCursorStore::new();
-        // Cap=1 with busy holder → acquire parks then hold_bound Err.
         let pool = DispatchPool::new(DispatchConfig {
             max_concurrency: 1,
             hold_bound_ms: 30,
@@ -8910,7 +8495,7 @@ steps:
         let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
         let out = mention_outcome(
             bus.as_ref(),
-            None, // no signer
+            None,
             CoalesceDecision::FlushNow(batch),
             "ek-ns".into(),
             Some(&store),
@@ -9011,9 +8596,6 @@ steps:
     fn t1_capmention_buffered_is_deferred_not_settled() {
         use toron_core::index::workflow_effects::EffectState;
         let out = {
-            // mention_outcome Buffered arm is sync in effect (no I/O) — drive via
-            // the decision mapping by constructing the Deferred shape classify uses.
-            // Full async path covered by dispatch_job_actions_coalesce_via_runner.
             ProviderOutcome::Deferred(serde_json::json!({
                 "ok": true,
                 "coalesced": true,
@@ -9022,8 +8604,6 @@ steps:
                 "effect_key": "ek-buf",
             }))
         };
-        // Also exercise live mention_outcome Buffered via block_on-free classify of
-        // the real function in the async twin below; here lock the settle class.
         let (state, _, val) = classify_outcome(&out);
         assert_eq!(state, EffectState::Accepted, "Buffered must not Settled");
         assert_ne!(state, EffectState::Settled);
@@ -9144,7 +8724,6 @@ steps:
         let signer = Keys::generate();
         let session = "oc-t2-ex";
         let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
-        // Sibling already Buffered (live buffer) — must survive Exhausted.
         {
             let mut g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
             let _ = g.submit(
@@ -9156,9 +8735,8 @@ steps:
                 0,
             );
             assert_eq!(g.buffered_for(session), 1);
-            drop(g); // bd-x4qw: explicit release, not end-of-block.
+            drop(g);
         }
-        // Burn Transient budget with FlushNow Transport failures.
         for i in 0..REQUEUE_MAX_ATTEMPTS {
             let batch = Coalesced {
                 assignee: session.into(),
@@ -9219,14 +8797,12 @@ steps:
                 .any(|e| e.reason == DlqReason::Exhausted),
             "DLQ reason Exhausted"
         );
-        // Sibling + any Transient-restored parents may be in live buffer;
-        // critically the pre-existing sibling must not be wiped.
         assert!(
             g.buffered_for(session) >= 1,
             "sibling Buffered must not be silently lost, buffered={}",
             g.buffered_for(session)
         );
-        drop(g); // bd-x4qw: last read above; release before the file cleanup.
+        drop(g);
         let _ = std::fs::remove_file(&db);
     }
 
@@ -9247,7 +8823,6 @@ steps:
                 .await
                 .expect("bus"),
         );
-        // over_bus with no job signer — timer NoSigner path.
         let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
         {
             let mut c = host
@@ -9262,11 +8837,9 @@ steps:
                 },
                 0,
             );
-            // Force flush-ready so tick publishes immediately.
             let batch = c.force_flush("oc-t3").expect("flush");
             let _ = c.requeue(batch, 0, RequeueSchedule::FreshWindow);
         }
-        // Drive one flush (timer path).
         host.flush_coalesced_bursts().await;
         let c = host
             .coalescer()
@@ -9275,7 +8848,7 @@ steps:
         assert_eq!(c.dlq_len(), 1, "timer NoSigner must park DLQ, not drop");
         assert_eq!(c.dlq_for("oc-t3")[0].reason, DlqReason::NoSigner);
         assert_eq!(c.buffered_for("oc-t3"), 0, "must not live-requeue NoSigner");
-        drop(c); // bd-x4qw: last read above; release before the file cleanup.
+        drop(c);
         let _ = std::fs::remove_file(&db);
     }
 
@@ -9331,10 +8904,6 @@ steps:
     #[test]
     fn flush_tick_drains_requeue_without_bus_event() {
         use toron_workflow::coalesce::InboundMention;
-        // Timer ≤ subwindow so a lone Transient/FreshWindow requeue becomes
-        // ready without requiring another SubscriptionEvent on the bus.
-        // bd-x4qw: const-asserted at module scope, so a runtime assert here was
-        // a duplicate that could never fail.
         let mut c = MentionCoalescer::new(
             std::time::Duration::from_millis(2_000),
             std::time::Duration::from_millis(500),
@@ -9350,7 +8919,6 @@ steps:
         );
         let batch = c.force_flush("oc").expect("flushed");
         let _ = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
-        // No further submit/bus event — only advancing time by tick cadence.
         assert!(c.tick(1_000).is_empty());
         let mut t = 1_000u64;
         let mut drained = false;
@@ -9473,8 +9041,6 @@ steps:
                 (
                     "spin",
                     graph_node(
-                        // `loop` stays refused permanently (design, item 3):
-                        // it is rewritten as a bounded guarded sequence.
                         Action::Loop {
                             max: "3".into(),
                             until: None,
@@ -9624,7 +9190,6 @@ steps:
             ];
             assert!(durable_route(&wf, true, false).is_ok());
 
-            // The mix refusal: spawn + parallel is neither shape.
             let mut mixed = wf.clone();
             mixed.steps.insert(
                 0,
@@ -9735,8 +9300,6 @@ steps:
 
         #[test]
         fn durable_pending_carries_run_id_and_never_parses_as_resolution() {
-            // The park publishes run id as the correlation key with no
-            // verdict, so the resolution parser must ignore it.
             let entry = PendingEntry::new(
                 "run-cut-9",
                 None,
@@ -9834,7 +9397,6 @@ steps:
             host.resolve_parked(bad_generation).await.is_err(),
             "a stale generation must not settle a durable park"
         );
-        // Both rejections leave the park recorded for the real resolution.
         assert!(
             host.durable_parks
                 .lock()
@@ -10022,7 +9584,6 @@ steps:
             "the full launcher value settled the step"
         );
 
-        // The 43001 job is evidence, not transport.
         let mut carried = None;
         for _ in 0..20 {
             let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await
@@ -10172,8 +9733,6 @@ steps:
             inputs: vec![],
             crew: None,
         };
-        // Host1: no signer, so the approval parks (publication warns, the
-        // park is retained, state goes Suspended) — then the host dies.
         let bus1: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
                 .await
@@ -10205,8 +9764,6 @@ steps:
             "host1 parks the approval"
         );
         drop(host1);
-        // Host2 (the restart): the sweep re-opens the persisted model and
-        // re-drives it to a fresh park on this host.
         let bus2: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
                 .await
@@ -10218,9 +9775,6 @@ steps:
                 toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
             )
             .await;
-        // The daemon arms THIS function, so the test drives the spawned
-        // first pass, not the inner sweep: one immediate pass then the
-        // interval (1h here, so the rest of the test sees only the first).
         let _sweep = host2.spawn_durable_sweep(std::time::Duration::from_secs(3600));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -10239,7 +9793,6 @@ steps:
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        // A resolution through the store settles the run end to end.
         let res = Resolution {
             run_id: "run-cut-9".into(),
             node: None,

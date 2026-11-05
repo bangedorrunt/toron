@@ -207,8 +207,6 @@ pub fn why_fold(rows: &[serde_json::Value]) -> Result<String, String> {
     Ok(out.join(" → "))
 }
 
-// ponytail: one test module, table-driven over STAGE_MAP. New stages extend
-// the table; the all-mapped test forces the taxonomy to follow.
 #[cfg(test)]
 mod inspection_events_tests {
     use super::*;
@@ -219,7 +217,6 @@ mod inspection_events_tests {
         for (stage, kind) in STAGE_MAP {
             let ev = InspectionEvent::for_stage(stage, "ok");
             assert_eq!(&ev.kind, kind, "stage `{stage}`");
-            // Round-trips through the validator (writers emit valid rows).
             let v = serde_json::to_value(&ev).expect("serializes");
             assert_eq!(InspectionEvent::validate(&v).expect("valid"), ev);
         }
@@ -276,8 +273,6 @@ mod inspection_events_tests {
 
     #[test]
     fn source_kinds_event_and_actor_round_trip() {
-        // XState inspection.ts carries six types; event + actor were
-        // missing. Both validate and fold like any other kind.
         for kind in [InspectionKind::Event, InspectionKind::Actor] {
             let ev = InspectionEvent::emitted(kind, Some("PiAlpha".into()), None);
             let v = serde_json::to_value(&ev).expect("serializes");

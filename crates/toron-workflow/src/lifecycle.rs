@@ -84,7 +84,7 @@ impl WorkflowLifecycle {
             Some(rec) if rec.deleted => LifecycleEffect::AlreadyDeleted { id: id.into() },
             Some(rec) => {
                 rec.deleted = true;
-                rec.executable = false; // same critical section — no ghost runnable
+                rec.executable = false;
                 LifecycleEffect::SoftDeleted {
                     id: id.into(),
                     generation: rec.generation,

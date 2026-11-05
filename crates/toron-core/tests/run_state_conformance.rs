@@ -55,8 +55,6 @@ fn boundary(seq: i64, created_at: i64, model: &str) -> NewRunStateCheckpoint {
     }
 }
 
-// --- 1. round trip -------------------------------------------------------
-
 #[tokio::test]
 async fn append_then_get_returns_the_same_boundary() {
     let (s, _p) = store("roundtrip").await;
@@ -77,8 +75,6 @@ async fn append_then_get_returns_the_same_boundary() {
     );
 }
 
-// --- 2. idempotent append ------------------------------------------------
-
 #[tokio::test]
 async fn append_is_idempotent_for_a_replayed_boundary() {
     let (s, _p) = store("idempotent").await;
@@ -98,8 +94,6 @@ async fn append_is_idempotent_for_a_replayed_boundary() {
     );
     assert_eq!(first, second, "the replay attaches to the same row");
 }
-
-// --- 3. divergent rewrite refused ---------------------------------------
 
 #[tokio::test]
 async fn divergent_rewrite_of_one_boundary_is_refused_and_keeps_the_original() {
@@ -124,15 +118,12 @@ async fn divergent_rewrite_of_one_boundary_is_refused_and_keeps_the_original() {
     );
 }
 
-// --- 4. latest is clock-independent --------------------------------------
-
 #[tokio::test]
 async fn latest_is_the_newest_seq_even_when_the_clock_steps_backwards() {
     let (s, _p) = store("clock").await;
     s.append(boundary(1, 10_000, r#"{"n":1}"#))
         .await
         .expect("append 1");
-    // A backwards clock step: created_at goes DOWN while seq goes UP.
     s.append(boundary(2, 5_000, r#"{"n":2}"#))
         .await
         .expect("append 2");
@@ -149,8 +140,6 @@ async fn latest_is_the_newest_seq_even_when_the_clock_steps_backwards() {
     );
 }
 
-// --- 5. history ordering and bounds --------------------------------------
-
 #[tokio::test]
 async fn history_is_newest_first_and_honours_before_and_limit() {
     let (s, _p) = store("history").await;
@@ -160,7 +149,6 @@ async fn history_is_newest_first_and_honours_before_and_limit() {
             .expect("append");
     }
 
-    // A real bound, not 0: history refuses an unbounded read by design.
     let all = s.history(T, None, 100).await.expect("history");
     assert_eq!(
         all.iter().map(|r| r.seq).collect::<Vec<_>>(),
@@ -182,8 +170,6 @@ async fn history_is_newest_first_and_honours_before_and_limit() {
         "limit bounds the read"
     );
 }
-
-// --- 6. get by durable id ------------------------------------------------
 
 #[tokio::test]
 async fn get_by_checkpoint_id_resolves_the_exact_row() {
@@ -209,8 +195,6 @@ async fn get_by_checkpoint_id_resolves_the_exact_row() {
         "an unknown id is None, never a wrong row"
     );
 }
-
-// --- 7. prune honours the protected floor --------------------------------
 
 #[tokio::test]
 async fn prune_keeps_the_protected_boundary_and_deletes_strictly_below_it() {
@@ -238,8 +222,6 @@ async fn prune_keeps_the_protected_boundary_and_deletes_strictly_below_it() {
         "prune must never drop the boundary a live resume is standing on"
     );
 }
-
-// --- 8. resume falls back at-or-before -----------------------------------
 
 #[tokio::test]
 async fn resume_uses_the_exact_boundary_then_falls_back_at_or_before() {
@@ -294,21 +276,14 @@ async fn history_refuses_an_unbounded_read_instead_of_reading_everything() {
         err.to_string().contains("positive limit"),
         "the refusal names the real constraint: {err}"
     );
-    // And a negative bound is equally refused rather than coerced.
     assert!(
         s.history(T, None, -5).await.is_err(),
         "a negative limit is a caller bug, not a cap"
     );
 }
 
-// --- 11. construction failure is a distinct outcome ----------------------
-
 #[tokio::test]
 async fn a_store_over_an_unmigrated_index_fails_loud_rather_than_reading_empty() {
-    // CONSTRUCTION FAILURE, scripted: a pool that never got `migrate` applied.
-    // The store must surface a real SQL error naming the missing table — NOT
-    // return None, which would read as "this thread has no checkpoints" and
-    // invite a resume from nothing.
     let path = std::env::temp_dir().join(format!(
         "toron-run-state-conf-unmigrated-{}.sqlite",
         uuid::Uuid::new_v4()
@@ -326,8 +301,6 @@ async fn a_store_over_an_unmigrated_index_fails_loud_rather_than_reading_empty()
     );
 }
 
-// --- 12. an interrupted prune leaves the protected floor intact ----------
-
 #[tokio::test]
 async fn a_prune_that_cannot_complete_leaves_the_protected_floor_intact() {
     let (s, _p) = store("prune-fail").await;
@@ -337,10 +310,6 @@ async fn a_prune_that_cannot_complete_leaves_the_protected_floor_intact() {
             .expect("append");
     }
 
-    // INTERRUPTION, scripted at the storage layer: make the DELETE impossible,
-    // then prove the floor and everything above it are still readable. A prune
-    // is one atomic statement, so a failure must leave the log exactly as it
-    // was — never half-deleted with the resume point gone.
     sqlx::query("DROP TABLE run_state_checkpoints")
         .execute(s.pool())
         .await
@@ -354,8 +323,6 @@ async fn a_prune_that_cannot_complete_leaves_the_protected_floor_intact() {
         s.get(T, 3).await.is_err(),
         "the store stays broken rather than reporting an empty thread"
     );
-    // A fresh store over an intact index is unaffected: the outage was ours,
-    // not the log's.
     let (fresh, _p2) = store("prune-fail-control").await;
     for seq in 1..=4 {
         fresh
@@ -375,8 +342,6 @@ async fn a_prune_that_cannot_complete_leaves_the_protected_floor_intact() {
     );
 }
 
-// --- 9. a corrupt payload fails closed -----------------------------------
-
 #[tokio::test]
 async fn corrupt_model_payload_fails_closed_instead_of_reading_as_empty_state() {
     let (s, _p) = store("corrupt").await;
@@ -386,16 +351,11 @@ async fn corrupt_model_payload_fails_closed_instead_of_reading_as_empty_state() 
 
     let row = s.get(T, 1).await.expect("get").expect("row exists");
     let err = parse_model(&row).expect_err("a corrupt payload must not parse");
-    // Assert on the diagnostic carrying a position rather than serde's exact
-    // wording: the load-bearing property is that it fails WITH a located parse
-    // error instead of degrading to empty state.
     assert!(
         err.to_string().contains("line 1"),
         "the parse error is located, so an operator can see which boundary is \
          unreadable: {err}"
     );
-    // The load-bearing part: the row is still there, so a caller can see the
-    // boundary EXISTS and is unreadable, rather than resuming from nothing.
     assert!(
         row.seq == 1,
         "the boundary is visible even though its payload is not"

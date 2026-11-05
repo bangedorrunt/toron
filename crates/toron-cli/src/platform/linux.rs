@@ -1,7 +1,4 @@
 // governed-by: ADR-0031
-// Linux supervision (bd-nc5d): verbatim move of the linux-gated blocks out
-// of `daemon.rs`. No signature or behavior changes — this module is only
-// compiled on Linux, so it carries zero cfg attributes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

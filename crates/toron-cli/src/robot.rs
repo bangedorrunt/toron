@@ -241,9 +241,6 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 args.result_path.clone(),
                 args.verdict.clone(),
             )?;
-            // ADR-0010 D9 (bd-l0fz): --resolve-bead stamps the structural
-            // done-hold tag. SendTags::parse validates it at the send boundary
-            // (non-empty); the guard matches the TAG, not the subject.
             if let Some(bd) = args.resolve_bead.as_deref() {
                 extra_tags.push(
                     toron_core::nostr::Tag::parse(["bead", bd.trim()])
@@ -268,12 +265,9 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
             emit(mailbox.send_message(&msg).await?)
         }
         MailCommand::Overseer(args) => {
-            // ADR-0004 Ship 5: operator Overseer override. Signs with the
-            // operator key (sender_name is ignored), importance=high, tagged
-            // toron:overseer, body carries the override preamble.
             let msg = SendMessage {
                 project_slug: args.project.clone(),
-                sender_name: String::new(), // overseer signs with the operator key
+                sender_name: String::new(),
                 to: args.to.clone(),
                 subject: args
                     .subject
@@ -547,8 +541,6 @@ fn stamp_bootstrap_pane(
     ]);
     match toron_core::backend::hc::HcBackend::connect(None) {
         Ok(backend) => match backend.client().terminal_label(&terminal, &labels) {
-            // Prefixed form (`hc:tN`): matches every other toron pane_id
-            // field (whois / list_agents / PaneInfo.pane_id).
             Ok(labelled) => Some(toron_core::backend::hc::prefix_id(&labelled.address)),
             Err(e) => {
                 eprintln!("toron: pane stamp skipped ({e})");
@@ -568,13 +560,6 @@ fn stamp_bootstrap_pane(
 pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
-            // bd-pinrule: the pin is a NAMESPACE, not a label, so the shape is
-            // enforced at the door where an operator types it. Identity is
-            // per-PROJECT, so one agent holds a different key in each project
-            // and a name two agents can pick independently WILL collide: proven
-            // live, `Buffy` is registered in two projects and resolves to two
-            // different npubs, so mail sent to that name from one project is
-            // invisible to the agent reading under the other (bd-xroute).
             toron_core::nostr::identity::validate_agent_pin(&args.agent)
                 .map_err(anyhow::Error::msg)?;
             let profile = toron_core::nostr::identity::AgentProfile {
@@ -584,11 +569,6 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 task_description: args.task.clone(),
                 persona: None,
             };
-            // bd-toron-bootstrap-dryrun-mutates-1-we4c: `-n/--dry-run` is a
-            // GLOBAL flag whose help promises "show changes without running".
-            // Minting key material under it is the one class of side effect
-            // callers cannot retry away — the next real run can no longer show
-            // what it would have done. Preview, never mutate.
             if dry_run {
                 let plan = mailbox
                     .plan_agent_registration(&args.project, &profile)
@@ -643,9 +623,6 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
             }))
         }
         AgentCommand::Prune(args) => {
-            // bd-4a0u: `-n/--dry-run` is a GLOBAL flag promising "show changes
-            // without running" — so preview the rows doctor names and absorb
-            // nothing (the mutation could not be retried away otherwise).
             if dry_run {
                 let leftovers = mailbox.folded_slug_leftovers_for(&args.project).await?;
                 print_json(&json!({
@@ -659,12 +636,6 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 return Ok(());
             }
             let report = mailbox.prune_folded_slugs(&args.project).await?;
-            // bd-0tbg: a held row is NOT a tidy-up. It is an identity still
-            // holding reservations, and absorbing it would delete the roster
-            // row those reservations are addressed by — so it is reported in
-            // its own bucket with the paths, and the operator is told the
-            // release comes first. Silently folding it into `kept` would tell
-            // them to go register a pin, which fixes nothing.
             let held_count = report.held.len();
             print_json(&json!({
                 "project": args.project,
@@ -688,10 +659,6 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
             }))
         }
         AgentCommand::Rename(args) => {
-            // A rename MOVES an identity; it never mints a second key for the
-            // same words (bd-0tbg). The npub is unchanged, so anything the
-            // identity received stays reachable — only the name it answers to
-            // changes.
             let report = mailbox
                 .rename_agent(&args.project, &args.old_name, &args.new_name)
                 .await?;
@@ -738,16 +705,8 @@ pub async fn run_agent_daemon(
 ) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
-            // bd-pinrule: same gate on the daemon arm, or the rule holds only
-            // when the CLI happens to run embedded.
             toron_core::nostr::identity::validate_agent_pin(&args.agent)
                 .map_err(anyhow::Error::msg)?;
-            // bd-toron-bootstrap-dryrun-mutates-1-we4c: the daemon arm must not
-            // mutate under `--dry-run` either. The daemon holds the mailbox, so
-            // the CLI cannot canonicalize the slug or read the key path without
-            // a new MCP verb (MCP freeze: same-verb-as-CLI only) — so it
-            // reports the request it would send and leaves the outcome
-            // explicitly unknown rather than guessing a `created` value.
             if dry_run {
                 print_json(&json!({
                     "dry_run": true,
@@ -761,10 +720,6 @@ pub async fn run_agent_daemon(
                 }))?;
                 return Ok(());
             }
-            // ADR-0037 W2: the MCP surface is frozen and refuses a second key
-            // for a known pin, so the reuse proof runs host-local against the
-            // shared durable root (the `agent prune` precedent). Afterwards the
-            // daemon registration is a plain idempotent upsert.
             let local = toron_mcp::demo_mailbox().await?;
             let profile = toron_core::nostr::identity::AgentProfile {
                 name: args.agent.clone(),
@@ -803,10 +758,6 @@ pub async fn run_agent_daemon(
                 )
                 .await?
             };
-            // bd-8xwk: client-side pane stamp — the daemon has no pane
-            // context (and the MCP register_agent schema is frozen), so the
-            // CLI stamps from its own pane env, same best-effort rule as the
-            // direct arm above.
             let daemon_stamped = stamp_bootstrap_pane(
                 args.pane_id.clone(),
                 &args.agent,
@@ -827,11 +778,6 @@ pub async fn run_agent_daemon(
             }))
         }
         AgentCommand::Prune(_) => {
-            // bd-4a0u: no daemon MCP tool exists (ADR-0020 wave 1 freeze:
-            // CLI-only nouns stay CLI-only), so the sweep runs against the
-            // shared durable XDG root the daemon itself uses — the same
-            // store, never a second one. Roster state is sqlite, so the
-            // cross-process read is exact.
             eprintln!(
                 "toron agent prune: no daemon tool; sweeping the shared durable root directly"
             );
@@ -839,10 +785,6 @@ pub async fn run_agent_daemon(
             run_agent(&mb, cmd, dry_run).await
         }
         AgentCommand::Rename(_) => {
-            // A rename MOVES an identity: its key directory, its roster row,
-            // its kind-30013 profile and its live leases. Like the prune, it
-            // runs against the shared durable XDG root the daemon itself
-            // uses — the same store, never a second one.
             eprintln!(
                 "toron agent rename: no daemon tool; renaming in the shared durable root directly"
             );
@@ -913,7 +855,6 @@ pub(crate) async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent
     if mailbox.agent_registered(project, agent).await {
         return;
     }
-    // Attempt auto-reuse of pin identity if it exists in another project (ADR-0037 W2)
     if let Ok(Some(from)) = mailbox.pin_reuse_source(project, agent, None).await
         && let Ok(proof) = mailbox.prove_pin_possession(&from, agent, project).await
     {
@@ -1056,9 +997,6 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             }),
             "nothing was transferred",
         ),
-        // Read-only commands run normally under -n; with-lease is dispatched
-        // in `main` and owns its own dry-run (it prints the plan and leases
-        // nothing).
         ReserveCommand::Conflicts(_)
         | ReserveCommand::List(_)
         | ReserveCommand::WithLease(_)
@@ -1086,7 +1024,6 @@ pub async fn run_reserve(
         ReserveCommand::Acquire(args) => {
             let paths = normalize_reserve_paths(&args.paths);
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
-            // bd-v354: loud zero-file-match warning (stderr, warning only).
             warn_acquire_paths(&paths);
             emit(
                 mailbox
@@ -1129,8 +1066,6 @@ pub async fn run_reserve(
                     .collect(),
             }
             .to_json();
-            // bd-close-releases-leases-qkbo: stale audit rides on top of the
-            // shared board (default repo = cwd).
             let closed =
                 crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
             annotate_stale_rows(&mut board, &closed, &args.project);
@@ -1364,13 +1299,9 @@ pub async fn run_reserve_daemon(
     match cmd {
         ReserveCommand::Acquire(args) => {
             let paths = normalize_reserve_paths(&args.paths);
-            // bd-zugo: same ghost-holder warning on the daemon arm — the
-            // shared durable root is readable from here (`demo_mailbox`).
             if let Ok(mb) = toron_mcp::demo_mailbox().await {
                 warn_if_unregistered(&mb, &args.project, &args.agent).await;
             }
-            // bd-v354: client-side zero-file-match warning (cwd is the repo;
-            // the daemon never sees it). Stderr, warning only.
             warn_acquire_paths(&paths);
             daemon_tool(
                 dc,
@@ -1410,8 +1341,6 @@ pub async fn run_reserve_daemon(
                     }),
                 )
                 .await?;
-            // bd-close-releases-leases-qkbo: the tracked repo is the client's
-            // cwd — the daemon never sees it — so annotate here.
             let closed =
                 crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
             annotate_stale_rows(&mut board, &closed, &args.project);
@@ -1511,10 +1440,6 @@ pub async fn run_reserve_daemon(
             }
             print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
         }
-        // bd-reserve-yield-taqf: CLI-only noun, NO daemon tool (the frozen 41
-        // stays frozen) — scan the shared durable root directly, the same
-        // pattern `ack-sla` uses. Loud on stderr so a divergence between the
-        // daemon's root and this process's root is never silent.
         ReserveCommand::Yield(_) | ReserveCommand::Yields(_) => {
             eprintln!(
                 "toron reserve yield/yields: no daemon tool; scanning the shared durable root directly"
@@ -1699,7 +1624,6 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             .await
         }
         ContactCommand::Captain(args) => {
-            // bd-auqj: clear the captain alias for the project.
             if args.clear {
                 let previous = toron_core::mailbox::identity::clear_captain_alias_in_db(
                     &toron_core::config::ToronPaths::resolve()
@@ -1716,17 +1640,8 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
                 }))?;
                 return Ok(());
             }
-            // bd-captain-alias-0g8a: validate the pin against the WRITER
-            // (the daemon's whois tool), then write the plain-state UPSERT
-            // into the durable root's index DB directly — no second
-            // in-process mailbox (guard precedent). Reads of `captain` then
-            // resolve through the ONE resolver everywhere.
             let db_path = toron_core::config::ToronPaths::resolve().index_path();
             let db_path_s = db_path.display().to_string();
-            // bd-lsgm: the captain fold is consulted ONLY in swarm identity
-            // mode — writing it in open mode silently creates a fold that
-            // can never route. Fail loud with the remedy; --force writes
-            // anyway, audited to stderr.
             let mode = toron_core::mailbox::identity::project_identity_mode_in_db(
                 &db_path_s,
                 &args.project,
@@ -1854,7 +1769,6 @@ pub async fn run_contact(mailbox: &Mailbox, cmd: &ContactCommand) -> anyhow::Res
             match &args.pin {
                 Some(pin) => {
                     let captain = mailbox.set_project_captain(&args.project, pin).await?;
-                    // Prove the fold end-to-end: the alias itself must resolve.
                     let w = mailbox.whois(&args.project, "captain").await?;
                     print_json(&json!({
                         "project": args.project,
@@ -1888,23 +1802,11 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
             let rows = mailbox
                 .active_reservations_all_aliases(&args.project)
                 .await?;
-            // adr-0018 D1a ("ONE resolver") + bd-guard-holder-identity-fold-dqog:
-            // every lease row carries the holder's AUTHORITATIVE hex pubkey
-            // (`agent_pubkey`) beside its possibly-rendered name. Seed the fold
-            // from the row's own pubkey FIRST — that evidence needs no roster
-            // read, so a lease held under an `npub[..8]` rendering still folds
-            // to the same identity as the name. The roster/`whois` lookup below
-            // is an ADDITIONAL source for spellings the rows cannot attribute
-            // (aliases, slugs), never the primary one.
             let mut holder_fold = HolderFold::default();
             for r in &rows {
                 holder_fold.record(&r.agent_pubkey, &r.agent_pubkey);
                 holder_fold.record(&r.agent_name, &r.agent_pubkey);
             }
-            // The committer resolves through the SAME name→pubkey path the
-            // acquire stamped the lease with (local key material, never the
-            // roster): acting as your own pin matches your own lease even when
-            // the roster cannot name either spelling.
             if let Some(name) = agent.as_deref()
                 && let Some(pk) = mailbox.agent_pubkey_hex(&args.project, name).await
             {
@@ -1918,10 +1820,6 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                     exclusive: r.exclusive,
                 })
                 .collect::<Vec<_>>();
-            // bd-guard-crossproject-lease-er38: one lease covers every
-            // spelling. Merge other-project HELD leases that escape into
-            // this repo (`../<repo>/...`), translated to repo-relative
-            // globs, and normalize the same spelling on own-project leases.
             if let Some(repo_name) = std::path::Path::new(&args.repo)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1943,9 +1841,6 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                     .collect::<Vec<_>>();
                 merge_cross_project_leases(&mut reservations, repo_name, foreign);
             }
-            // Additional evidence only: the project roster (the writer's view)
-            // plus a best-effort `whois` for spellings it does not name (the
-            // alias table — the pin a role/slug folds to).
             let spellings = reservations
                 .iter()
                 .map(|r| r.holder.clone())
@@ -1971,7 +1866,6 @@ fn run_guard_record(args: &crate::cli::GuardRecordArgs) -> anyhow::Result<()> {
             &journal,
         );
     }
-    // Best-effort: always exit 0, even when journal unwritable or repo unreadable.
     print_json(&json!({
         "recorded": agent.is_some(),
         "agent": agent,
@@ -2161,24 +2055,13 @@ pub fn guard_check_verdict(
         toron_core::mailbox::guard::SHARED_SAFE_PATHS,
         resolve,
     );
-    // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged diff must
-    // appear in the commit message (--msg-file from the commit-msg hook).
-    // Skipped when no message was supplied.
     let bead_blocks = message.map_or_else(Vec::new, |msg| {
         let added = toron_core::mailbox::guard::added_lines_for_hunk_attribution(repo);
         toron_core::mailbox::guard::bead_hunk_violations(&added, msg)
     });
-    // bd-lyih: a repository that VENDORS prose from another repo declares
-    // those paths in .gitattributes, and the bead ids inside them belong to
-    // the SOURCE ledger. A declaration we cannot honour is NOT ignored —
-    // honouring a bad one hides real work, and ignoring a good one blocks a
-    // legitimate commit with no explanation. Both fail closed, loudly.
     let projected_paths = toron_core::mailbox::guard::projected_paths_in(repo);
     let projected_fault = toron_core::mailbox::guard::projected_decl_fault(repo, &projected_paths);
 
-    // bd-26yr build gate: the staged paths' packages must build. Runs LAST,
-    // because a build over a broken reservation is not the reservation's fault
-    // and the reservation message is the one the agent needs first.
     let mut blocked = blocked;
     blocked.extend(toron_core::mailbox::guard::build_gate_blocks(repo, staged));
 
@@ -2284,13 +2167,7 @@ fn finish_guard_check(
     reservations: &[toron_core::mailbox::guard::Reservation],
     fold: &HolderFold,
 ) -> anyhow::Result<()> {
-    // Both comparison surfaces go through the ONE identity fold: a lease's
-    // holder and the committer's name are the same person when they fold to
-    // the same pubkey, whatever spelling either side used.
     let resolve = |n: &str| fold.resolve(n);
-    // bd-2dox strict sweep-guard: --strict or TORON_GUARD_STRICT
-    // non-"0" enables; TORON_GUARD_STRICT=0 is the operator escape
-    // hatch (logged, wins over the flag).
     let strict = match std::env::var("TORON_GUARD_STRICT") {
         Ok(v) if v == "0" => {
             eprintln!(
@@ -2301,12 +2178,6 @@ fn finish_guard_check(
         Ok(_) => true,
         Err(_) => args.strict,
     };
-    // bd-sdzw: the hatch disables the WHOLE sweep, not just strict mode —
-    // a disabled guard must exit 0 with an empty report (the operator chose
-    // to bypass; the legacy non-strict path must not still block after the
-    // hatch). Without this, `TORON_GUARD_STRICT=0` printed the escape-hatch
-    // notice then STILL exited 1 on any held-by-other path, making commits
-    // fall back to --no-verify (the hatch was unusable).
     if !strict {
         print_json(&json!({
             "strict": false,
@@ -2318,11 +2189,6 @@ fn finish_guard_check(
         std::process::exit(0);
     }
     if strict {
-        // NO `--msg-file` means the pre-commit hook, which runs before the
-        // editor opens and therefore has no message to judge. That must stay
-        // DISTINCT from an empty one: collapsing the two made pre-commit
-        // charge every bead-tagged hunk against an empty message, so any
-        // commit carrying a `bd-*` line was blocked twice over.
         let message = args
             .msg_file
             .as_ref()
@@ -2340,13 +2206,8 @@ fn finish_guard_check(
             eprintln!("{line}");
         }
         print_json(&verdict.report)?;
-        // Explicit exit both ways: the demo mailbox keeps a
-        // background thread alive after the tokio runtime shuts down,
-        // which would HANG a pre-commit hook.
         std::process::exit(verdict.exit_code);
     }
-    // Legacy (non-strict) surface: unchanged fail-open for an unattributed
-    // commit, but the same identity fold for everything attributed.
     let blocked = agent.map_or_else(Vec::new, |agent| {
         toron_core::mailbox::guard::guard_blocked_paths_resolved(
             agent,
@@ -2361,10 +2222,6 @@ fn finish_guard_check(
         "project": args.project,
     });
     print_json(&out)?;
-    // Explicit exit both ways: the demo mailbox keeps a background
-    // thread alive after the tokio runtime shuts down, which would
-    // HANG a pre-commit hook. A hook must terminate with the exit
-    // code of the check, never dangle.
     std::process::exit(
         if out["blocked"].as_array().map(Vec::is_empty).unwrap_or(true) {
             0
@@ -2408,19 +2265,8 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
                         args.project
                     )
                 })?;
-            // adr-0018 D1a: the daemon's roster is a RENDERING — when it
-            // cannot name a holder it emits `npub[..8]`, a string no agent
-            // name can equal, so the owner's own shared lease reads as
-            // "unreserved". Identity is LOCAL truth (the key store the lease
-            // was acquired from), so fold the committer and any unnamed
-            // holder through one local mailbox lookup. Best-effort: no local
-            // store leaves today's raw compare, never a harder block.
             let local = toron_mcp::demo_mailbox().await.ok();
             if let Some(mb) = local.as_ref() {
-                // The committer resolves through the SAME local name→pubkey
-                // path `reserve acquire` stamped the lease with, so acting as
-                // one's own pin matches one's own lease even when the roster
-                // cannot name either spelling.
                 if let Some(name) = agent.as_deref()
                     && let Some(pk) = mb.agent_pubkey_hex(&args.project, name).await
                 {
@@ -2432,11 +2278,6 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
                     .chain(agent.clone());
                 fold.merge(embedded_roster_fold(mb, &args.project, spellings).await);
             }
-            // bd-guard-crossproject-lease-er38: the roster resource is
-            // project-scoped, so foreign-project leases escape it. Augment
-            // from the durable root (the same store the daemon serves);
-            // best-effort — on failure the guard degrades to the old
-            // project-scoped behavior, never blocks harder.
             if let Some(repo_name) = std::path::Path::new(&args.repo)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2511,9 +2352,6 @@ async fn daemon_guard_roster(
         .read_resource(&format!("toron://agents/{project}"))
         .await?;
     let now_secs = chrono::Utc::now().timestamp();
-    // adr-0018 D1a: seed the fold from the lease events' own author pubkeys
-    // FIRST (roster-independent — it holds even when the agents document is
-    // empty), then let the agents document name any remaining spellings.
     let mut fold = fold_from_daemon_leases(&res, &agents);
     fold.merge(fold_from_agents_resource(&agents));
     Ok((resolve_daemon_roster(&res, &agents, now_secs), fold))
@@ -2556,7 +2394,6 @@ fn resolve_daemon_roster(
             || content.contains("\"status\":\"released\"")
     }
     fn event_path(ev: &serde_json::Value) -> String {
-        // Path from the d-tag (`{project}:{path}` — server split_once ':').
         ev.get("tags")
             .and_then(|v| v.as_array())
             .and_then(|tags| {
@@ -2570,9 +2407,6 @@ fn resolve_daemon_roster(
             .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
             .unwrap_or_default()
     }
-    // PASS 1 — tombstone cutoff per path: the newest revocation/release
-    // marker's timestamp. Older events at that path are dead; newer ones
-    // (re-acquired after the release) stay live.
     let mut cutoff: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for ev in events {
         if !is_marker(event_content(ev)) {
@@ -2585,8 +2419,6 @@ fn resolve_daemon_roster(
             .and_modify(|c| *c = (*c).max(at))
             .or_insert(at);
     }
-    // PASS 2 — resolve live leases (markers, intents, expired, and
-    // tombstoned-older events are dropped).
     let mut out = Vec::new();
     for ev in events {
         let content = event_content(ev);
@@ -2598,7 +2430,6 @@ fn resolve_daemon_roster(
         {
             continue;
         }
-        // Skip expired (NIP-40 expiration tag < now).
         if let Some(exp) = ev.get("tags").and_then(|v| v.as_array()).and_then(|tags| {
             tags.iter().find_map(|t| {
                 let a = t.as_array()?;
@@ -2615,8 +2446,6 @@ fn resolve_daemon_roster(
             continue;
         }
         let path = event_path(ev);
-        // bd-0pjf: tombstoned-older events stay dead even though the marker
-        // itself is skipped above.
         if cutoff
             .get(&path)
             .is_some_and(|c| event_created_at(ev) <= *c)
@@ -2948,8 +2777,6 @@ mod holder_fold_tests {
             "the owner's own shared lease must cover its commit: {blocked:?}"
         );
 
-        // And a DIFFERENT agent is still blocked — the fold must not open the
-        // guard for everyone.
         let other = toron_core::mailbox::guard::guard_check_strict_resolved(
             Some("BlueLake"),
             &staged,
@@ -2994,8 +2821,6 @@ mod holder_fold_tests {
     fn roster_blind_fold_covers_the_owner_and_blocks_foreign_pins() {
         let res = json!({ "events": [lease_event(ALICE)] });
         let mut fold = fold_from_daemon_leases(&res, &json!([]));
-        // The committer resolves through local key material, exactly as the
-        // guard seeds it (`agent_pubkey_hex`).
         fold.record("RoseDune", ALICE);
         let reservations = vec![toron_core::mailbox::guard::Reservation {
             holder: ALICE[..8].to_string(),
@@ -3056,11 +2881,6 @@ mod guard_projection_tests {
     /// Built with the git CLI: toron-cli does not depend on libgit2, and this
     /// is the index state the guard reads, not the library that reads it.
     fn repo(attrs: &str) -> PathBuf {
-        // A per-process COUNTER, not a clock. `SystemTime::now()` is coarse
-        // enough on macOS that two test threads reading it in the same
-        // instant get the same value, so two fixtures landed in one
-        // directory and raced on `git init` — a flake that only shows up
-        // under the parallel runner.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root =
@@ -3149,9 +2969,6 @@ mod guard_projection_tests {
 
     #[test]
     fn the_same_commit_without_the_declaration_is_blocked() {
-        // The negative control. Same repo, same message, same staged files —
-        // only the .gitattributes line removed. Without this the test above
-        // could be green because the guard is not scanning the guide at all.
         let root = repo("# no declaration here\n");
         let v = verdict(&root, "docs: refresh [bd-source01]\n");
 
@@ -3174,8 +2991,6 @@ mod guard_projection_tests {
 
     #[test]
     fn a_declaration_reaching_compiled_source_fails_closed() {
-        // The dangerous direction: `**` would switch the rule off for every
-        // source file in the repo. It must BLOCK and name itself.
         let root = repo("** linguist-generated=true\n");
         let v = verdict(&root, "docs: [bd-source01] [bd-foreign1]\n");
 
@@ -3231,7 +3046,6 @@ mod guard_projection_tests {
         }];
         let resolve = |n: &str| n.to_string();
 
-        // pre-commit's shape: no message at all.
         let v = guard_check_verdict(
             &root,
             "demo",
@@ -3253,7 +3067,6 @@ mod guard_projection_tests {
             v.notices
         );
 
-        // And the contrast: an empty MESSAGE is a real, unsatisfied message.
         let w = guard_check_verdict(
             &root,
             "demo",
@@ -3275,9 +3088,6 @@ mod guard_projection_tests {
 
     #[test]
     fn a_projected_path_still_needs_its_own_reservation() {
-        // The exemption is for the HUNK rule only. A projected path with no
-        // lease must still be Unreserved, or the projection is an
-        // unaudited write lane that happens to also skip attribution.
         let root = repo("docs/guides/** linguist-generated=true\n");
         let staged = vec!["docs/guides/mail.md".to_string()];
         let resolve = |n: &str| n.to_string();

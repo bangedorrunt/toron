@@ -158,7 +158,6 @@ mod tests {
 
     #[test]
     fn sha256_hex_known_vector() {
-        // Known sha256 of "hello".
         assert_eq!(
             sha256_hex(b"hello"),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -176,7 +175,6 @@ mod tests {
         assert_eq!(store.get(&hash).expect("get"), data.to_vec());
         assert!(blob_path(&root, &hash).ends_with(format!("blobs/sha256/{hash}").as_str()));
 
-        // Idempotent: second put does not duplicate.
         let hash2 = store.put(data).expect("put again");
         assert_eq!(hash, hash2);
         let _ = std::fs::remove_dir_all(root);
@@ -203,8 +201,6 @@ mod tests {
 
     #[test]
     fn large_payload_not_inlined_into_event_content() {
-        // Large payloads go to blob storage; the event content is just the
-        // toron-blob:// URL, never the payload itself.
         let root = temp_root("large");
         let store = BlobStore::new(root.clone());
 
@@ -215,7 +211,6 @@ mod tests {
         assert_eq!(file_ref.url, format!("{BLOB_SCHEME}{hash}"));
         assert!(file_ref.url.len() < 128, "content is just a short URL");
 
-        // Tag set carries the hash + file type.
         let tags = file_ref.tags();
         assert!(
             tags.iter()
@@ -223,7 +218,6 @@ mod tests {
                     && t.as_slice().get(1).map(String::as_str) == Some(&hash))
         );
 
-        // Recipient fetches by hash and recovers the exact bytes.
         assert_eq!(store.get(&hash).expect("fetch").len(), payload.len());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -251,11 +245,9 @@ mod tests {
         assert!(store.exists(&hash));
         assert!(!store.exists("0".repeat(64).as_str()));
 
-        // Default put keeps no sidecar.
         let plain = store.put(b"plain").expect("put");
         assert_eq!(store.get_type(&plain), None);
 
-        // Sidecar is not overwritten once recorded (first type wins).
         store
             .put_with_type(b"<svg>hi</svg>", Some("text/plain"))
             .expect("put again");

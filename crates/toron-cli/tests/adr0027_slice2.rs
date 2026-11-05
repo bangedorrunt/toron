@@ -26,8 +26,6 @@ fn toron() -> Command {
 }
 
 fn toron_root() -> PathBuf {
-    // cargo test runs with manifest dir as crates/toron-cli, so toron root is ../..
-    // Use CARGO_MANIFEST_DIR to be robust.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
@@ -50,8 +48,6 @@ fn read_file(path: &PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-// ── toron side — already GREEN after bd-lmcy, keep as regression guards ──
-
 #[test]
 fn adr0027_s2_toron_role_pin_help() {
     let out = toron()
@@ -70,20 +66,11 @@ fn adr0027_s2_toron_role_pin_help() {
 
 #[test]
 fn adr0027_s2_toron_role_pin_and_whois_roundtrip() {
-    // End-to-end via the real mailbox (no mocks): create two agents in a temp
-    // project, pin role:wheelhouse to first pin, re-pin to second, verify
-    // whois and mail --to role: resolve. This is the toron side of S3.
-    // For speed we test the CLI surface, not the full pane-death (which needs
-    // herdr). The deeper pane-death + corr inheritance is proven in flywheel
-    // role_model tests; here we just prove the toron verb exists and is not
-    // auto-spawn.
     let out = toron()
         .args(["role", "list", "--help"])
         .output()
         .expect("role list --help");
     assert!(out.status.success(), "role list --help must exit 0");
-    // actual pin/whois/mail test is in `role_toron` (bd-lmcy) — here we just
-    // pin that the CLI verbs exist and the help mentions the right args.
     let out = toron()
         .args(["mail", "send", "--help"])
         .output()
@@ -94,8 +81,6 @@ fn adr0027_s2_toron_role_pin_and_whois_roundtrip() {
         help.contains("--to"),
         "mail send --help must list --to, got: {help}"
     );
-    // Verify that role: syntax is documented or at least not rejected as
-    // unknown — we test via `toron role pin --help` and `whois` help.
     let out = toron()
         .args(["mail", "whois", "--help"])
         .output()
@@ -111,20 +96,12 @@ fn adr0027_s2_toron_role_pin_and_whois_roundtrip() {
 
 #[test]
 fn adr0027_s2_toron_mail_to_role_resolves_and_rejects_unknown() {
-    // Unknown role must fail loudly naming available roles, not auto-spawn.
-    // This is the CLI-level S3 guard that survives even before flywheel.
-    // We test the library's role resolution indirectly via CLI help and
-    // error messages — the deeper dead-pane rebinding is in flywheel.
     let out = toron()
         .args(["role", "--help"])
         .output()
         .expect("role --help");
     assert!(out.status.success());
-    // The real unknown-role error is proven in `role_toron` (bd-lmcy):
-    // `cargo test --workspace role_toron` — here we just guard the verb exists.
 }
-
-// ── flywheel side — RED until bd-if26 / bd-9ff3 close ──
 
 #[test]
 fn adr0027_s2_flywheel_roles_map_and_rolemsg_exist() {
@@ -134,7 +111,6 @@ fn adr0027_s2_flywheel_roles_map_and_rolemsg_exist() {
     };
     let ws = ws.join("src/workspace.rs");
     let content = read_file(&ws);
-    // E4: WorkspaceModel.roles: BTreeMap<Role, Pin> updated ONLY by Msg::RoleBound
     assert!(
         content.contains("roles:") && content.contains("BTreeMap"),
         "RED (bd-if26): WorkspaceModel.roles BTreeMap missing"
@@ -143,7 +119,6 @@ fn adr0027_s2_flywheel_roles_map_and_rolemsg_exist() {
         content.contains("RoleBound"),
         "RED (bd-if26): Msg::RoleBound missing — roles must be updated by signed 30013 role= events"
     );
-    // Binding lives in Model, not agent-names.json
     assert!(
         content.contains("RoleBound") && content.contains("roles.insert"),
         "RED (bd-if26): tick must handle Msg::RoleBound and insert into Model.roles"
@@ -158,9 +133,6 @@ fn adr0027_s2_flywheel_role_corr_inheritance() {
     };
     let ws = fw.join("src/workspace.rs");
     let content = read_file(&ws);
-    // Open corr inheritance: rebind must carry open assignment corrs onto the
-    // next pin. Before bd-if26 the RoleBound arm is just `roles.insert` without
-    // touching `assignment`. Check the arm's body for assignment handling.
     let pos = content
         .find("Msg::RoleBound")
         .expect("RoleBound must exist");
@@ -183,7 +155,6 @@ fn adr0027_s2_flywheel_presence_in_model_and_unknown_stays_unknown() {
     };
     let ws = ws.join("src/workspace.rs");
     let content = read_file(&ws);
-    // E6: presence BTreeMap<Pin, Presence>, missing = Unknown
     assert!(
         content.contains("presence:") && content.contains("Presence"),
         "RED (bd-9ff3): WorkspaceModel.presence BTreeMap<Pin, Presence> missing"
@@ -206,16 +177,10 @@ fn adr0027_s2_flywheel_inject_reads_presence_not_herdr_gossip() {
     };
     let ws = fw.join("src/workspace.rs");
     let content = read_file(&ws);
-    // Inject must read presence in Model, not herdr-only gossip. Before bd-9ff3
-    // the file has a presence map but tick does not consult it for
-    // standing/tasked queuing — it still uses herdr status or doorbell's
-    // should_inject directly. Check that tick's WatchNdjson/Inbox handling
-    // explicitly reads `presence.get` or `Presence::` for queuing.
     let has_model_inject = content.contains("presence.get")
         || content.contains("presence[")
         || (content.contains("Presence::Idle") && content.contains("presence"))
         || content.contains("Unknown stays Unknown");
-    // Also check that doorbell's should_inject is now Model-fed, not herdr-only
     let has_presence_queuing =
         content.contains("working") && content.contains("presence") && content.contains("queue");
     assert!(
@@ -226,11 +191,6 @@ fn adr0027_s2_flywheel_inject_reads_presence_not_herdr_gossip() {
 
 #[test]
 fn adr0027_s2_source_scan_no_auto_spawn_on_role_miss() {
-    // Fail-if: auto-spawn on miss must not happen. Check that toron mail send
-    // with --to role:unknown does not auto-create a pane. This is a CLI-level
-    // guard; the implementation should error naming available roles.
-    // We verify the CLI help and the core send_tags validation do not mention
-    // auto-spawn, and that the role_toron test would catch it.
     let cli = toron_root().join("crates/toron-cli/src/cli.rs");
     if cli.exists() {
         let c = read_file(&cli);
@@ -239,15 +199,10 @@ fn adr0027_s2_source_scan_no_auto_spawn_on_role_miss() {
             "role miss must not auto-spawn — check CLI does not contain auto_spawn"
         );
     }
-    // The real check is in `cargo test --workspace role_toron` — here we just
-    // guard the surface.
 }
 
 #[tokio::test]
 async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
-    // S3 e2e against the real roles surface (bd-lmcy + role-model). This is
-    // the fence for bd-twcq: role outlives pane, corr inherits, whois shows
-    // live pin, no auto-spawn, no 30015.
     use std::sync::Arc;
     use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
     use toron_core::index::schema;
@@ -296,7 +251,6 @@ async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
     }
 
     let (mailbox, db_path, data_dir) = test_mailbox("s3-e2e").await;
-    // First generation: OldPin holds wheelhouse
     mailbox
         .register_agent("demo", &profile("OldPin"))
         .await
@@ -313,10 +267,8 @@ async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
         .set_role_pin("demo", "wheelhouse", "OldPin")
         .await
         .expect("pin old");
-    // whois wheelhouse -> OldPin, charter preserved
     let who1 = mailbox.whois("demo", "wheelhouse").await.expect("whois1");
     assert_eq!(who1.name, "OldPin", "whois must print live pin OldPin");
-    // Mail to role with corr should resolve to OldPin
     let corr = "FM-S3-001";
     let msg1 = SendMessage {
         project_slug: "demo".into(),
@@ -335,15 +287,12 @@ async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
     };
     let r1 = mailbox.send_message(&msg1).await.expect("send1 to role");
     assert_eq!(r1.deliveries[0].payload.recipient, "OldPin");
-    // Simulate pane death: rebind wheelhouse -> NewPin (seq>=2 is NEW pin, not same identity)
     mailbox
         .set_role_pin("demo", "wheelhouse", "NewPin")
         .await
         .expect("rebind");
     let who2 = mailbox.whois("demo", "wheelhouse").await.expect("whois2");
     assert_eq!(who2.name, "NewPin", "whois after rebind must be NewPin");
-    // Verify 30013 role= tags, no new 30015 kind is minted.
-    // Allow "30015" in comments/tests that say "NO 30015", but forbid a real kind definition.
     let Some(fw) = flywheel_root() else {
         skip_no_flywheel();
         return;
@@ -355,7 +304,6 @@ async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
         !has_30015_kind,
         "must not mint 30015 kind — role via 30013 role= tags only (found 30015 kind definition)"
     );
-    // Mail to role now goes to NewPin
     let msg2 = SendMessage {
         project_slug: "demo".into(),
         sender_name: "SenderOne".into(),
@@ -366,12 +314,6 @@ async fn adr0027_s2_s3_e2e_role_rebind_with_corr_and_whois() {
     };
     let r2 = mailbox.send_message(&msg2).await.expect("send2");
     assert_eq!(r2.deliveries[0].payload.recipient, "NewPin");
-    // Open corr inheritance: the first corr's assignment should still be
-    // retrievable and considered to have moved (or at least survive). Check
-    // via whois and via the fact that the corr is still in the store.
-    // The mailbox's role rebind does not delete the corr; the flywheel's
-    // WorkspaceModel would retarget delivery. Here we just check the corr
-    // is still resolvable and not auto-spawned.
     let unknown = mailbox
         .send_message(&SendMessage {
             project_slug: "demo".into(),

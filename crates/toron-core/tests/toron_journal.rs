@@ -111,8 +111,6 @@ impl Drop for Db {
     }
 }
 
-// --- 1. the upstream contract, as a law suite over any JournalStore -------
-
 fn intent_before_provider_same_key_on_retry(db: &dyn JournalStore) {
     let first = db.record_intent_ok("job-1", 3);
     assert_eq!(first.state, EffectState::Prepared);
@@ -122,17 +120,12 @@ fn intent_before_provider_same_key_on_retry(db: &dyn JournalStore) {
 
 fn claim_sets_owner_lease_generation_atomically(db: &dyn JournalStore) {
     db.record_intent_ok("job-1", 3);
-    // Fresh row: generation 0, no owner.
     let row = db.claim_ok("job-1", "worker-a", 9999, 0, 0).unwrap();
     assert_eq!(row.owner.as_deref(), Some("worker-a"));
     assert_eq!(row.lease_deadline, Some(9999));
     assert_eq!(row.generation, 1);
-    // A stale generation claims nothing.
     assert!(db.claim_ok("job-1", "worker-a", 9999, 0, 0).is_none());
-    // A live lease under another owner is never stolen ...
     assert!(db.claim_ok("job-1", "worker-b", 10000, 0, 1).is_none());
-    // ... but the same owner may renew, and anyone may reclaim after expiry
-    // (deadline <= now_ms releases the lease).
     let row = db.claim_ok("job-1", "worker-a", 10000, 0, 1).unwrap();
     assert_eq!(row.generation, 2);
     let row = db.claim_ok("job-1", "worker-b", 20000, 10000, 2).unwrap();
@@ -163,7 +156,6 @@ fn terminal_states_never_move(db: &dyn JournalStore) {
     assert!(settle_to(db, "job-1", EffectState::Failed).is_none());
     assert!(settle_to(db, "job-1", EffectState::Cancelled).is_none());
     assert_eq!(db.get_ok("job-1").unwrap().state, EffectState::Settled);
-    // Terminal rows never move, not even by claim (generation matches here).
     assert!(db.claim_ok("job-1", "w", 1, 0, 1).is_none());
 }
 
@@ -202,7 +194,6 @@ fn exhausted_attempts_dead_letter(db: &dyn JournalStore) {
 fn stale_generation_spends_no_attempts(db: &dyn JournalStore) {
     db.record_intent_ok("job-1", 3);
     db.claim_ok("job-1", "worker-a", 9999, 0, 0);
-    // Generation 1 holds the lease; generation 0 is the zombie that lost it.
     assert!(db.attempt_ok("job-1", 0).is_none());
     assert_eq!(db.get_ok("job-1").unwrap().attempts, 0);
     assert_eq!(db.attempt_ok("job-1", 1).unwrap().attempts, 1);
@@ -230,7 +221,6 @@ fn offsets_move_only_forward(db: &dyn JournalStore) {
     db.claim_ok("a", "w", 1, 0, 0);
     let second = db.get_ok("a").unwrap().offset;
     assert!(second > first);
-    // A refused settle commits nothing: the offset does not move.
     assert!(db.settle_ok("a", 0, EffectState::InFlight).is_none());
     assert_eq!(db.get_ok("a").unwrap().offset, second);
 }
@@ -295,13 +285,10 @@ fn the_reference_store_satisfies_the_laws() {
 fn toron_journal_satisfies_the_same_laws() {
     let db = Db::new("laws");
     for (name, law) in LAWS {
-        // A fresh scope per law: same isolation as a fresh in-memory store.
         law(&db.journal(name, 8));
     }
     old_offset_returns_gone_with_first_replayable(&db.journal("retention", 2));
 }
-
-// --- 2. differential against the reference ------------------------------
 
 /// A tiny deterministic PRNG (no ambient randomness in a reproducible test).
 struct Lcg(u64);
@@ -375,8 +362,6 @@ fn random_operation_sequences_match_the_reference() {
                 }
                 1 => {
                     let d = rng.next(100) as i64;
-                    // Mostly the current generation, sometimes a stale one,
-                    // like the settle arm below: both sides must agree.
                     let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
@@ -389,7 +374,6 @@ fn random_operation_sequences_match_the_reference() {
                     )
                 }
                 2 => {
-                    // Mostly the current generation, sometimes a stale one.
                     let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
@@ -403,8 +387,6 @@ fn random_operation_sequences_match_the_reference() {
                     )
                 }
                 3 => {
-                    // Mostly the current generation, sometimes a stale one:
-                    // both fences must agree.
                     let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
@@ -426,11 +408,8 @@ fn random_operation_sequences_match_the_reference() {
             }
         }
     }
-    // Negative control on the generator: the sequences actually move rows.
     assert!(changed > 600, "only {changed} steps changed anything");
 }
-
-// --- 3. what only a database shows ---------------------------------------
 
 #[test]
 fn rows_survive_a_reopen_and_scopes_are_isolated() {
@@ -457,22 +436,17 @@ fn rows_survive_a_reopen_and_scopes_are_isolated() {
         (row.offset, row.generation, row.owner.as_deref()),
         (offset, generation, Some("loop-a"))
     );
-    // Idempotent after the reopen, too.
     assert_eq!(j.record_intent_ok("mail.append:x", 3), row);
 }
 
 #[test]
 fn racing_claims_from_two_processes_never_share_a_generation() {
-    // Two pools on one file = two processes' views of one database.
     let a = Db::new("race");
     let mut b = Db::at(a.path.clone());
     b.keep = true;
     let ja = a.journal("race", 1000);
     let jb = b.journal("race", 1000);
     ja.record_intent_ok("job", 3);
-    // now_ms = MAX retires the lease fence (deadline 1 is always expired),
-    // so this measures exactly the generation fence: every success bumps
-    // the generation by one, and a stale read retries instead of sharing.
     let race = |j: ToronJournal, owner: &'static str| {
         std::thread::spawn(move || {
             let mut gens = Vec::with_capacity(40);
@@ -503,10 +477,6 @@ fn racing_claims_from_two_processes_never_share_a_generation() {
 
 #[test]
 fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
-    // elm-effect 0.4.0 runs every loop command on a blocking fiber
-    // (`spawn_blocking`), so a call from that context must answer: the wait
-    // is plain `recv_timeout`, never `block_on`. This is the production
-    // shape, not a direct call from an async task.
     let db = Db::new("f2");
     let j = db.journal("f2", 8);
     let j2 = j.clone();
@@ -518,7 +488,6 @@ fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
         .unwrap()
         .expect("answers from a blocking fiber");
     assert_eq!(row.state, EffectState::Prepared);
-    // Through the trait the answer is the same row, not a lossy sentinel.
     let j3 = j.clone();
     let row = db
         .rt

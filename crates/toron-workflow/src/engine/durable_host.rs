@@ -185,8 +185,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
             let mut model: RunModel = serde_json::from_str(&json)
                 .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?;
-            // A model written before the branch slice has no plan; compiling
-            // is deterministic, so a restart lands on the same entries.
             model.recompile_plan();
             let mut run = Self {
                 model,
@@ -197,26 +195,17 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             return run.resume(now_ms).map(|effects| (run, effects));
         }
 
-        // This driver sequences the linear plan only. A graph-lowered shape
-        // (`parallel`) belongs to the graph driver; flattening it here would
-        // be a second scheduler (bd-durable-parallel-53um).
         if needs_graph_model(&workflow) {
             return Err(HostError::Unsupported("not a linear workflow".into()));
         }
         if let Some(reason) = unsupported_reason(&workflow) {
             return Err(HostError::Unsupported(reason));
         }
-        // Capability, not shape (bd-spawn-launcher-flip-d8mv): a direct caller
-        // that never installed a launcher must be refused here too, or the run
-        // would park on a launch nothing can perform.
         if let Some(reason) = spawn_launcher_refusal(&workflow)
             && spawn_seams.launcher.is_none()
         {
             return Err(HostError::Unsupported(reason));
         }
-        // bd-loop-rewrites-fap8: resolve every loop bound from the trigger
-        // before any engine or state row. An unbounded loop refuses here; the
-        // fold performs the same pure read at the marker.
         for step in &workflow.steps {
             if let crate::schema::Action::Loop { max, .. } = &step.action {
                 resolve_loop_max(max, &trigger, &serde_json::Map::new())
@@ -231,8 +220,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                     phase: status.phase,
                 });
             }
-            // A parked row without a model is a run whose state was lost; its
-            // wake is free, so take it and re-drive from the start.
             StartOutcome::Already { status } if status.phase == EnginePhase::Parked => {
                 engine.wake(&run_id, now_ms)?;
             }
@@ -275,8 +262,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     /// resolver does not know keeps `None` and lands the old unknown-profile
     /// value, never a run failure.
     pub fn prepare_spawns(&mut self, seams: &SpawnSeams) {
-        // Plan-entry aligned: a `spawn` inside a branch arm gets a spec too,
-        // so the arm is a normal linear step (bd-engine-facade-74nw).
         self.spawns = (0..self.model.plan.entries.len())
             .map(|index| {
                 let (authored, step) = self.model.plan.step_at(index)?;
@@ -410,9 +395,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     ///
     /// [`HostError::WrongPhase`] unless the model is parked.
     pub fn woke(&mut self, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
-        // A spawn-await has its own park deadline arm in the fold: waking it is
-        // how a launcher that outlives the deadline fails the node with the
-        // canonical text (bd-spawn-launcher-flip-d8mv).
         if !matches!(
             self.model.phase,
             ModelPhase::Parked { .. } | ModelPhase::AwaitingSpawn { .. }
@@ -455,8 +437,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     fn resume(&mut self, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
         match self.model.phase.clone() {
             ModelPhase::Parked { until_ms, .. } => {
-                // Same instant, same park generation: a restart re-parks
-                // idempotently instead of extending the wait.
                 self.park(until_ms, 0, now_ms)?;
                 if until_ms <= now_ms {
                     return self.apply(RunMsg::Woke { now_ms }, now_ms);
@@ -481,9 +461,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                     now_ms,
                 )?;
             }
-            // A cursor on a branch marker / arm end: consume the pure markers
-            // (guard included) and persist the advance, so the returned
-            // `ExecuteStep` names the entry the model now holds.
             ModelPhase::Running if self.model.plan.step_at(self.model.step_index).is_none() => {
                 let mut next = self.model.clone();
                 let effects = next_effects(&mut next, now_ms, &self.spawns);
@@ -534,8 +511,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     fn engine_verb(&mut self, effect: &RunEffect, now_ms: u64) -> Result<(), HostError> {
         let key = self.model.run_id.clone();
         match effect {
-            // A spawn is published by the embedding, not by the engine: the
-            // durable model owns the park, the host owns the job event.
             RunEffect::ExecuteStep { .. }
             | RunEffect::Unsupported { .. }
             | RunEffect::StartSpawn { .. }
@@ -600,10 +575,6 @@ fn phase_name(phase: &ModelPhase) -> &'static str {
 fn state_error(e: anyhow::Error) -> HostError {
     HostError::State(format!("{e:#}"))
 }
-
-// ---------------------------------------------------------------------------
-// Graph driver (bd-durable-graph-impl-r2x1)
-// ---------------------------------------------------------------------------
 
 /// The capabilities a `call_workflow` graph needs (bd-durable-call-workflow-mg6y).
 ///
@@ -763,12 +734,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
             return run.resume(now_ms).map(|effects| (run, effects));
         }
 
-        // Captain review Q3: a validation the old path performs must not
-        // disappear because the workflow took the new path.
         validate_workflow_lineage(&trigger, &workflow.name).map_err(HostError::Unsupported)?;
-        // bd-durable-parallel-53um: a `steps:` fan-out is lowered into copy
-        // nodes + a collect join. The lanes are pure and resolved here, so a
-        // refusal still happens before any engine or state row.
         let workflow = match durable_graph(&workflow, &trigger) {
             Ok(Some(graph)) => {
                 let mut lowered = workflow;
@@ -781,9 +747,6 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
         if let Some(reason) = graph_unsupported_reason(&workflow) {
             return Err(HostError::Unsupported(reason));
         }
-        // The child graph is validated here: recursion, unknown callees, and
-        // callees the durable models cannot sequence refuse the parent before
-        // any row (bd-durable-call-workflow-mg6y).
         validate_children(&workflow, children).map_err(HostError::Unsupported)?;
 
         match engine.start(&run_id, now_ms)? {
@@ -1002,22 +965,15 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
 
     fn engine_verb(&mut self, effects: &[GraphEffect], now_ms: u64) -> Result<(), HostError> {
         let key = self.model.run_id.clone();
-        // ONE park per transition. `park_until` holds a single wake per run and
-        // a second call OVERWRITES the first (last wins, not min), so a wave
-        // with a 5s delay plus an approval must park at the 5s deadline — the
-        // model's own in-flight deadlines decide it, not the effect order.
         if let Some((until_ms, max_wait_secs)) = park_deadline(&self.model, now_ms) {
             self.park(until_ms, max_wait_secs, now_ms)?;
         }
-        // Terminal verbs only; every park-shaped effect is the park above.
         for effect in effects {
             match effect {
                 GraphEffect::ExecuteNode { .. }
                 | GraphEffect::Unsupported { .. }
                 | GraphEffect::ParkUntil { .. }
                 | GraphEffect::AwaitApproval { .. }
-                // The embedding owns the child run; the engine has no verb for
-                // opening or joining one (bd-durable-call-workflow-mg6y).
                 | GraphEffect::ChildRun { .. }
                 | GraphEffect::ChildJoin { .. } => {}
                 GraphEffect::Complete { .. } => {

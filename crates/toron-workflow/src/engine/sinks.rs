@@ -82,8 +82,6 @@ pub struct VerifySink(
 impl std::fmt::Debug for VerifySink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifySink")
-            // Poison-recovering, never `.unwrap()`: a poisoned lock must not
-            // turn a diagnostic formatting path into a second panic.
             .field(
                 "has_sink",
                 &self
@@ -127,19 +125,6 @@ impl VerifySink {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Structured parked work (ADR-0032 Spec 6, bd-asx3).
-//
-// The engine pushes bare promise ids into [`ApprovalSink`]/[`SpawnSink`]
-// (that seam is unchanged). The host drains those ids into [`PendingEntry`]
-// records carrying run/node/effect/promise/generation identity plus a
-// bounded payload, kept in a [`PendingRegistry`] with idempotent
-// observation. Entries are deterministically replayable: re-draining the
-// same live sinks after a restart reconstructs the identical registry — no
-// durable row and no in-memory carry required (Wave-1 per captain review;
-// durable `workflow_pending` rows are Wave 3).
-// ---------------------------------------------------------------------------
 
 /// Which parked control produced the promise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,7 +564,6 @@ mod lifecycle_tests {
             validate_resolution(Some(&entry), &wrong_project),
             Err(ResolutionMismatch::WrongProject { .. })
         ));
-        // A project-scoped entry resolves only under the same project.
         let mut scoped = approval_entry();
         scoped.project = Some("demo".into());
         let cross = Resolution {

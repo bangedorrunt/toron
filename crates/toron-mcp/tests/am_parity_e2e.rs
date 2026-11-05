@@ -1,5 +1,4 @@
 // governed-by: ADR-0003
-//
 //! AM-parity end-to-end test (bd-am-parity-e2e).
 //!
 //! Boots the REAL toron MCP daemon (axum router on a real TCP socket, with an
@@ -29,10 +28,6 @@ use rmcp::transport::streamable_http_client::{
 };
 use serde_json::Value;
 
-// ======================================================================
-// Harness
-// ======================================================================
-
 /// One live toron daemon: operator key on disk + env set BEFORE `router()`
 /// (which reads `TORON_OPERATOR_KEY` at boot), axum on a random port, and an
 /// rmcp client connected over Streamable HTTP. Dropping this kills the server
@@ -43,8 +38,6 @@ struct LiveDaemon {
     _dir: Arc<ScrubDir>,
 }
 
-// We avoid pulling `tempfile` as a named dep by reusing the crate's existing
-// pattern (std::env::temp_dir). Wrap a cleanup guard manually.
 struct ScrubDir(std::path::PathBuf);
 impl Drop for ScrubDir {
     fn drop(&mut self) {
@@ -54,19 +47,16 @@ impl Drop for ScrubDir {
 
 impl LiveDaemon {
     async fn boot(tag: &str) -> anyhow::Result<Self> {
-        // 1. temp dir holding the operator ncryptsec + the mailbox data dir.
         let dir =
             std::env::temp_dir().join(format!("toron-am-parity-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let scrub = Arc::new(ScrubDir(dir.clone()));
 
-        // 2. generate an operator keypair → encrypt to ncryptsec → write 0600.
         let keys = toron_core::keys::generate();
         let pass = "am-parity-test-pass";
         let ncryptsec = toron_core::keys::encrypt(&keys, pass, 16)?;
         let key_path = dir.join("operator_nsec");
         std::fs::write(&key_path, ncryptsec)?;
-        // chmod 0600 on unix (NIP-49 keys are sensitive at rest).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -75,14 +65,8 @@ impl LiveDaemon {
             std::fs::set_permissions(&key_path, perms)?;
         }
 
-        // 3. NO process-global env writes (bd-6wfv): the cluster tests run in
-        // PARALLEL threads; setting TORON_MCP_DATA_DIR / TORON_OPERATOR_KEY /
-        // TORON_KEY_PASSPHRASE per daemon raced — daemons booted against each
-        // other's data dirs (intermittent "unknown agent"/"no local key").
-        // The router gets its paths EXPLICITLY via router_with_isolated.
         let mailbox_dir = dir.join("mailbox");
 
-        // 4. boot the router with the explicit paths on a kernel-chosen port.
         let router = toron_mcp::router_with_isolated(mailbox_dir.clone(), key_path, pass).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -90,7 +74,6 @@ impl LiveDaemon {
             let _ = axum::serve(listener, router).await;
         });
 
-        // 5. connect an rmcp client over the real HTTP socket.
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
         );
@@ -153,10 +136,6 @@ impl LiveDaemon {
     }
 }
 
-// ======================================================================
-// F14: structuredContent present for outputSchema-bearing tools
-// ======================================================================
-
 /// F14 (docs/learnings/2026-09-12-swarm-stack-friction.md): every tool here
 /// declares an `outputSchema`, so the server MUST return `structuredContent`
 /// — strict MCP clients rejected object calls with "has an output schema but
@@ -181,23 +160,17 @@ async fn tool_results_carry_structured_content() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ======================================================================
-// Cluster 1+2: Infrastructure + Identity
-// ======================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     let mut d = LiveDaemon::boot("infra-id").await?;
     let proj = format!("/tmp/toron-am-parity-infra-{}", uuid::Uuid::new_v4());
 
-    // health_check → a status-ish field (archive/bus/ok).
     let health = d.call("health_check", serde_json::json!({})).await;
     let has_status = health.get("ok").is_some()
         || health.pointer("/bus/ok").is_some()
         || health.get("status").is_some();
     assert!(has_status, "health_check surfaces a status field: {health}");
 
-    // ensure_project → idempotent; carries a slug.
     let p1 = d
         .call("ensure_project", serde_json::json!({ "human_key": proj }))
         .await;
@@ -221,7 +194,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         "second ensure_project is a no-op (created=false)"
     );
 
-    // register_agent (upsert) → crypto identity envelope (npub, key_path, ...).
     let alice = d
         .call(
             "register_agent",
@@ -245,7 +217,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     );
     let npub_a = alice["npub"].as_str().unwrap().to_string();
 
-    // re-register same name = upsert: same npub, no duplicate key.
     let alice_again = d
         .call(
             "register_agent",
@@ -263,7 +234,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         "re-register is an upsert (npub stable)"
     );
 
-    // register a second agent for the messaging round-trip.
     let bob = d
         .call(
             "register_agent",
@@ -277,7 +247,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         .await;
     assert_eq!(bob["name"], "BobPine");
 
-    // list_agents → both present, each with npub.
     let agents = d
         .call("list_agents", serde_json::json!({ "project_key": proj }))
         .await;
@@ -290,7 +259,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     let names: Vec<&str> = arr.iter().filter_map(|a| a["name"].as_str()).collect();
     assert!(names.contains(&"AliceOak") && names.contains(&"BobPine"));
 
-    // whois → resolves name → npub (the AM "enriched profile" parity field).
     let who = d
         .call(
             "whois",
@@ -304,7 +272,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         "whois carries program (AM parity)"
     );
 
-    // create_agent_identity → always-fresh (mint a new key, never upsert).
     let carol = d
         .call(
             "create_agent_identity",
@@ -322,10 +289,6 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     d.client.close().await?;
     Ok(())
 }
-
-// ======================================================================
-// Cluster 3: Messaging (send → inbox → reply → ack → read → search → thread)
-// ======================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
@@ -348,7 +311,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         .await;
     d.call("register_agent", reg("BobPine", "pi").await).await;
 
-    // send_message: Alice → Bob, ack_required, on a thread.
     let send = d
         .call(
             "send_message",
@@ -370,9 +332,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         "deliveries[] carries the per-recipient record: {send}"
     );
 
-    // The unwrap loop projects wraps → the inbox asynchronously. Poll Bob's
-    // inbox until the message lands (bounded — same shape as flywheel's
-    // live_parity harness).
     let bob_inbox = poll_inbox(&mut d, &proj, "BobPine", "parity subject", 30).await;
     let msg = &bob_inbox[0];
     assert_eq!(msg["sender"], "AliceOak", "inbox entry names the sender");
@@ -392,11 +351,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         "toron message id is a hex event id (not an int): {msg_id}"
     );
 
-    // acknowledge_message: idempotent; carries an ack timestamp.
-    // NOTE: toron's id model is hex (content-addressed). The tool MUST accept
-    // the hex id as a string. AM uses integer ids; toron's divergence is
-    // documented (known-divergences §1) — the tool arg is typed to match
-    // toron's own id model, not AM's.
     let ack = d
         .call(
             "acknowledge_message",
@@ -408,7 +362,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         )
         .await;
     assert_eq!(ack["acknowledged"], true, "ack surfaces acknowledged=true");
-    // idempotent re-ack does not error.
     let ack2 = d
         .call(
             "acknowledge_message",
@@ -421,7 +374,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         .await;
     assert_eq!(ack2["acknowledged"], true, "re-ack is idempotent");
 
-    // mark_message_read: idempotent read receipt.
     let read = d
         .call(
             "mark_message_read",
@@ -437,9 +389,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         "mark_read echoes the message id"
     );
 
-    // reply_message: Bob → Alice on the SAME thread. AM anchors a reply to the
-    // original message_id; toron replies via thread_id (its NIP-10 model). The
-    // thread must be preserved so summarize_thread resolves both participants.
     let reply = d
         .call(
             "reply_message",
@@ -455,17 +404,12 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         .await;
     assert_eq!(reply["count"], 1, "reply delivers to one recipient");
 
-    // Alice's inbox eventually receives Bob's reply.
     let alice_inbox = poll_inbox(&mut d, &proj, "AliceOak", "ack from Bob", 30).await;
     assert_eq!(
         alice_inbox[0]["sender"], "BobPine",
         "Alice sees Bob's reply"
     );
 
-    // search_messages: the message body is FTS-indexed (porter + unicode61).
-    // The projection is ASYNC (unwrap loop → sqlite sink), so poll until the
-    // FTS index catches up (bounded 20s) — an immediate single search races
-    // the sink and flakes (the am-parity "projection never lands" class).
     let mut search_hits: Vec<Value> = Vec::new();
     for _ in 0..40 {
         let search = d
@@ -493,7 +437,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
         "search finds the parity message (projection caught up)"
     );
 
-    // summarize_thread: participants include both agents, message_count >= 2.
     let summary = d
         .call(
             "summarize_thread",
@@ -520,10 +463,6 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ======================================================================
-// Cluster 4: Contacts (policy → request → respond → list)
-// ======================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_contacts_handshake() -> anyhow::Result<()> {
     let mut d = LiveDaemon::boot("contacts").await?;
@@ -541,7 +480,6 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
         .await;
     }
 
-    // set_contact_policy on the recipient.
     let _ = d
         .call(
             "set_contact_policy",
@@ -553,7 +491,6 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
         )
         .await;
 
-    // request_contact: DawnElm → FoxRidge.
     let req = d
         .call(
             "request_contact",
@@ -570,7 +507,6 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
         "request_contact returns a link/status: {req}"
     );
 
-    // respond_contact: FoxRidge accepts.
     let _ = d
         .call(
             "respond_contact",
@@ -583,7 +519,6 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
         )
         .await;
 
-    // list_contacts: the accepted link is visible.
     let links = d
         .call(
             "list_contacts",
@@ -604,10 +539,6 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ======================================================================
-// Cluster 5: File Reservations (acquire → conflict → renew → release → force)
-// ======================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_file_reservations() -> anyhow::Result<()> {
     let mut d = LiveDaemon::boot("reservations").await?;
@@ -625,7 +556,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         .await;
     }
 
-    // GaleSummit acquires an exclusive lease on src/**.
     let acquire = d
         .call(
             "file_reservation_paths",
@@ -648,7 +578,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         .unwrap_or_else(|| panic!("reservation carries an id: {acquire}"))
         .to_string();
 
-    // HillCrest checks the SAME path → conflict reported (but read-only check).
     let conflicts = d
         .call(
             "check_file_reservation_conflicts",
@@ -670,8 +599,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
             >= 1,
         "conflict count is non-zero: {conflicts}"
     );
-    // bd-dsu1: the conflict report carries the conflicting lease's event id —
-    // the operator lock board needs it for diagnostics without DB access.
     let ids = conflicts["conflicts"][0]["reservation_ids"]
         .as_array()
         .unwrap_or_else(|| panic!("conflict carries reservation_ids: {conflicts}"));
@@ -682,10 +609,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         "reservation id matches the granted lease's id: {conflicts}"
     );
 
-    // GaleSummit renews → expiry extends (absolute, not recomputed from now).
-    // bd-evqs cap: a lease whose remaining TTL is ALREADY >= extend_secs is
-    // NOT republished — so the extension must exceed the remaining TTL
-    // (acquire used 3600s; 7200s > remaining) to actually renew.
     let renew = d
         .call(
             "renew_file_reservations",
@@ -701,7 +624,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         "renew extends the lease"
     );
 
-    // release → freed.
     let release = d
         .call(
             "release_file_reservations",
@@ -716,7 +638,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         "release frees the lease"
     );
 
-    // After release, HillCrest's conflict check is now clear.
     let clear = d
         .call(
             "check_file_reservation_conflicts",
@@ -732,11 +653,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         "no conflict after release: {clear}"
     );
 
-    // force_release_file_reservation path: re-acquire then operator force-release.
-    // The staleness heuristic correctly DENIES force-release of an active
-    // (non-stale) holder — that denial is the right behavior, not a failure.
-    // We assert the tool runs the operator-gated logic and returns EITHER a
-    // release OR a structured denial (both prove the tool is functional).
     let _re_acq = d
         .call(
             "file_reservation_paths",
@@ -761,10 +677,6 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
             }),
         )
         .await;
-    // The staleness heuristic correctly DENIES force-release of an active
-    // (non-stale) holder. The denial surfaces as an MCP error result whose
-    // text carries the reason — assert that reason is the staleness gate, not
-    // a transport/schema failure (which would say "deserialize" / "no operator").
     let forced_text = forced_raw
         .content
         .iter()
@@ -774,14 +686,10 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         forced_text.contains("stale") || forced_text.contains("denied"),
         "force-release of an active holder is denied by the staleness gate: {forced_text}"
     );
-    let _ = res_id; // suppress unused on older toolchains
+    let _ = res_id;
     d.client.close().await?;
     Ok(())
 }
-
-// ======================================================================
-// Cluster 6: Build Slots (acquire → renew → release)
-// ======================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_build_slots() -> anyhow::Result<()> {
@@ -837,9 +745,6 @@ async fn cluster_build_slots() -> anyhow::Result<()> {
             }),
         )
         .await;
-    // release returns a truthy result (bare `true` or an envelope). AM
-    // returns `{slot, released_at}`; toron currently returns bare `true` —
-    // either is a successful release, neither is an error.
     assert!(
         rel == Value::Bool(true)
             || rel.get("released").is_some()
@@ -852,16 +757,11 @@ async fn cluster_build_slots() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ======================================================================
-// Cluster 7+8: Macros + Product Bus
-// ======================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
     let mut d = LiveDaemon::boot("macros-prod").await?;
     let proj = format!("/tmp/toron-am-parity-macro-{}", uuid::Uuid::new_v4());
 
-    // macro_start_session: ensure project + register + reserve + inbox in one call.
     let session = d
         .call(
             "macro_start_session",
@@ -889,7 +789,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         "macro reserved the requested paths: {session}"
     );
 
-    // file_reservation_cycle: reserve then auto-release.
     let cycle = d
         .call(
             "macro_file_reservation_cycle",
@@ -908,7 +807,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         "cycle reserves (and releases): {cycle}"
     );
 
-    // contact_handshake: JadeCove + a second agent, auto-accept.
     d.call(
         "register_agent",
         serde_json::json!({
@@ -936,7 +834,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         "handshake returns a link/status: {hs}"
     );
 
-    // Drop a message on JadeCove so the product-bus search has something to find.
     d.call(
         "send_message",
         serde_json::json!({
@@ -950,7 +847,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
     )
     .await;
 
-    // ensure_product + link the project.
     let prod = d
         .call(
             "ensure_product",
@@ -972,8 +868,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         )
         .await;
 
-    // Probe: membership must persist (kind-30011 a-tags AND/OR the SQLite
-    // mirror). If this is empty, `search_messages_product` fans over nothing.
     let mut linked = false;
     for _ in 0..20 {
         let p2 = d
@@ -997,7 +891,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         "products_link persists membership (probe ensure_product: {prod} -> {product_key})"
     );
 
-    // fetch_inbox_product: JadeCove's inbox fanned across the product.
     let pinbox = d
         .call(
             "fetch_inbox_product",
@@ -1013,9 +906,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         "product inbox returns a list: {pinbox}"
     );
 
-    // search_messages_product: poll until the projection catches up. First
-    // confirm per-project search finds the message (isolates projection vs
-    // product-membership), then fan across the product.
     let mut per_project_hit = false;
     for _ in 0..40 {
         let s = d
@@ -1056,9 +946,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
                 }),
             )
             .await;
-        // Wire shape is a BARE array of ProjectSearchMessageOut (outputSchema
-        // `Vec<ProjectSearchMessageOut>`), unlike per-project search_messages
-        // which wraps in `{result: [...], next_cursor}`. Accept both.
         prod_hits = s.as_array().cloned().unwrap_or_else(|| {
             s.get("result")
                 .and_then(|r| r.as_array())
@@ -1078,10 +965,6 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
     d.client.close().await?;
     Ok(())
 }
-
-// ======================================================================
-// Helpers
-// ======================================================================
 
 /// Poll an agent's inbox until at least one entry's subject contains `needle`,
 /// returning the filtered entries. Bounded by `tries` × 500ms — the unwrap
@@ -1143,7 +1026,6 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
     let mut d = LiveDaemon::boot("guard-pane").await?;
     let proj = format!("/tmp/toron-am-parity-guard-{}", uuid::Uuid::new_v4());
 
-    // install_precommit_guard needs a REAL git repo (git2 open).
     let repo = std::env::temp_dir().join(format!("toron-parity-repo-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&repo)?;
     let init = std::process::Command::new("git")
@@ -1175,9 +1057,6 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
         "uninstall_precommit_guard returns the removal result: {removed}"
     );
 
-    // resolve_pane_identity / cleanup_pane_identities are herdr-backed: without
-    // a live herdr socket the HONEST response is a structured note naming the
-    // requirement — never a hang, never a fake pane mapping.
     let pane = d
         .call(
             "resolve_pane_identity",
@@ -1199,7 +1078,6 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
         "cleanup_pane_identities returns a structured response: {cleaned}"
     );
 
-    // macro_prepare_thread: ensure registration + thread summary in one call.
     let prep = d
         .call(
             "macro_prepare_thread",
@@ -1226,7 +1104,6 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
         "macro_prepare_thread returns a thread summary: {prep}"
     );
 
-    // summarize_thread_product: product-bus fan-out across a linked project.
     let prod = format!("parity-prod-{}", uuid::Uuid::new_v4());
     let ep = d
         .call(
@@ -1270,10 +1147,6 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ======================================================================
-// P0 regression: MCP fetch_inbox filter parity (bd-mcp-inbox-filter-qyyq)
-// ======================================================================
-
 /// P0 (bd-mcp-inbox-filter-qyyq): the MCP `fetch_inbox` tool MUST apply the
 /// same post-projection filters as the MailSurface path — `urgent_only` and
 /// `since_ts` (RFC3339, strict-newer, Malformed error on bad input). Live
@@ -1299,7 +1172,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
         .await;
     }
 
-    // 1. urgent message first; poll until PROJECTED (unwrap loop is async).
     d.call(
         "send_message",
         serde_json::json!({
@@ -1314,7 +1186,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
     .await;
     poll_inbox(&mut d, &proj, "BlueLake", "filter-urgent", 40).await;
 
-    // 2. take a bound, then send a normal-priority message AFTER it.
     let bound = chrono::Utc::now().to_rfc3339();
     d.call(
         "send_message",
@@ -1346,8 +1217,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
         "unfiltered inbox shows both messages"
     );
 
-    // since_ts = bound taken BETWEEN the two sends → only the later message
-    // (strict-newer compare, exactly the MailSurface contract).
     let since = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(bound)))).await;
     let since_arr = since
         .as_array()
@@ -1364,7 +1233,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
         "since_ts must exclude pre-bound mail on the MCP path"
     );
 
-    // urgent_only → only the urgent message.
     let urgent =
         fetch_inbox_filtered(&mut d, &proj, Some(("urgent_only", Value::Bool(true)))).await;
     let urgent_arr = urgent
@@ -1382,7 +1250,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
         "urgent_only must exclude normal-priority mail on the MCP path"
     );
 
-    // Future bound → empty inbox.
     let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
     let fut = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(future)))).await;
     let fut_arr = fut
@@ -1396,7 +1263,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
         "future since_ts must exclude all mail on the MCP path"
     );
 
-    // Malformed bound → tool ERROR (Malformed), never a silent ignore.
     let raw = d
         .call_raw(
             "fetch_inbox",
@@ -1425,8 +1291,6 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
 
     Ok(())
 }
-
-// (dead helpers pruned: the test asserts behavior directly on Value.)
 
 /// `fetch_inbox` with one optional extra filter arg (bd-mcp-inbox-filter-qyyq).
 async fn fetch_inbox_filtered(

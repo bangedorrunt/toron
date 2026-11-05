@@ -67,10 +67,6 @@ impl Mailbox {
         note: &str,
     ) -> anyhow::Result<()> {
         let pool = self.index_pool_required()?;
-        // bd-ow6c: ONE project key on both halves of the join. The marker was
-        // written and read RAW while the lease board was canonicalized, so a
-        // marker written under a path-form or alias spelling was invisible to
-        // the join — and the loop resumed a bead a live peer held.
         let project_slug = self.canonical_project(project_slug).await;
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         sqlx::query(
@@ -97,8 +93,6 @@ impl Mailbox {
         project_slug: &str,
     ) -> anyhow::Result<Vec<YieldMarker>> {
         let pool = self.index_pool_required()?;
-        // bd-ow6c: the read half joins the canonical lease board, so it reads
-        // the canonical project key too.
         let project_slug = self.canonical_project(project_slug).await;
         let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
             "SELECT bead_id, holder, yielder, note, created_ts_us \
@@ -193,11 +187,10 @@ mod tests {
         let rows = vec![
             marker("bead-a", "Holder"),
             marker("bead-b", "Gone"),
-            marker("bead-a", "Holder"), // duplicate pair → one bead out
-            marker("bead-c", ""),       // unstamped holder → never live
+            marker("bead-a", "Holder"),
+            marker("bead-c", ""),
         ];
         assert_eq!(suppressed_beads(&rows, &live), vec!["bead-a".to_string()]);
-        // Holder released: the marker survives but suppresses nothing.
         assert!(
             suppressed_beads(&rows, &BTreeSet::new()).is_empty(),
             "no live holders → nothing suppressed"

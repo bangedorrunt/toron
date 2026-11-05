@@ -46,10 +46,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first), so
-        // the CLI would hit a live daemon instead of this scenario's store
-        // and reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .output()
         .expect("spawn toron")
@@ -104,7 +100,6 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
     let dir = std::env::temp_dir().join(format!("toron-sc33-{}", uuid::Uuid::new_v4()));
     let pool = setup(&dir, PROJECT, &[A, B, C]).await;
 
-    // --- Plane P: mail send A→B still gift-wraps. ---
     let subject = "sc33-secret";
     let out = run(
         &dir,
@@ -130,7 +125,6 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // B's inbox sees it; C's does not (fetch_inbox privacy).
     let out = run(&dir, &["mail", "inbox", "--as", B, "--project", PROJECT]);
     assert_eq!(
         exit_code(&out),
@@ -156,14 +150,12 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
         "C inbox must NOT see A→B's message (plane P named recipients): {c_inbox}"
     );
 
-    // Plane P is gift-wrapped: kind 1059 on the shared bus.
     let wraps_after_mail = store_kind_count(&pool, 1059).await;
     assert!(
         wraps_after_mail >= 1,
         "mail send must produce a kind-1059 gift-wrap"
     );
 
-    // --- Plane S: a channel post is kind 9 (not 1059) and member-visible. ---
     let out = run(
         &dir,
         &[
@@ -223,8 +215,6 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
     );
     let post_id = post["event_id"].as_str().expect("event_id").to_string();
 
-    // Member read sees it; the post is NOT a 1059; the channel post added no
-    // gift-wrap (plane S never wraps).
     let out = run(
         &dir,
         &["channel", "read", CHANNEL, "--project", PROJECT, "--as", B],

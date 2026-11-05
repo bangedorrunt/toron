@@ -1,12 +1,6 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
-// bd-led.4.2: single-writer SQLite discipline (ADR G15, risk 8).
-// - Dedicated write pool sized to one connection; reads on a separate pool.
-// - An async write gate serializes all mutations (no SQLITE_BUSY storms).
-// - `DeferredTouch` coalesces "last-active"-style writes (30s, AM-Rust parity)
-//   behind an injectable clock so hot-path updates batch instead of spamming.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -205,11 +199,9 @@ mod tests {
         assert!(!touch.touch("pi".into(), 2), "second touch coalesces");
         assert_eq!(touch.pending_len(), 1);
 
-        // Within 30s: nothing drains.
         clock.advance(10_000_000);
         assert!(touch.drain_due().is_empty(), "not yet due");
 
-        // Past 30s: drains once with the latest value.
         clock.advance(25_000_000);
         let due = touch.drain_due();
         assert_eq!(due, vec![("pi".to_string(), 2)]);
@@ -241,8 +233,6 @@ mod tests {
             .await
             .expect("seed");
 
-        // Concurrent: many writes + many reads. WAL + single-writer gate must
-        // serialize writes so no SQLITE_BUSY surfaces.
         let mut writes = Vec::new();
         for i in 0..20i64 {
             let w2 = writer.clone();
@@ -274,7 +264,6 @@ mod tests {
             h.await.expect("task");
         }
 
-        // All writes landed.
         let n: i64 = writer
             .query_scalar("SELECT count(*) FROM agents")
             .await

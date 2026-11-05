@@ -143,7 +143,6 @@ async fn next_urgent(s: &InboxStore, reader: &str) -> (u64, Option<HeadRow>, boo
 async fn an_empty_inbox_has_no_head() {
     let s = store("empty").await;
     assert_eq!(s.unread_head(CREW, 0).await.unwrap(), None);
-    // Another recipient's mail is not this recipient's head.
     s.append_envelope(&notify(SYS, 0, OTHER, "hi"))
         .await
         .unwrap();
@@ -162,7 +161,6 @@ async fn an_urgent_steer_head_is_a_control_steer_and_urgent() {
     assert_eq!(h.contract, ContractId::new("steer", 1));
     assert_eq!(h.class, Class::Control);
     assert_eq!(h.urgency, Urgency::Urgent);
-    // A normal-priority steer is a steer head and not urgent.
     let s = store("steer-normal").await;
     s.append_envelope(&lead()).await.unwrap();
     s.append_envelope(&steer(0, CREW, "normal")).await.unwrap();
@@ -195,15 +193,12 @@ async fn the_head_is_the_oldest_row_past_the_offset() {
         .await
         .unwrap();
     let st = s.append_envelope(&steer(1, CREW, "urgent")).await.unwrap();
-    // Oldest first, not newest: the notify, though an urgent steer is behind it.
     let h = s.unread_head(CREW, 0).await.unwrap().unwrap();
     assert_eq!(h.offset.get(), n.offset);
     assert_eq!(h.urgency, Urgency::Normal);
-    // Past the notify, the steer; the other recipient's row is skipped.
     let h = s.unread_head(CREW, n.offset).await.unwrap().unwrap();
     assert_eq!(h.offset.get(), st.offset);
     assert_eq!(h.urgency, Urgency::Urgent);
-    // Past the last row, nothing.
     assert_eq!(s.unread_head(CREW, st.offset).await.unwrap(), None);
 }
 
@@ -216,12 +211,9 @@ async fn after_next_and_an_ack_the_head_moves_past_the_read_row() {
     assert_eq!(read.items.len(), 1);
     let key = read.items[0].msg_key.clone();
     s.ack(CREW, &key, true, None).await.expect("crew accepts");
-    // The cursor is keyed by the recipient stream (the npub), as `next` commits it.
     let cursor = s.cursor(CREW, CREW).await.unwrap();
     assert_eq!(cursor, read.cursor_after);
-    // Read and acked: nothing unread past the cursor.
     assert_eq!(s.unread_head(CREW, cursor).await.unwrap(), None);
-    // The next row is the head again.
     let a = s
         .append_envelope(&notify(OP, 1, CREW, "later"))
         .await
@@ -237,7 +229,6 @@ async fn the_head_is_the_first_item_next_serves_as_the_log_and_cursor_move() {
     s.append_envelope(&lead()).await.unwrap();
     let (mut op, mut sys) = (1u64, 0u64);
     for round in 0..12u64 {
-        // Mixed mail for both recipients; urgent and normal steers.
         match round % 4 {
             0 => {
                 s.append_envelope(&notify(OP, op, CREW, "n")).await.unwrap();
@@ -266,7 +257,6 @@ async fn the_head_is_the_first_item_next_serves_as_the_log_and_cursor_move() {
         let pending = s.pending_urgent(CREW, cursor).await.unwrap();
         assert_eq!(pending, urgent, "round {round}: the first urgent item");
         assert_eq!(pending.is_some(), any, "round {round}: --peek --urgent");
-        // Every third round the crew reads, so the cursor moves.
         if round % 3 == 2 {
             s.next(CREW, None, false).await.unwrap();
         }
@@ -280,9 +270,6 @@ async fn the_head_read_is_one_index_seek_at_100k_rows() {
     let s = store("100k").await;
     s.append_envelope(&lead()).await.unwrap();
     let first = s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap();
-    // 100k more rows: 50k unread for CREW behind its head, 50k for OTHER.
-    // Bulk-inserted in one statement (a fixture shortcut: they copy the
-    // head's payload and get their own triples), not through append.
     let pool = s.pool().clone();
     sqlx::query(
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) \
@@ -302,8 +289,6 @@ async fn the_head_read_is_one_index_seek_at_100k_rows() {
         .unwrap();
     assert!(total > 100_000);
 
-    // The plan: one search of the recipient index, bounded by the offset, no
-    // sort and no scan.
     let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {UNREAD_HEAD_SQL}"))
         .bind(INBOX_STREAM)
         .bind(CREW)
@@ -327,7 +312,6 @@ async fn the_head_read_is_one_index_seek_at_100k_rows() {
             .any(|p| p.contains("TEMP B-TREE") || p.starts_with("SCAN"))
     );
 
-    // One row back, at the head and past it, however long the backlog.
     let t = Instant::now();
     let runs = 200u32;
     let mut h = None;
@@ -341,8 +325,6 @@ async fn the_head_read_is_one_index_seek_at_100k_rows() {
     let mid = s.unread_head(CREW, 60_000).await.unwrap().unwrap();
     assert!(mid.offset.get() > 60_000);
 
-    // The same predicate without the limit: what reading the whole unread
-    // set costs, for scale.
     let t = Instant::now();
     let all = sqlx::query(UNREAD_SQL)
         .bind(INBOX_STREAM)
@@ -374,8 +356,6 @@ async fn an_older_notify_ahead_of_an_urgent_steer_is_pending_urgent() {
     s.append_envelope(&notify(OP, 2, CREW, "newer"))
         .await
         .unwrap();
-    // FIFO head is the notify; the pending urgent row is the steer behind it,
-    // not the other recipient's.
     assert_eq!(
         s.unread_head(CREW, 0).await.unwrap().unwrap().offset.get(),
         n.offset
@@ -389,7 +369,6 @@ async fn an_older_notify_ahead_of_an_urgent_steer_is_pending_urgent() {
     assert_eq!(p.contract, ContractId::new("steer", 1));
     assert_eq!(p.class, Class::Control);
     assert_eq!(p.urgency, Urgency::Urgent);
-    // Past it, nothing urgent is pending.
     assert_eq!(s.pending_urgent(CREW, st.offset).await.unwrap(), None);
 }
 
@@ -425,7 +404,6 @@ async fn a_read_and_acked_urgent_steer_is_not_pending() {
     let (c, _, any) = next_urgent(&s, CREW).await;
     assert_eq!(c, cursor);
     assert!(!any);
-    // A later normal steer does not revive it.
     s.append_envelope(&steer(1, CREW, "normal")).await.unwrap();
     assert_eq!(s.pending_urgent(CREW, cursor).await.unwrap(), None);
 }
@@ -437,8 +415,6 @@ fn squash(s: &str) -> String {
 
 #[tokio::test]
 async fn the_sql_urgency_predicate_is_urgency_of_and_the_index() {
-    // The partial index declares the same predicate the query uses, so the
-    // planner can match them.
     let ix = schema::ADDITIVE_INDEXES
         .iter()
         .find(|ix| ix.name == "inbox_log_urgent")
@@ -449,7 +425,6 @@ async fn the_sql_urgency_predicate_is_urgency_of_and_the_index() {
         "the additive index and URGENT_WHERE drifted"
     );
     assert!(squash(PENDING_URGENT_SQL).contains(&squash(URGENT_WHERE)));
-    // And the predicate is urgency_of, case by case.
     let s = store("pred").await;
     let cases = [
         ("steer", 1, serde_json::json!({"priority": "urgent"})),
@@ -599,13 +574,12 @@ async fn pending_urgent_is_one_partial_index_seek_at_100k_rows_front_and_back() 
     }
 }
 
-/// The highest versioned migration on main 5cdd555, before the urgent index.
+/// The highest versioned migration on main, before the urgent index.
 /// A pre-index binary resolves exactly this.
-const PRE_INDEX_MAX_MIGRATION: i64 = 30;
+const PRE_INDEX_MAX_MIGRATION: i64 = 31;
 
 #[tokio::test]
 async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
-    // A store opened by this build: migrated, and the additive index applied.
     let path =
         std::env::temp_dir().join(format!("toron-head-compat-{}.sqlite", uuid::Uuid::new_v4()));
     let db = path.to_str().unwrap().to_string();
@@ -632,9 +606,6 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
         .unwrap();
     drop(s);
 
-    // The pre-index open path: the versioned migrations alone, as 5cdd555's
-    // `schema::migrate` runs them, with no additive step. It resolves the
-    // same versions and opens the store with no skew.
     let max = schema::MIGRATOR.iter().map(|m| m.version).max();
     assert_eq!(max, Some(PRE_INDEX_MAX_MIGRATION));
     let old = schema::connect(&db).await.unwrap();
@@ -643,8 +614,6 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
         .await
         .expect("a pre-index binary opens the store: no store_skew");
 
-    // It writes and reads as before. Its insert lands in the index too:
-    // SQLite maintains a partial index on every insert.
     let s = InboxStore::new(old).with_operator(OP);
     let st = s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap();
     let b = s.next(CREW, None, true).await.unwrap();
@@ -661,7 +630,6 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
         "the old binary's write is in the index"
     );
 
-    // And this build reopens it: still no version raised, index still there.
     schema::migrate(s.pool()).await.unwrap();
     assert_eq!(
         schema::store_version(s.pool()).await.unwrap().min_binary,
@@ -685,7 +653,6 @@ async fn pending_urgent_is_correct_without_the_index() {
         ],
         "the dropped index is gone; the additive table is still there"
     );
-    // The planner falls back to the recipient index: slower, same answers.
     let plan = plan_of(&s, PENDING_URGENT_SQL).await;
     assert!(
         plan[0].contains("USING INDEX inbox_log_by_recipient"),
@@ -725,7 +692,6 @@ async fn pending_urgent_is_correct_without_the_index() {
         "read and acked"
     );
 
-    // The next open by this build puts the index back.
     schema::migrate(s.pool()).await.unwrap();
     assert_eq!(
         schema::store_version(s.pool()).await.unwrap().additive,

@@ -1,6 +1,4 @@
 // governed-by: ADR-0003
-// Catalog contract: toron.dev ADR-0002 D3 — `docs/catalog/toron-mcp.json`,
-// 38 frozen AM-Rust parity tools (ADR-0007 C3) + 25 resources.
 
 //! MCP surface catalog extractor (toron.dev ADR-0002 D3).
 //!
@@ -26,9 +24,7 @@ pub const ADDITIVE_TOOL: &str = "release_file_reservations_by_reason";
 /// surface, excluded from the frozen 38-parity catalog.
 pub const ADDITIVE_TOOLS: &[&str] = &[
     ADDITIVE_TOOL,
-    // read-only lease board — the state the strict guard evaluates
     "list_file_reservations",
-    // judgment bridge — flywheel math out-of-process, journaled by effect_key
     "ask_judgment",
 ];
 

@@ -73,11 +73,6 @@ pub fn acquire(data_dir: &Path) -> anyhow::Result<ServeLock> {
     write!(file, "{pid}")?;
     file.flush()?;
 
-    // Record the artifact we are executing. A daemon keeps running the file it
-    // was exec'd from after a rebuild replaces it, and nothing else on the host
-    // can tell you that (2026-09-30: an hour-stale daemon rewrote the operator
-    // key on every boot while `doctor` stayed green). Diagnostic only — a
-    // daemon that cannot write this must still serve.
     let record = data_dir.join(toron_core::serve_build::SERVE_BUILD_FILE);
     if let Ok(exe) = std::env::current_exe()
         && let Some(snap) =
@@ -102,8 +97,6 @@ fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // Use `ps -p` rather than `kill -0` so EPERM (no permission to signal pid 1)
-    // still counts as alive. `ps` succeeds for any existing pid.
     Command::new("ps")
         .args(["-p", &pid.to_string()])
         .output()
@@ -112,10 +105,6 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 fn pid_is_toron_serve(pid: u32) -> bool {
-    // Check cmdline/args for "toron" to avoid PID-reuse false positives.
-    // Broad check intentionally matches "toron", "toron_mcp", etc. for test
-    // coverage (second_acquire test's holder is the test binary itself).
-    // The /proc fast path lives in platform/<os>.rs (bd-nc5d).
     if crate::platform::proc_cmdline_contains(pid, "toron") {
         return true;
     }
@@ -185,7 +174,6 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // Spawn a non-toron process (sleep) to simulate PID reuse by a foreign binary
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -212,11 +200,6 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // Spawn a child whose argv[0] is "toron" to simulate a live
-        // serve. Uses Command::arg0 (portable) — the old `sh -c "exec -a
-        // toron …"` form depends on shell-specific exec -a semantics and
-        // silently produced argv[0]=sh on runners whose /bin/sh lacks it
-        // (GS-018: Ubuntu CI failed the detect assert).
         let mut child = std::process::Command::new("sleep")
             .arg0("toron")
             .arg("30")
@@ -273,9 +256,6 @@ mod tests {
         );
         assert!(snap.started_at_unix > 0, "the boot time is recorded");
 
-        // The identity it carries is the artifact actually on disk, so the
-        // verdict for a daemon that has not been rebuilt reads `current` —
-        // the check must not cry stale at a healthy daemon.
         assert_eq!(
             toron_core::serve_build::build_verdict(
                 &snap,

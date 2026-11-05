@@ -1,8 +1,5 @@
 // governed-by: ADR-0020
 // governed-by: ADR-0023
-// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
-// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
-// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-channel-close-purge-bsqb + bd-delivery-visibility-g96y +
 //! bd-verify-after-send-fxtv: channel lifecycle + delivery visibility +
@@ -81,7 +78,6 @@ fn channel_close_purge_lifecycle_through_binary() {
     register_agents();
     let ch = channel();
 
-    // open: creator creates, scout joins, both post.
     assert!(
         run(&[
             "channel",
@@ -118,7 +114,6 @@ fn channel_close_purge_lifecycle_through_binary() {
         .success()
     );
 
-    // close: non-creator refused, creator succeeds.
     let refused = run(&[
         "channel",
         "close",
@@ -146,8 +141,6 @@ fn channel_close_purge_lifecycle_through_binary() {
     );
     assert_eq!(out_json(&closed)["closed"], serde_json::json!(true));
 
-    // closed gates, in a FRESH process: post refused, join refused, read
-    // refused, list hides the channel (and --all flags it closed).
     let post = run(&[
         "channel",
         "post",
@@ -208,8 +201,6 @@ fn channel_close_purge_lifecycle_through_binary() {
         .expect("closed channel visible with --all");
     assert_eq!(flagged["closed"], serde_json::json!(true));
 
-    // purge: refused while... already closed here; refused for non-creator;
-    // creator purge removes events (fresh rebuild shows channel gone).
     let stranger = run(&[
         "channel",
         "purge",
@@ -240,7 +231,6 @@ fn channel_close_purge_lifecycle_through_binary() {
         "close 39000 supersedes create (NIP-33); join 39002 + post + close remain"
     );
 
-    // After purge the channel is GONE (no create event to rebuild).
     let post_after = run(&[
         "channel",
         "post",
@@ -322,12 +312,9 @@ fn channel_read_author_filter_delivery_visibility() {
         delivery["newest_post_at"].is_u64(),
         "newest post ts present: {delivery}"
     );
-    // every returned event is the scout's (creator's posts excluded).
     let events = delivery["events"].as_array().expect("events");
     assert!(!events.is_empty());
 
-    // an author with zero posts: delivered_posts == 0 (the captain's
-    // silent-drop detector — zero is the answer, not absence).
     let none = out_json(&run(&[
         "channel",
         "read",
@@ -391,7 +378,6 @@ fn channel_post_wait_ack_verifies_readback() {
     assert_eq!(v["verified"], serde_json::json!(true), "verified: {v}");
     let event_id = v["event_id"].as_str().expect("event id").to_string();
 
-    // The verified id IS readable back (independent fresh process).
     let read_back = out_json(&run(&[
         "channel",
         "read",

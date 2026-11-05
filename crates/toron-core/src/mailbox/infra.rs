@@ -95,7 +95,7 @@ impl Mailbox {
     /// (`toron`) and persists an alias row, so every spelling of a project
     /// lands in ONE root (dir, manifest `d`-tag, scoping tags).
     pub async fn ensure_project(&self, slug: &str) -> anyhow::Result<ProjectState> {
-        let slug = &self.canonical_project(slug).await; // ADR-0017: one root per project
+        let slug = &self.canonical_project(slug).await;
         std::fs::create_dir_all(crate::mailbox::aliases::project_root(&self.data_dir, slug))?;
 
         let existing = self
@@ -127,7 +127,6 @@ impl Mailbox {
         )?;
         let ok = self.bus.publish(event.clone()).await?;
         if !ok.stored {
-            // A concurrent ensure_project won the race; treat as existing.
             return Ok(ProjectState {
                 slug: slug.to_string(),
                 manifest_event_id: event.id.to_hex(),
@@ -290,7 +289,6 @@ mod tests {
             "same manifest re-read, not republished"
         );
 
-        // Only ONE kind-30010 manifest exists in the bus for "demo".
         let filter = kind_project_filter(toron_kind(PROJECT_MANIFEST), "demo");
         let manifest_count = {
             let bus = mailbox.bus.clone();
@@ -315,13 +313,11 @@ mod tests {
         schema::migrate(&pool).await.expect("migrate");
         let mailbox = mailbox.with_index_pool(pool);
 
-        // No mode yet → open.
         assert_eq!(
             mailbox.project_identity_mode("toron").await,
             crate::mailbox::naming::IdentityMode::Open
         );
 
-        // ensure_project_with_mode persists swarm.
         let state = mailbox
             .ensure_project_with_mode("toron", Some("swarm"))
             .await
@@ -332,7 +328,6 @@ mod tests {
             crate::mailbox::naming::IdentityMode::Swarm
         );
 
-        // A second plain ensure (no mode) does not clobber the policy.
         let again = mailbox.ensure_project("toron").await.expect("plain ensure");
         assert!(!again.created, "second ensure is a no-op");
         assert_eq!(
@@ -340,7 +335,6 @@ mod tests {
             crate::mailbox::naming::IdentityMode::Swarm
         );
 
-        // set_identity_mode flips it back.
         mailbox.set_identity_mode("toron", "open").await;
         assert_eq!(
             mailbox.project_identity_mode("toron").await,
@@ -356,7 +350,6 @@ mod tests {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox("scoped").await;
         mailbox.ensure_project("demo").await.expect("ensure");
 
-        // Manifest event must carry dual-emit scoping (#t + NIP-32 label).
         let filter = kind_project_filter(toron_kind(PROJECT_MANIFEST), "demo");
         let events = collect_replay(mailbox.bus.as_ref(), filter)
             .await
@@ -383,14 +376,12 @@ mod tests {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox("health").await;
 
         let report = mailbox.health_check().await;
-        // JSON shape: { bus: {ok, message}, archive: {ok, message} }.
         let json = serde_json::to_value(&report).expect("serialize");
         assert_eq!(json["bus"]["ok"], true, "bus healthy");
         assert!(json["bus"]["message"].is_string());
         assert!(json["archive"]["ok"].is_boolean());
         assert!(json["archive"]["message"].is_string());
 
-        // Round-trips: deserialize is stable (schema lock).
         let back: HealthReport = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, report);
 
@@ -447,7 +438,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // Compile-only: unused warning guard for helper imports used in tests.
     #[allow(dead_code)]
     fn _keep(_: &Keys, _: SubscriptionId, _: Timestamp) {}
 }

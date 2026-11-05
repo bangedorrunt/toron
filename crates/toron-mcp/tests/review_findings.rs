@@ -38,8 +38,6 @@ fn fetch_inbox_noop_disclosure_bd_7qcw() {
         .pointer("/properties")
         .cloned()
         .expect("properties");
-    // unread_only is still an accepted no-op (disclosed); ack_overdue_only
-    // is implemented and must NOT claim no-op.
     let unread = props
         .get("unread_only")
         .and_then(|f| f.get("description"))

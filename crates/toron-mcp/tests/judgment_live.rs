@@ -34,7 +34,6 @@ async fn ask_judgment_live_stub_journals_and_replays() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&tmp).expect("tmp");
-    // bd-6wfv: explicit data dir (no process-global env for the mailbox).
     unsafe {
         std::env::set_var("TORON_MCP_DATA_DIR", tmp.join("data"));
     }

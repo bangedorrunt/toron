@@ -278,7 +278,6 @@ impl Mailbox {
             }
             Err(_) => None,
         };
-        // Bound the memo; clear wholesale on overflow (a memo, not truth).
         {
             const UNWRAP_CACHE_CAP: usize = 10_000;
             let mut cache = self.unwrap_cache.lock();
@@ -389,7 +388,6 @@ impl Mailbox {
     /// unchanged keys within this process.
     fn cached_load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
         let content = std::fs::read_to_string(path).ok()?;
-        // Pin scoped: the ~1s argon2 below must never hold a guard.
         {
             let cache = self.key_cache.pin();
             if let Some(cached) = cache.get(path)
@@ -469,17 +467,10 @@ impl Mailbox {
                 std::time::Instant::now(),
             );
             if rebuild {
-                // Record BEFORE the await: a build that fails or yields None
-                // must still consume this event's rebuild budget (bd-gtqe —
-                // per-event retry of a doomed build pinned a core at 100%).
                 policy.record_attempt(sig.clone(), std::time::Instant::now());
                 current = self.build_unwrap_pipeline().await.map(|p| (sig, p));
             }
             if let Some((_, pipeline)) = &current {
-                // bd-verify-once-ph7t: this loop consumes ONLY bus-delivered
-                // events (verified at publish ingress) — project_verified
-                // skips the redundant re-verify (exactly one schnorr per
-                // event end-to-end).
                 let out = pipeline.project_verified(&event).await;
                 tracing::debug!(out = ?out, "unwrap loop projected {seen}");
             }
@@ -553,7 +544,6 @@ impl Mailbox {
     async fn build_unwrap_pipeline(&self) -> Option<UnwrapPipeline> {
         let pool = self.index_pool.as_ref()?;
         let paths = self.local_agent_key_paths();
-        // Roster from the registration index — pubkeys WITHOUT decryption.
         let roster: Vec<(String, String, String)> =
             sqlx::query_as("SELECT project_slug, name, pubkey FROM agents")
                 .fetch_all(pool)
@@ -562,13 +552,10 @@ impl Mailbox {
         if roster.is_empty() && paths.is_empty() {
             return None;
         }
-        // Recipient-npub → verbatim project slug + name (the wrap hides the
-        // project; the sinks + resolver read it off this map).
         let npub_to_agent: std::collections::HashMap<String, (String, String)> = roster
             .iter()
             .map(|(slug, name, npub)| (npub.clone(), (slug.clone(), name.clone())))
             .collect();
-        // Sender-npub → display name (AM-parity sender naming).
         let npub_to_name: std::collections::HashMap<String, String> = roster
             .iter()
             .map(|(_slug, name, npub)| (npub.clone(), name.clone()))
@@ -577,9 +564,6 @@ impl Mailbox {
             .iter()
             .map(|(slug, _name, npub)| (npub.clone(), slug.clone()))
             .collect();
-        // Policy over the registered roster (pubkeys from the index — no KDF).
-        // bd-gtqe: roster-direct bulk load — ONE kind-30014 replay per
-        // distinct project, no per-npub profile scans.
         let source = Arc::new(BusPolicySource::load_roster(self, &roster).await);
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
@@ -587,19 +571,11 @@ impl Mailbox {
                 .with_memberships(&roster)
                 .with_names(npub_to_name),
         );
-        // G11 (bd-p3-projection-atomicity-rtjz): the production projection
-        // writes BOTH recovery stores — the per-project Git archive (canonical
-        // system of record; `doctor reconstruct` rebuilds from it) AND the
-        // SQLite index. Git first: a git failure fails the whole write so the
-        // archive never diverges from a "projected" claim; sqlite failure
-        // after git success heals via re-delivery/rebuild.
         let git: Arc<dyn ProjectionSink> = Arc::new(ProjectGitProjectionSink::for_mailbox(
             self.data_dir.clone(),
             npub_to_project,
         ));
         let dual: Arc<dyn ProjectionSink> = Arc::new(DualProjectionSink::new(git, sqlite));
-        // ADR-0007 R3: wrap with TriggerNotifySink when the host subscribed
-        // a post-unwrap channel (message_posted workflows).
         let sink: Arc<dyn ProjectionSink> = match &self.trigger_tx {
             Some(tx) => Arc::new(TriggerNotifySink::new(dual, tx.clone())),
             None => dual,
@@ -742,8 +718,6 @@ mod newest_tests {
         } else {
             &second
         };
-        // Both orders on purpose: "the last one wins" and "the higher id wins"
-        // agree on any fixture whose winner happens to come last.
         for order in [[&first, &second], [&second, &first]] {
             assert_eq!(
                 order.into_iter().newest().map(|e| e.id),
@@ -803,11 +777,6 @@ mod tests {
     use crate::index::schema;
     use crate::nostr::identity::AgentProfile;
 
-    // ── bd-gtqe: unwrap-loop rebuild policy ─────────────────────────────
-    // The daemon previously rebuilt the unwrap pipeline on EVERY inbound
-    // event whenever a build could not succeed (and re-built at full speed
-    // under flapping key-set signatures), pinning a worker core at 100% CPU
-    // and starving every other tool handler — the bd-gtqe silent-hang root.
     use std::time::Duration;
 
     #[test]
@@ -819,8 +788,6 @@ mod tests {
 
     #[test]
     fn rebuild_policy_failed_build_not_retried_per_event() {
-        // THE regression: build failed (current stays None) → identical sig
-        // must NOT trigger another attempt per inbound event.
         let mut policy = UnwrapRebuildPolicy::new(Duration::from_secs(2));
         let now = std::time::Instant::now();
         assert!(policy.should_rebuild(None, "sig-a", now));
@@ -961,9 +928,6 @@ mod tests {
             .expect("register");
         let sender = Keys::generate();
 
-        // Build a gift-wrap addressed to the recipient's npub using the same
-        // key material the registered agent holds — load from disk like the
-        // loop does.
         let path = mailbox.agent_key_path("demo", "RoseDune");
         let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
         let rumor = crate::nostr::gift_wrap::build_rumor(
@@ -979,10 +943,7 @@ mod tests {
         let stored = mailbox.bus.publish(wrap).await.expect("publish");
         assert!(stored.stored, "wrap must be stored on the bus");
 
-        // Spawn the daemon inbound loop and let it discover the agent key.
         let handle = mailbox.spawn_unwrap_loop();
-        // No fixed sleep: the loop's argon2 key scan is load-sensitive
-        // (bd-projection-flake-gyox). Poll to completion instead.
         let pool = mailbox.index_pool().unwrap();
         let projected = wait_projected(|| async {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
@@ -1037,7 +998,6 @@ mod tests {
             .await
             .expect("register b");
 
-        // Lazy contract: the pipeline BUILD performs zero KDF.
         let pipeline = mailbox.build_unwrap_pipeline().await.expect("pipeline");
         assert_eq!(
             mailbox.kdf_load_count(),
@@ -1045,7 +1005,6 @@ mod tests {
             "lazy keyring: build decrypts nothing"
         );
 
-        // Wrap addressed to BetaTwo's npub: exactly ONE key decrypts.
         let recipient_npub: crate::nostr::PublicKey =
             crate::nostr::PublicKey::parse(&reg_b.npub).expect("beta npub");
         let sender = Keys::generate();
@@ -1067,7 +1026,6 @@ mod tests {
             mailbox.kdf_load_count()
         );
 
-        // A second wrap to AlphaOne adds exactly one more decrypt.
         let rumor2 = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
             crate::nostr::Timestamp::now(),
@@ -1129,9 +1087,6 @@ mod tests {
         mailbox.bus.publish(wrap).await.expect("publish");
 
         let handle = mailbox.spawn_unwrap_loop();
-        // Poll to completion — the argon2 key scan is load-sensitive
-        // (bd-projection-flake-gyox); the Git leg writes before the SQLite
-        // leg in the dual sink, so a visible row implies archive completion.
         let pool = mailbox.index_pool().unwrap();
         let projected = wait_projected(|| async {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
@@ -1146,10 +1101,6 @@ mod tests {
             "mail must be projected into the SQLite index (90s poll deadline)"
         );
 
-        // 2. The per-project Git archive holds the canonical unwrapped mail:
-        //    {data_dir}/demo/messages/{YYYY}/{MM}/{rumor_id}.json. This is the
-        //    G11 path-1 rebuild source — without it, "either alone rebuilds"
-        //    is false and SQLite loss = total mail loss.
         let archive_root = data_dir.join("demo");
         let messages_root = archive_root.join("messages");
         let json_files = collect_message_files(&messages_root);
@@ -1169,11 +1120,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unwrap_loop_projects_inbound_gift_wrap_absolute_slug() {
-        // MCP clients pass absolute project keys (AM parity). The agent key
-        // MUST stay discoverable under the mailbox data_dir regardless of
-        // slug depth (regression: PathBuf::join discarded the data_dir prefix
-        // on absolute slugs, so the unwrap-loop key scan never found the key
-        // and search never projected — live-parity failure 2026-08-08).
         let (mailbox, db, data_dir) = loop_mailbox("project").await;
         let slug = format!("/tmp/toron-abs-slug-{}", uuid::Uuid::new_v4());
         mailbox
@@ -1206,8 +1152,6 @@ mod tests {
         assert!(stored.stored, "wrap must be stored on the bus");
 
         let handle = mailbox.spawn_unwrap_loop();
-        // Poll to completion — load-sensitive argon2 scan
-        // (bd-projection-flake-gyox), no fixed sleep.
         let pool = mailbox.index_pool().unwrap();
         let projected = wait_projected(|| async {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
@@ -1222,10 +1166,6 @@ mod tests {
             "inbound wrap under an absolute project slug must be projected \
              (90s poll deadline)"
         );
-        // ADR-0017: the projected row carries the CANONICAL slug — the
-        // absolute path form resolves to its basename at registration, so
-        // search (which canonicalizes the client's key the same way) matches
-        // exactly what the client passes.
         let projected_slug: String = sqlx::query_scalar("SELECT project_slug FROM messages")
             .fetch_one(pool)
             .await
@@ -1255,8 +1195,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gate_no_new_dirs_outside_data_dir_for_absolute_slug() {
         let (mailbox, db, data_dir) = loop_mailbox("s10-gate").await;
-        // A fake "workspace root" the mailbox must never touch: it stands in
-        // for ~/workspace under the old cwd-derived-root bug.
         let fake_ws = std::env::temp_dir().join(format!("toron-s10-ws-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&fake_ws).expect("fake ws");
         let snapshot: Vec<String> = std::fs::read_dir(&fake_ws)
@@ -1302,8 +1240,6 @@ mod tests {
              (mailbox escaped data_dir): {after:?}"
         );
 
-        // The mailbox root itself lives under data_dir under the canonical
-        // short slug — NOT at the absolute key path.
         let canonical = std::path::Path::new(&slug)
             .file_name()
             .and_then(|f| f.to_str())
@@ -1333,9 +1269,6 @@ mod tests {
         let pass = "loop-test-pass";
         let agent_dir = data_dir.join("proj").join("agents");
 
-        // Fixture: 50 UNREGISTERED agent keys on disk (TEST_LOG_N — ~ms
-        // each, CI-safe). None of them sit in the agents index, so wraps to
-        // them exercise the fallback scan.
         for i in 0..50usize {
             let p = agent_dir.join(format!("agent-{i}")).join("key.ncryptsec");
             crate::keys::write_encrypted_key(
@@ -1351,9 +1284,6 @@ mod tests {
         crate::keys::write_encrypted_key(&p50, &target, pass, crate::keys::TEST_LOG_N)
             .expect("write target key");
 
-        // Every build is KDF-free — cold, after a new key, after a rewrite,
-        // and no-op. (The eager keyring is deleted; nothing decrypts at
-        // build time.)
         let pipeline = mailbox.build_unwrap_pipeline().await.expect("cold build");
         assert_eq!(mailbox.kdf_load_count(), 0, "cold build is KDF-free");
         let other = crate::keys::generate();
@@ -1371,9 +1301,6 @@ mod tests {
             "rebuild after a new key file is still KDF-free"
         );
 
-        // A wrap to the unregistered target projects via the fallback scan
-        // (bounded by the local key-file count) — the pre-lazy contract for
-        // on-disk-but-unregistered keys is preserved.
         let sender = crate::keys::generate();
         let rumor = build_rumor(
             sender.public_key(),
@@ -1395,7 +1322,6 @@ mod tests {
             "fallback scan decrypts at most the local key files ({after_first})"
         );
 
-        // Repeat wrap to the same recipient: pure cache hit.
         let rumor2 = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_001u64),

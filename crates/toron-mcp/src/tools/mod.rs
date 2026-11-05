@@ -103,13 +103,6 @@ impl IntoCallToolResult for ToolOutput {
                 let text = serde_json::to_string(&value)
                     .unwrap_or_else(|e| format!("serialize tool result: {e}"));
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                // MCP 2025-06-18: a tool that declares an `outputSchema` MUST
-                // return `structuredContent` conforming to it. Every tool here
-                // declares one, so a text-only result made strict clients
-                // reject the call ("has an output schema but did not return
-                // structured content"). structuredContent must be a JSON
-                // object; object-shaped results get it, scalar/array results
-                // keep the text contract only.
                 if value.is_object() {
                     result.structured_content = Some(value);
                 }
@@ -309,7 +302,6 @@ impl ToJson for InboxMessage {
             "thread_id": self.thread_id,
             "created_ts_us": self.created_ts_us,
             "read_ts_us": self.read_ts_us,
-            // S5 (bd-dup-assign-collapse-ws21): duplicate-group first id.
             "duplicate_of": self.duplicate_of,
             "corr": self.corr,
             "wake": self.wake,
@@ -349,8 +341,6 @@ impl ToJson for PathConflict {
         json!({
             "path": self.path,
             "holders": self.holders,
-            // bd-dsu1: the reservation ids ride through every conflict
-            // surface (acquire + report) for operator diagnostics.
             "reservation_ids": self.reservation_ids,
         })
     }
@@ -361,7 +351,6 @@ impl ToJson for AcquireResult {
         json!({
             "granted": self.granted.to_json(),
             "conflicts": self.conflicts.to_json(),
-            // ADR-0011 Spec 4: additive soft tier (frozen-acquire paths).
             "soft_conflicts": self.soft_conflicts.to_json(),
         })
     }
@@ -375,7 +364,6 @@ impl ToJson for ConflictReport {
             "clear_paths": self.clear_paths,
             "checked_paths": self.checked_paths,
             "total_conflicting_reservations": self.total_conflicting_reservations,
-            // ADR-0011 Spec 4: additive soft tier (in-TTL intents).
             "soft_conflicts": self.soft_conflicts.to_json(),
             "has_soft_conflicts": self.has_soft_conflicts,
         })
@@ -666,8 +654,6 @@ mod tests {
 
     #[test]
     fn tool_error_envelope_is_conservative_and_parseable() {
-        // G4: every tool error carries {code, retryable, hint}; deny-codes
-        // are never retryable; the envelope round-trips as JSON.
         for (msg, code, retryable) in [
             ("agent X not found", "not_found", false),
             ("policy denied: block_all", "policy_denied", false),
@@ -686,9 +672,6 @@ mod tests {
 
     #[test]
     fn nonneg_secs_rejects_negative_wrap() {
-        // P2 (bd-p2-unwrap-or-zero-coercion-5ac3): a negative i64 TTL/extend
-        // coerced with `as u64` wraps to ~1.8e19 seconds — an astronomical
-        // lease. Negative must become None (default TTL / no extension).
         assert_eq!(nonneg_secs(Some(-1)), None);
         assert_eq!(nonneg_secs(Some(-86_400)), None);
         assert_eq!(nonneg_secs(None), None);
@@ -709,7 +692,6 @@ mod tests {
     /// pass `name`). Both missing still fails (required identity field).
     #[test]
     fn whois_args_accepts_name_alias_and_stays_required() {
-        // Canonical field name.
         let by_agent_name: WhoisArgs = serde_json::from_value(json!({
             "project_key": "toron",
             "agent_name": "BlueRidge",
@@ -717,7 +699,6 @@ mod tests {
         .expect("agent_name accepted");
         assert_eq!(by_agent_name.agent_name, "BlueRidge");
 
-        // The `name` alias maps onto the same field.
         let by_name: WhoisArgs = serde_json::from_value(json!({
             "project_key": "toron",
             "name": "BlueRidge",
@@ -725,8 +706,6 @@ mod tests {
         .expect("name alias accepted");
         assert_eq!(by_name.agent_name, "BlueRidge");
 
-        // Both missing → required-field failure (never $USER, never a
-        // generated pin — there is no default).
         let err = serde_json::from_value::<WhoisArgs>(json!({
             "project_key": "toron",
         }))
@@ -786,8 +765,6 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         };
-        // send_message: REQUIRED token lists the mandatory args + the shell
-        // escape hatch (agents with a shell should prefer `flywheel mail`).
         let send = desc("send_message");
         for token in ["REQUIRED: project_key, sender_name", "flywheel mail send"] {
             assert!(
@@ -795,8 +772,6 @@ mod tests {
                 "send_message description missing {token:?}: {send}"
             );
         }
-        // reply_message: same REQUIRED + thread context comes from args
-        // (no auto-parent resolution on toron; the flywheel facade resolves).
         let reply = desc("reply_message");
         for token in [
             "REQUIRED: project_key, sender_name",
@@ -808,9 +783,6 @@ mod tests {
                 "reply_message description missing {token:?}: {reply}"
             );
         }
-        // release_file_reservations_by_reason: REQUIRED + the crew-visible
-        // release path (their own locks go via release_file_reservations /
-        // the CLI, not this operator hook).
         let release = desc("release_file_reservations_by_reason");
         for token in [
             "REQUIRED: project_key, agent_name, bead_id",
@@ -945,7 +917,6 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        // whois → npub (not integer id), *_ts_us microsecond timestamp.
         assert!(
             props("whois").contains(&"npub".to_string()),
             "whois schema must expose npub"
@@ -954,8 +925,6 @@ mod tests {
             props("whois").contains(&"last_active_ts_us".to_string()),
             "whois schema must expose *_ts_us timestamp"
         );
-        // send_message → deliveries[].payload {recipient, event_id}.
-        // schemars emits nested types as $ref into $defs — resolve through it.
         let schema_obj = by("send_message")
             .output_schema
             .as_ref()
@@ -982,15 +951,11 @@ mod tests {
             "send payload recipient"
         );
         assert!(deliveries.contains_key("event_id"), "send payload event_id");
-        // release_file_reservations → {released, leases} (bd-release-breakdown-xom3
-        // added the per-path breakdown; released count unchanged).
         assert_eq!(
             props("release_file_reservations"),
             vec!["leases".to_string(), "released".to_string()],
             "release schema = {{released, leases}}"
         );
-        // set_contact_policy → object wrapper {event_id} (pi client requires
-        // top-level type object; bare string fails tools/list validation).
         assert_eq!(
             by("set_contact_policy").output_schema.as_ref().unwrap()["type"],
             "object",

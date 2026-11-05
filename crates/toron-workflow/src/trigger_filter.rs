@@ -100,8 +100,8 @@ pub const JOB_EMITS_KINDS: &[u16] = &[
 
 /// Workflow-run kinds 46001–46012 (the run/step/approval event stream).
 /// Sourced from the registry range.
-pub const JOB_RUN_FIRST: u16 = JOB_REQUEST; // 43001
-pub const JOB_RUN_LAST: u16 = JOB_ERROR; // 43006
+pub const JOB_RUN_FIRST: u16 = JOB_REQUEST;
+pub const JOB_RUN_LAST: u16 = JOB_ERROR;
 
 pub fn workflow_run_kind(kind: u16) -> bool {
     (WORKFLOW_RUN_FIRST..=WORKFLOW_RUN_LAST).contains(&kind)
@@ -136,14 +136,12 @@ pub fn has_workflow_emitted_tag(event: &Event) -> bool {
 ///
 /// Pure + sync + O(tags). No allocation on the fast path (kind check first).
 pub fn should_evaluate_trigger_event(event: &Event) -> bool {
-    // 1. Kind check (fast path — no tag scan needed for these).
     if is_workflow_emitted_kind(event.kind.as_u16()) {
         return false;
     }
     if event.kind.as_u16() == GIFT_WRAP {
         return false;
     }
-    // 2. Tag check (defense in depth — catches workflow-emitted kind-14/15/7).
     if has_workflow_emitted_tag(event) {
         return false;
     }
@@ -157,22 +155,6 @@ pub fn should_evaluate_trigger_event(event: &Event) -> bool {
 pub fn should_evaluate_trigger_kind(kind: u16) -> bool {
     !is_workflow_emitted_kind(kind) && kind != GIFT_WRAP
 }
-
-// ---------------------------------------------------------------------------
-// Trigger-spec evaluation (P11.1 reactive ingress — the wiring layer)
-//
-// The embedding (toron-mcp serve host, flywheel, any bus subscriber) runs:
-//
-//   should_evaluate_trigger_event(&event)?   // loop prevention (above)
-//     → matches_trigger(trigger, &event)?    // this layer
-//     → engine.run(trigger_run_id(...), RunInput { workflow, trigger: trigger_payload(&event) })
-//
-// Kind-level matching + the reservation acquired/released DISAMBIGUATION
-// (both are kind-30031; a release marker must fire `reservation_released`,
-// never `reservation_acquired`) + the Trigger's own project/path/channel/
-// emoji scoping fields. The loop-prevention filter stays the layer above —
-// it never consults trigger specs.
-// ---------------------------------------------------------------------------
 
 use serde_json::{Value, json};
 
@@ -191,9 +173,6 @@ pub fn is_reservation_released_marker(event: &Event) -> bool {
     if is_revocation(event) {
         return true;
     }
-    // Canonical forms only (mirrors is_revocation): the bare substring
-    // "released" would misclassify an ACQUIRE whose free-text `reason`
-    // mentions "released" — routing the trigger to the wrong arm.
     event.content.contains("status:released")
         || event.content.contains("\"status\":\"released\"")
         || event.tags.iter().any(|t| {
@@ -242,8 +221,8 @@ pub fn matches_trigger(trigger: &Trigger, event: &Event) -> bool {
                 && path_scoped_match(path.as_deref(), event)
         }
         Trigger::AgentStateChanged { .. } => kind == 20001,
-        Trigger::Schedule { .. } => false, // cron-managed, not event-driven
-        Trigger::Webhook { .. } => false,  // external, not a bus event
+        Trigger::Schedule { .. } => false,
+        Trigger::Webhook { .. } => false,
     }
 }
 
@@ -378,7 +357,6 @@ mod tests {
             );
             assert!(!should_evaluate_trigger_kind(k));
         }
-        // JOB_EMITS_KINDS list is consistent with the range.
         for &k in JOB_EMITS_KINDS {
             assert!(job_kind(k));
         }
@@ -415,10 +393,8 @@ mod tests {
     #[test]
     fn workflow_emitted_tag_rejects_kind_14() {
         let keys = Keys::generate();
-        // Bare kind-14 → passes.
         let bare = ev(14, vec![], &keys);
         assert!(should_evaluate_trigger_event(&bare));
-        // Tagged kind-14 → rejected.
         let tagged = ev(14, vec![tag_t(WORKFLOW_EMITTED_TAG)], &keys);
         assert!(
             !should_evaluate_trigger_event(&tagged),
@@ -435,15 +411,11 @@ mod tests {
     #[test]
     fn self_send_message_workflow_cannot_loop() {
         let workflow_keys = Keys::generate();
-        // The workflow's send_message action emits this kind-14, stamped with
-        // the workflow-emitted tag by the action runner.
         let emitted = ev(14, vec![tag_t(WORKFLOW_EMITTED_TAG)], &workflow_keys);
-        // The ingress filter MUST reject it.
         assert!(
             !should_evaluate_trigger_event(&emitted),
             "loop-prevention: workflow-emitted kind-14 must not re-trigger"
         );
-        // Therefore no new RunInput is built → no new run → no infinite loop.
     }
 
     /// The kind-only predicate is consistent with the event predicate for
@@ -461,9 +433,6 @@ mod tests {
                 "kind {k}: kind-predicate must agree"
             );
         }
-        // The event predicate additionally catches the tag; the kind
-        // predicate cannot (documented). A kind-14 bare event passes both;
-        // a kind-14 tagged event passes kind-pred but fails event-pred.
         assert!(should_evaluate_trigger_kind(14));
     }
 
@@ -475,15 +444,10 @@ mod tests {
         let e = EventBuilder::new(Kind::from_u16(JOB_RESULT), r#"{"status":"ok"}"#)
             .finalize(&keys)
             .expect("sign");
-        // Wire round-trip.
         let parsed = Event::from_json(e.as_json()).expect("parse");
         assert_eq!(parsed, e);
         assert!(!should_evaluate_trigger_event(&parsed));
     }
-
-    // ------------------------------------------------------------------
-    // P11.1 trigger-spec evaluation
-    // ------------------------------------------------------------------
 
     use crate::schema::{CronScope, Trigger};
 
@@ -502,7 +466,6 @@ mod tests {
     #[test]
     fn reservation_acquired_vs_released_disambiguation() {
         let keys = Keys::generate();
-        // Plain acquire (status-less content) → acquired only.
         let acquired = reservation(
             r#"{"exclusive":true}"#,
             vec![tag_d("demo", "src/**"), tag_t("demo")],
@@ -526,7 +489,6 @@ mod tests {
             "an acquire must NOT fire reservation_released"
         );
 
-        // Released marker in content → released only.
         let released = reservation(
             r#"{"status":"released"}"#,
             vec![tag_d("demo", "src/**"), tag_t("demo")],
@@ -550,7 +512,6 @@ mod tests {
             "a release must NOT fire reservation_acquired"
         );
 
-        // Released via the `["status", "released"]` tag form (release path).
         let tagged = reservation(
             r#"{"exclusive":true}"#,
             vec![
@@ -568,7 +529,6 @@ mod tests {
             &tagged
         ));
 
-        // Operator revocation (force-release) → released (lease terminated).
         let revoked = reservation(
             r#"{"status":"revoked","heuristic":"stale-holder"}"#,
             vec![
@@ -628,7 +588,6 @@ mod tests {
             serde_json::json!("acquired")
         );
 
-        // Positive controls: both canonical content forms still classify.
         for content in [
             r#"{"status":"released"}"#.to_string(),
             "status:released".to_string(),
@@ -653,7 +612,6 @@ mod tests {
             vec![tag_d("demo", "src/lib.rs"), tag_t("demo")],
             &keys,
         );
-        // Wrong project → no match.
         assert!(!matches_trigger(
             &Trigger::ReservationAcquired {
                 project: "other".into(),
@@ -661,7 +619,6 @@ mod tests {
             },
             &acquired
         ));
-        // No project t-tag at all → no match (required scoping).
         let unscoped = reservation(
             r#"{"exclusive":true}"#,
             vec![tag_d("demo", "src/lib.rs")],
@@ -674,7 +631,6 @@ mod tests {
             },
             &unscoped
         ));
-        // Path glob: symmetric overlap (trigger glob vs d-tag path).
         assert!(matches_trigger(
             &Trigger::ReservationAcquired {
                 project: "demo".into(),
@@ -712,7 +668,6 @@ mod tests {
             },
             &thumbs
         ));
-        // Emoji constraint matches the NIP-25 content.
         assert!(matches_trigger(
             &Trigger::ReactionAdded {
                 channel: None,
@@ -741,7 +696,6 @@ mod tests {
             },
             &thumbs
         ));
-        // A kind-7 is NOT a message_posted trigger.
         assert!(!matches_trigger(
             &Trigger::MessagePosted {
                 channel: None,
@@ -793,7 +747,6 @@ mod tests {
             },
             &dm
         ));
-        // Schedule/webhook never match bus events.
         assert!(!matches_trigger(
             &Trigger::Schedule {
                 cron: "* * * * *".into(),
@@ -823,12 +776,10 @@ mod tests {
             &keys,
         );
         assert_eq!(trigger_payload(&released)["status"], json!("released"));
-        // A non-reservation payload has no status field.
         let dm = EventBuilder::new(Kind::from_u16(14), "hi")
             .finalize(&keys)
             .expect("sign");
         assert!(trigger_payload(&dm).get("status").is_none());
-        // Deterministic run ids: stable per (workflow, event), distinct per event.
         assert_eq!(
             trigger_run_id("wf-a", &acquired),
             trigger_run_id("wf-a", &acquired)

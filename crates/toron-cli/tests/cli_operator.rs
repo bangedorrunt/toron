@@ -1,7 +1,4 @@
 // governed-by: ADR-0003
-// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
-// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
-// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-led.8.2 acceptance: operator commands (doctor/metrics/key/project/relay/backend).
 //!
@@ -19,13 +16,6 @@ use serde_json::Value;
 
 fn toron() -> Command {
     let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
-    // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
-    // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
-    // checks the daemon URL first and returns before reading the data dir —
-    // so the shelled-out CLI would talk to a developer's live daemon and
-    // never see the keys registered into the temp dir, failing as
-    // "unknown agent name" / "has no local key". Drop it by default so the
-    // suite is hermetic on any machine with the daemon running (bd-5z0l).
     c.env_remove("TORON_MCP_URL");
     c
 }
@@ -74,10 +64,6 @@ fn unique_dir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
-
-// ---------------------------------------------------------------------------
-// key
-// ---------------------------------------------------------------------------
 
 #[test]
 fn key_generate_writes_0600_ncryptsec_without_nsec() {
@@ -228,14 +214,6 @@ fn key_generate_refuses_to_overwrite_an_existing_key() {
 
 #[test]
 fn key_generate_default_path_ok_or_clean_error() {
-    // No --out: default to operator_key or the canonical config-home key.
-    //
-    // BOTH HOME and XDG_CONFIG_HOME are isolated. Isolating HOME alone was not
-    // enough once the operator key moved to the config home (ADR-0038): with an
-    // ambient XDG_CONFIG_HOME set, the default resolved to the operator's REAL
-    // key and this test overwrote it (2026-09-30, the loss that produced the
-    // no-clobber guard in `key generate`). `run_with_env` cannot remove a
-    // variable, so the command is built here.
     let dir = unique_dir("keydefault");
     let out = toron()
         .env("HOME", &dir)
@@ -251,10 +229,6 @@ fn key_generate_default_path_ok_or_clean_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
-// ---------------------------------------------------------------------------
-// doctor
-// ---------------------------------------------------------------------------
 
 #[test]
 fn doctor_json_parses_with_checks() {
@@ -311,8 +285,6 @@ fn doctor_keys_check_resolves_the_canonical_config_home_key() {
         .join("toron")
         .join("operator")
         .join("operator.ncryptsec");
-    // Removed rather than set-empty: an empty `TORON_OPERATOR_KEY` would
-    // configure a path that is not a file, which is a different case.
     let doctor_keys = || -> (bool, String) {
         let out = toron()
             .env("HOME", &home)
@@ -336,11 +308,9 @@ fn doctor_keys_check_resolves_the_canonical_config_home_key() {
         )
     };
 
-    // 1. No key anywhere: reported as not configured, never green.
     let (ok, detail) = doctor_keys();
     assert!(!ok, "an absent operator key must not read green: {detail}");
 
-    // 2. The canonical config-home key: green, and the detail names it.
     let generated = toron()
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")
@@ -368,8 +338,6 @@ fn doctor_keys_check_resolves_the_canonical_config_home_key() {
         "the detail must name the path that resolved: {detail}"
     );
 
-    // 3. Only a LEGACY data-root key: NOT green, and both paths are named —
-    //    reporting a bare "not configured" would hide the two identities.
     std::fs::remove_file(&canonical).unwrap();
     std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
     std::fs::write(&legacy, b"placeholder, never loaded").unwrap();
@@ -380,10 +348,6 @@ fn doctor_keys_check_resolves_the_canonical_config_home_key() {
         "the detail must name the legacy path it found: {detail}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// metrics
-// ---------------------------------------------------------------------------
 
 #[test]
 fn metrics_json_has_counters() {
@@ -417,7 +381,6 @@ fn metrics_increment_after_robot_call() {
     let before = parse(&run_with_env(&["metrics", "--json"], &env).stdout);
     let before_total = before["total_calls"].as_u64().unwrap();
 
-    // A robot tool call: record the metrics-probe agent so inbox resolves.
     register_probe_agent();
     let tool = run_with_env(
         &[
@@ -445,8 +408,6 @@ fn metrics_increment_after_robot_call() {
 /// Register `metrics-probe` in the shared demo mailbox (idempotent), so the
 /// robot call in [`metrics_increment_after_robot_call`] succeeds cleanly.
 fn register_probe_agent() {
-    // Ensure the shared data dir env is set BEFORE demo_mailbox constructs
-    // in-process (a durable-root mailbox would re-KDF 500+ agent keys).
     let _ = shared_data_dir();
     static REG: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = REG
@@ -466,10 +427,6 @@ fn register_probe_agent() {
             .expect("register metrics-probe");
     });
 }
-
-// ---------------------------------------------------------------------------
-// project / relay / backend
-// ---------------------------------------------------------------------------
 
 #[test]
 fn project_list_is_object_with_projects_array() {
@@ -525,7 +482,6 @@ fn agent_bootstrap_registers_and_reserves() {
         value["created"].is_boolean(),
         "bootstrap reports created flag, got {value}"
     );
-    // Idempotent re-run: same pin upserts, reserves again.
     let again = run(&args);
     assert!(again.status.success());
     let second = parse(&again.stdout);

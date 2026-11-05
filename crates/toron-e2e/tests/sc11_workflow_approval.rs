@@ -105,7 +105,6 @@ async fn sc11_approval_crash_resume() {
     let trigger = serde_json::json!({});
     let digest = durable::digest(&workflow);
 
-    // 2. Driver A runs the deploy workflow → prep executes, then parks.
     let (run, effects) = open_run(&pool, "sc11-deploy", workflow.clone(), trigger.clone())
         .await
         .expect("open");
@@ -136,12 +135,8 @@ async fn sc11_approval_crash_resume() {
     };
     assert_eq!(step, "gate");
 
-    // 3. KILL THE WORKER: drop driver A entirely (fresh handles below prove
-    //    no live state carried over — the pool retains everything).
     drop(run);
 
-    // 4. RESTART: re-open the same run id (resume — the model wins) and
-    //    approve the gate through the state store.
     let (run, effects) = open_run(&pool, "sc11-deploy", workflow.clone(), trigger.clone())
         .await
         .expect("reopen");
@@ -163,7 +158,6 @@ async fn sc11_approval_crash_resume() {
     })
     .await;
 
-    // 5. Drive the remainder to terminal: ship executes, run completes.
     let output = loop {
         if effects.is_empty() {
             panic!("drive ran out of effects while non-terminal");
@@ -209,14 +203,6 @@ async fn sc11_approval_crash_resume() {
     };
     drop(run);
 
-    // ADR-0024 Spec 2 (one decision spelling): the decision is published under
-    // the node's OWN name (`gate`). The durable `Complete` carries
-    // `{status, steps}`, so the contract reads under `steps` (same keys,
-    // new envelope).
-    //
-    // ADR-0024 Spec 2: the decision is published under the node name AND the
-    // canonical `decision` alias (parity with the old linear path; the fold
-    // landed the alias with bd-approval-alias).
     let steps = &output["steps"];
     assert_eq!(
         steps["gate"]["outcome"], "approved",

@@ -57,7 +57,6 @@ pub struct DispatchConfig {
 
 impl Default for DispatchConfig {
     fn default() -> Self {
-        // Buzz default: a pool of 100.
         Self {
             max_concurrency: 100,
             hold_bound_ms: DEFAULT_HOLD_BOUND_MS,
@@ -167,7 +166,6 @@ impl DispatchPool {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let claimed_generation = self.generation_of(agent);
-        // Option API drops effects — live hosts must not use this path.
         self.try_acquire_fenced(agent, now_ms, claimed_generation)
             .ok()
     }
@@ -178,16 +176,15 @@ impl DispatchPool {
         let mut in_flight = self.in_flight.lock();
         let count = in_flight.entry(agent.to_string()).or_insert(0);
         if *count >= 1 {
-            return None; // one-in-flight-per-agent
+            return None;
         }
         self.semaphore.clone().try_acquire_owned().map_or_else(
-            |_| None, // global cap reached
+            |_| None,
             |permit| {
                 *count += 1;
                 Some(DispatchPermit {
                     pool: self,
                     agent: agent.to_string(),
-                    // Holder generation filled by try_acquire_fenced on Acquired.
                     busy_generation: None,
                     _permit: permit,
                 })
@@ -258,10 +255,6 @@ impl DispatchPool {
     /// global/agent semaphore `try_acquire` then failed; the holder is released
     /// so holders and `in_flight` stay in lockstep. No journalable busy-owner
     /// effect remains — callers treat empty as "retry later / cap contention".
-    // clippy::option_if_let_else: the two arms are a 20-line lock-and-mutate
-    // rollback and a permit fixup. Rewriting them as map_or_else closures makes
-    // the rollback harder to read for no semantic gain, and the nursery lint
-    // fires on body size it cannot judge. Allowed with the reason.
     #[allow(clippy::option_if_let_else)]
     pub fn try_acquire_fenced(
         &self,
@@ -285,13 +278,10 @@ impl DispatchPool {
                 drop(busy);
                 match self.try_acquire_slots(agent) {
                     Some(mut permit) => {
-                        // Keep holders + in_flight in lockstep on the fenced path.
                         permit.busy_generation = Some(generation);
                         Ok(permit)
                     }
                     None => {
-                        // Global/agent cap lost the race after Acquired — roll back holder
-                        // so the agent is not stuck busy forever (dual SoT: holders vs in_flight).
                         let mut busy = self.busy.lock();
                         let (next, _) = busy_tick(
                             &busy,
@@ -391,7 +381,6 @@ impl Drop for DispatchPermit<'_> {
             }
         }
         drop(in_flight);
-        // Generation-aware Release keeps holders in lockstep with in_flight/semaphore.
         if let Some(generation) = self.busy_generation.take() {
             let mut busy = self.pool.busy.lock();
             let (next, _) = busy_tick(
@@ -429,7 +418,6 @@ mod tests {
                 spec: serde_json::json!({}),
             },
         ];
-        // Fresh process, wiped cache: rebuild from the durable rows.
         let pool = DispatchPool::rebuild_from_jobs(DispatchConfig::default(), jobs);
         assert_eq!(pool.queued_len(), 2, "both rows restored");
         assert_eq!(pool.next_ready().expect("j1").job_id, "j1");
@@ -441,11 +429,9 @@ mod tests {
     fn one_in_flight_per_agent() {
         let pool = DispatchPool::new(DispatchConfig::default());
         let a = pool.try_acquire("agent-a").expect("first permit");
-        // Second acquire for the same agent → None (one-in-flight).
         assert!(pool.try_acquire("agent-a").is_none());
         assert_eq!(pool.in_flight_for("agent-a"), 1);
         drop(a);
-        // After release, the slot is free again.
         assert!(pool.try_acquire("agent-a").is_some());
     }
 
@@ -457,7 +443,6 @@ mod tests {
         });
         let p1 = pool.try_acquire("a").expect("a");
         let p2 = pool.try_acquire("b").expect("b");
-        // Global cap reached → third agent waits.
         assert!(pool.try_acquire("c").is_none());
         drop(p1);
         assert!(pool.try_acquire("c").is_some(), "slot freed after release");
@@ -476,7 +461,6 @@ mod tests {
         pool.enqueue(q1.clone());
         pool.enqueue(q1);
         assert_eq!(pool.queued_len(), 2);
-        // Drains in FIFO order when slots are free.
         let popped = pool.next_ready().expect("first");
         assert_eq!(popped.job_id, "j1");
         assert_eq!(pool.queued_len(), 1);
@@ -494,7 +478,6 @@ mod tests {
             fx[0],
             BusyOwnerEffect::GenerationAdvanced { generation: 1, .. }
         ));
-        // Stale gen-0 claim is fenced (no second permit).
         let err = match pool.try_acquire_fenced("a", 50, 0) {
             Err(e) => e,
             Ok(_) => panic!("stale gen must be fenced"),
@@ -520,7 +503,6 @@ mod tests {
             parent_id: "p".into(),
             spec: serde_json::json!({}),
         });
-        // Agent a is busy → the job stays queued, not dispatched.
         assert!(pool.next_ready().is_none());
         assert_eq!(pool.queued_len(), 1);
     }
@@ -560,7 +542,6 @@ mod tests {
             "Drop must Release holder — otherwise agent stays busy forever"
         );
         assert_eq!(pool.in_flight_for("a"), 0);
-        // Re-acquire at same generation must succeed after Release.
         let again = pool
             .try_acquire_fenced("a", 20, 0)
             .expect("re-acquire after Drop Release");
@@ -576,7 +557,6 @@ mod tests {
             max_concurrency: 1,
             hold_bound_ms: 1_000,
         });
-        // Occupy the only global slot (live try_acquire also inserts a busy holder for "other").
         let cap = pool.try_acquire("other").expect("cap holder");
         assert_eq!(pool.in_flight_for("other"), 1);
         assert!(
@@ -595,7 +575,6 @@ mod tests {
             "holder must roll back when try_acquire fails after Acquired"
         );
         assert_eq!(pool.in_flight_for("a"), 0);
-        // After cap frees, fenced acquire works.
         drop(cap);
         let ok = pool
             .try_acquire_fenced("a", 60, 0)
@@ -631,7 +610,6 @@ mod tests {
             }
             other => panic!("busy agent must Park with effects, got {other:?}"),
         }
-        // Option shim still drops — prove why live must not use it.
         assert!(
             pool.try_acquire("a").is_none(),
             "Option shim maps Sleep→None; hosts must use try_acquire_for_host"

@@ -47,7 +47,6 @@ impl Mailbox {
 
         let pool = self.index_pool_required()?;
 
-        // Build the lease event first (pure — nothing published yet).
         let d = format!("{project_slug}:{slot}");
         let created = Timestamp::now();
         let ttl_secs = ttl_secs.unwrap_or(crate::bus::DEFAULT_ENVELOPE_TTL_SECS);
@@ -65,7 +64,6 @@ impl Mailbox {
             created,
         )?;
 
-        // Decide atomically: win → granted; lose → holder list, no publish.
         let decision = slots::try_acquire(
             pool,
             &slots::SlotLease {
@@ -89,10 +87,6 @@ impl Mailbox {
             });
         }
 
-        // Publish the kind-30032 lease (NIP-40 expiration + dual-emit).
-        // A publish failure compensates the projection win (release by own
-        // key — only our just-written row matches) so no phantom grant
-        // survives.
         let ok = self.bus.publish(event.clone()).await?;
         if !ok.stored {
             let _ =
@@ -101,13 +95,6 @@ impl Mailbox {
             anyhow::bail!("build-slot event rejected by bus");
         }
 
-        // bd-2dox: a build-slot acquire extends the holder's active file
-        // reservations by the claimed liveness window (capped at 1h). A 4+
-        // min cargo run outlives a short reservation TTL; without this the
-        // strict pre-commit guard sees the files as unreserved when the
-        // commit lands after the build (the sweep root-cause 3). Best-effort
-        // only: slot acquisition is primary, a renewal failure never fails
-        // the slot. The cap bounds stale-lock risk from a default 90d slot.
         let extend = ttl_secs.min(3600);
         if let Err(e) = self
             .renew_file_reservations(project_slug, agent_name, &[], extend)
@@ -138,8 +125,6 @@ impl Mailbox {
         let npub = agent_keys.public_key().to_hex();
         let pool = self.index_pool_required()?;
 
-        // Extension must be relative to the EXISTING lease expiry, not `now`.
-        // Recomputing from `now` collapses a long-lived lease to now+extend
         // (parity bug bd-XXX: reported under-extension to ~10s).
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let existing = active_slot(pool, project_slug, slot).await;
@@ -150,8 +135,6 @@ impl Mailbox {
             return Ok(None);
         }
 
-        // Re-publish the lease with the extended TTL (operator supersedes per
-        // author isolation).
         let d = format!("{project_slug}:{slot}");
         let created = Timestamp::now();
         let expires_secs = (new_expiry / 1_000_000) as u64;
@@ -185,7 +168,6 @@ impl Mailbox {
 
         let released = slots::release_slot(pool, project_slug, slot, &npub).await?;
         if released {
-            // Publish the status:released marker (own-event supersession).
             let d = format!("{project_slug}:{slot}");
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
@@ -263,7 +245,6 @@ mod tests {
         register(&mailbox, "BlueLake").await;
         register(&mailbox, "RoseDune").await;
 
-        // A acquires slot ci exclusively.
         let a = mailbox
             .acquire_build_slot("demo", "BlueLake", "ci", Some(3600), true)
             .await
@@ -272,7 +253,6 @@ mod tests {
         assert_eq!(a.granted[0].slot, "ci");
         assert!(a.conflicts.is_empty());
 
-        // B exclusive acquire conflicts.
         let b = mailbox
             .acquire_build_slot("demo", "RoseDune", "ci", Some(3600), true)
             .await
@@ -282,7 +262,6 @@ mod tests {
         assert_eq!(b.conflicts[0].slot, "ci");
         assert!(!b.conflicts[0].holders.is_empty(), "holder identified");
 
-        // A re-acquiring own slot never conflicts.
         let a2 = mailbox
             .acquire_build_slot("demo", "BlueLake", "ci", Some(3600), true)
             .await
@@ -302,7 +281,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("renewres").await;
         register(&mailbox, "BlueLake").await;
 
-        // Hold a SHORT-TTL reservation (60s) on src/**.
         let held = mailbox
             .file_reservation_paths(
                 "demo",
@@ -317,16 +295,12 @@ mod tests {
         assert_eq!(held.granted.len(), 1);
         let before = held.granted[0].expires_ts_us.expect("expiry");
 
-        // Acquire a cargo slot with a 1h window.
         let slot = mailbox
             .acquire_build_slot("demo", "BlueLake", "cargo", Some(3600), true)
             .await
             .expect("acquire slot");
         assert_eq!(slot.granted.len(), 1, "slot granted");
 
-        // The reservation's expiry must have been extended past the 60s
-        // original (renewed: remaining 60s < extend 3600s → not skipped by
-        // the bd-evqs cap).
         let after = mailbox
             .active_reservations_all_aliases("demo")
             .await
@@ -366,7 +340,6 @@ mod tests {
             .expect("release");
         assert!(released, "release marks lease released");
 
-        // After release, slot is free for another agent.
         register(&mailbox, "RoseDune").await;
         let b = mailbox
             .acquire_build_slot("demo", "RoseDune", "ci", Some(3600), true)
@@ -381,11 +354,6 @@ mod tests {
     #[tokio::test]
     async fn renew_extends_from_absolute_expiry_not_now() {
         // Regression pin (parity bug bd-XXX): renewal must extend the OLD
-        // absolute lease expiry by the extend amount — NOT recompute from
-        // `now`. Recomputing from now collapses a long-lived lease to
-        // now+extend (reported under-extension to ~10s). A lease acquired
-        // with TTL 3600 then renewed +7200 must expire at old+7200, which is
-        // ~3600s later than the buggy now+7200.
         let (mailbox, db_path, data_dir) = test_mailbox("renew-abs").await;
         register(&mailbox, "BlueLake").await;
 

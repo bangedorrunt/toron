@@ -33,7 +33,7 @@ pub struct SearchMessages {
     pub project_key: String,
     pub query: String,
     pub limit: Option<usize>,
-    pub ranking: Option<String>, // "relevance" | "recency"
+    pub ranking: Option<String>,
     pub sender_name: Option<String>,
     pub importance: Option<String>,
     pub thread_id: Option<String>,
@@ -95,19 +95,9 @@ impl Mailbox {
             .index_pool()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))?;
 
-        // ADR-0017: expand the project key to its full alias set (canonical +
-        // every stored alias), so rows written under ANY spelling of the
-        // project are searchable from every other spelling.
         let set = self.project_read_set(&args.project_key).await;
 
-        // An EMPTY query is invalid FTS5 ("syntax error near \"\"") and a bare
-        // `*` is not a valid match-all — skip the FTS join entirely when there
-        // is no text filter (thread-only / digest searches). Relevance ranking
-        // degrades to recency (nothing to score).
         let empty_query = args.query.trim().is_empty();
-        // Placeholder layout: the MATCH query is ?1 when present, so project
-        // params start at ?2 (empty-query searches start at ?1). The two must
-        // never share an index — FTS5 `MATCH ?1` collides with `IN (?1)`.
         let (proj_ph, mut params, mut bind_id) = if empty_query {
             (
                 (1..=set.len()).map(|i| format!("?{i}")).collect::<Vec<_>>(),
@@ -149,13 +139,8 @@ impl Mailbox {
         let since: Option<i64> = args.since_us;
         let until: Option<i64> = args.until_us;
 
-        // Build a WHERE clause with placeholders and bind each in order.
         let mut filter_sql = String::new();
         if let Some(s) = args.sender_name.clone() {
-            // The filter takes a NAME but the column stores the hex pubkey —
-            // resolve through the agents table (per project). An unknown
-            // name matches nothing (subquery → NULL), which is the correct
-            // filter semantics.
             let sub_ph: Vec<String> = (bind_id..bind_id + set.len() as i32)
                 .map(|i| format!("?{i}"))
                 .collect();
@@ -245,8 +230,6 @@ impl Mailbox {
         let pool = self
             .index_pool()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))?;
-        // ADR-0017: expand the project key to its alias set (legacy
-        // path-slug thread rows stay visible from every spelling).
         let set = self.project_read_set(project_key).await;
         let ph: Vec<String> = (1..=set.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
@@ -515,7 +498,7 @@ mod tests {
         let hits = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),
-                query: String::new(), // thread-only search
+                query: String::new(),
                 thread_id: Some("collab-t1".into()),
                 ranking: Some("recency".into()),
                 limit: Some(10),
@@ -545,9 +528,6 @@ mod tests {
         let (mailbox, db_path, data_dir) = test_mailbox("alias-sender").await;
         let pool = mailbox.index_pool().unwrap();
 
-        // Legacy spelling of "demo" + an agents row under it (same name as
-        // the modern row, written pre-canonicalization). Same key: ADR-0037
-        // W2 refuses a second key for a known pin on every new write.
         sqlx::query(
             "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
              VALUES ('/w/demo', 'demo', 1)",
@@ -563,7 +543,6 @@ mod tests {
         .await
         .expect("legacy agent row");
 
-        // Modern row under the canonical spelling.
         seed(
             &mailbox,
             "demo",
@@ -583,7 +562,6 @@ mod tests {
         .await
         .expect("modern agent row");
 
-        // sender filter over the alias-expanded project must not SQL-error.
         let hits = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),
@@ -671,7 +649,6 @@ mod tests {
         )
         .await;
 
-        // Porter stem: "Running" → run, "builds" → build.
         let res = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),
@@ -687,7 +664,6 @@ mod tests {
             res.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
 
-        // remove_diacritics: café → cafe.
         let res2 = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),
@@ -698,7 +674,6 @@ mod tests {
             .expect("search cafe");
         assert!(res2.iter().any(|m| m.id == "e2"));
 
-        // Importance filter.
         let res3 = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),
@@ -711,7 +686,6 @@ mod tests {
         assert_eq!(res3.len(), 1);
         assert_eq!(res3[0].id, "e2");
 
-        // Thread filter.
         let res4 = mailbox
             .search_messages(&SearchMessages {
                 project_key: "demo".into(),

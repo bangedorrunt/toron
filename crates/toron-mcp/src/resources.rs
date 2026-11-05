@@ -249,8 +249,6 @@ fn static_resource(uri: &str) -> Option<serde_json::Value> {
         "toron://tooling/metrics" => Some(serde_json::json!({"tools_called": 0, "errors": 0})),
         "toron://tooling/metrics_core" => Some(serde_json::json!({
             "http": "not started", "database": "not wired", "storage": "not wired",
-            // S8 honest-stub gate (Rev 1): placeholder fields MUST name the
-            // live tool that serves the real value (bd-p0-s8-resources-stub-gate-rrfz).
             "status": "live via health_check / diagnostics tools",
         })),
         "toron://tooling/schemas" => Some(serde_json::json!({
@@ -863,8 +861,6 @@ mod tests {
     #[test]
     fn all_25_resources_resolve_to_non_empty_json() {
         fn concrete(template: &str) -> String {
-            // Substitute the first {param} with a sample value; remaining
-            // params get "demo" (all templates have ≤2 params).
             let mut out = template.to_string();
             for p in [
                 "slug",
@@ -891,7 +887,6 @@ mod tests {
                 _ => true,
             };
             assert!(non_empty, "{name}: {uri} resolves to empty JSON");
-            // Stub entries (not real static data) must name the live tool.
             let obj = v.as_object().expect("object");
             let is_stub = obj.get("status").is_some();
             if is_stub {
@@ -961,11 +956,6 @@ mod tests {
             .await
             .expect("send");
         assert_eq!(sent.count, 1, "delivered");
-        // Poll the projection to completion. The signal is the messages
-        // TABLE (toron://messages/{mid}), NOT the inbox resource: inbox
-        // replays the bus and sees the wrap BEFORE the unwrap loop's argon2
-        // KDF (log_n=16, ~4.4s/key) lands the SQLite row. A fixed sleep is
-        // never enough under parallel load (bd-projection-flake-gyox).
         async {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
             loop {
@@ -989,7 +979,6 @@ mod tests {
         }
         .await;
 
-        // agents/{project} → live registration list.
         let agents = project_resource_value(&mailbox, "toron://agents/demo")
             .await
             .expect("agents projection");
@@ -1004,10 +993,6 @@ mod tests {
             "agents/demo lists registered agents: {names:?}"
         );
 
-        // agents/{name}/inbox → the projected message (exercised by the poll
-        // above; mid feeds the remaining index URIs).
-
-        // threads/{id} → thread members.
         let thread = project_resource_value(&mailbox, "toron://threads/res-thread-1")
             .await
             .expect("thread projection");
@@ -1016,8 +1001,6 @@ mod tests {
             "thread has the one message"
         );
 
-        // views/ack-overdue/{agent} → the ack-required message (sender-side:
-        // the index stores senders, not recipients).
         let overdue = project_resource_value(&mailbox, "toron://views/ack-overdue/workflow-demo")
             .await
             .expect("ack-overdue projection");
@@ -1026,13 +1009,11 @@ mod tests {
             "ack-required message surfaces as overdue"
         );
 
-        // project/{slug} → live manifest state.
         let project = project_resource_value(&mailbox, "toron://project/demo")
             .await
             .expect("project projection");
         assert_eq!(project["slug"].as_str(), Some("demo"));
 
-        // reservations/{project} → project-scoped kind-30031 events (empty ok).
         let reservations = project_resource_value(&mailbox, "toron://reservations/demo")
             .await
             .expect("reservations projection");
@@ -1042,13 +1023,11 @@ mod tests {
             "no reservations registered"
         );
 
-        // slots/{project} → project-scoped kind-30032 events (empty ok).
         let slots = project_resource_value(&mailbox, "toron://slots/demo")
             .await
             .expect("slots projection");
         assert_eq!(slots["count"].as_u64(), Some(0), "no slots leased");
 
-        // identity/{project} → the registered agents.
         let identity = project_resource_value(&mailbox, "toron://identity/demo")
             .await
             .expect("identity projection");
@@ -1058,7 +1037,6 @@ mod tests {
             "identity lists both registered agents"
         );
 
-        // agents/{name}/outbox → the sent message (sender-side index scan).
         let outbox = project_resource_value(&mailbox, "toron://agents/workflow-demo/outbox")
             .await
             .expect("outbox projection");
@@ -1067,14 +1045,12 @@ mod tests {
             "outbox has the sent message"
         );
 
-        // mailbox/{name} → health + inbox summary.
         let mbx = project_resource_value(&mailbox, "toron://mailbox/BlueLake")
             .await
             .expect("mailbox projection");
         assert_eq!(mbx["agent"].as_str(), Some("BlueLake"));
         assert!(mbx["health"].is_object(), "health object present");
 
-        // Static tooling URIs keep serving (no mailbox needed).
         assert!(
             project_resource_value(&mailbox, "toron://tooling/metrics")
                 .await
@@ -1111,7 +1087,7 @@ mod tests {
         let mailbox =
             toron_core::mailbox::Mailbox::new(bus, data_dir, None).with_index_pool(pool.clone());
 
-        pool.close().await; // break the index pool
+        pool.close().await;
 
         let res = index_scan(
             &mailbox,

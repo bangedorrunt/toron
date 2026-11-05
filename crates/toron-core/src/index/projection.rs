@@ -47,9 +47,6 @@ pub struct MailItem {
     pub toron_kind: Option<String>,
 }
 
-// Contact policy (kind-30014, ADR G14) lives in crate::mailbox::unwrap —
-// one canonical home (bd-05yr twins unification). The old infallible shadow
-// `parse` (unknown → BlockAll) is gone; callers parse strictly and fail loud.
 /// Outcome of deciding whether to project one unwrapped gift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionDecision {
@@ -123,7 +120,6 @@ pub fn extract_mail(unwrapped: &UnwrappedGift, local_seq: i64) -> MailItem {
     let (to_list, cc_list) = addressing_lists(&rumor.tags);
 
     MailItem {
-        // Envelope id is filled by the caller (we don't have the wrap here).
         envelope_id: String::new(),
         sender: unwrapped.sender,
         author: rumor.pubkey,
@@ -235,8 +231,6 @@ mod tests {
         let sender = Keys::generate();
         let recipient = Keys::generate();
 
-        // Rumor at t=2000s, envelope created_at randomizes to t=1000s — the
-        // mail timeline MUST use 2000s (rumor), not the envelope.
         let (rumor, wrapped) = wrap_with(
             &sender,
             &recipient.public_key(),
@@ -266,7 +260,6 @@ mod tests {
             vec![Tag::parse(["ts_ms", "1700000000500000"]).unwrap()],
             "x".to_string(),
         );
-        // The tag is an absolute unix-µs timestamp, never base + tag.
         assert_eq!(rumor_timestamp_us(&rumor), 1_700_000_000_500_000);
     }
 
@@ -290,7 +283,6 @@ mod tests {
             )
         };
 
-        // Absolute µs timestamp (2023-11-14T22:13:20.123456Z).
         let tagged = build(vec![Tag::parse(["ts_ms", "1700000000123456"]).unwrap()]);
         assert_eq!(rumor_timestamp_us(&tagged), 1_700_000_000_123_456);
         let mail = UnwrappedMail {
@@ -307,7 +299,6 @@ mod tests {
             "index timeline and inbox ordering must agree on the tag"
         );
 
-        // No tag → both fall back to rumor created_at * 1e6.
         let untagged = build(vec![]);
         assert_eq!(rumor_timestamp_us(&untagged), 1_700_000_000_000_000);
         let mail = UnwrappedMail {
@@ -327,18 +318,12 @@ mod tests {
         let recipient = Keys::generate();
         let rpk = recipient.public_key();
 
-        // A: rumor t=100, envelope t=900  (envelope says A is NEWER)
-        // B: rumor t=500, envelope t=100  (envelope says B is OLDER)
-        // Correct G7 order: A (t=100) then B (t=500). The envelope's
-        // created_at is deliberately NOT consulted.
         let (rumor_a, wrap_a) = wrap_with(&sender, &rpk, Timestamp::from(100), "a").await;
         let (rumor_b, wrap_b) = wrap_with(&sender, &rpk, Timestamp::from(500), "b").await;
 
-        // Unwrap both with the recipient key (envelope id filled in here).
         let unwrap_a = gift_wrap::unwrap(&recipient, &wrap_a).expect("unwrap a");
         let unwrap_b = gift_wrap::unwrap(&recipient, &wrap_b).expect("unwrap b");
 
-        // Envelope timestamps are inverted vs rumor order (NIP-17 randomization).
         let mut items = vec![
             MailItem {
                 envelope_id: wrap_b.id.to_string(),
@@ -371,7 +356,6 @@ mod tests {
         let ua = gift_wrap::unwrap(&recipient, &wrap_a).unwrap();
         let ub = gift_wrap::unwrap(&recipient, &wrap_b).unwrap();
 
-        // Same rumor ts; local_seq decides (reproducible timeline).
         let mut items = vec![
             extract_mail(&ub, 2),
             extract_mail(&ua, 1),
@@ -404,7 +388,6 @@ mod tests {
             ProjectionDecision::Index(_) => panic!("block_all must drop before write"),
         }
 
-        // open accepts.
         let decision = decide(&uw, ContactPolicy::Open, &approved);
         assert!(matches!(decision, ProjectionDecision::Index(_)));
     }

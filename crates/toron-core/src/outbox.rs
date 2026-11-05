@@ -212,8 +212,6 @@ impl Program for Outbox {
     fn failure(failure: &Failure<String>) -> OutboxMsg {
         match failure {
             Failure::NotAppended(e) => OutboxMsg::NotJournaled(e.to_string()),
-            // A lost acknowledgement is not a refusal: the append may have
-            // landed. Park it so recovery reconciles instead of retrying.
             Failure::Unknown(e) => OutboxMsg::JournalUnknown(e.to_string()),
             other => OutboxMsg::NotJournaled(format!("{other:?}")),
         }
@@ -234,7 +232,6 @@ fn fault(point: &str) {
 }
 
 fn provider_append(log: &ToronLog, env: &Envelope) -> OutboxMsg {
-    // The loop journaled the intent before calling this provider (L14).
     fault("after_intent");
     let appended = log.append_json(&l16_json(env));
     if appended.is_ok() {
@@ -262,13 +259,10 @@ fn provider_append(log: &ToronLog, env: &Envelope) -> OutboxMsg {
 
 fn provider_reconcile(log: &ToronLog, env: &Envelope) -> OutboxMsg {
     match log.lookup(&env.msg) {
-        // Present: settle with the original offset.
         Ok(Some(offset)) => OutboxMsg::Reconciled {
             envelope: env.clone(),
             offset,
         },
-        // Absent: append the SAME triple now. The log dedupes, so even a
-        // race with a late original append yields one row.
         Ok(None) => provider_append(log, env),
         Err(e) => OutboxMsg::Uncertain {
             envelope: env.clone(),
@@ -358,11 +352,6 @@ pub async fn send_and_recover(
 ) -> Result<SendReport, crate::inbox::InboxError> {
     use crate::inbox::{INBOX_STREAM, JOURNAL_STREAM};
     let producer = journal_producer(&sender);
-    // Claimed, not computed: `producer_epoch + 1` was a read-then-add that
-    // two runs of one sender could win together, and that a run which
-    // journaled nothing never recorded (bd-journal-claim-epoch-4blu). The
-    // claim is one transaction; it also fences this sender's older journal
-    // epochs, so a zombie run cannot journal behind this one.
     let holder = format!(
         "send_and_recover:{}:{}",
         std::process::id(),

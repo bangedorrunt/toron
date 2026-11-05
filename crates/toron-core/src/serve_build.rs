@@ -97,16 +97,11 @@ pub fn build_verdict(
     serving_pid: Option<u32>,
     on_disk: Option<ArtifactId>,
 ) -> BuildVerdict {
-    // Whoever holds the address now is the only process this record can
-    // describe; anything else is a leftover from an earlier boot.
     if serving_pid != Some(snap.pid) {
         return BuildVerdict::NotServing;
     }
     match on_disk {
-        // Identity match, not clock order: the same artifact is still there.
         Some(id) if id == snap.artifact() => BuildVerdict::Current,
-        // Rebuilt, swapped, resized, or gone — all mean the daemon being served
-        // is not the build on disk.
         _ => BuildVerdict::Replaced,
     }
 }
@@ -253,7 +248,6 @@ mod tests {
             BuildVerdict::Replaced
         );
         assert!(build_verdict(&s, Some(73527), Some(rebuilt)).is_replaced());
-        // Same inode, different length is a rebuild too (in-place writer).
         let resized = ArtifactId {
             ino: s.ino,
             size: s.size + 16,
@@ -297,13 +291,11 @@ mod tests {
         let before = artifact_id(&path).expect("stat");
         assert_eq!(before.size, 11);
 
-        // Same path, different artifact — as a rebuild leaves it.
         std::fs::write(&path, b"second build, longer").expect("rewrite");
         let after = artifact_id(&path).expect("restat");
         assert_ne!(before, after, "a rewrite must change the identity");
         assert_eq!(after.size, 20);
 
-        // And a missing file has no identity to compare (never a false Current).
         assert_eq!(artifact_id(&dir.join("absent")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

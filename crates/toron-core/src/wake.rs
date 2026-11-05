@@ -305,7 +305,7 @@ mod tests {
         let mut i = base();
         i.last_ring_wm = Some(5);
         i.last_ring_at_ms = Some(999_999);
-        i.rings_since_advance = 0; // the cursor advanced since that ring
+        i.rings_since_advance = 0;
         assert_eq!(should_ring(&i), RingDecision::Ring { wm: 7 });
     }
 

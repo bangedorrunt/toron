@@ -65,8 +65,6 @@ fn env_off_overrides_inbox_log_true() {
     assert!(refused_as_off(&o), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
-// --- negative controls ------------------------------------------------------
-
 /// CONTROL: no config and no env var opens the gate. The off switches are
 /// `TORON_COMMS_INBOX=0` and `inbox_log = false`.
 #[test]

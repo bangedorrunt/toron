@@ -83,7 +83,6 @@ async fn sc14a_git_rebuild_of_sqlite_converges() {
     let db_path = dir.join("index.sqlite");
     let db_str = db_path.to_str().unwrap();
 
-    // --- populate: unwrapped canonical content to Git + SQLite index ---
     let archive = GitArchive::open_or_init(&archive_root).expect("init archive");
     let write_pool = schema::connect(db_str).await.expect("write pool");
     schema::migrate(&write_pool).await.expect("migrate");
@@ -105,12 +104,10 @@ async fn sc14a_git_rebuild_of_sqlite_converges() {
         "canonical content in index"
     );
 
-    // --- destroy SQLite (index lost; Git archive survives) ---
     drop((write_pool, read_pool, writer));
     let _ = std::fs::remove_file(&db_path);
     assert!(!db_path.exists(), "sqlite destroyed");
 
-    // --- rebuild from Git archive (no bus/relay) ---
     let write_pool2 = schema::connect(db_str).await.expect("reconnect write");
     schema::migrate(&write_pool2)
         .await
@@ -123,7 +120,6 @@ async fn sc14a_git_rebuild_of_sqlite_converges() {
         .expect("rebuild from Git");
     assert_eq!(rebuilt, 2, "both canonical records re-inserted");
 
-    // --- convergence: tool query matches prior snapshot ---
     let after = inbox_snapshot(&writer2).await;
     assert_eq!(before, after, "fetch_inbox snapshot converges after DR");
 

@@ -693,8 +693,6 @@ impl WfxFold {
             "workflow_effect_attempts" => {
                 match serde_json::from_value::<EffectAttempt>(row.clone()) {
                     Ok(r) => {
-                        // Logged attempts always carry their row id (post-insert
-                        // read-back); 0 is unreachable from our writer.
                         self.attempts.insert(r.id.unwrap_or(0), (r, ts_us));
                         true
                     }
@@ -928,15 +926,6 @@ impl WorkflowEffectStore {
         .execute(&mut *tx)
         .await?;
         let created = res.rows_affected() > 0;
-        // bd-vt9y: the same KEY with a different digest is a replay too (the
-        // pre-minted-key path), and so is a DIFFERENT key for the same
-        // logical node (the render-derived-key path — the break path this
-        // bead is about). Both refuse; the transaction rolls back, so no
-        // second row is left behind.
-        //
-        // The rows a node also OWNS but that are not the node's effect — the
-        // park placeholder and the cleanup attempts — are skipped: they have
-        // their own identity, and their digests are not the node's digest.
         let prepared_digests: Vec<String> = sqlx::query_scalar(
             "SELECT action_digest FROM workflow_effects \
              WHERE run_id = ?1 AND node_path = ?2 AND COALESCE(iteration_key, '') = ?3 \
@@ -973,10 +962,6 @@ impl WorkflowEffectStore {
         .await?
         .ok_or_else(|| anyhow::anyhow!("effect vanished after prepare"))?;
         let row = self.map_effect(&row)?;
-        // The same KEY with a different digest is a replay too: the node's
-        // prepared identity is fixed, so the stored digest is the truth and a
-        // changed render reconciles explicitly. A prepare that declares NO
-        // digest (the cleanup path renders no action) is not compared.
         if !effect.action_digest.is_empty() {
             check_replay(&row.action_digest, &effect.action_digest).map_err(|m| {
                 anyhow::anyhow!(
@@ -1069,8 +1054,6 @@ impl WorkflowEffectStore {
             now,
         )
         .await?;
-        // The resume index commits with the effect row: a crash between
-        // them would leave a Parked row no supervisor lists.
         let presid = sqlx::query(
             "INSERT INTO workflow_pending \
              (run_id, promise_id, park_generation, project, workflow, node_path, effect_key, \
@@ -1170,8 +1153,6 @@ impl WorkflowEffectStore {
                 fold.skipped += 1;
             }
         }
-        // Attempts pruned as orphans carry no tombstone: drop attempts whose
-        // effect is absent from the fold (matches prune semantics exactly).
         fold.attempts
             .retain(|_, (a, _)| fold.effects.contains_key(&a.effect_key));
         fold
@@ -1957,8 +1938,6 @@ impl WorkflowEffectStore {
         terminal_max_age_us: i64,
         limit: i64,
     ) -> anyhow::Result<PruneCounts> {
-        // NOTE: stock SQLite has no DELETE..LIMIT; bound each pass with a
-        // rowid subquery instead (same bound, portable syntax).
         let mut tx = self.pool.begin().await?;
         let doomed_effects: Vec<(String,)> = sqlx::query_as(
             "SELECT effect_key FROM workflow_effects \
@@ -2125,7 +2104,6 @@ mod workflow_effect_schema_tests {
         assert_eq!(rows[0].0, "s1");
         assert_eq!(rows[0].1, r#"["a","b"]"#);
         assert_eq!(rows[0].2, 2);
-        // Upsert: same session overwrites, never duplicates.
         store
             .save_delivery_cursor("s1", r#"["a","b","c"]"#, 3)
             .await
@@ -2143,10 +2121,8 @@ mod workflow_effect_schema_tests {
     async fn delivery_cursor_prune_keeps_fresh() {
         let (p, _dir) = pool("cursor-prune").await;
         let store = WorkflowEffectStore::new(p);
-        // Anchor the idle bound BEFORE the saves: pruning deletes strictly older.
         let bound = now_us();
         store.save_delivery_cursor("fresh", "[]", 0).await.unwrap();
-        // Backdate one row past any sane idle bound directly.
         sqlx::query("UPDATE delivery_cursors SET updated_us = 1 WHERE session = 'fresh'")
             .execute(store.pool())
             .await
@@ -2254,20 +2230,16 @@ mod workflow_effect_schema_tests {
             .note_terminal_pub(TerminalPub::new("dig-1", "run-1", "succeeded", "gate"))
             .await
             .unwrap();
-        // Tombstone one pending entry before the wipe.
         assert!(store.delete_pending("run-1", "p1", 0).await.unwrap());
         wipe_workflow_tables(&p).await;
         let (applied, deleted, skipped) = rebuild_workflow_effects_from_log(&store).await.unwrap();
         assert_eq!(skipped, 0);
-        // 4 live rows (run, effect, attempt, terminal); the pending entry
-        // was tombstoned pre-wipe and stays deleted.
         assert_eq!(applied, 4, "live rows restored, got {applied}");
         assert_eq!(deleted, 0);
         assert!(store.get_effect("ek-1").await.unwrap().is_some());
         assert_eq!(store.list_attempts("ek-1").await.unwrap().len(), 1);
         assert!(store.get_run("run-1").await.unwrap().is_some());
         assert!(store.list_pending("run-1").await.unwrap().is_empty());
-        // Second rebuild is idempotent (same rows, no dupes).
         let (applied2, _, _) = rebuild_workflow_effects_from_log(&store).await.unwrap();
         assert_eq!(applied2, applied);
     }
@@ -2310,7 +2282,6 @@ mod workflow_effect_schema_tests {
         let row = store.get_effect("ek-1").await.unwrap().unwrap();
         let live = row.claim_token.clone();
 
-        // Wrong and empty tokens refuse on both sides.
         assert!(!may_settle(live.as_deref(), "tok-b"));
         assert!(
             !store
@@ -2326,7 +2297,6 @@ mod workflow_effect_schema_tests {
                 .unwrap()
         );
 
-        // The live token settles on both sides, exactly once.
         assert!(may_settle(live.as_deref(), "tok-a"));
         assert!(
             store
@@ -2580,18 +2550,14 @@ mod workflow_effect_schema_tests {
         assert!(out.effect.state.is_resumable());
         assert!(!out.effect.state.is_terminal());
         assert_ne!(out.effect.state, EffectState::Failed);
-        // The resume index lists it under the same key triple.
         let pending = store.list_pending("run-9").await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].park_generation, 0);
         assert_eq!(pending[0].kind, PendingKind::Park);
         assert_eq!(pending[0].effect_key.as_deref(), Some("park:run-9:n1:2000"));
-        // Re-parking the same key is idempotent, not a duplicate wait.
         let again = store.park_effect(park).await.unwrap();
         assert!(!again.created);
         assert_eq!(store.list_pending("run-9").await.unwrap().len(), 1);
-        // A host-side promise park carries no T (the leaf waits; the host
-        // indexes the promise): digest reads "unknown", deadline is null.
         let host_park = NewPark {
             effect_key: "park:run-9:n2:prom-1".into(),
             run_id: "run-9".into(),
@@ -2610,8 +2576,6 @@ mod workflow_effect_schema_tests {
         assert_eq!(hosted.effect.action_digest, "unknown");
         let rows = store.list_pending("run-9").await.unwrap();
         assert_eq!(rows.len(), 2);
-        // No edge into or out of Parked through the transition table, on
-        // any state — the row arrives by insert and leaves by resume.
         for state in [
             EffectState::Prepared,
             EffectState::InFlight,
@@ -2652,8 +2616,6 @@ mod workflow_effect_schema_tests {
             assert_eq!(state, state.as_str().parse().unwrap());
         }
         assert!("bogus".parse::<EffectState>().is_err());
-        // Legal lattice (ADR-0032 §5.2): unknown enters only from
-        // in-flight/accepted uncertainty and leaves only via reconciliation.
         assert!(can_transition(EffectState::InFlight, EffectState::Unknown));
         assert!(can_transition(
             EffectState::Unknown,

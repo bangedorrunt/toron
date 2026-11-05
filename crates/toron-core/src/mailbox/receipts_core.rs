@@ -182,8 +182,6 @@ pub fn tick(model: &ReceiptsModel, msg: &ReceiptsMsg) -> (ReceiptsModel, Vec<Rec
         } => {
             match next.entries.get(corr).cloned() {
                 Some(entry) if is_proven(entry.state) => {
-                    // Proven rows keep their stored path unless the incoming
-                    // row carries a new one (explicit path update).
                     if result_path.is_some() && *result_path != entry.result_path {
                         next.entries.insert(
                             corr.clone(),
@@ -321,7 +319,6 @@ pub fn machine_config() -> serde_json::Value {
     })
 }
 
-// ponytail: one test module covering fence + determinism + guards + paths.
 #[cfg(test)]
 mod pure_cores_tests {
     use super::*;
@@ -364,16 +361,12 @@ mod pure_cores_tests {
                 );
             }
         }
-        // Belt and braces: no clock read anywhere in the shipped core.
         for needle in ["Utc::now", "SystemTime::now"] {
             assert!(
                 !shipped.contains(needle),
                 "receipts_core.rs contains clock read `{needle}`"
             );
         }
-        // bd-zh38: harden to QUALIFIED paths — the use-line fence above is
-        // blind to `tokio::spawn` written inline. The shipped body must not
-        // name a runtime, clock, env, fs, net, process, or thread path.
         for path in [
             "tokio::",
             "nostr::",
@@ -406,7 +399,6 @@ mod pure_cores_tests {
     #[test]
     fn bfs_reachable_states_obey_monotonic_invariants() {
         use std::collections::{HashSet, VecDeque};
-        // Alphabet: one message per shape, two corrs, two timestamps.
         fn alphabet(corr: &str) -> Vec<ReceiptsMsg> {
             vec![
                 ReceiptsMsg::Ack {
@@ -439,8 +431,6 @@ mod pure_cores_tests {
         }
         let mut transitions = 0usize;
         while let Some((model, depth)) = queue.pop_front() {
-            // Canonical encoding bounds the BFS (timestamps normalized: the
-            // core only compares them, so shape + state space is finite).
             let key = format!("{:?}", model.entries);
             if !visited.insert(key) {
                 continue;
@@ -448,10 +438,7 @@ mod pure_cores_tests {
             for msg in alphabet("s").into_iter().chain(alphabet("t")) {
                 let (next, _) = tick(&model, &msg);
                 for (corr, entry) in &next.entries {
-                    // Invariants on EVERY reachable row, not just named cases.
                     if entry.state == State::Owed {
-                        // Nothing ever transitions INTO owed: any row that is
-                        // owed now was owed before (no re-owe path exists).
                         let before = model.entries.get(corr).map(|e| e.state);
                         assert!(
                             before.is_none() || before == Some(State::Owed),
@@ -487,7 +474,6 @@ mod pure_cores_tests {
                 },
             ]
         }
-        // One deep path per seed, replayed twice.
         let seeds = vec![
             ReceiptsModel::new(),
             ReceiptsModel::with_row("s", State::Owed, None, 1),
@@ -520,8 +506,6 @@ mod pure_cores_tests {
                 (model, all_fx)
             };
             assert_eq!(run_once, run_twice, "replay is deterministic");
-            // Terminal invariant on the deep state: the path acked every
-            // seeded row, so no Owed may remain (nothing re-owes).
             for entry in run_once.0.entries.values() {
                 assert_ne!(
                     entry.state,
@@ -587,17 +571,12 @@ mod pure_cores_tests {
 
     #[test]
     fn same_msg_log_byte_identical_effects() {
-        // Seed one owed row the way the store would load it.
         let seed = ReceiptsModel::with_row("o1", State::Owed, None, 5);
         let log = scripted_log();
         let (a_model, a_fx) = replay(&seed, &log);
         let (b_model, b_fx) = replay(&seed, &log);
         assert_eq!(format!("{a_fx:?}"), format!("{b_fx:?}"));
         assert_eq!(a_model, b_model);
-        // Trace: new→Resulted stamp; ghost→Ignored; o1 owed→Resulted stamp
-        // (explicit verb jumps straight); ack on resulted→Ignored; dup
-        // ack→Ignored; set-resulted w/ new path→Stamp (path update);
-        // same path again→Ignored; prune→PruneBefore{70}.
         assert_eq!(
             a_fx,
             vec![
@@ -679,8 +658,6 @@ mod pure_cores_tests {
 
     #[test]
     fn degraded_upgrades_to_acked_never_reowes() {
-        // ADR-0010 D8: degraded is acked-unknown — an ack landing after is
-        // the recovery path; re-owed would invite a duplicating resend.
         let seed = ReceiptsModel::with_row("d", State::Degraded, None, 1);
         let (_, fx) = tick(
             &seed,

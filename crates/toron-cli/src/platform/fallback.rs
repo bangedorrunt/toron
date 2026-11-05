@@ -1,8 +1,4 @@
 // governed-by: ADR-0031
-// Fallback supervision (bd-nc5d): pidfile + detached spawn for hosts with
-// neither launchd nor systemd. Verbatim move of the fallback-gated blocks
-// out of `daemon.rs` — no signature or behavior changes. Only compiled off
-// macOS/Linux, so it carries zero cfg attributes.
 
 use std::path::Path;
 use std::process::Command;

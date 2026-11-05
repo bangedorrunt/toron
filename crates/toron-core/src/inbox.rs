@@ -479,8 +479,6 @@ impl InboxStore {
                 Refusal::PayloadConflict { msg_key } => AppendError::NotAnEnvelope(format!(
                     "payload conflict on {msg_key}: the log already holds different content under this producer triple"
                 )),
-                // The vendored enum is closed: through the kernel entry a typed
-                // refusal is its text. `append_envelope` returns it typed.
                 Refusal::Reject(r) => AppendError::NotAnEnvelope(r.to_string()),
             })
     }
@@ -570,8 +568,6 @@ impl InboxStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(unavailable)?;
-        // Outer None = open; Some(None) = bare close; Some(Some(key)) = sealed
-        // by that append, whose own retry still answers.
         let closed_by: Option<Option<String>> =
             sqlx::query_scalar("SELECT closed_by FROM inbox_stream_close WHERE stream = ?1")
                 .bind(stream)
@@ -584,9 +580,6 @@ impl InboxStore {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(unavailable)?;
-        // The fence is the higher of the producer's last appended epoch and
-        // its highest claimed epoch (bd-epoch-claim-z5m5): a claim fences
-        // every older incarnation before the new one has appended anything.
         let claimed: Option<i64> =
             sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
                 .bind(&producer)
@@ -614,21 +607,16 @@ impl InboxStore {
         .await
         .map_err(unavailable)?;
         if let Some((offset, stored)) = existing {
-            // Same triple: a replay only if it is the same content.
             let same = serde_json::from_str::<serde_json::Value>(&stored)
                 .is_ok_and(|stored| stored == payload);
             if !same {
                 return Err(Refusal::PayloadConflict { msg_key });
             }
-            // A closed stream dedupes only the append that closed it; any
-            // earlier triple is refused like a new append.
             if let Some(closed_by) = &closed_by
                 && closed_by.as_deref() != Some(msg_key.as_str())
             {
                 return Err(AppendError::Closed.into());
             }
-            // The exact closing triple stays answerable after the close; a
-            // replay is not a new append, so it may still seal the stream.
             if close {
                 mark_closed(&mut tx, stream, now_us(), Some(&msg_key))
                     .await
@@ -640,14 +628,9 @@ impl InboxStore {
                 replay: true,
             });
         }
-        // A closed stream refuses every new append. Checked after the replay
-        // answer, so retrying the closing triple still returns its offset.
         if closed_by.is_some() {
             return Err(AppendError::Closed.into());
         }
-        // Authority (Phase 4.1): after the fence and the replay answer, before
-        // anything is written. A replay of a message already in the log was
-        // authorised when it landed and stays idempotent.
         let facts = match &envelope {
             Some(env) => self.authorize_in(&mut tx, env).await?,
             None => AppendFacts::none(),
@@ -712,8 +695,6 @@ impl InboxStore {
             write_steer(&mut tx, env, steer)
                 .await
                 .map_err(unavailable)?;
-            // Redirect fences the task's current gen; cancel ends it. Pause
-            // and resume record the steer and leave the gen alone.
             apply_steer(&mut tx, env, steer, now)
                 .await
                 .map_err(unavailable)?;
@@ -851,10 +832,6 @@ impl InboxStore {
             let Body::Steer(steer) = contracts::parse(env)? else {
                 unreachable!("steer@1 parses as a steer body");
             };
-            // F7: with a lead row, only its holder at its epoch steers; a
-            // lower or higher epoch, or another key at the right one, writes
-            // nothing. With no row, only the operator steers (`NoLead` for
-            // anyone else), and no epoch or holder is invented.
             let lead = lead_row(conn, context).await.map_err(unavailable)?;
             Authority::check_steer(
                 lead.as_ref().map(|l| (l.holder.as_str(), l.sup_epoch)),
@@ -863,9 +840,6 @@ impl InboxStore {
                 steer.sup_epoch,
                 context,
             )?;
-            // A steer is the control fact itself, not a swarm send. Return
-            // before the supervisor-topology refusal, the same way a role
-            // fact does, so it is stored rather than answered `NotYet`.
             return Ok(AppendFacts {
                 steer: Some(steer),
                 ..AppendFacts::none()
@@ -874,13 +848,8 @@ impl InboxStore {
         if env.class == Class::Control
             && (env.contract.name == "goal" || env.contract.name == "escalate")
         {
-            // Same exemption as steer: a supervisor context stores the fact.
-            // There is no projection table; the log row is the record.
-            // `check_send` above still refuses a crew `goal`.
             return Ok(AppendFacts::none());
         }
-        // A supervisor context is stored, not projected. Do not run the send
-        // as a swarm. Role and context facts above are the governance log.
         if current_context.is_some_and(|c| c.topology == Topology::Supervisor) {
             return Err(Reject::NotYet {
                 what: "supervisor".into(),
@@ -1118,11 +1087,7 @@ impl InboxStore {
             let role = role_row(&mut tx, &envelope.context.0, reader)
                 .await?
                 .map(|r| r.role);
-            // Both facts, or today's phase table. No fact: project is not called.
             let mut allowed_now = allowed_now_for(&state, &msg_key, &envelope, topology, role);
-            // The head item only. `next` already refused a reader who is not
-            // the recipient, so this is their own stream. No pending steer:
-            // `allowed_now_for` is left as it was.
             if items.is_empty()
                 && let Some(task) = &envelope.task
                 && let Some((steer_key, _)) =
@@ -1182,8 +1147,6 @@ impl InboxStore {
             return Err(reject.into());
         }
         let next = DeliveryFsm::step(&s, event)?;
-        // Accepting the steer message is what clears `pending`. A reject
-        // leaves it pending: the crew has not taken the new instruction.
         if let Some(env) = &env
             && env.contract.name == "steer"
             && matches!(event, DeliveryEvent::Accept { .. })
@@ -1230,8 +1193,6 @@ impl InboxStore {
         task_id: &str,
         evidence: &[String],
     ) -> Result<(String, DeliveryState), InboxError> {
-        // The task row, not a later steer/control that names the same task id.
-        // A steer is class Control; `done` fences the Task delivery.
         let key: Option<String> = sqlx::query_scalar(
             "SELECT msg_key FROM inbox_delivery WHERE task_id = ?1 AND recipient = ?2 \
              AND json_extract(state_json, '$.class') = 'task' \
@@ -1249,10 +1210,6 @@ impl InboxStore {
         };
         self.authorize_done(reader, &msg_key).await?;
         let s = self.delivery(&msg_key, reader).await?;
-        // The gen the crew was assigned is the task envelope's, which a
-        // redirect does not rewrite. The delivery gen moves. Passing the
-        // assignment gen is what makes the old one `StaleGen` after a bump;
-        // with no steer the two are equal, so `done` is unchanged.
         let generation = assignment_gen(&self.pool, &msg_key)
             .await?
             .unwrap_or(s.generation);
@@ -2049,10 +2006,6 @@ pub fn allowed_now_for(
     }
 }
 
-// ---------------------------------------------------------------------------
-// ToronLog: the store as a kernel DurableLog, bridged to the async store.
-// ---------------------------------------------------------------------------
-
 enum Req {
     Append {
         json: String,
@@ -2211,8 +2164,6 @@ impl DurableLog for ToronLog {
     }
 
     fn status(&self) -> Status {
-        // An unanswered status is not EOF: report open (UpToDate) rather than
-        // hide readable records behind a close the store never confirmed.
         match self.call(|reply| Req::Status { reply }) {
             Ok(true) => Status::Closed,
             Ok(false) => Status::UpToDate,

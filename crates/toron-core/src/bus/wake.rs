@@ -391,8 +391,6 @@ impl WakeServer {
                 .await
                 .map_err(|e| WakeError::Bind(e.to_string()))?;
         }
-        // ponytail: stale-file probe is a connect check, not a pid read;
-        // pid reuse can't fake a live listener.
         if path.exists() {
             match UnixStream::connect(&path).await {
                 Ok(_) => {
@@ -410,7 +408,6 @@ impl WakeServer {
             let perm = std::fs::Permissions::from_mode(0o600);
             std::fs::set_permissions(&path, perm).map_err(|e| WakeError::Bind(e.to_string()))?;
         }
-        // One held trusted subscription: the daemon's single fan-out source.
         let filter = Filter::new().kinds(WAKE_KINDS.iter().map(|k| Kind::from(*k)));
         let sub = self.bus.subscribe_trusted(filter).await?;
         let handle = WakeHandle::serve(
@@ -504,15 +501,6 @@ impl WakeHandle {
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
         let subscriber_bus = bus.clone();
-        // Fan-out pump: bus → broadcast (bounded; lagging subscribers shed).
-        // bd-d41q: the held subscription only observes THIS process's bus.
-        // Writes from other processes on the shared store (CLI plane
-        // commands) never traverse it, so every poll_interval the pump
-        // re-reads the store through a short subscription and fans out
-        // ids not yet forwarded (bounded seen-set). bd-qpm0: that re-read
-        // is gated on the store's mutation version, so a quiet tick costs
-        // one indexed read instead of a subscription. No poll when nobody
-        // listens; 0 interval disables (live fanout only).
         {
             let bus_tx = bus_tx.clone();
             let poll_filter = Filter::new().kinds(WAKE_KINDS.iter().map(|k| Kind::from(*k)));
@@ -520,8 +508,6 @@ impl WakeHandle {
             let poll_on = config.poll_interval_ms > 0;
             tasks.spawn(async move {
                 let mut cursor: u64 = 0;
-                // Last store version we re-read at (bd-qpm0). `None` = this
-                // backend cannot answer cheaply, so every tick polls blind.
                 let mut last_store_version: Option<i64> = None;
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let mut seen_order: std::collections::VecDeque<String> =
@@ -572,11 +558,6 @@ impl WakeHandle {
                             if bus_tx.receiver_count() == 0 {
                                 continue;
                             }
-                            // Cheapest possible quiet tick: ask the store
-                            // whether anything moved since the last poll.
-                            // Minting the subscription below costs two store
-                            // scans plus a spawned task, so skipping it while
-                            // the version is unchanged is the whole point.
                             let version = bus.store_version().await;
                             if let (Some(now), Some(prev)) = (version, last_store_version)
                                 && now == prev
@@ -617,7 +598,6 @@ impl WakeHandle {
                 }
             });
         }
-        // Accept loop: one task per subscriber, each bounded.
         {
             let recent = recent.clone();
             let totals = totals.clone();
@@ -631,11 +611,6 @@ impl WakeHandle {
                     let (stream, _) = match listener.accept().await {
                         Ok(pair) => pair,
                         Err(e) => {
-                            // bd-j2vo: an accept error (EMFILE above all) must
-                            // NOT end the wake plane. The daemon's control
-                            // plane has to keep answering, so count it, back
-                            // off a beat, and keep serving. The old `break`
-                            // killed the wake plane on the first error.
                             accept_errors_accept.fetch_add(1, Ordering::SeqCst);
                             tracing::warn!(
                                 error = %e,
@@ -646,10 +621,6 @@ impl WakeHandle {
                         }
                     };
                     if live_accept.load(Ordering::SeqCst) as usize >= max_subscribers {
-                        // bd-j2vo: refuse the SUBSCRIBER, never the daemon.
-                        // One fd per subscriber is what exhausted the fd
-                        // budget; over the cap the new subscriber is dropped
-                        // (counted + logged) and the daemon keeps serving.
                         let n = refused_accept.fetch_add(1, Ordering::SeqCst) + 1;
                         tracing::warn!(
                             cap = max_subscribers,
@@ -669,9 +640,6 @@ impl WakeHandle {
                     live.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
                         let st = serve_subscriber(stream, rx, cfg, clock, bus).await;
-                        // Fold into the exact running totals first: the
-                        // aggregate must never be capped by the detail
-                        // window (bd-qpm0).
                         if let Ok(mut t) = totals.lock() {
                             t.fold(&st);
                         }
@@ -806,8 +774,6 @@ async fn write_matching_event(
     }
     let payload = serde_json::to_value(event).map_err(|e| WakeError::Codec(e.to_string()))?;
     let line = WakeFrame::Event(payload).encode_line()?;
-    // bd-ojw3: bounded like every other frame write - an unbounded write to a
-    // peer that stopped reading held its fd for the life of the daemon.
     tokio::time::timeout(
         std::time::Duration::from_millis(write_timeout_ms),
         writer.write_all(line.as_bytes()),
@@ -953,9 +919,6 @@ async fn serve_arrivals(
         Resume::Legacy(c) => match bus.arrival_seq_of(&c.event_id).await {
             Ok(Some(seq)) => (seq, true, None),
             Ok(None) => {
-                // The cursor's event is no longer stored, so its place in
-                // arrival order is unknown. Say so, then replay from its
-                // second: a duplicate is recoverable, a silent skip is not.
                 let lost = WakeFrame::EventsLost {
                     from: from_wire.to_string(),
                     through: "unknown".to_string(),
@@ -1025,9 +988,6 @@ async fn serve_arrivals(
         let wait = std::time::Duration::from_millis(config.heartbeat_ms);
         match tokio::time::timeout(wait, rx.recv()).await {
             Ok(Ok(_) | Err(RecvError::Lagged(_))) => {
-                // Coalesce queued rings: one drain covers all of them, and a
-                // lagged doorbell loses nothing because the store is the
-                // source.
                 loop {
                     match rx.try_recv() {
                         Ok(_) | Err(TryRecvError::Lagged(_)) => {}
@@ -1044,7 +1004,6 @@ async fn serve_arrivals(
             }
             Ok(Err(RecvError::Closed)) => return stats,
             Err(_) => {
-                // Quiet tick: catch up anything a missed ring left behind.
                 if drain_arrivals(writer, &live_plan, &mut after, &mut stats)
                     .await
                     .is_err()
@@ -1053,12 +1012,6 @@ async fn serve_arrivals(
                 }
             }
         }
-        // bd-j2vo: the heartbeat is the RECLAIM SIGNAL — the only write a
-        // dead peer can fail — so it must NOT be conditional on a quiet tick.
-        // On a busy bus the ring arm won every round, the heartbeat never
-        // fired, and a dead subscriber's fd was held for the life of the
-        // daemon. Written on its own cadence, the fd is released within one
-        // heartbeat interval of the peer's death.
         if clock.now_ms() >= heartbeat_at {
             let hb = WakeFrame::Heartbeat {
                 ts_ms: clock.now_ms(),
@@ -1108,9 +1061,6 @@ async fn serve_subscriber(
         },
         None => Resume::Origin,
     };
-    // bd-wake-live-burst-loss-j86v / bd-wake-replay-cap-qk8n: a backend with
-    // an arrival log serves the lossless store-tail path. The legacy path
-    // below stays only for backends without one (relay buses, test fakes).
     if matches!(
         bus.arrivals_after(&req.kinds, u64::MAX, 0).await,
         Ok(Some(_))
@@ -1133,8 +1083,6 @@ async fn serve_subscriber(
     let mut cursor = match resume {
         Resume::Origin => WakeCursor::origin(),
         Resume::Legacy(cursor) => cursor,
-        // A `seq:` cursor names an arrival; without an arrival log it cannot
-        // be placed, so refuse rather than guess.
         Resume::Seq(_) => return stats,
     };
     let Ok(mut replay) = bus.subscribe_trusted(filter.clone()).await else {
@@ -1217,11 +1165,8 @@ async fn serve_subscriber(
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return stats,
             Err(_) => {
-                // Bounded wait expiry (not a poll of truth).
             }
         }
-        // bd-j2vo: the heartbeat is the reclaim signal, so it is written on
-        // its own cadence — not only when the bus happens to be quiet.
         if clock.now_ms() >= heartbeat_at {
             let hb = WakeFrame::Heartbeat {
                 ts_ms: clock.now_ms(),
@@ -1404,8 +1349,6 @@ mod wake_bus_tests {
             .await
             .expect("bind");
 
-        // A client that reads NOTHING: its socket buffer fills and every
-        // write to it blocks.
         let client = {
             use tokio::io::AsyncWriteExt;
             let mut stream = UnixStream::connect(&sock).await.expect("connect");
@@ -1419,8 +1362,6 @@ mod wake_bus_tests {
                 .expect("subscribe");
             stream
         };
-        // Hold the client OPEN (so its socket is not closed) but never read
-        // from it.
         let _keep_open = client;
 
         let live = async {
@@ -1435,9 +1376,6 @@ mod wake_bus_tests {
         .await;
         assert!(live, "the subscriber should register as live");
 
-        // A frame far larger than the socket buffer cannot be written to a
-        // peer that never reads, so the bounded write fails and the subscriber
-        // is dropped.
         let keys = crate::nostr::Keys::generate();
         let big = "x".repeat(512 * 1024);
         let event = crate::nostr::event::build_event(
@@ -1549,15 +1487,12 @@ mod wake_bus_tests {
             let mode = std::fs::metadata(&sock).expect("meta").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "wake.sock is 0600");
         }
-        // Live peer holds it: second start is a typed refusal, never a steal.
         match mk(&sock).start().await {
             Err(WakeError::AlreadyServing(_)) => {}
             other => panic!("expected AlreadyServing, got {other:?}"),
         }
         drop(h1);
-        // RAII: socket file goes away with the handle.
         assert!(!sock.exists(), "drop removes wake.sock");
-        // Stale file (no live listener) is taken over, not refused.
         tokio::fs::write(&sock, b"stale")
             .await
             .expect("plant stale");
@@ -1579,7 +1514,6 @@ mod wake_bus_tests {
             .start()
             .await
             .expect("bind");
-        // Connect and say nothing: the server must drop us on a bounded wait.
         let stream = UnixStream::connect(&sock).await.expect("connect");
         let (r, _w) = stream.into_split();
         let mut lines = BufReader::new(r).lines();
@@ -1588,7 +1522,6 @@ mod wake_bus_tests {
                 .await
                 .expect("test bound")
                 .expect("io");
-        // Server closes without our subscribe: EOF, never a frame.
         assert!(got.is_none());
     }
 
@@ -1824,7 +1757,6 @@ mod wake_bus_tests {
 
     #[test]
     fn wake_bus_shed_counters_exact() {
-        // Pure shed accounting: queue 2, 5 arrivals → 3 shed, cursor exact.
         let cap = 2usize;
         let arrivals = 5u64;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(cap);
@@ -1844,7 +1776,6 @@ mod wake_bus_tests {
                     }
                 }
             }
-            // Drain what fits: exactly `cap` delivered, rest shed.
             let mut drained = 0;
             while rx.try_recv().is_ok() {
                 drained += 1;
@@ -1865,7 +1796,6 @@ mod wake_bus_tests {
         assert!(e.to_string().contains("already served"));
         let e = WakeError::HandshakeTimeout(5);
         assert!(e.to_string().contains('5'));
-        // BusError passthrough is typed (no string-throw across the boundary).
         let b: WakeError = BusError::Shutdown.into();
         assert!(matches!(b, WakeError::Bus(_)));
     }
@@ -1876,8 +1806,6 @@ mod wake_bus_tests {
     async fn wake_bus_aggregate_shed_stats_exact() {
         let sock = tmp_sock("agg");
         let _ = std::fs::remove_file(&sock);
-        // Short heartbeat: disconnects are detected on the next heartbeat
-        // write, so finished stats land within one interval of the drop.
         let mut cfg = WakeConfig::new(&sock);
         cfg.heartbeat_ms = 50;
         let clock = Arc::new(ManualClock::new(0));
@@ -1901,9 +1829,6 @@ mod wake_bus_tests {
             drop(lines);
             drop(w);
         }
-        // Finished-subscriber stats land on task end: bounded spin, never
-        // an unbounded wait. The scripted clock advances each tick so the
-        // heartbeat fires and the dropped connection is reaped.
         let agg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let a = h.aggregate_stats();
@@ -1946,8 +1871,6 @@ mod wake_bus_tests {
             .expect("io")
             .expect("eose line");
         assert!(eose.contains("eose"), "live path starts at EOSE");
-        // Quiet bus: advance the scripted clock past the heartbeat
-        // interval and the next frame must be a stamped heartbeat.
         clock.advance(60_000);
         let hb = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
             .await
@@ -1959,7 +1882,6 @@ mod wake_bus_tests {
             WakeFrame::Heartbeat { ts_ms: 61_000 },
             "quiet bus heartbeats with the injected clock, not wall time"
         );
-        // Deaf watcher: the server is gone, the client reads EOF.
         drop(h);
         let eof: Option<String> =
             tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
@@ -2022,8 +1944,6 @@ mod wake_bus_tests {
             .expect("io")
             .expect("eose line");
         assert!(eose.contains("eose"), "handshake first, {eose}");
-        // Foreign write: bus B publishes (and stores) a kind-9 that bus
-        // A's live fanout never traverses.
         let keys = crate::keys::generate();
         let ev = crate::nostr::event::build_event(
             &keys,
@@ -2140,8 +2060,6 @@ mod wake_bus_tests {
             .start()
             .await
             .expect("bind");
-        // A live consumer is required: the pump never polls with nobody
-        // listening, which is why the churn scaled with consumers.
         let stream = UnixStream::connect(&sock).await.expect("connect");
         let (r, mut w) = stream.into_split();
         w.write_all(b"{\"subscribe\":{\"kinds\":[9]}}\n")
@@ -2154,7 +2072,6 @@ mod wake_bus_tests {
             .expect("io")
             .expect("eose line");
         assert!(eose.contains("eose"), "handshake first: {eose}");
-        // Let the first tick arm the version, then measure steady state.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let settled = bus.subscribes();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -2163,7 +2080,6 @@ mod wake_bus_tests {
             quiet_delta <= 1,
             "a quiet store must not re-subscribe per tick: {quiet_delta} polls in ~20 ticks"
         );
-        // The skip must be a skip, not a dead poll.
         bus.bump();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(

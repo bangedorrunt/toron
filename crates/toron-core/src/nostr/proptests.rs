@@ -105,9 +105,6 @@ mod tests {
         fn gift_wrap_roundtrip_preserves_rumor(
             secret in any_content(),
         ) {
-            // Property: wrap → unwrap recovers the exact rumor for arbitrary
-            // plaintext (the envelope is opaque; the secret is not the
-            // envelope content in the clear).
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let rumor = gift_wrap::build_rumor(
@@ -127,9 +124,6 @@ mod tests {
         fn seal_roundtrip_preserves_rumor(
             secret in any_content(),
         ) {
-            // Property (P5 bd-p5-crypto-property-tests-2qvs): the kind-13
-            // SEAL layer alone — sender signs, recipient decrypts — recovers
-            // the exact rumor for arbitrary content.
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let rumor = gift_wrap::build_rumor(
@@ -145,7 +139,6 @@ mod tests {
             )
             .finalize(&sender)
             .expect("sign seal");
-            // Recipient decrypts the seal content → the exact rumor JSON.
             let plain = gift_wrap::decrypt(
                 recipient.secret_key(),
                 &seal.pubkey,
@@ -164,8 +157,6 @@ mod tests {
         fn unwrap_wrong_recipient_fails(
             secret in any_content(),
         ) {
-            // Property: a gift wrap addressed to A can never be unwrapped by
-            // B for arbitrary content.
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let stranger = Keys::generate();
@@ -184,8 +175,6 @@ mod tests {
         fn seal_sender_mismatch_rejected(
             secret in any_content(),
         ) {
-            // Property: a seal signed by Y wrapping a rumor authored by X is
-            // rejected (NIP-59 SenderMismatch) for arbitrary content.
             let signer = Keys::generate();
             let rumor_author = Keys::generate();
             let recipient = Keys::generate();

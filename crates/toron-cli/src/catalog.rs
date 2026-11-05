@@ -1,6 +1,4 @@
 // governed-by: ADR-0003
-// Catalog contract: toron.dev ADR-0002 D3 — `toron catalog --json` emits the
-// MCP surface catalog; `cargo test catalog_freshness` fails red on drift.
 
 //! `toron catalog` — emit the machine-readable surface catalog consumed by
 //! toron.dev (ADR-0002 D3): the 38 MCP tools + 25 resources from toron-mcp,
@@ -139,7 +137,6 @@ mod tests {
         let additive = toron_mcp::catalog::ADDITIVE_TOOLS;
         let total = parity + additive.len();
 
-        // Every "38 AM-Rust parity + N toron additive" claim in the file.
         let mut claims = 0usize;
         for (idx, _) in agents.match_indices("AM-Rust parity + ") {
             let rest = &agents[idx + "AM-Rust parity + ".len()..];
@@ -160,8 +157,6 @@ mod tests {
             "expected the header and CONVENTIONS to state the count (found {claims})"
         );
 
-        // Every total: "N MCP tools" / "N tool names". A phrase whose run of
-        // digits is empty ("no new MCP tools") is not a claim.
         for marker in [" MCP tools", " tool names"] {
             for (idx, _) in agents.match_indices(marker) {
                 let digits: String = agents[..idx]
@@ -187,8 +182,6 @@ mod tests {
             }
         }
 
-        // The header must NAME every additive tool: a count that says three
-        // while listing two is the drift that started this.
         let after = agents
             .split("toron additive:")
             .nth(1)
@@ -256,9 +249,6 @@ mod tests {
              --output docs/catalog/toron-mcp.json` and commit the result"
         );
 
-        // Structural floor (toron ADR-0007 C3 / ADR-0002 D3): exactly 38
-        // parity tools, the additive excluded, 25 resources, group order
-        // matches TOOL_GROUPS.
         let tools = fresh["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),

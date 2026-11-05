@@ -170,7 +170,6 @@ fn topology_projection_is_pure() {
 
 #[test]
 fn the_purity_check_bites() {
-    // Negative control: the interpreter is impure by design and must trip it.
     let src = include_str!("../src/outbox.rs");
     let run = block(src, "impl Interpret<Outbox> for OutboxRun");
     assert!(

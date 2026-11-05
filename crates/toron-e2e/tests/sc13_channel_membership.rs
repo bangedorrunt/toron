@@ -32,7 +32,6 @@ use toron_workflow::channels::{
 
 /// Named actors with fixed keys for a readable scenario trace.
 fn actors() -> (Keys, Keys, Keys, Keys) {
-    // Pi-α, OC-β, Grok-γ (members), Pi-δ (non-member).
     let keys: Vec<Keys> = (0..4)
         .map(|i| Keys::parse(&format!("{:064x}", i + 1)).expect("fixed key"))
         .collect();
@@ -49,14 +48,13 @@ async fn sc13_private_channel_membership_gate() {
     let (pi_a, oc_b, grok_g, pi_d) = actors();
     let operator = Keys::generate();
 
-    // 1. Operator creates a PRIVATE channel; members join.
     let store = ChannelStore::new();
     store
         .create_channel(
             &operator.public_key(),
             "auth-refactor",
             "Auth Refactor",
-            true, // private: global subs must never see its events
+            true,
             None,
         )
         .expect("create private channel");
@@ -66,14 +64,11 @@ async fn sc13_private_channel_membership_gate() {
             .expect("member join");
     }
 
-    // Membership is the only gate: members in, non-member Pi-δ out.
     assert!(store.is_member("auth-refactor", &pi_a.public_key()));
     assert!(store.is_member("auth-refactor", &oc_b.public_key()));
     assert!(store.is_member("auth-refactor", &grok_g.public_key()));
     assert!(!store.is_member("auth-refactor", &pi_d.public_key()));
 
-    // 2. Pi-α posts (kind 9 per ADR-0020 Spec 1); OC-β reacts (kind 7);
-    //    Grok-γ @mentions Pi-α.
     let post = store
         .post(&pi_a, "auth-refactor", "password hashing review", &[])
         .expect("member posts");
@@ -107,11 +102,9 @@ async fn sc13_private_channel_membership_gate() {
         "@mention must tag Pi-α"
     );
 
-    // History is visible to a member.
     let hist = store.history("auth-refactor");
     assert_eq!(hist.len(), 3, "post + reaction + mention recorded");
 
-    // 3. Non-member Pi-δ: read denied + post denied.
     assert!(
         !store.can_read("auth-refactor", &pi_d.public_key()),
         "non-member cannot read private channel"
@@ -124,16 +117,12 @@ async fn sc13_private_channel_membership_gate() {
         Ok(_) => panic!("non-member POST must be denied"),
     }
 
-    // Global-subscription exclusion: a reader with no member set (a global
-    // sub) must not see the private channel. `can_read` requires membership,
-    // so a non-member is exactly the global-sub shape — nothing leaks.
-    let unknown = Keys::generate(); // not a member, no channel context
+    let unknown = Keys::generate();
     assert!(
         !store.can_read("auth-refactor", &unknown.public_key()),
         "global subscription (non-member) must be excluded from private channel events"
     );
 
-    // 1b. The channel is private (flag) and the CREATE kind is emitted.
     let ch = store.get("auth-refactor").expect("channel exists");
     assert!(ch.private, "channel must be private");
     assert_eq!(
@@ -141,8 +130,6 @@ async fn sc13_private_channel_membership_gate() {
         "kind registry stable (ADR-0023 39000)"
     );
 
-    // 2b. ADR-0020 Spec 1 legacy ingest: a kind-42 event from a member
-    // projects as a channel post alongside the kind-9 emits.
     let legacy = EventBuilder::new(Kind::from_u16(42), "legacy pre-ADR-0020 post")
         .tags(vec![Tag::parse(["h", "auth-refactor"]).expect("h tag")])
         .finalize(&oc_b)
@@ -156,8 +143,6 @@ async fn sc13_private_channel_membership_gate() {
         "post + reaction + mention + legacy"
     );
 
-    // 2c. Kind registry stability (ADR-0020 Spec 1): 9 is the canonical emit,
-    // 42 is legacy ingest only.
     assert_eq!(CHANNEL_MESSAGE, 9, "channel post emits kind 9 (ADR-0020)");
     assert_eq!(CHANNEL_MESSAGE_LEGACY, 42, "legacy 42 is ingest only");
 }

@@ -78,7 +78,6 @@ mod tests {
 
     #[test]
     fn output_format_and_color_precedence() {
-        // json > plain > default; no_color forces Never. One table (was 3 tests).
         let g = Globals {
             json: true,
             plain: true,

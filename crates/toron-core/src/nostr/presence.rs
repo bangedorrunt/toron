@@ -114,20 +114,18 @@ mod tests {
         let ev = build_presence_event(&keys, &payload, Timestamp::from(1_700_000_000_u64))
             .expect("build");
         assert_eq!(ev.kind.as_u16(), PRESENCE);
-        // System-level: NO project scoping (global broker sub must receive it).
         assert!(
             !ev.tags
                 .iter()
                 .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]),
             "presence must not carry project #t scoping"
         );
-        // Not metadata-hiding.
         assert!(!crate::bus::is_metadata_hiding_kind(ev.kind));
 
         let parsed = parse_presence(&ev).expect("parse");
         assert_eq!(parsed, payload);
         assert_eq!(presence_author(&ev), keys.public_key());
-        assert!(!ev.as_json().contains("working-state")); // content is payload json
+        assert!(!ev.as_json().contains("working-state"));
     }
 
     #[test]

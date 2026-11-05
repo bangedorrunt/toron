@@ -96,10 +96,8 @@ mod tests {
             tags.push(tag);
         }
         let ev = build_event(&k, Kind::GiftWrap, "wrapped", tags, ts).expect("build");
-        // The signed event carries the NIP-40 expiration.
         let exp = ev.tags.expiration().expect("expiration tag present");
         assert_eq!(exp.as_secs(), 1_700_000_000 + DEFAULT_ENVELOPE_TTL_SECS);
-        // Its canonical id is valid (built with the tag from the start).
         assert!(crate::nostr::event::verify_event(&ev).is_ok());
     }
 }

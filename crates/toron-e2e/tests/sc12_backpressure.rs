@@ -30,21 +30,17 @@ fn job(i: usize) -> QueuedJob {
 
 #[test]
 fn sc12_burst_backpressure_bounded_and_ordered() {
-    // N = 3 global concurrency — forces contention on 20 bursts.
     let pool = DispatchPool::new(DispatchConfig {
         max_concurrency: 3,
         ..DispatchConfig::default()
     });
 
-    // 20 @mentions enqueued in order.
     for i in 0..20 {
         let depth = pool.enqueue(job(i));
         assert!(depth >= 1, "job {i} queued");
     }
     assert_eq!(pool.queued_len(), 20, "all 20 queued (none dropped)");
 
-    // --- One-in-flight-per-agent: only ONE permit for OCBeta at a time ---
-    // Even with global slots free, a second acquire for the same agent → None.
     let permit = pool.try_acquire("OCBeta").expect("first permit");
     assert!(
         pool.try_acquire("OCBeta").is_none(),
@@ -52,23 +48,19 @@ fn sc12_burst_backpressure_bounded_and_ordered() {
     );
     assert_eq!(pool.in_flight_for("OCBeta"), 1, "in-flight == 1");
 
-    // --- Ordering preserved: jobs dispatched in FIFO via next_ready ---
     let next = pool.next_ready();
     assert!(next.is_none(), "OCBeta already in-flight, no ready job");
 
-    // Release → slot frees → next queued job becomes ready (FIFO order).
     drop(permit);
     let ready = pool.next_ready().expect("next job after release");
     assert_eq!(ready.job_id, "job-0", "FIFO: first queued dispatched first");
 
-    // Re-acquire → one-in-flight again; release → next in order.
     let p1 = pool.try_acquire("OCBeta").expect("p1");
     assert!(pool.try_acquire("OCBeta").is_none(), "still one-in-flight");
     drop(p1);
     let ready2 = pool.next_ready().expect("next after second release");
     assert_eq!(ready2.job_id, "job-1", "FIFO preserved: job-1 next");
 
-    // --- In-flight never exceeds N (global cap) across agents ---
     let pool_multi = DispatchPool::new(DispatchConfig {
         max_concurrency: 2,
         ..DispatchConfig::default()
@@ -76,7 +68,6 @@ fn sc12_burst_backpressure_bounded_and_ordered() {
     for i in 0..5 {
         pool_multi.enqueue(job(i));
     }
-    // Two distinct agents each acquire → global cap 2 hit → third blocked.
     let a = pool_multi.try_acquire("AgentA").expect("A");
     let b = pool_multi.try_acquire("AgentB").expect("B");
     assert!(
@@ -95,35 +86,26 @@ fn sc12_ordering_preserved_across_full_burst() {
         max_concurrency: 1,
         ..DispatchConfig::default()
     });
-    // Single-agent serialization: max_concurrency=1 + one-in-flight = strict
-    // FIFO dispatch order across the whole 20-burst.
     for i in 0..20 {
         pool.enqueue(job(i));
     }
     assert_eq!(pool.queued_len(), 20);
 
     let mut dispatched = Vec::new();
-    // Dispatch: pop a ready job (agent has a free slot) then acquire+hold the
-    // permit briefly to model work, then release. max_concurrency=1 + one-in-
-    // flight = strict FIFO.
     for _ in 0..20 {
         if let Some(j) = pool.next_ready() {
             dispatched.push(j.job_id);
         }
-        // Acquire the single permit to serialize (simulates in-flight work),
-        // then release so the next job becomes ready.
         if let Some(permit) = pool.try_acquire("OCBeta") {
             drop(permit);
         }
     }
-    // After draining, in-flight cleared and queue processed in order.
     assert_eq!(
         dispatched.len(),
         20,
         "all 20 dispatched in FIFO order (got {})",
         dispatched.len()
     );
-    // Every dispatched job is in FIFO order (no reordering).
     let positions: Vec<usize> = dispatched
         .iter()
         .map(|id| id.split('-').nth(1).unwrap().parse::<usize>().unwrap())

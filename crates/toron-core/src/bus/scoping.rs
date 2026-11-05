@@ -102,7 +102,6 @@ mod tests {
             has_tag(&ev, &["l", "demo", "toron"]),
             "must carry NIP-32 label"
         );
-        // The d tag survives.
         assert!(has_tag(&ev, &["d", "demo:BlueLake"]));
     }
 
@@ -155,7 +154,6 @@ mod tests {
         let sender = Keys::generate();
         let recipient = Keys::generate();
 
-        // Rumor: private DM must not be scoped at the wrap level.
         let rumor = gift_wrap::build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000_u64),
@@ -165,7 +163,6 @@ mod tests {
         );
         let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
-        // The kind-1059 wrap must carry NO project-scoping tags.
         assert!(!has_tag(&wrapped, &["t", "demo"]));
         assert!(!has_tag(&wrapped, &["L", "toron"]));
         assert!(!has_tag(&wrapped, &["l", "demo", "toron"]));
@@ -174,9 +171,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrap_rumor_has_no_project_tags_either() {
-        // ADR: DMs carry neither #t nor NIP-32 on the wrap (and the rumor is
-        // encrypted inside; its own tags are invisible). The visible envelope
-        // has only the recipient `p` tag.
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let rumor = gift_wrap::build_rumor(
@@ -196,7 +190,6 @@ mod tests {
             .iter()
             .map(|t| t.as_slice().iter().map(ToString::to_string).collect())
             .collect();
-        // Only the recipient p tag should be visible on the wrap.
         assert_eq!(envelope_tags.len(), 1, "got {envelope_tags:?}");
         assert_eq!(envelope_tags[0][0], "p");
     }
@@ -217,8 +210,6 @@ mod tests {
 
     #[test]
     fn test_ephemeral_kinds_identified() {
-        // Ephemeral class 20000-29999: presence 20001 is ephemeral; a
-        // profile (30013) and a gift wrap (1059) are not.
         assert!(is_ephemeral_kind(crate::nostr::kinds::toron_kind(
             crate::nostr::kinds::PRESENCE
         )));

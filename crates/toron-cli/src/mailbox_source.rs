@@ -1,6 +1,5 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0017 (project-root canonicalization — the daemon is the
-// canonical writer; the CLI robot path is a client of it)
 
 //! One-mailbox daemon client (bd-pin-public-plane-s-easy.14).
 //!
@@ -222,28 +221,6 @@ fn decide_source(
     flywheel_url: Option<String>,
     default_port_live: bool,
 ) -> SourceDecision {
-    // bd-qpm0 (P0, from the 2026-09-27 adversarial review): BOTH an explicit
-    // daemon URL and an explicit durable-root pin is a CONTRADICTION, and it is
-    // refused rather than silently resolved.
-    //
-    // The original order let the URL always win, which made the CLI's own
-    // documented remedy a no-op: robot.rs:548 tells an operator to "set
-    // TORON_MCP_DATA_DIR to run against an embedded mailbox", and it did
-    // nothing whenever TORON_MCP_URL was also present — ambient machine state on
-    // every crew pane, since the doorbell plist sets it. Proven by a two-case
-    // execution diff: with both set the pinned dir stayed EMPTY and the answer
-    // came back as an MCP wire envelope.
-    //
-    // Flipping the order is NOT the fix, and here is the proof: an existing
-    // conformance test (guard_check_reads_reservations_from_daemon_when_url_set)
-    // sets URL + pin-to-an-EMPTY-dir and requires the DAEMON's lease table,
-    // because an empty embedded store false-blocks every path and silently
-    // diverges beside the live daemon — which is what `RefuseSecondStore`
-    // exists to prevent. So the reviewer and that test want OPPOSITE answers to
-    // the SAME input. That is the definition of an ambiguous input, and an
-    // ambiguous input must not be resolved by a tie-break: it must be refused
-    // loudly so the operator picks one. Both callers now get an error naming
-    // both variables, which is the first outcome here that is correct for both.
     if let Some(url) = env_url {
         return SourceDecision::DaemonUrl(url);
     }
@@ -280,14 +257,6 @@ impl MailboxSource {
     ///    `TORON_MCP_URL` to use it or stop it).
     pub async fn resolve() -> anyhow::Result<Self> {
         // bd-qpm0: report the ambiguity LOUDLY, but do not change the decision.
-        //
-        // I first made this a hard refusal and four conformance tests broke —
-        // correctly. Setting TORON_MCP_DATA_DIR to the data root a daemon OWNS,
-        // alongside that daemon's URL, is not a contradiction: it names the same
-        // store from two angles, and it is the ordinary way to point a test at
-        // its own daemon. The reviewer's actual harm was the SILENCE (the pin
-        // was ignored and nothing said so), not the ordering. A warning fixes the
-        // harm and keeps the working pattern; a refusal broke one to fix neither.
         if daemon_url_from_env().is_some() && data_dir_pinned_from_env() {
             eprintln!("{CONTRADICTION_MESSAGE}");
         }
@@ -381,31 +350,9 @@ mod selector_tests {
 
     #[test]
     fn decide_source_precedence() {
-        // Pinned data dir > env URL > flywheel URL > loud refusal on a live
-        // default daemon > quiet embedded default. One table (was 5 tests).
-        // No URL + live default daemon refuses, never embeds silently.
-        //
-        // bd-qpm0: the first case USED to assert the reverse ("env url wins"
-        // with a pin present), which is how the selector kept its defect: the
-        // test was written to match the code rather than the documented intent.
-        // A fence that pins the bug is worse than no fence, because it reads as
-        // coverage of the thing that matters.
-        // (TORON_MCP_URL, data_dir_pinned, flywheel_url, flywheel_configured)
         type EnvRow = (Option<String>, bool, Option<String>, bool);
         let cases: Vec<(&str, EnvRow, SourceDecision)> = vec![
             (
-                // bd-qpm0: with BOTH set the DAEMON wins, and the ambiguity is
-                // WARNED about rather than refused.
-                //
-                // I first made this a hard refusal, on the reasoning that two
-                // explicit answers to "which store?" cannot both be honoured.
-                // Four conformance tests then failed, and they were right:
-                // pointing TORON_MCP_DATA_DIR at the data root a daemon OWNS,
-                // alongside that daemon's URL, names the SAME store twice and is
-                // the ordinary way to run a test against its own daemon. The
-                // reviewer's harm was the SILENCE — the pin was ignored and
-                // nothing said so — not the ordering. A warning fixes the harm
-                // and keeps the pattern; the refusal broke one and fixed neither.
                 "url wins over a pin, and the ambiguity is warned about",
                 (
                     Some("http://x/mcp".to_string()),
@@ -453,8 +400,6 @@ mod selector_tests {
 
     #[test]
     fn daemon_url_loopback_means_shared_local_store() {
-        // bd-d41q: loopback daemons share the durable root — embedded
-        // plane writes land where the daemon reads.
         assert!(daemon_url_is_loopback("http://127.0.0.1:18080/mcp"));
         assert!(daemon_url_is_loopback("http://localhost:18080/mcp"));
         assert!(daemon_url_is_loopback("http://[::1]:18080/mcp"));

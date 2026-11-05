@@ -22,10 +22,6 @@ use super::msg::{Effect, Msg, Op};
 use super::{bounded, compose, keymap, update};
 use toron_core::nostr::presence::PresenceState;
 
-// ---------------------------------------------------------------------------
-// fixtures
-// ---------------------------------------------------------------------------
-
 fn settings() -> SettingsState {
     SettingsState {
         project: "demo".into(),
@@ -78,10 +74,6 @@ fn step(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
     update::tick(model, msg)
 }
 
-// ---------------------------------------------------------------------------
-// 1. determinism
-// ---------------------------------------------------------------------------
-
 /// The same message log produces the same model and the same effect list,
 /// byte for byte — the ADR-0031 §9 proof, asserted on the real fold.
 #[test]
@@ -99,7 +91,6 @@ fn same_msg_log_same_model_and_effects() {
         format!("{effects_b:?}"),
         "effect list diverged on replay"
     );
-    // And the log actually did something (a pinned test beats a weak one).
     assert!(!effects_a.is_empty(), "the scripted log must dispatch work");
     assert_eq!(model_a.tab, Tab::Agents, "the log's last tab switch landed");
 }
@@ -149,10 +140,6 @@ fn scripted_log() -> Vec<Msg> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// 2. the fold decides
-// ---------------------------------------------------------------------------
-
 #[test]
 fn startup_dispatches_presence_and_the_active_tab() {
     let (_, effects) = step(&model(), Msg::Init);
@@ -166,7 +153,6 @@ fn startup_dispatches_presence_and_the_active_tab() {
 #[test]
 fn tick_refreshes_the_active_tab_on_cadence() {
     let m = model();
-    // In-flight work gates the tick: no second wave while one is out.
     let (busy, effects) = step(
         &Model {
             inflight: 1,
@@ -180,7 +166,6 @@ fn tick_refreshes_the_active_tab_on_cadence() {
     let (_, effects) = step(&m, Msg::Tick { now_unix: 10 });
     assert_eq!(effects, vec![Effect::RefreshInbox]);
 
-    // Channels ride the slower cadence: the first tick is quiet, the third is not.
     let channels = Model {
         tab: Tab::Channels,
         ..m.clone()
@@ -194,7 +179,6 @@ fn tick_refreshes_the_active_tab_on_cadence() {
         "tick 3 refreshes channels, got {e3:?}"
     );
 
-    // Presence is the Agents tab's content: every tick.
     let agents = Model {
         tab: Tab::Agents,
         ..m
@@ -216,7 +200,6 @@ fn opening_a_message_fetches_its_thread() {
         },
         ..model()
     };
-    // Rows are newest first: m2 then m1.
     assert_eq!(loaded.mail_rows()[0].key, "m2");
     let (opened, effects) = step(&loaded, Msg::OpenSelection);
     assert_eq!(
@@ -227,14 +210,10 @@ fn opening_a_message_fetches_its_thread() {
     );
     assert_eq!(opened.pane, Pane::Reader);
 
-    // The reader owns j/k while it has focus: that scrolls the conversation
-    // instead of moving the list cursor underneath it.
     let (scrolled, _) = step(&opened, Msg::MoveCursor(1));
     assert_eq!(scrolled.mail.selected, 0, "the list cursor did not move");
     assert_eq!(scrolled.mail.scroll, 1, "the reader scrolled");
 
-    // h / Esc hands the keys back to the list, where a second row opens its
-    // own thread.
     let (back, _) = step(&scrolled, Msg::CloseReader);
     assert_eq!(back.pane, Pane::List);
     let (down, _) = step(&back, Msg::MoveCursor(1));
@@ -260,8 +239,6 @@ fn folder_switch_resets_cursor_reader_and_search() {
         input: "hit".into(),
         ..model()
     };
-    // The sidebar cursor *is* the folder: j/k walks it, and switching drops
-    // the cursor, the open conversation and any search results.
     let sidebar = Model {
         pane: Pane::Sidebar,
         ..with_search
@@ -368,10 +345,6 @@ fn local_filter_narrows_rows_and_esc_clears_search() {
         input: "alpha".into(),
         ..model()
     };
-    // Search results replace the folder list, and the local box must NOT
-    // re-filter them: the store matched fields the local predicate cannot see
-    // (the body), so a second pass hides hits while the title still counts
-    // them.
     assert_eq!(m.mail_rows().len(), 1, "hits survive the search text");
     assert_eq!(m.mail_rows()[0].key, "m3");
     let (cleared, _) = step(&m, Msg::CancelInsert);
@@ -380,7 +353,6 @@ fn local_filter_narrows_rows_and_esc_clears_search() {
     let (again, _) = step(&cleared, Msg::OpenInsert);
     assert_eq!(again.mode, Mode::Insert);
 
-    // Filtering the folder list is local and pure.
     let filtered = Model {
         input: "beta".into(),
         ..cleared
@@ -450,7 +422,6 @@ fn ack_and_read_target_the_selected_message() {
         }]
     );
 
-    // A thread row acks its newest message.
     let threaded = Model {
         mail: super::model::MailState {
             messages: vec![
@@ -472,7 +443,6 @@ fn ack_and_read_target_the_selected_message() {
         "the newest message in the thread is the one acknowledged"
     );
 
-    // Nothing selected is a status-line error, never a panic or a silent no-op.
     let empty = Model {
         mail: super::model::MailState::default(),
         ..model()
@@ -662,23 +632,16 @@ fn model_derivations_feed_the_dashboard() {
     assert_eq!(m.arrivals().len(), 24, "one bucket per hour of the window");
     assert_eq!(m.arrivals().iter().sum::<u64>(), 2);
     assert_eq!(m.channel_bars()[0], ("#loud".to_string(), 9));
-    // Ties on count break by label, so the chart order is deterministic.
     assert_eq!(
         m.agent_state_counts(),
         vec![("offline".to_string(), 1), ("working".to_string(), 1)]
     );
-    // The roster is the only npub→pin map the views need.
     assert_eq!(m.agent_name_for("n1"), Some("bee"));
     assert_eq!(m.agent_name_for("nope"), None);
 }
 
-// ---------------------------------------------------------------------------
-// 3. responsive + keymap
-// ---------------------------------------------------------------------------
-
 #[test]
 fn layout_breakpoints_are_pure() {
-    // 40x12 is the floor: a phone-width PTY is single-pane, not "too small".
     assert_eq!(layout_mode(39, 24), LayoutMode::TooSmall);
     assert_eq!(layout_mode(40, 11), LayoutMode::TooSmall);
     assert_eq!(layout_mode(40, 12), LayoutMode::Stacked);
@@ -735,8 +698,6 @@ fn keymap_normal_mode_table() {
         Some(Msg::StepRefresh(-super::keymap::REFRESH_STEP_MS))
     );
     assert_eq!(press(&m, KeyCode::Enter), Some(Msg::OpenSelection));
-    // 'c' composes on every tab; the closed-channel filter moved to 'C' so the
-    // console's primary action is not tab-scoped.
     assert_eq!(press(&m, KeyCode::Char('c')), Some(Msg::OpenCompose));
     assert_eq!(press(&m, KeyCode::Char('C')), None);
     let channels = Model {
@@ -748,7 +709,6 @@ fn keymap_normal_mode_table() {
         press(&channels, KeyCode::Char('C')),
         Some(Msg::ToggleClosedChannels)
     );
-    // l drills in from the list, h backs out of the reader.
     assert_eq!(press(&m, KeyCode::Char('l')), Some(Msg::OpenSelection));
     let reader = Model {
         pane: Pane::Reader,
@@ -756,7 +716,6 @@ fn keymap_normal_mode_table() {
     };
     assert_eq!(press(&reader, KeyCode::Char('h')), Some(Msg::CloseReader));
     assert_eq!(press(&reader, KeyCode::Esc), Some(Msg::CloseReader));
-    // Esc from the list quits (there is nothing above the list).
     assert_eq!(press(&m, KeyCode::Esc), Some(Msg::Quit));
 }
 
@@ -780,8 +739,6 @@ fn keymap_insert_and_help_modes_trap_focus() {
     );
     assert_eq!(press(&typing, KeyCode::Enter), Some(Msg::SubmitInput));
     assert_eq!(press(&typing, KeyCode::Esc), Some(Msg::CancelInsert));
-    // Ctrl-C is still the escape hatch, even mid-typing? No: typing owns the
-    // keys, and the fold's CancelInsert is one Escape away.
     assert_eq!(press(&typing, KeyCode::Tab), None);
 
     let help = Model {
@@ -828,10 +785,6 @@ fn reader_scroll_is_clamped_at_the_top() {
     let (top, _) = step(&bottom, Msg::GotoCursor(true));
     assert_eq!(top.mail.scroll, 0);
 }
-
-// ---------------------------------------------------------------------------
-// 4. the interpreter bounds the world
-// ---------------------------------------------------------------------------
 
 /// Success: the fake records the attempt before it answers, and the answer is
 /// the message the fold expects.
@@ -906,10 +859,6 @@ async fn interpreter_cancellation_leaves_no_message() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5. the reader vs. the mailbox's thread rule
-// ---------------------------------------------------------------------------
-
 /// The reader narrows the body-carrying page to one thread — and a top-level
 /// message (no thread tag) opens as its own thread instead of an empty pane.
 /// This is the case an exact `thread_id` query cannot serve: the mailbox
@@ -932,7 +881,6 @@ fn reader_opens_untagged_and_tagged_threads() {
         ..model()
     };
 
-    // Untagged: the page's row matches by its own id, and the reader opens it.
     let (solo, _) = step(
         &page,
         Msg::ThreadLoaded {
@@ -945,7 +893,6 @@ fn reader_opens_untagged_and_tagged_threads() {
     assert_eq!(open.messages[0].id, "m1");
     assert_eq!(open.subject, "solo");
 
-    // Tagged: only the thread's own messages, oldest first.
     let (thread, _) = step(
         &page,
         Msg::ThreadLoaded {
@@ -959,8 +906,6 @@ fn reader_opens_untagged_and_tagged_threads() {
     assert_eq!(open.messages[1].id, "m3");
     assert_eq!(open.subject, "reply", "the newest subject wins the title");
 
-    // A page that no longer holds the thread falls back to what is already on
-    // screen instead of opening an empty reader.
     let (fallback, _) = step(
         &page,
         Msg::ThreadLoaded {
@@ -986,10 +931,6 @@ async fn interpreter_slow_provider_still_lands() {
     assert!(matches!(msg, Msg::AgentsLoaded(_)));
 }
 
-// ---------------------------------------------------------------------------
-// 6. the empty panes (what an operator sees on a quiet project)
-// ---------------------------------------------------------------------------
-
 /// A fetch that FAILED must stop saying "loading": the pane has to name the
 /// error and the command that fixes it, or a fresh console with an
 /// unregistered pin waits forever on a load that already happened.
@@ -1011,7 +952,6 @@ fn a_failed_fetch_stops_saying_loading_and_names_the_fix() {
         Some("agent PtyAgent has no local key in this project")
     );
 
-    // A later success clears it (the pane is not stuck in the failure).
     let (recovered, _) = step(
         &failed,
         Msg::InboxLoaded(vec![mail("m1", "t1", "bee", "hi", 10)]),
@@ -1019,7 +959,6 @@ fn a_failed_fetch_stops_saying_loading_and_names_the_fix() {
     assert_eq!(recovered.mail.error, None);
     assert!(recovered.mail.loaded);
 
-    // Only the pane whose op failed is settled by it.
     assert!(!failed.channels.loaded, "another pane's fetch is still out");
 }
 
@@ -1111,10 +1050,6 @@ fn onboarding_commands_parse_as_real_cli_invocations() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 7. the responsive ladder, rendered (not just selected)
-// ---------------------------------------------------------------------------
-
 /// Every mode by name. The match is exhaustive on purpose: a variant nothing
 /// can produce is dead code, and this is where that used to hide.
 fn mode_name(mode: LayoutMode) -> &'static str {
@@ -1164,13 +1099,11 @@ fn split_tiles_the_frame_and_honours_the_sidebar_flag() {
     assert_eq!(tri.list.right(), tri.reader.x);
     assert_eq!(tri.reader.right(), area.right());
 
-    // A tab with no sidebar of its own (Agents) gets the full width back.
     let wide = super::view::split(area, LayoutMode::Tri, false);
     assert!(wide.sidebar.is_none());
     assert_eq!(wide.list.x, area.x);
     assert_eq!(wide.reader.right(), area.right());
 
-    // One pane at a time: the list and the reader are the same rect.
     let single = super::view::split(area, LayoutMode::Stacked, true);
     assert!(single.sidebar.is_none());
     assert_eq!(single.list, area);
@@ -1312,7 +1245,6 @@ fn folder_highlight_tracks_the_folder_not_the_message_count() {
         "Important is the last folder whatever the index holds"
     );
 
-    // An empty index still highlights the folder the operator chose.
     let empty = Model {
         mail: super::model::MailState {
             folder: Folder::Unread,
@@ -1514,7 +1446,6 @@ fn agent_detail_scrolls_and_resets_on_a_new_agent() {
     let (top, _) = step(&scrolled, Msg::MoveCursor(-10));
     assert_eq!(top.agents.scroll, 0, "and stops at the top");
 
-    // Scrolled card + a different agent selected = a fresh card.
     let (moved, _) = step(
         &Model {
             pane: Pane::List,
@@ -1581,19 +1512,12 @@ async fn a_panicked_effect_leaves_the_refresh_gate_open() {
         1,
         "only the hung task is still owed an answer"
     );
-    // Cancellation is cooperative, so the handle only reports finished once
-    // the runtime has polled it — which is exactly what the derived count
-    // waits for (an accumulator would have to guess).
     handles[0].abort();
     while !handles[0].is_finished() {
         tokio::task::yield_now().await;
     }
     assert_eq!(super::live_handles(&mut handles), 0);
 }
-
-// ---------------------------------------------------------------------------
-// 8. the compose form (pure: fields, caret, and the one wrap function)
-// ---------------------------------------------------------------------------
 
 /// Wrapping and caret placement come from ONE function, so the property that
 /// matters is structural: for every caret offset the caret lands inside the
@@ -1628,10 +1552,6 @@ fn every_caret_offset_lands_inside_the_wrapped_box() {
                     line.text
                 );
             }
-            // The offsets tile the source with no gap and no overlap, except
-            // for the single newline BETWEEN two logical lines — which no
-            // line's text contains, and which is why a caret sitting on it
-            // belongs to the end of the line before it.
             for pair in lines.windows(2) {
                 let newline = usize::from(text.as_bytes().get(pair[0].end) == Some(&b'\n'));
                 assert_eq!(
@@ -1641,8 +1561,6 @@ fn every_caret_offset_lands_inside_the_wrapped_box() {
                     pair[0].text
                 );
             }
-            // Every caret offset (char boundary) resolves to a column inside
-            // the width, and never to a row past the end.
             for at in char_boundaries(text) {
                 let (row, col) = compose::caret_pos(text, width, at);
                 assert!(
@@ -1684,13 +1602,10 @@ fn caret_row_follows_the_newline_it_sits_on() {
     );
     assert_eq!(compose::caret_pos(text, 20, 5), (1, 2), "end of the text");
 
-    // A wrapped line: the caret past the break is on row 1, column 0.
     let wrapped = "aaaa bbbb";
     assert_eq!(compose::caret_pos(wrapped, 5, 5), (1, 0));
     assert_eq!(compose::caret_pos(wrapped, 5, 9), (1, 4));
 
-    // Zero width is "nothing measurable": no wrapping, and the caret math
-    // still has to answer.
     assert_eq!(compose::wrap("anything at all", 0).len(), 1);
     assert_eq!(compose::caret_pos("anything", 0, 4), (0, 4));
 }
@@ -1716,7 +1631,6 @@ fn compose_stops_cycle_and_the_caret_follows_the_focus() {
     c.set_field(Field::Body);
     assert_eq!(c.caret, 5, "focus parks the caret at the end of the text");
 
-    // Tab order walks all seven stops and wraps back to the first.
     c.set_field(Field::To);
     let mut seen = Vec::new();
     for _ in 0..Field::ALL.len() {
@@ -1726,7 +1640,6 @@ fn compose_stops_cycle_and_the_caret_follows_the_focus() {
     assert_eq!(seen, Field::ALL.to_vec());
     assert_eq!(c.field, Field::To, "the walk wrapped");
 
-    // A toggle stop cycles its own value and nothing else.
     c.set_field(Field::Wake);
     c.cycle(1);
     assert_eq!(c.wake.as_str(), "standing");
@@ -1740,14 +1653,11 @@ fn compose_stops_cycle_and_the_caret_follows_the_focus() {
     c.set_field(Field::Ack);
     c.cycle(1);
     assert!(c.ack);
-    // Cycling a text stop is a no-op, never an edit.
     c.set_field(Field::To);
     let before = c.to.clone();
     c.cycle(1);
     assert_eq!(c.to, before);
 
-    // Caret movement over logical lines keeps the COLUMN. "one\ntwenty\nxy"
-    // has its lines at bytes 0..3, 4..10 and 11..13.
     c.set_field(Field::Body);
     c.body = "one\ntwenty\nxy".into();
     c.set_field(Field::Body);
@@ -1761,11 +1671,9 @@ fn compose_stops_cycle_and_the_caret_follows_the_focus() {
     assert_eq!(c.caret, 0, "up from the first line goes to the top");
     c.move_caret(CaretMove::Down);
     assert_eq!(c.caret, 4, "down returns to the same column");
-    // A column past the shorter line clamps to its end.
     c.caret = 9;
     c.move_caret(CaretMove::Up);
     assert_eq!(c.caret, 3, "column 5 clamped to the 3-char line");
-    // Home / End stop at the LOGICAL line, not at the whole text.
     c.caret = 6;
     c.move_caret(CaretMove::Home);
     assert_eq!(c.caret, 4);
@@ -1831,8 +1739,6 @@ fn compose_editing_never_splits_a_character() {
     c.delete_forward();
     assert_eq!(c.subject, "b", "a caret past the end cannot panic");
 
-    // A caret in the middle of a multi-byte char snaps backwards rather than
-    // slicing it.
     c.subject = "é".into();
     c.caret = 1;
     c.move_caret(CaretMove::Left);
@@ -1841,10 +1747,6 @@ fn compose_editing_never_splits_a_character() {
     c.move_caret(CaretMove::Right);
     assert_eq!(c.caret, 2, "snapped to the boundary then stepped");
 }
-
-// ---------------------------------------------------------------------------
-// 9. the compose form in the fold (intent in, effect out)
-// ---------------------------------------------------------------------------
 
 /// A model whose roster is loaded, so the console can address a live pin and
 /// can tell a promptable recipient from a digest-bound one.
@@ -1891,11 +1793,9 @@ fn compose_opens_on_the_selected_agent_or_the_open_conversation() {
     assert_eq!(form.field, Field::To);
     assert_eq!(form.wake.as_str(), "tasked");
 
-    // A second `c` must not silently discard a draft.
     let (again, _) = step(&c, Msg::OpenCompose);
     assert_eq!(again.compose, c.compose, "the draft survived");
 
-    // An open conversation: `c` is a reply, pre-addressed and in-thread.
     let (open, _) = step(
         &model(),
         Msg::ThreadLoaded {
@@ -1929,15 +1829,14 @@ fn enter_advances_the_form_and_only_a_complete_form_sends() {
         Field::Subject,
         "Enter on a text stop advances"
     );
-    let (next, _) = step(&m, Msg::ComposeFocus(1)); // -> Body
+    let (next, _) = step(&m, Msg::ComposeFocus(1));
     m = next;
     let (next, effects) = step(&m, Msg::ComposeEnter);
     m = next;
     assert!(effects.is_empty(), "a newline sends nothing");
     assert_eq!(m.compose.as_ref().expect("form").body, "\n");
 
-    // Walk to the send stop and try an incomplete form.
-    let (next, _) = step(&m, Msg::ComposeFocus(4)); // Body -> Send
+    let (next, _) = step(&m, Msg::ComposeFocus(4));
     m = next;
     assert_eq!(m.compose.as_ref().expect("form").field, Field::Send);
     let (refused, effects) = step(&m, Msg::ComposeEnter);
@@ -1957,7 +1856,6 @@ fn enter_advances_the_form_and_only_a_complete_form_sends() {
         draft.error
     );
 
-    // Complete it, keeping the multi-line body.
     let mut ready = refused;
     {
         let c = ready.compose.as_mut().expect("form");
@@ -2023,7 +1921,6 @@ fn a_refused_send_keeps_the_draft_and_a_landed_one_says_how_it_wakes() {
     assert!(failed.status.text.contains("store refused"));
     assert_eq!(failed.status.kind, StatusKind::Error);
 
-    // Editing clears the stale reason.
     let (typed, _) = step(&failed, Msg::ComposeInsert('!'));
     assert_eq!(
         typed.compose.expect("form").error,
@@ -2031,7 +1928,6 @@ fn a_refused_send_keeps_the_draft_and_a_landed_one_says_how_it_wakes() {
         "a changed form has no stale refusal on it"
     );
 
-    // A pane-less recipient is a digest, said plainly.
     let (quiet, _) = step(
         &m,
         Msg::MailSent {
@@ -2049,7 +1945,6 @@ fn a_refused_send_keeps_the_draft_and_a_landed_one_says_how_it_wakes() {
     );
     assert!(quiet.status.text.contains("QuietLark"));
 
-    // A live recipient, in-thread, gets no warning and the thread is named.
     let (live, _) = step(
         &m,
         Msg::MailSent {
@@ -2072,8 +1967,6 @@ fn a_refused_send_keeps_the_draft_and_a_landed_one_says_how_it_wakes() {
 /// drawn row and inside the box.
 #[test]
 fn compose_windows_keep_the_caret_visible() {
-    // A caret at the very end shows the last `width - 1` characters plus the
-    // caret in the final column, rather than scrolling the caret out of the box.
     let (visible, col) = compose::single_line_window("abcdefghij", 4, 10);
     assert_eq!(visible, "hij");
     assert_eq!(col, 3, "the caret sits in the last column, after the text");
@@ -2154,7 +2047,6 @@ fn the_form_draws_every_stop_even_at_phone_width() {
         "the subject is drawn:\n{drawn}"
     );
 
-    // A refusal reaches the form, where the draft still is.
     let (refused, _) = step(
         &m,
         Msg::Failed {
@@ -2220,10 +2112,6 @@ fn the_compose_log_is_deterministic() {
     assert!(a.compose.is_some());
 }
 
-// ---------------------------------------------------------------------------
-// 10. the send seam: the console builds the mailbox's own message
-// ---------------------------------------------------------------------------
-
 /// The console does not wrap the message itself. `composed_send` builds the same
 /// shape the `mail` verb does, with the ADR-0027 assignment vocabulary on the
 /// rumor, and hands it to `MailSurface::send_message`.
@@ -2263,7 +2151,6 @@ fn a_composed_send_carries_the_assignment_vocabulary_the_mailbox_parses() {
     assert_eq!(msg.thread_id.as_deref(), Some("t9"));
     assert!(!msg.overseer, "the console never signs as the operator");
 
-    // The vocabulary on the rumor is the typed value the mailbox acts on.
     let parsed = SendTags::parse(&msg.extra_tags).expect("the tags re-parse");
     assert_eq!(
         parsed.wake,
@@ -2272,9 +2159,6 @@ fn a_composed_send_carries_the_assignment_vocabulary_the_mailbox_parses() {
         msg.extra_tags
     );
 
-    // And the message text never rides the tags: the ring the core emits reads
-    // this vocabulary, so a subject or body here would leak into an unsealed
-    // kind-9 addressed to the recipient.
     let flat: String = msg
         .extra_tags
         .iter()

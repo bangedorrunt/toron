@@ -32,7 +32,6 @@ fn violations(source: &str) -> Vec<(usize, String)> {
         while let Some(at) = rest.find("Command::new(") {
             let arg = &rest[at + "Command::new(".len()..];
             let arg = arg.split(')').next().unwrap_or("");
-            // `apply_test_env(&mut Command::new(..))` is the harness itself.
             let harnessed = rest[..at]
                 .trim_end_matches("std::process::")
                 .trim_end_matches("tokio::process::")

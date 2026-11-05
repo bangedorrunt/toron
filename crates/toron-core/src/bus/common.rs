@@ -1,8 +1,4 @@
 // governed-by: ADR-0003
-// F23.BUS-DEDUP (batch-fix): the publish-time verify block was copy-pasted
-// between in_process.rs and relay_bus.rs. This is the canonical
-// VerifyError -> BusError mapping; both publish paths call it (in_process
-// keeps its stage_log on the returned error).
 
 use crate::bus::BusError;
 use crate::nostr::event::VerifyError;

@@ -66,7 +66,6 @@ fn engine_store_round_trips_start_park_restart_and_wake() {
         RunPhase::Parked
     );
 
-    // Crash: drop the engine and both handles, then rebuild on the same DB.
     drop(engine);
     let journal = ToronJournal::spawn(
         JournalDb::new(pool.clone(), "durable-engine-test", 64),

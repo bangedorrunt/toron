@@ -121,17 +121,9 @@ pub fn validate_agent_pin(name: &str) -> Result<(), String> {
     if name.len() < 3 {
         return reject("too short to be two words");
     }
-    // Alphabetic only, NOT alphanumeric: a digit makes the first "word" not a
-    // word (`Ivory2Ridge`), and `Agent1` is exactly the kind of name two agents
-    // pick independently. Each word must be Upper then lowercase(s).
     if !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return reject("contains a non-alphabetic character — each word is Upper then lowercase");
     }
-    // Exactly two Capitalised words. An uppercase begins a word when it is at
-    // index 0 OR follows a lowercase — my first version only counted the
-    // "follows a lowercase" case, so it scored EmberOtter as ONE word and
-    // refused the pin I use myself. The fence caught it, which is the third
-    // time this session that has paid for itself.
     let mut words = 0usize;
     let mut prev_lower = false;
     for (i, c) in name.chars().enumerate() {
@@ -147,9 +139,6 @@ pub fn validate_agent_pin(name: &str) -> Result<(), String> {
     if !name.ends_with(char::is_alphabetic) {
         return reject("ends mid-word");
     }
-    // Each word is Upper then lower(s): NO two capitals may be adjacent, or the
-    // first "word" is not a capitalised word but a typo. Without this,
-    // `IVoryRidge` scores as exactly two words and is accepted.
     let mut prev_upper = false;
     for c in name.chars() {
         if c.is_ascii_uppercase() {
@@ -413,14 +402,12 @@ mod tests {
         let r = create_agent_identity("demo", &p, ts()).expect("create");
         let ev = &r.event;
 
-        // d-tag = project-slug:name
         assert!(
             ev.tags
                 .iter()
                 .any(|t| { t.as_slice() == ["d".to_string(), "demo:BlueLake".to_string(),] })
         );
 
-        // Dual-emit scoping: #t + NIP-32 label (kind-30013 is not hiding).
         assert!(
             ev.tags
                 .iter()
@@ -465,13 +452,10 @@ mod tests {
         let r = create_agent_identity("demo", &p, ts()).expect("create");
         let ev = &r.event;
 
-        // 1. harness/model present in CONTENT (the content-map target).
         let parsed = parse_profile(ev).expect("parse profile content");
         assert_eq!(parsed.program.as_deref(), Some("pi"));
         assert_eq!(parsed.model.as_deref(), Some("claude-sonnet-4"));
 
-        // 2. The ONLY `t` tag is the project slug. NO `t` tag carries
-        // harness/model/role values (pi, claude-sonnet-4, oracle, ...).
         let t_tags: Vec<Vec<String>> = ev
             .tags
             .iter()
@@ -484,7 +468,6 @@ mod tests {
             "t tag must be project-slug-only; harness/model must NOT overload it"
         );
 
-        // 3. Nothing resembling harness/model/role leaks into ANY tag value.
         for tag in ev.tags.iter() {
             for part in tag.as_slice() {
                 let s = part.as_str();
@@ -522,14 +505,13 @@ mod tests {
         assert_eq!(persona.version, "1.0.0");
         assert_eq!(persona.name, "researcher");
         assert!(persona.system_prompt.contains("rigorous researcher"));
-        // The signed profile still verifies.
         assert!(crate::nostr::event::verify_event(&r.event).is_ok());
     }
 
     /// Backward-compatible parse: a profile without persona fields loads fine.
     #[test]
     fn test_persona_optional_absent() {
-        let p = sample_profile(); // persona: None
+        let p = sample_profile();
         assert!(p.persona.is_none());
         let r = create_agent_identity("demo", &p, ts()).expect("create");
         let parsed = parse_profile(&r.event).expect("parse");
@@ -556,7 +538,6 @@ mod tests {
             resolve_name("demo", profiles.iter().copied(), "Ghost"),
             None
         );
-        // Wrong project d-tag does not match.
         let other = create_agent_identity("other", &p, ts()).expect("create other");
         assert_eq!(
             resolve_name("demo", [&other.event].into_iter(), "BlueLake"),
@@ -591,13 +572,11 @@ mod tests {
         let new = create_agent_identity("demo", &sample_profile(), Timestamp::from(TS + 60))
             .expect("new");
 
-        // Replay order A: oldest first (rumor-time order).
         assert_eq!(
             resolve_name("demo", [&old.event, &new.event], "BlueLake"),
             Some(new.event.pubkey),
             "latest profile wins over the stale one"
         );
-        // Replay order B: newest first.
         assert_eq!(
             resolve_name("demo", [&new.event, &old.event], "BlueLake"),
             Some(new.event.pubkey),
@@ -767,20 +746,20 @@ mod bd_pinrule_tests {
     #[test]
     fn the_shapes_that_collide_are_all_refused() {
         for bad in [
-            "Agent1",          // word + digit
-            "agent",           // lowercase
-            "ivoryridge",      // lowercase joined
-            "IVoryRidge",      // two capitals in a row
-            "AB",              // shouty
-            "EmberOTTER",      // shouty tail
-            "Ivory-Ridge",     // kebab
-            "Ivory_Ridge",     // snake
-            "Blue",            // adjective only
-            "Ridge",           // noun only
-            "IvoryRidgeCreek", // three words
-            "",                // empty
-            "Ab",              // too short
-            "Ivory2Ridge",     // digit inside
+            "Agent1",
+            "agent",
+            "ivoryridge",
+            "IVoryRidge",
+            "AB",
+            "EmberOTTER",
+            "Ivory-Ridge",
+            "Ivory_Ridge",
+            "Blue",
+            "Ridge",
+            "IvoryRidgeCreek",
+            "",
+            "Ab",
+            "Ivory2Ridge",
         ] {
             assert!(
                 validate_agent_pin(bad).is_err(),

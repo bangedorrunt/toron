@@ -15,50 +15,41 @@ use rmcp::transport::streamable_http_client::{
 
 /// The 38 AM-Rust parity tool names (bd-led.7.2).
 const AM_RUST_TOOLS: [&str; 38] = [
-    // Infrastructure (4)
     "health_check",
     "ensure_project",
     "install_precommit_guard",
     "uninstall_precommit_guard",
-    // Identity (6)
     "register_agent",
     "create_agent_identity",
     "whois",
     "resolve_pane_identity",
     "cleanup_pane_identities",
     "list_agents",
-    // Messaging (5)
     "send_message",
     "reply_message",
     "fetch_inbox",
     "acknowledge_message",
     "mark_message_read",
-    // Contacts (4)
     "request_contact",
     "respond_contact",
     "list_contacts",
     "set_contact_policy",
-    // File reservations (5)
     "check_file_reservation_conflicts",
     "file_reservation_paths",
     "renew_file_reservations",
     "release_file_reservations",
     "force_release_file_reservation",
-    // Search (2)
     "search_messages",
     "summarize_thread",
-    // Macros (4)
     "macro_start_session",
     "macro_prepare_thread",
     "macro_contact_handshake",
     "macro_file_reservation_cycle",
-    // Product bus (5)
     "ensure_product",
     "products_link",
     "search_messages_product",
     "fetch_inbox_product",
     "summarize_thread_product",
-    // Build slots (3)
     "acquire_build_slot",
     "renew_build_slot",
     "release_build_slot",
@@ -110,7 +101,6 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
         )
         .await?;
 
-    // Only concrete, directly readable resources belong in resources/list.
     let resources = client.list_all_resources().await?;
     assert_eq!(
         resources.len(),
@@ -122,7 +112,6 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
         "resources/list must not contain URI templates"
     );
 
-    // Parameterized handles are advertised separately.
     let templates = client.list_resource_templates(None).await?;
     assert_eq!(templates.resource_templates.len(), 18);
     assert!(
@@ -133,8 +122,6 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
         "resources/templates/list must contain URI templates"
     );
 
-    // Every concrete listed resource must be directly readable at the exact
-    // URI returned by resources/list.
     for resource in &resources {
         let read = client
             .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
@@ -147,13 +134,11 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
         );
     }
 
-    // Static resource reads succeed.
     let env = client
         .read_resource(ReadResourceRequestParams::new("toron://config/environment"))
         .await?;
     assert_eq!(env.contents.len(), 1);
 
-    // Unknown resource is rejected with invalid params.
     let missing = client
         .read_resource(ReadResourceRequestParams::new(
             "toron://nope/does-not-exist",
@@ -272,7 +257,6 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
         names.contains(&"ask_judgment"),
         "additive judgment bridge missing (bd-ncpt)"
     );
-    // Exact name matches on representative tools.
     let by_name = |n: &str| {
         tools
             .tools
@@ -287,7 +271,6 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
         "file_reservation_paths"
     );
 
-    // Annotation parity: read-only + destructive hints on the wire.
     let ro = |n: &str| by_name(n).annotations.as_ref();
     assert_eq!(
         ro("health_check").and_then(|a| a.read_only_hint),
@@ -310,8 +293,6 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
         "install_precommit_guard destructive"
     );
 
-    // SEP-2106 structured outputs (bd-jgd): every tool carries an outputSchema
-    // over the wire, not just inputSchema.
     let no_output: Vec<&str> = tools
         .tools
         .iter()
@@ -336,9 +317,6 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
 /// (`ClientLifecycleMode::Discover`), exercised here over stdio.
 #[tokio::test]
 async fn stdio_discover_negotiates_2026_07_28() -> anyhow::Result<()> {
-    // Drive the server over an in-process duplex pair instead of the real
-    // process stdin/stdout so the test needs no child binary. The wire frames
-    // are identical to a real stdio connection (newline-delimited JSON-RPC).
     let (server_io, client_io) = tokio::io::duplex(4096);
 
     let server_task = tokio::spawn(async move {
@@ -392,10 +370,8 @@ async fn blossom_route_serves_upload_and_retrieval() -> anyhow::Result<()> {
     use tower::ServiceExt;
 
     let router = isolated_router().await?;
-    // Directly exercise the merged router (no socket needed for the contract).
     let payload = b"blossom round-trip payload";
 
-    // PUT /upload
     let put = router
         .clone()
         .oneshot(
@@ -417,7 +393,6 @@ async fn blossom_route_serves_upload_and_retrieval() -> anyhow::Result<()> {
         serde_json::from_slice(&put.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let hash = descriptor["sha256"].as_str().unwrap().to_string();
 
-    // GET /<hash>
     let get = router
         .oneshot(
             Request::builder()

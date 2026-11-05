@@ -67,7 +67,6 @@ async fn serve_one_subscriber(sock: &std::path::Path) {
     let (r, mut w) = stream.into_split();
     w.write_all(b"{\"subscribe\":{}}\n").await.expect("sub");
     let mut lines = BufReader::new(r).lines();
-    // Drain the EOSE so the handshake completes and the task is live.
     let eose = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
         .await
         .expect("eose bound")
@@ -97,8 +96,6 @@ async fn boot() -> (
     Arc<dyn Bus>,
     toron_core::bus::wake::WakeHandle,
 ) {
-    // A Unix socket path must fit SUN_LEN, so keep it short and unique rather
-    // than nesting a uuid directory under the temp dir.
     let tag = uuid::Uuid::new_v4().simple().to_string();
     let mut sock = std::env::temp_dir();
     sock.push(format!("tw-{}-{}.sock", std::process::id(), &tag[..8]));
@@ -113,16 +110,8 @@ async fn boot() -> (
             .await
             .expect("bus"),
     );
-    // Short heartbeat so a dropped connection is reaped promptly.
     let mut cfg = WakeConfig::new(sock.clone());
     cfg.heartbeat_ms = 50;
-    // bd-j2vo: this file fences the RETENTION window, not the subscriber cap.
-    // A subscriber's slot is held until the daemon's next write fails (one
-    // heartbeat), so serving thousands in a tight loop keeps hundreds live
-    // at once — over the production cap of 128, where the daemon REFUSES a
-    // subscriber instead of holding its fd. The cap has its own fence
-    // (crates/toron-core/tests/wake_fd_budget.rs); here it must not
-    // interfere with what is being measured.
     cfg.max_subscribers = 4_096;
     let h = WakeServer::new(
         cfg,
@@ -153,8 +142,6 @@ async fn aggregate_counts_every_subscriber_and_matches_the_detail_view() {
 
     let agg = wait_for_finished(&h, served).await;
 
-    // The aggregate is a true count of everyone served, not a count of what
-    // the detail window happens to still retain.
     assert_eq!(
         agg.subscribers_finished, served,
         "aggregate finished-count is exact"
@@ -165,9 +152,6 @@ async fn aggregate_counts_every_subscriber_and_matches_the_detail_view() {
         served,
         "detail view holds every subscriber while under the cap"
     );
-    // At least one frame per subscriber (the EOSE). The exact frame count is
-    // timing-dependent on a real clock and is pinned deterministically by the
-    // in-crate ManualClock test; what matters here is that it is not capped.
     assert!(
         agg.delivered >= served as u64,
         "every subscriber got at least its EOSE: delivered {} for {served} subscribers",
@@ -177,14 +161,8 @@ async fn aggregate_counts_every_subscriber_and_matches_the_detail_view() {
 
 #[tokio::test]
 async fn serving_many_subscribers_in_sequence_does_not_retain_them_all() {
-    // The actual leak: retention grew one record per finished subscriber for
-    // the life of the process. Serving a long sequence must not grow the
-    // process in step with the count. The aggregate is still exact at the end,
-    // which is what a naive ring buffer would get wrong.
     let (sock, _bus, h) = boot().await;
 
-    // More than STATS_CAP (1024) so the cap demonstrably engages. Below the
-    // cap this test could not distinguish bounded from unbounded retention.
     let rounds = 1_500usize;
     let before = rss_kb();
     for _ in 0..rounds {
@@ -193,14 +171,11 @@ async fn serving_many_subscribers_in_sequence_does_not_retain_them_all() {
     let agg = wait_for_finished(&h, rounds).await;
     let after = rss_kb();
 
-    // The falsifiable pair: the detail view dropped the oldest records...
     let retained = h.stats().len();
     assert!(
         retained < rounds,
         "detail view is bounded: retained {retained} of {rounds} served"
     );
-    // ...while the aggregate still counts every single one. This is what a
-    // naive ring buffer gets wrong.
     assert_eq!(
         agg.subscribers_finished, rounds,
         "aggregate counts all {rounds} despite the bounded detail view"
@@ -211,14 +186,6 @@ async fn serving_many_subscribers_in_sequence_does_not_retain_them_all() {
         agg.delivered
     );
 
-    // A COARSE guard, not the fence. The leak this test names retains
-    // ~64 B per subscriber, so 1500 of them is ~96 KB — two orders of
-    // magnitude under this bound, which therefore cannot catch THAT leak and
-    // must not be read as if it did. It catches a gross regression (retention
-    // going megabytes). The falsifiable fence for bd-qpm0 is the
-    // retained-count pair above: `retained < rounds` with an exact
-    // `subscribers_finished`. Both RSS samples are real or the test is red —
-    // `parse_rss_kb` refuses rather than reading a failed `ps` as 0 KB.
     let grew_kb = after.saturating_sub(before);
     assert!(
         grew_kb < 32_768,

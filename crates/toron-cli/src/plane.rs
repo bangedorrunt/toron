@@ -291,10 +291,6 @@ fn parse_since(s: &str) -> anyhow::Result<u64> {
     Ok(dt.timestamp().max(0) as u64)
 }
 
-// ---------------------------------------------------------------------------
-// plane S — channels + reactions
-// ---------------------------------------------------------------------------
-
 /// Publish the channel-create lifecycle event (kind 39000).
 async fn publish_create(
     bus: &dyn Bus,
@@ -397,9 +393,6 @@ async fn channel_join(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Resu
 async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
-    // GS-062 captain A: leave() HOLDS authority after FireLive across the
-    // critical section (publish CS). settle_authority ends the CS — required
-    // so CLI leave does not permanently FenceReAdd (unlike in-process hold).
     store
         .leave(&args.id, &keys.public_key())
         .with_context(|| format!("leave {} as {}", args.id, args.as_name))?;
@@ -412,7 +405,6 @@ async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Res
         &members,
     )
     .await?;
-    // End of CS: settle after successful publish (captain A lock).
     store.settle_authority(&args.id);
     print_json(&serde_json::json!({
         "channel_id": args.id,
@@ -457,7 +449,6 @@ async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Re
     let ch = store
         .get(&args.id)
         .with_context(|| format!("channel not found: {}", args.id))?;
-    // GS-062 captain A: close() HOLDS Disable after FireLive across publish CS.
     store
         .close(&args.id, &keys.public_key())
         .with_context(|| format!("close channel {} as {}", args.id, args.as_name))?;
@@ -470,9 +461,8 @@ async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Re
         ch.private,
     )
     .await?;
-    // End of CS: settle after successful publish (captain A lock).
     store.settle_authority(&args.id);
-    let _ = ch; // (kept: future closed-at bookkeeping)
+    let _ = ch;
     print_json(&serde_json::json!({
         "channel": args.id,
         "closed": true,
@@ -513,9 +503,6 @@ async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Re
         );
     }
 
-    // Every bus event bound to the channel (lifecycle + posts + reactions),
-    // scoped to this project so a same-named channel in another project is
-    // untouched.
     let filter = Filter::new()
         .kinds([
             Kind::GroupMetadata,
@@ -540,7 +527,6 @@ async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Re
         .await
         .map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
 
-    // Audit trail (operator-grade action): who, what, how many. Guarded row.
     let log_line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "project": args.project,
@@ -577,12 +563,9 @@ async fn channel_list(mailbox: &Mailbox, args: &ChannelListArgs) -> anyhow::Resu
         .list()
         .into_iter()
         .filter(|c| {
-            // bd-channel-close-purge-bsqb: retired channels are clutter —
-            // hidden unless --all, and flagged when shown.
             if c.closed && !args.all {
                 return false;
             }
-            // Private channels appear only to members; open channels to anyone.
             if !c.private {
                 return true;
             }
@@ -616,9 +599,6 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
 
-    // bd-channel-truncation-238e: exactly one of --body / --file. A file
-    // post chunks at 700 chars into an (1/N)-marked thread (the swarm's
-    // crew-report convention, now the mechanism instead of a brief rule).
     let bodies: Vec<String> = match (&args.body, &args.file) {
         (Some(b), None) => vec![b.clone()],
         (None, Some(f)) => toron_workflow::channels::split_channel_post(
@@ -639,7 +619,7 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
             &keys,
             args,
             chunk,
-            i == 0, // mentions ride the first chunk only
+            i == 0,
         )
         .await?;
     }
@@ -663,10 +643,8 @@ async fn post_one(
     body: &str,
     with_mentions: bool,
 ) -> anyhow::Result<()> {
-    // Resolve --mention names → npubs via the project identity index.
     let mut mention_pks: Vec<PublicKey> = Vec::new();
     if !with_mentions {
-        // chunked thread: dispatch on the first chunk only
     }
     for name in args.mention.iter().filter(|_| with_mentions) {
         let whois = mailbox
@@ -676,17 +654,11 @@ async fn post_one(
         mention_pks.push(PublicKey::from_hex(&whois.npub).context("whois npub parses")?);
     }
 
-    // Membership-gated store post (kind 9; non-member → error exit 1).
     let ev = store
         .post(keys, &args.id, body, &mention_pks)
         .with_context(|| format!("post to channel {}", args.id))?;
     mailbox.bus().publish(ev.clone()).await?;
 
-    // ADR-0020 Spec 4: a kind-9 post with @mentions + p-tags dispatches one
-    // 43001 per assignee through the mention coalescer. The CLI drives the
-    // dispatcher inline (same wiring the workflow host uses) and force-flushes
-    // so the job is visible immediately (SC-27 expects one 43001 after the
-    // post, not a 2s coalesce wait).
     if !args.mention.is_empty() {
         let mut coalescer = MentionCoalescer::with_defaults();
         let mut jobs =
@@ -703,8 +675,6 @@ async fn post_one(
         }
     }
 
-    // bd-verify-after-send-fxtv: read-back verification — the send is
-    // confirmed only when the projection serves the event id back.
     let mut verified = false;
     if let Some(secs) = args.wait_ack {
         let timeout = Duration::from_secs(secs.max(1));
@@ -759,8 +729,6 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
     let ch = store
         .get(&args.id)
         .with_context(|| format!("channel not found: {}", args.id))?;
-    // Membership gate: private channels are members-only; open channels are
-    // readable by anyone on the project bus (ADR-0020 Spec 0).
     if ch.private && !store.can_read(&args.id, &keys.public_key()) {
         anyhow::bail!(
             "not a member of private channel {} — membership is the only gate",
@@ -768,8 +736,6 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
         );
     }
 
-    // bd-channel-close-purge-bsqb: a closed channel is retired — history is
-    // gone at purge; read refuses so a closed channel never looks live.
     if ch.closed {
         anyhow::bail!(
             "channel {} is closed (retired) — history lives until purge: \
@@ -780,9 +746,6 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
         );
     }
 
-    // bd-delivery-visibility-g96y: `--author <pin>` narrows to one author —
-    // "did the scout report?" is a single query. Resolved through whois so
-    // the caller names the pin, never the npub.
     let author_pk: Option<PublicKey> = match &args.author {
         Some(name) => {
             let whois = mailbox
@@ -802,7 +765,6 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
     if let Some(pk) = &author_pk {
         events.retain(|ev| ev.pubkey == *pk);
     }
-    // Newest first; honor --limit after sorting.
     events.sort_by_key(|ev| std::cmp::Reverse(ev.created_at.as_secs()));
     if let Some(limit) = args.limit {
         events.truncate(limit);
@@ -836,8 +798,6 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
         })
         .collect();
 
-    // bd-delivery-visibility-g96y: with --author, append the one-command
-    // delivery check — count + newest post ts for that author.
     if let Some(pk) = &author_pk {
         let posts = events.iter().filter(|ev| ev.kind.as_u16() == 9).count();
         let newest = events.first().map(|ev| ev.created_at.as_secs());
@@ -858,7 +818,6 @@ async fn react(mailbox: &Mailbox, args: &ReactArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
 
-    // Resolve the channel from --channel or the target event's `h` tag.
     let channel = match &args.channel {
         Some(c) => c.clone(),
         None => {
@@ -876,11 +835,6 @@ async fn react(mailbox: &Mailbox, args: &ReactArgs) -> anyhow::Result<()> {
         }
     };
 
-    // bd-13lb: synchronous post visibility — `channel read` projects from the
-    // bus (rumor-time G7), but `store.react` looked up only the in-memory
-    // `ChannelStoreInner.events` which is empty after `rebuild_store` in a
-    // fresh process. Hydrate the target post from the bus so `react` sees
-    // what `read` sees without a sleep.
     {
         let target = EventId::from_hex(&args.to)
             .map_err(|_| anyhow::anyhow!("bad --to event id: {}", args.to))?;
@@ -916,10 +870,6 @@ async fn react(mailbox: &Mailbox, args: &ReactArgs) -> anyhow::Result<()> {
         "react_to": args.to,
     }))
 }
-
-// ---------------------------------------------------------------------------
-// plane J — jobs 43001-43006
-// ---------------------------------------------------------------------------
 
 /// Collect every job-lifecycle event for `project` (43001-43006). Un-scoped
 /// events pass (DM-path jobs may lack `t`); scoped events must match the slug.
@@ -1025,7 +975,6 @@ fn job_row(job: &Event, events: &[Event], arrivals: Option<&ClaimArrivals>) -> V
 
 async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
     if let Some(name) = &args.as_name {
-        // Reads may carry an identity; unknown is still a usage error.
         let _ = mailbox.whois(&args.project, name).await.map_err(|_| {
             UsageError(format!(
                 "unknown agent name: {name} for project {}",
@@ -1042,7 +991,6 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
     let mut rows: Vec<Value> = Vec::new();
     for job in requests {
         let state = job_state_for(job.id, &events, arrivals.as_ref());
-        // --state filter.
         let state_pass = match (args.state, &state) {
             (None, _) => true,
             (Some(JobStateArg::Open), JobState::Open) => true,
@@ -1054,7 +1002,6 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
         if !state_pass {
             continue;
         }
-        // --assignee filter (tag or payload).
         if let Some(want) = &args.assignee {
             let has = request_assignee(job)
                 .or_else(|| {
@@ -1070,7 +1017,6 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
         }
         rows.push(job_row(job, &events, arrivals.as_ref()));
     }
-    // Newest first.
     rows.sort_by(|a, b| {
         let ka = a["created_at"].as_u64().unwrap_or(0);
         let kb = b["created_at"].as_u64().unwrap_or(0);
@@ -1146,7 +1092,6 @@ async fn resolve_claim_winner(
     if let Some(arrivals) = claim_arrivals(mailbox.bus().as_ref(), &claims).await? {
         return Ok(first_claimer_by_arrival(job, &claims, &arrivals));
     }
-    // No arrival log: converge by watching the stored claim set go quiet.
     let quiesce = toron_core::policy::Timeout::new(Duration::from_secs(2))
         .with_poll(Duration::from_millis(50));
     wait_claim_quiescent(quiesce, || {
@@ -1168,7 +1113,6 @@ async fn resolve_claim_winner(
 /// `won: false` and exits 1 (never a silent success).
 async fn job_claim(mailbox: &Mailbox, args: &JobClaimArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
-    // Verify the job exists before claiming.
     let _ = find_request(mailbox, &args.project, &args.job_id).await?;
     let job = EventId::from_hex(&args.job_id).context("job id parses")?;
 
@@ -1277,10 +1221,6 @@ async fn job_cancel(mailbox: &Mailbox, args: &JobCancelArgs) -> anyhow::Result<(
     }))
 }
 
-// ---------------------------------------------------------------------------
-// plane N — presence 20001
-// ---------------------------------------------------------------------------
-
 const fn presence_state(arg: PresenceStateArg) -> PresenceState {
     match arg {
         PresenceStateArg::Idle => PresenceState::Idle,
@@ -1352,7 +1292,6 @@ pub(crate) fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> 
             .unwrap_or_default()
             .to_string();
         let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        // Stale heartbeats drop out (broker-expiry parity).
         if now_secs.saturating_sub(ts) > ttl {
             continue;
         }
@@ -1427,8 +1366,6 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
     let ev = build_presence_event(&keys, &payload, now)?;
     mailbox.bus().publish(ev).await?;
 
-    // Append to the CLI projection (last-wins by npub on read). Guarded:
-    // exactly one JSON row, never a corrupt line.
     let whois = mailbox
         .whois(&project, &as_name)
         .await
@@ -1466,10 +1403,6 @@ async fn presence_list(mailbox: &Mailbox, args: &PresenceListArgs) -> anyhow::Re
     let rows = read_presence(mailbox, &project, now_secs);
     print_json(&serde_json::to_value(rows)?)
 }
-
-// ---------------------------------------------------------------------------
-// plane W — watch (NIP-01 REQ)
-// ---------------------------------------------------------------------------
 
 fn parse_kinds(s: &str) -> anyhow::Result<Vec<u16>> {
     s.split(',')
@@ -1590,13 +1523,6 @@ fn watch_emit(seen: &mut HashSet<String>, args: &WatchArgs, ev: &Event) -> bool 
 }
 
 async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
-    // ADR-0017: match the SEND side before filtering. `send_message`
-    // canonicalizes its project and stamps the CANONICAL slug as the `t`
-    // hashtag (aliases.rs: a path form folds to its basename when no
-    // alias row exists). A watcher that filters the RAW caller string
-    // (`--project /abs/path/to/proj`) subscribes to a hashtag no sender
-    // ever writes: every wake for that project is silently invisible.
-    // `wait_for_corr` already canonicalizes; watch must too.
     let args = WatchArgs {
         project: mailbox.canonical_project(&args.project).await,
         ..args.clone()
@@ -1610,8 +1536,6 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         )));
     }
     if !args.once {
-        // Bare non-live watch (no bound, no --live): the 1s snapshot pump
-        // is deleted (bd-qg6w, wave 3) — this is the live tail now.
         return watch_live(mailbox, &args).await;
     }
     watch_once(mailbox, &args).await
@@ -1663,16 +1587,9 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watching kinds={}", args.kinds);
-    // Wave 4 (bd-ud7k): the socket tail is the path, no flag. Absent
-    // socket degrades LOUD to the in-process replay+live below.
     {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
-        // bd-73s8: discovery never consults TORON_MCP_DATA_DIR (ADR-0036
-        // Spec 2), so a pinned store and a live machine daemon can disagree
-        // silently. Name the socket on ATTACH: the absent arm below already
-        // names its path, and only the present one used to say nothing — which
-        // is why a foreign attach reads as a bare `watch: timeout`.
         let sock_path = cfg.sock_path.clone();
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
         match tail.connect().await {
@@ -1707,8 +1624,6 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
                         Ok(Ok(_)) => {}
                     }
                 }
-                // Fell through without a match: remaining budget (if any)
-                // continues in-process below.
                 if Instant::now() >= deadline {
                     eprintln!("watch: timeout");
                     std::process::exit(1);
@@ -1719,8 +1634,6 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
             }
         }
     }
-    // In-process bounded live tail: replay first (late joiners), then
-    // subscribe until the deadline. No snapshot poll (pump deleted).
     let replay = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
     let mut seen: HashSet<String> = HashSet::new();
     for ev in replay {
@@ -1793,15 +1706,10 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
     let store = mailbox.receipt_store().map_err(|e| {
         anyhow::anyhow!("wait --corr for project {canonical} requires receipts store: {e}")
     })?;
-    // Fast path: already present
     if let Some(r) = store.get(&args.corr).await? {
         print_corr_receipt(&r)?;
         return Ok(());
     }
-    // Wave 3 (bd-qg6w): socket wake first. Any EVENT frame re-checks the
-    // store (the store is the truth, the socket is the wake); heartbeats
-    // only prove liveness and never touch the store. Shed, absent socket,
-    // or error degrades LOUD to the in-process subscribe below.
     {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(WAIT_WAKE_KINDS.to_vec());
         cfg.project = Some(canonical.clone());
@@ -1829,10 +1737,6 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
                             }
                             Ok(_) => {}
                         }
-                        // No inner deadline check: the outer `timeout(remain)`
-                        // owns expiry. Falling through here means shed or a
-                        // loud socket error — the in-process path below still
-                        // enforces the absolute deadline.
                     }
                     Ok::<bool, anyhow::Error>(false)
                 };
@@ -1861,10 +1765,6 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
             }
         }
     }
-    // Subscribe to live bus (any kind that could lead to a receipt). The
-    // receipts store itself is not a bus kind, so we wake on any new bus
-    // event and re-check the store — still subscribe-driven, not poll.
-    // Kinds are WAIT_WAKE_KINDS (E2 held-subscription vocabulary).
     let filter = Filter::new().kinds(WAIT_WAKE_KINDS.iter().map(|k| toron_kind(*k)));
     let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
     loop {
@@ -1877,12 +1777,10 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
                 timeout
             );
         }
-        // Check store after each wake (including immediately)
         if let Some(r) = store.get(&args.corr).await? {
             print_corr_receipt(&r)?;
             return Ok(());
         }
-        // Unpark on bus event or deadline only — no 200ms costume poll.
         if let Some(d) = deadline {
             let remain = d.saturating_duration_since(Instant::now());
             tokio::select! {
@@ -1912,10 +1810,6 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let kinds = parse_kinds(&args.kinds)?;
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watch --live kinds={}", args.kinds);
-    // Wave 4 (bd-ud7k): the socket tail is the path, no flag (slices B+C,
-    // ADR-0036 Spec 8). Absent socket degrades LOUD to the in-process
-    // replay+live below, never silent. The 1s snapshot pump is deleted
-    // (bd-qg6w, wave 3).
     {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
@@ -1925,8 +1819,6 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         let channel = args.channel.clone();
         match tail
             .run(&mut |ev| {
-                // `true` keeps tailing: filtering is the gate's job,
-                // stopping is `--once`'s (run stops only on false).
                 if watch_gate(&mut seen, &ev.id, &ev.tags, &project, channel.as_ref()) {
                     println!("{}", crate::wake_sock::format_sock_line(ev));
                 }
@@ -1945,16 +1837,11 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
             }
         }
     }
-    // Collect replay first (so late joiners see history), then stream live.
     let replay = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
     let mut seen: HashSet<String> = HashSet::new();
     for ev in replay {
         watch_emit(&mut seen, args, &ev);
     }
-    // Live tail — shares one subscription with `wait --corr` (same bus source).
-    // `--idle-exit <secs>` bounds silence: no matching event for N seconds
-    // exits 4 so the consumer can respawn a fresh child (a half-open bus
-    // subscription otherwise sits here forever — the zombie-watch defect).
     let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
     if let Some(idle_secs) = args.idle_exit {
         loop {
@@ -1981,10 +1868,6 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// dispatch
-// ---------------------------------------------------------------------------
 
 /// Run a two-plane command against the shared mailbox (built once per
 /// invocation, the same in-process bus the MCP server uses).
@@ -2080,11 +1963,6 @@ mod live_watch_tests {
                 std::process::id()
             ));
             let _ = std::fs::remove_file(&p);
-            // Safe cfg(test) seam (no env set_var: the crate forbids unsafe).
-            // OnceLock serialization plus fixture-first ordering: every
-            // socket-discovering test here builds its mailbox through
-            // `test_mailbox` BEFORE spawning its waiter/watcher, so no
-            // discovery read can race this pin.
             crate::wake_sock::pin_wake_sock_for_tests(p);
         });
     }
@@ -2150,7 +2028,6 @@ mod live_watch_tests {
     #[tokio::test]
     async fn live_watch_yields_kind9_lines() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox("yield").await;
-        // Publish a channel post (kind 9) directly via bus
         let keys = toron_core::keys::generate();
         let ev = toron_core::nostr::event::build_event(
             &keys,
@@ -2164,11 +2041,9 @@ mod live_watch_tests {
         )
         .expect("event");
         mailbox.bus().publish(ev.clone()).await.expect("publish");
-        // Live subscription should see it (same source as watch --live)
         let filter =
             toron_core::bus::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(9)]);
         let mut sub = mailbox.bus().subscribe(filter).await.expect("sub");
-        // Also check via collect_trusted (replay)
         let replay = collect_trusted(
             mailbox.bus().as_ref(),
             toron_core::bus::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(9)]),
@@ -2179,7 +2054,6 @@ mod live_watch_tests {
             replay.iter().any(|e| e.id == ev.id),
             "replay must contain published kind-9"
         );
-        // Live: publish another and see it via subscription
         let ev2 = toron_core::nostr::event::build_event(
             &keys,
             toron_core::nostr::kinds::toron_kind(9),
@@ -2192,8 +2066,6 @@ mod live_watch_tests {
         )
         .expect("event2");
         mailbox.bus().publish(ev2.clone()).await.expect("publish2");
-        // Deterministic: await delivery with a deadline instead of a fixed
-        // sleep (a 100ms sleep raced bus delivery under load and flaked).
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
             .await
             .expect("live delivery within 5s");
@@ -2210,7 +2082,6 @@ mod live_watch_tests {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox("wait-unpark").await;
         let store = mailbox.receipt_store().expect("store");
         let corr = format!("test-corr-{}", uuid::Uuid::new_v4());
-        // Spawn waiter in background
         let mb_clone = mailbox.clone();
         let corr_clone = corr.clone();
         let handle = tokio::spawn(async move {
@@ -2221,12 +2092,6 @@ mod live_watch_tests {
             };
             wait_for_corr(&mb_clone, &args).await
         });
-        // Give waiter time to subscribe
-        // No fixed subscribe-delay sleep: a single wake published before the
-        // waiter's subscription is live is LOST, and the waiter deadlines —
-        // the flake. Publish a wake stream inside the waiter's 5s deadline
-        // instead; whichever wake lands after subscribe unparks it.
-        // Insert receipt — should unpark waiter
         let receipt = Receipt {
             corr: corr.clone(),
             state: ReceiptState::Owed,
@@ -2236,7 +2101,6 @@ mod live_watch_tests {
             updated_at: 1_700_000_000_000_000,
         };
         store.upsert(&receipt).await.expect("upsert");
-        // Also publish a bus event to wake the waiter (receipts store alone doesn't wake, but bus event does)
         let keys = toron_core::keys::generate();
         let ev = toron_core::nostr::event::build_event(
             &keys,
@@ -2344,7 +2208,6 @@ mod live_watch_tests {
         )
         .expect("event");
         let pub_box = mailbox.clone();
-        // Deliver at t+600ms, window is 1s: the event must reset the clock.
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
             let _ = pub_box.bus().publish(ev).await;
@@ -2359,8 +2222,6 @@ mod live_watch_tests {
             live: true,
             idle_exit: Some(1),
         };
-        // Spawn the watch; it must still be running 1.1s later (one idle
-        // window elapsed, but the event reset the clock mid-window).
         let handle = tokio::spawn(async move {
             let _ = watch_live(&mailbox, &args).await;
         });
@@ -2393,8 +2254,6 @@ mod live_watch_tests {
             })
             .await
             .expect("upsert");
-        // Walker is dead: no bus event is ever published. The wait must
-        // still resolve from the durable store, fast (well under timeout).
         let args = WaitArgs {
             corr,
             timeout: Some(5),
@@ -2453,8 +2312,6 @@ mod live_watch_tests {
             Some(first.public_key().to_hex()),
             "a later claim never overtakes the one that landed first"
         );
-        // Control: the created_at rule alone would have picked the other one,
-        // so the assertion above can only pass through arrival order.
         assert_eq!(
             first_claimer(job, &[lands_first, lands_second]),
             Some(second.public_key().to_hex())
@@ -2519,7 +2376,6 @@ mod presence_env_tests {
 
     #[test]
     fn presence_project_precedence() {
-        // flag > env > blank-absent, one table (was 3 one-assert tests).
         for (flag, env, want) in [
             (
                 Some("flag-proj"),
@@ -2576,8 +2432,6 @@ mod presence_env_tests {
 
     #[test]
     fn presence_project_and_as_precedence() {
-        // Project: nothing set is absent. Identity: flag, else AGENT_NAME.
-        // TORON_AGENT and FLYWHEEL_MAIL_AS do not supply a pin.
         assert_eq!(resolve_presence_project(None, &lookup(&env_map(&[]))), None);
         for (flag, env, want) in [
             (

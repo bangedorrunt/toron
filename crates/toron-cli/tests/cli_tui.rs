@@ -1,8 +1,5 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0031
-// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
-// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
-// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! `toron tui` acceptance: flags, the TTY gate, and the data contract the
 //! console reads.
@@ -184,11 +181,6 @@ async fn tui_mail_pipeline_exposes_the_fields_the_console_maps() {
     );
     assert!(row.created_ts_us > 0, "the ledger row is timestamped");
 
-    // The reader opens a body-carrying page and narrows it to the thread.
-    // It deliberately does NOT ask for `thread_id`: a top-level message
-    // carries no thread tag, so an exact thread query returns nothing for the
-    // most common case (a single message with no replies) — the console reads
-    // the page and matches on the row's own thread (its id when untagged).
     assert!(
         row.thread_id.is_none(),
         "a fresh top-level message has no thread tag, got {:?}",

@@ -49,8 +49,6 @@ pub async fn run_cli(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Resu
 
 async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
     let paths = crate::robot::normalize_reserve_paths(&args.paths);
-    // Preflight BEFORE anything is leased: a glob that matches zero files
-    // would hold nothing while reporting success.
     for p in &paths {
         if let Some(w) = guard::whitespace_path_warning(p) {
             eprintln!("{w}");
@@ -95,19 +93,9 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
     let store = LeaseStore::resolve().await?;
     store.warn_if_ghost(&args.project, &args.agent).await;
 
-    // Acquire, keeping what is already held across attempts (a path that
-    // granted stays ours; only the missing ones are re-attempted, so waiting
-    // publishes no churn). A hard conflict waits out the holder until the
-    // deadline; an intent (soft conflict) refuses at once — the kernel
-    // freezes that path and waiting cannot convert an intent unless its
-    // declarer acts.
     let mut held: BTreeSet<String> = BTreeSet::new();
     let mut blockers: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    // How many acquire calls the wait loop made. `1` means no conflict was
-    // ever seen; `>= 2` is the witness that the wrapper actually waited a
-    // peer's hold out (the fence asserts on it, so a "serialize" test can
-    // never pass by arriving after the peer already released).
     let mut acquire_attempts: u64 = 0;
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(args.wait_secs);
@@ -152,9 +140,6 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
         blocks,
     }) = refusal
     {
-        // Fail clean: release anything a partial attempt granted before the
-        // refusal — a refused wrapper must hold nothing, and it must never
-        // touch a peer's lease (release filters by this agent).
         if let Err(e) = store.release(args).await {
             eprintln!("toron reserve with-lease: release after refusal failed: {e:#}");
         }
@@ -203,8 +188,6 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
         return Ok(REFUSED);
     }
 
-    // Install the signal traps BEFORE the child exists, so there is no window
-    // where a signal can kill the wrapper while its lease is still held.
     let mut signals = match Signals::install() {
         Ok(signals) => signals,
         Err(e) => {
@@ -216,18 +199,9 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
         }
     };
 
-    // Heartbeat: renew every half-TTL while the child runs. The TTL is now
-    // the reservation default (180 s), so without this a five-minute test run
-    // would silently lose its hold halfway through — the exact stale/phantom
-    // split this verb exists to prevent. A crashed wrapper stops renewing and
-    // the lease ages out in one TTL; a finished one releases in `release`.
     let ttl = args
         .ttl_secs
         .unwrap_or(toron_core::mailbox::reservations::DEFAULT_RESERVATION_TTL_SECS);
-    // Half a TTL, renewed every half TTL: `renew` ADDS to the current expiry,
-    // so renewing by a full TTL would ratchet the lease to 2x the runtime and
-    // a crashed wrapper would hold its paths that much longer. Half-TTL keeps
-    // the expiry pinned near `now + ttl` for the whole run.
     let extend = (ttl / 2).max(5);
     let heartbeat = {
         let project = args.project.clone();
@@ -279,8 +253,6 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
     let (code, signal) = wait_child(&mut signals, &mut child).await;
     heartbeat.abort();
 
-    // ALWAYS release — the one invariant. A release failure cannot pass as
-    // success: it is printed loud and carried in the summary.
     let release = store.release(args).await;
     if let Err(e) = &release {
         eprintln!("toron reserve with-lease: RELEASE FAILED — the lease may still be held: {e:#}");
@@ -407,8 +379,6 @@ fn exit_code_of(status: std::io::Result<std::process::ExitStatus>) -> (u8, Optio
                 }
             }
         }
-        // The wait itself failed (no status to report) — the release still
-        // runs; exit 1 so a missing status is never read as success.
         Err(_) => (1, None),
     }
 }
@@ -499,9 +469,6 @@ impl LeaseStore {
                         "project_key": project,
                         "agent_name": agent,
                         "paths": paths,
-                        // The daemon tool's key is `extend_seconds`
-                        // (RenewFileReservationsArgs); `extend_secs` would leave
-                        // the arg at 0 and renew nothing.
                         "extend_seconds": extend_secs,
                     }),
                 )
@@ -690,7 +657,7 @@ mod tests {
             use std::os::unix::process::ExitStatusExt;
             let status = std::process::ExitStatus::from_raw(7 << 8);
             assert_eq!(exit_code_of(Ok(status)), (7, None));
-            let killed = std::process::ExitStatus::from_raw(15); // signal 15
+            let killed = std::process::ExitStatus::from_raw(15);
             assert_eq!(exit_code_of(Ok(killed)), (143, Some(15)));
         }
         let _ = exit_code_of(Err(std::io::Error::other("no status")));

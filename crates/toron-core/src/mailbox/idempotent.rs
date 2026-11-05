@@ -162,7 +162,6 @@ impl IdempotentSendStore {
                     })
                 }
             }
-            // Lost race against a concurrent delete (prune): reclaim.
             None => Ok(SendClaim::New),
         }
     }
@@ -301,7 +300,6 @@ mod tests {
             }
             SendClaim::New => panic!("second claim must be a duplicate"),
         }
-        // The publish completes → the claim is settled.
         store
             .mark_published(&key, "ev-1", "[]")
             .await

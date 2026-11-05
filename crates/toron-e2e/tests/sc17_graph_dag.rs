@@ -79,8 +79,6 @@ graph:
     .expect("open task")
     .expect("open graph run");
 
-    // Node execution order is observed: waves run scout < plan <
-    // {fix_a, fix_b} < ship, each node exactly once.
     let mut executed: Vec<String> = Vec::new();
     let output = loop {
         if effects.is_empty() {
@@ -145,20 +143,16 @@ graph:
     };
     drop(run);
 
-    // Every node produced output under its node name.
     for node in ["scout", "plan", "fix_a", "fix_b", "ship"] {
         assert!(
             output.get(node).is_some(),
             "graph node {node} produced output: {output}"
         );
     }
-    // Value-returning actions flow through the DAG (P0.1 x P5.2).
     assert_eq!(
         output["scout"]["n"], 42,
         "node value flows through: {output}"
     );
-    // Wave ordering: scout before plan before the fixes before ship; each
-    // node executed exactly once.
     assert_eq!(
         executed,
         vec!["scout", "plan", "fix_a", "fix_b", "ship"],

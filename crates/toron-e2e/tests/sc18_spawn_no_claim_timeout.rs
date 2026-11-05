@@ -67,8 +67,6 @@ steps:
         launcher: Some(pending_launcher(started.clone())),
     };
 
-    // Open with seams: the single spawn step prepares and parks with a
-    // deadline (2s), emitting StartSpawn for the host.
     let (engine_store, journal, state) = durable::handles(&pool);
     let (wf_open, trig_open) = (wf.clone(), trigger.clone());
     let (run, effects) = tokio::task::spawn_blocking(move || {
@@ -86,9 +84,6 @@ steps:
     .await
     .expect("open task")
     .expect("open with launcher");
-    // Open emits StartSpawn (launch the child) plus the deadline ParkUntil
-    // (the model's park arm); the park effect needs no host action here —
-    // the deadline below bounds the launch instead.
     let [RunEffect::StartSpawn { node, .. }, ..] = effects.as_slice() else {
         panic!("spawn step parks with StartSpawn: {effects:?}");
     };
@@ -101,12 +96,7 @@ steps:
         other => panic!("run parked AwaitingSpawn with a deadline: {other:?}"),
     };
 
-    // Never claim the job: await the launch bounded by the model's
-    // deadline (the production `await_spawn_launch` shape). The timeout
-    // fires first; feed `woke` at the deadline and the fold fails the node
-    // with the canonical timeout text (not a hang).
     let launcher = pending_launcher(started.clone());
-    // Re-read the spec from the parked model for the launch call.
     let spec = match effects.iter().find_map(|e| match e {
         RunEffect::StartSpawn { spec, .. } => Some(spec.clone()),
         _ => None,
@@ -140,8 +130,6 @@ steps:
         "the child was launched before the timeout (not refused upfront)"
     );
 
-    // Re-open to read the terminal outcome: the step FAILED with the
-    // timeout text and the run completed (Continue), not hung.
     let (engine_store, journal, state) = durable::handles(&pool);
     let (wf_open, trig_open) = (wf.clone(), trigger.clone());
     let (run, effects) = tokio::task::spawn_blocking(move || {
@@ -164,7 +152,6 @@ steps:
         "terminal run re-issues nothing: {effects:?}"
     );
 
-    // Read the settled outputs from the store directly.
     let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
     let json = state_store
         .load("sc18-spawn-timeout")

@@ -162,9 +162,6 @@ impl Default for ComposeState {
             body: String::new(),
             field: Field::To,
             caret: 0,
-            // A peer message from the console is normally work: the doorbell
-            // classifies `tasked` as an assignment. `standing` is the operator's
-            // explicit choice.
             wake: Wake::Tasked,
             importance: Importance::Normal,
             ack: false,
@@ -474,10 +471,6 @@ pub fn wrap(text: &str, width: usize) -> Vec<Wrapped> {
         let mut offset = base;
         while rest.chars().count() > width {
             let head: String = rest.chars().take(width).collect();
-            // Break AFTER a space rather than eating it: offsets stay exact.
-            // A space at index 0 is not a break point (it would emit a
-            // one-column line and then repeat), so fall through to the hard
-            // break in that case.
             let take = match head.rfind(' ') {
                 Some(sp) if sp > 0 => head[..sp].chars().count() + 1,
                 _ => width,
@@ -513,8 +506,6 @@ pub fn single_line_window(text: &str, width: usize, caret: usize) -> (String, us
     }
     let caret = snap(text, caret);
     let caret_col = text[..caret].chars().count();
-    // Scroll only as far as the caret needs, so the line does not jump while
-    // typing near its start.
     let start = if caret_col >= width {
         caret_col - width + 1
     } else {

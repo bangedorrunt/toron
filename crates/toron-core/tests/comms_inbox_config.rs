@@ -45,8 +45,6 @@ fn an_unrecognised_env_value_fails_closed() {
     }
 }
 
-// --- negative controls: the pre-existing behaviour, unchanged ---------------
-
 /// CONTROL: nothing set anywhere is on. An explicit false config still opts out.
 #[test]
 fn control_default_is_on() {

@@ -73,7 +73,6 @@ fn offenders(root: &Path) -> Vec<String> {
 fn only_the_kernel_port_names_the_framework() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     assert_eq!(offenders(&root), Vec::<String>::new());
-    // The port itself does name it (the fence is not vacuous).
     let kernel = fs::read_to_string(root.join(KERNEL)).unwrap();
     assert!(kernel.contains(&format!("pub use {}_journal", needle_rs())));
 }

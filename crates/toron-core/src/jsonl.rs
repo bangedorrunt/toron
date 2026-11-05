@@ -98,7 +98,6 @@ mod tests {
         }
         let back = read_rows(&p).unwrap();
         assert_eq!(back, rows);
-        // Byte-stable: one JSON value per line, trailing newline each.
         let raw = std::fs::read_to_string(&p).unwrap();
         assert_eq!(raw.lines().count(), 3);
         assert!(raw.ends_with('\n'));
@@ -115,7 +114,6 @@ mod tests {
             err.to_string().contains("row 2"),
             "names the row index: {err:#}"
         );
-        // The refused row was NOT appended.
         assert_eq!(read_rows(&p).unwrap().len(), 1);
         let _ = std::fs::remove_file(&p);
     }
@@ -135,7 +133,6 @@ mod tests {
 
     #[test]
     fn non_object_values_are_rows_too() {
-        // JSONL rows are JSON values, not necessarily objects.
         let p = tmp("scalar");
         append_row(&p, &json!("just a string")).unwrap();
         append_row(&p, &json!(42)).unwrap();

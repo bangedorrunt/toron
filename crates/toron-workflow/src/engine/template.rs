@@ -180,7 +180,6 @@ fn render_template_strict(
                 let token = &after[..end];
                 match resolve_template(token.trim(), trigger, step_outputs) {
                     Some(replaced) => out.push_str(&replaced),
-                    // Unresolvable — LOUD (ADR-0032 I10), never verbatim.
                     None => return Err(token.trim().to_string()),
                 }
                 rest = &after[end + 2..];
@@ -204,14 +203,11 @@ pub(crate) fn resolve_template(
 ) -> Option<String> {
     let (root, path) = match token.split_once('.') {
         Some((root, path)) => (root, path),
-        // Bare `{{item}}` — the current foreach iteration's value (injected
-        // into the iteration trigger by run_foreach).
         None if token == "item" => ("item", ""),
         None => return None,
     };
     let value = match root {
         "trigger" => trigger,
-        // `{{item}}` / `{{item.<path>}}` — the current foreach iteration value.
         "item" => {
             let item = trigger.get("item")?;
             if path.is_empty() {
@@ -219,10 +215,6 @@ pub(crate) fn resolve_template(
             }
             return descend(item, path.split('.')).map(render_scalar);
         }
-        // `{{inputs.x}}`: the invoke path embeds the caller's inputs under
-        // `trigger.inputs` (invoke synthesizes the trigger payload from them).
-        // Resolve the bare `inputs` root too — `{{inputs.goal}}` ==
-        // `{{trigger.inputs.goal}}` on the invoke path.
         "inputs" => {
             let inputs = trigger.get("inputs")?;
             if path.is_empty() {

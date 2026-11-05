@@ -22,8 +22,6 @@ fn every_upstream_durable_log_law_holds_through_the_kernel_port() {
 
 #[test]
 fn kernel_effect_table_is_toron_golden_table() {
-    // ADR-0002 forbids a third spelling: the journal's table must be the
-    // table toron already runs, pair for pair, before Phase 1 migrates.
     let names = [
         "prepared",
         "in_flight",
@@ -49,9 +47,6 @@ fn kernel_effect_table_is_toron_golden_table() {
 
 #[test]
 fn mail_append_capability_reconciles_and_never_refuses_blind() {
-    // Redesign §2.4: the log is the provider, so mail.append offers both an
-    // idempotency key and a reconcile query. An uncertain append after an
-    // expired lease is ReconcileFirst, never RefuseBlindRetry.
     let cap = ProviderCapability {
         supports_idempotency_key: true,
         supports_reconcile_query: true,
@@ -74,7 +69,6 @@ fn mail_append_capability_reconciles_and_never_refuses_blind() {
             "{state}"
         );
     }
-    // Negative control: a provider with no contract is refused.
     let none = ProviderCapability {
         supports_idempotency_key: false,
         supports_reconcile_query: false,

@@ -128,7 +128,6 @@ pub async fn try_acquire(
             conflicts: Vec::new(),
         });
     }
-    // Lost the race (or blocked): name the winner, write nothing.
     let active = active_slots(pool, &lease.project_slug).await?;
     let holders = conflict_for(&active, &lease.slot, &lease.agent_pubkey, lease.exclusive);
     Ok(AcquireSlotResult {
@@ -183,7 +182,6 @@ pub async fn active_slots(pool: &SqlitePool, project_slug: &str) -> anyhow::Resu
         .into_iter()
         .filter_map(|r| {
             let expires: Option<i64> = r.get("expires_ts_us");
-            // Expired → not active.
             if let Some(exp) = expires
                 && exp <= now
             {
@@ -315,8 +313,6 @@ mod tests {
 
     #[tokio::test]
     async fn try_acquire_concurrent_grants_exactly_one() {
-        // G3: eight concurrent exclusive acquirers converge on ONE winner;
-        // every loser names the holder (never a phantom grant).
         let (p, dir) = pool("race").await;
         let mut handles = Vec::new();
         for i in 0..8u32 {
@@ -345,8 +341,6 @@ mod tests {
 
     #[tokio::test]
     async fn try_acquire_own_reacquire_and_shared_coexist() {
-        // G3: own re-acquire always wins; shared vs shared never conflicts
-        // (overwrite semantics preserved from insert_slot).
         let (p, dir) = pool("reacq").await;
         let r1 = try_acquire(&p, &lease("ci", "A", "aaa", true))
             .await
@@ -378,13 +372,10 @@ mod tests {
             .unwrap();
         let active = active_slots(&p, "demo").await.unwrap();
 
-        // B (exclusive) conflicts with A's exclusive.
         let c1 = conflict_for(&active, "ci", "bbb", true);
         assert_eq!(c1, vec!["aaa".to_string()], "exclusive vs exclusive");
-        // B (shared) also conflicts with A's exclusive.
         let c2 = conflict_for(&active, "ci", "bbb", false);
         assert_eq!(c2, vec!["aaa".to_string()], "shared vs exclusive");
-        // A re-acquiring its own slot never conflicts.
         let c3 = conflict_for(&active, "ci", "aaa", true);
         assert!(c3.is_empty(), "own lease never conflicts");
 
@@ -406,7 +397,6 @@ mod tests {
     #[tokio::test]
     async fn expired_lease_not_active() {
         let (p, dir) = pool("expiry").await;
-        // Lease expires in the past.
         insert_slot(
             &p,
             &SlotLease {
@@ -428,11 +418,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Release by holder works; second release no-ops.
         assert!(release_slot(&p, "demo", "ci", "aaa").await.unwrap());
         assert!(!release_slot(&p, "demo", "ci", "aaa").await.unwrap());
 
-        // Re-acquire, then force-revoke via operator (G5 A1).
         insert_slot(&p, &lease("ci", "B", "bbb", true))
             .await
             .unwrap();

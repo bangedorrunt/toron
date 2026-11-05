@@ -1,7 +1,4 @@
 // governed-by: ADR-0007
-// R1 / D2 (ADR-0007): shared machine codes for the coordination fabric.
-// Mirrors the `BackendError` spirit (backend/error.rs): classification MUST
-// use `code`, never `message` text.
 
 use std::str::FromStr;
 
@@ -197,8 +194,6 @@ mod tests {
 
     #[test]
     fn mailbox_result_edge_round_trips() {
-        // G1: the typed edge carries codes end-to-end (anyhow bridge in,
-        // typed result out) without per-site signature churn.
         let via_anyhow: anyhow::Result<u32> = Err(anyhow::anyhow!("agent X not found"));
         let typed: MailboxResult<u32> = via_anyhow.map_mail_error();
         let err = typed.expect_err("maps to typed error");

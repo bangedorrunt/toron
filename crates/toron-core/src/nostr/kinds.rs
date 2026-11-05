@@ -104,14 +104,10 @@ mod tests {
 
     #[test]
     fn test_standard_kinds_are_frozen() {
-        // Standard kinds toron uses — verify the SDK's built-in Kind values
-        // match the registry (14/15/1059, 7). Kind 15 (file message) is not a
-        // named SDK variant; it stays as `Kind::Custom(15)`.
         assert_eq!(Kind::PrivateDirectMessage.as_u16(), 14);
         assert_eq!(Kind::GiftWrap.as_u16(), 1059);
         assert_eq!(Kind::Reaction.as_u16(), 7);
         assert_eq!(Kind::from_u16(15).as_u16(), 15);
-        // rust-nostr 0.45 named NIP-29 group kinds (ADR-0023).
         assert_eq!(Kind::GroupMetadata.as_u16(), CHANNEL_GROUP);
         assert_eq!(Kind::GroupMembers.as_u16(), CHANNEL_MEMBERS);
     }
@@ -140,12 +136,10 @@ mod tests {
             (WORKFLOW_RUN_FIRST, "workflow run first"),
             (WORKFLOW_RUN_LAST, "workflow run last"),
         ];
-        // Every ADR frozen value is present.
         assert_eq!(table.len(), 17, "frozen registry has 17 toron constants");
         for (value, _name) in table {
             assert_eq!(toron_kind(*value).as_u16(), *value);
         }
-        // No duplicates.
         let mut vals: Vec<u16> = table.iter().map(|(v, _)| *v).collect();
         let n = vals.len();
         vals.sort_unstable();
@@ -155,7 +149,6 @@ mod tests {
             n,
             "frozen registry has no duplicate kind values"
         );
-        // Kind ranges are internally consistent (const-time checked).
         const _: () = assert!(WORKFLOW_RUN_FIRST <= WORKFLOW_RUN_LAST);
         const _: () = assert!(
             (WORKFLOW_RUN_LAST - WORKFLOW_RUN_FIRST + 1) == 12,

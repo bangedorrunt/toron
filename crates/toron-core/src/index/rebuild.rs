@@ -67,17 +67,15 @@ impl MailRecord {
 /// Split a µs timestamp into calendar `(year, month)`.
 const fn calendar_ym(ts_us: i64) -> (u32, u32) {
     let secs = ts_us / 1_000_000;
-    // Days since epoch.
     let days = secs / 86_400;
-    // Civil-from-days (Howard Hinnant algorithm).
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     (year as u32, month as u32)
 }
@@ -90,8 +88,6 @@ pub async fn insert_record(writer: &IndexWriter, rec: &MailRecord) -> anyhow::Re
                 importance, ack_required, thread_id, reply_to, to_list, cc_list, \
                 created_ts_us, local_seq) \
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
-    // Writer exposes raw SQL execution without binds; use the write pool
-    // directly (single-writer discipline preserved by the pool size).
     let pool = writer.write_pool();
     let mut conn = pool.acquire().await?;
     sqlx::query(sql)
@@ -196,8 +192,6 @@ pub async fn rebuild_workflow_effects_from_log(
         store.restore_terminal_row(row, *ts).await?;
         applied += 1;
     }
-    // Tombstones: delete rows the fold dropped. The fold already applied
-    // tombstone removals, so diff the tables against it.
     let log = crate::index::event_log::EventLog::new(store.pool().clone());
     let mut deleted = 0u64;
     for event in log.read_since(0).await? {
@@ -266,7 +260,6 @@ pub async fn inspect_index(db_path: &Path) -> anyhow::Result<(bool, bool, Option
         Ok(p) => p,
         Err(_) => return Ok((true, false, None)),
     };
-    // integrity_check returns one row whose first column is "ok" on success.
     let integrity_ok = match sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
         .fetch_optional(&pool)
         .await
@@ -303,12 +296,9 @@ pub async fn build_fresh_index(
     let writer = IndexWriter::new(wp.clone(), rp.clone());
     let rebuilt = rebuild_index_from_git(&writer, archive_root).await?;
     drop(writer);
-    // Deterministically close ALL pool connections before sealing (a lingering
-    // idle connection could hold the checkpoint busy).
     rp.close().await;
     wp.close().await;
 
-    // Single connection: checkpoint + verify the main file is authoritative.
     let mut conn = crate::index::schema::connect_single(db_path).await?;
     let (busy, _log, _ckpt): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
         .fetch_one(&mut conn)
@@ -318,8 +308,6 @@ pub async fn build_fresh_index(
             "wal_checkpoint busy={busy}; refusing to seal a fresh index that may still have uncheckpointed WAL frames"
         );
     }
-    // Post-checkpoint count: the WAL is truncated, so this reads the MAIN
-    // file — the file the caller will rename into place.
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
         .fetch_one(&mut conn)
         .await?;
@@ -395,7 +383,6 @@ mod tests {
         let archive_root = dir.join("archive");
         let db_path = dir.join("index.sqlite").to_str().unwrap().to_string();
 
-        // --- populate: archive + index both written ---
         let archive = GitArchive::open_or_init(&archive_root).expect("init archive");
         let (w, r) = {
             let wp = schema::connect(&db_path).await.unwrap();
@@ -413,12 +400,10 @@ mod tests {
         assert_eq!(before.len(), 2);
         assert_eq!(before[0].0, "evt-1");
 
-        // --- destroy SQLite ---
         drop((w, r, writer));
         let _ = std::fs::remove_file(&db_path);
         assert!(std::fs::metadata(&db_path).is_err(), "sqlite destroyed");
 
-        // --- rebuild from Git archive ---
         let wp = schema::connect(&db_path).await.unwrap();
         schema::migrate(&wp).await.unwrap();
         let rp = schema::connect(&db_path).await.unwrap();
@@ -428,7 +413,6 @@ mod tests {
             .expect("rebuild");
         assert_eq!(rebuilt, 2, "both records re-inserted");
 
-        // --- convergence: snapshot matches prior state ---
         let after = index_snapshot(&writer2).await;
         assert_eq!(before, after, "fetch_inbox-equivalent snapshot converges");
 
@@ -449,7 +433,6 @@ mod tests {
         let recs = sample_records();
         let n = replay_sink(&writer, &recs).await.expect("replay");
         assert_eq!(n, 2);
-        // Idempotent — replaying again does not duplicate (INSERT OR IGNORE).
         let n2 = replay_sink(&writer, &recs).await.expect("replay again");
         assert_eq!(n2, 2);
         let rows = writer
@@ -465,11 +448,9 @@ mod tests {
 
     #[test]
     fn calendar_ym_matches_layout() {
-        // 2026-08-06 ~ 2026-08 epoch days.
         let (y, m) = calendar_ym(1_752_825_600_000_000);
         assert!((2025..=2027).contains(&y), "year in range: {y}");
         assert!((1..=12).contains(&m), "month in range: {m}");
-        // Deterministic: same input → same output.
         assert_eq!(calendar_ym(1_752_825_600_000_000), (y, m));
     }
 }

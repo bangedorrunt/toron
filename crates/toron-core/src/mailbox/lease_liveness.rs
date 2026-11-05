@@ -99,8 +99,6 @@ pub async fn read_activity_snapshot(
             rows
         }
         Err(e) => {
-            // Log once per outage, not once per 15 s tick: the first
-            // failure is the signal, the rest is a stuck counter.
             if !SNAPSHOT_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
                     error = %e,
@@ -142,11 +140,6 @@ impl Drop for LeaseLivenessGuard {
 impl LeaseLivenessGuard {
     async fn install(pool: sqlx::SqlitePool, ttl_secs: u64) -> Self {
         let live: Arc<RwLock<ActivityMap>> = Arc::new(RwLock::new(ActivityMap::new()));
-        // Initial load before the predicate goes live: an immediate serve
-        // must vouch holders polled before boot, not after the first tick.
-        // A failed first read keeps the empty set (nothing to keep yet) —
-        // the predicate then vouches nobody until SQLite answers, which is
-        // fail-closed toward expiry, never toward a phantom live set.
         let now_us = host_now_us();
         let first = read_activity_snapshot(&pool, ttl_secs, now_us).await;
         *live.write().unwrap_or_else(|e| e.into_inner()) =
@@ -166,8 +159,6 @@ impl LeaseLivenessGuard {
                 let now_us = host_now_us();
                 let snap = read_activity_snapshot(&pool, ttl_secs, now_us).await;
                 if let Ok(mut m) = live.write() {
-                    // A failed read keeps the previous map: an error is
-                    // never published as an empty live set.
                     *m = apply_snapshot(std::mem::take(&mut *m), snap);
                 }
             }
@@ -285,7 +276,6 @@ mod tests {
             .await
             .expect("agent");
         }
-        // A reader whose inbox is empty: stale delivery cursor, fresh poll.
         sqlx::query(
             "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us, last_poll_us) \
              VALUES ('demo', 'PollPin', 'P', ?1, ?2)",
@@ -295,7 +285,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("poll cursor");
-        // A cursor for an unregistered name joins to nothing (never vouched).
         for (name, seen) in [
             ("LivePin", fresh_us),
             ("QuietPin", stale_us),

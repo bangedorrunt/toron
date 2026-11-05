@@ -32,13 +32,10 @@ pub fn evaluate(
     if !matches!(action, Action::Reduce { .. }) {
         return fail("reduce: not a reduce action");
     }
-    // Strict render first: an unresolvable ref fails here with attribution.
     let render_outputs: Map<String, Value> = outputs
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    // `{{item}}` is deferred context: render the action with the join
-    // template removed, then restore it for the per-item pass.
     let mut to_render = action.clone();
     if let Action::Reduce { template, .. } = &mut to_render {
         *template = None;
@@ -214,7 +211,6 @@ fn resolve_list(
             )),
         };
     }
-    // A ref path: trigger.<path> / steps.<name>.<path>.
     let path = text.strip_prefix("{{").and_then(|s| s.strip_suffix("}}"));
     let path = path.map(str::trim).unwrap_or(text);
     let value = resolve_path(path, trigger, outputs).ok_or_else(|| {
@@ -293,8 +289,6 @@ fn render_item(template: &str, item: &Value) -> String {
         } else if let Some(path) = token.strip_prefix("item.") {
             walk(item, path).unwrap_or(&Value::Null)
         } else {
-            // An unknown token stays verbatim, matching the renderer's
-            // deferred-context rule for iteration bodies.
             out.push_str(&rest[start..start + 2 + end + 2]);
             rest = &after[end + 2..];
             continue;

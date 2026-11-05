@@ -190,7 +190,6 @@ fn test_bus_error_display_redacts_nothing_sensitive() {
     assert_eq!(format!("{e}"), "event failed verification: id mismatch");
 }
 
-// Compile-time: the trait object is usable as a dependency for mailbox.
 fn _assert_trait_object(_b: &dyn Bus) {}
 
 #[test]

@@ -47,7 +47,6 @@ impl Mailbox {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
 
-        // Idempotent: re-read existing kind-30011 for this product key.
         let existing = self
             .find_product(product_key)
             .await?
@@ -57,7 +56,6 @@ impl Mailbox {
             Some((id, members)) => (id, members),
             None => {
                 let base = vec![Tag::parse(["d", product_key]).expect("d")];
-                // Products aren't project-scoped; the operator owns them.
                 let tags = with_project_scoping(toron_kind(PRODUCT_MANIFEST), base, None);
                 let content = format!(
                     r#"{{"name":{}}}"#,
@@ -101,15 +99,12 @@ impl Mailbox {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
 
-        // Re-publish the product manifest with the member a-tag (operator
-        // replaces their own kind-30011 per NIP-33 author isolation).
         let existing = self.find_product(product_key).await?;
         let mut members = existing
             .as_ref()
             .map(member_projects_of)
             .unwrap_or_default();
         if members.contains(&project_slug.to_string()) {
-            // Already linked — idempotent no-op.
             let name = existing
                 .as_ref()
                 .and_then(parse_product_name)
@@ -127,8 +122,6 @@ impl Mailbox {
 
         let mut tags = vec![Tag::parse(["d", product_key]).expect("d")];
         for slug in &members {
-            // a-coordinate: kind 30010 (project manifest), author=operator,
-            // d=slug.
             let coord = format!("30010:{}:{slug}", operator.public_key().to_hex());
             tags.push(Tag::parse(["a", &coord]).expect("a tag"));
         }
@@ -183,7 +176,6 @@ impl Mailbox {
                 out.push((project.clone(), m));
             }
         }
-        // Merge: newest first across projects.
         out.sort_by_key(|(_, m)| std::cmp::Reverse(m.created_ts_us));
         Ok(out)
     }
@@ -209,10 +201,6 @@ impl Mailbox {
                 out.push((project.clone(), m));
             }
         }
-        // ADR-0037 §4.2/§4.4: one pin is one key, so every member project's
-        // inbox is the same key's inbox. Show each message once, under the
-        // project it was sent in (the index attributes it by the rumor's `t`
-        // tag); with no index row, the first member project keeps it.
         let mut home: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if let Some(pool) = self.index_pool.as_ref() {
             for (_, m) in &out {
@@ -274,7 +262,6 @@ impl Mailbox {
         if let Some(ev) = self.find_product(product_key).await? {
             return Ok(member_projects_of(&ev));
         }
-        // Fall back to the index mirror.
         if let Some(pool) = self.index_pool() {
             let rows = sqlx::query(
                 "SELECT p.project_slug FROM product_projects p \
@@ -349,7 +336,6 @@ impl Mailbox {
         let Some(pool) = self.index_pool() else {
             return Ok(());
         };
-        // Upsert the product (ensure id), then replace memberships.
         let product_id: i64 = sqlx::query_scalar(
             "INSERT INTO products (product_key, name, created_ts_us) VALUES (?1, '', ?2) \
              ON CONFLICT (product_key) DO UPDATE SET product_key = excluded.product_key \
@@ -382,7 +368,6 @@ impl Mailbox {
         Ok(())
     }
 
-    // Keep PublicKey imported for future cross-project resolution (G2).
     #[allow(dead_code)]
     const fn _pubkey_type(_k: PublicKey) {}
 }
@@ -397,7 +382,6 @@ fn member_projects_of(ev: &crate::nostr::Event) -> Vec<String> {
                 return None;
             }
             let coord = parts.get(1)?;
-            // "30010:<operator-pubkey>:<slug>"
             let mut it = coord.split(':');
             let kind = it.next()?;
             if kind != "30010" {
@@ -456,7 +440,6 @@ mod tests {
             .expect("ensure");
         assert_eq!(a.product_key, "notetoself");
 
-        // Kind-30011 published.
         let filter = ToronFilter::new()
             .kinds([toron_kind(PRODUCT_MANIFEST)])
             .build();
@@ -473,7 +456,6 @@ mod tests {
     #[tokio::test]
     async fn test_link_two_projects_and_fan_search() {
         let (mailbox, db_path, data_dir) = test_mailbox("link").await;
-        // Create two projects (kind-30010 manifests).
         mailbox.ensure_project("alpha").await.expect("proj alpha");
         mailbox.ensure_project("beta").await.expect("proj beta");
         mailbox
@@ -490,7 +472,6 @@ mod tests {
             .await
             .expect("link beta");
 
-        // Fan search across both projects.
         let pool = mailbox.index_pool().unwrap();
         for (project, eid) in [("alpha", "a1"), ("beta", "b1")] {
             sqlx::query(

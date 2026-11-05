@@ -1,9 +1,4 @@
 // governed-by: ADR-0003, ADR-0031
-// bd-led.6.1: shared backend types — pane id, agent status, events.
-// Wire contract mirrors herdr protocol v20 (AgentStatus lowercase JSON).
-// ADR-0031 S1: PaneId is opaque (adapters construct via new(), cores only
-// compare/clone/as_str); raw backend status strings enter only through
-// normalize_agent_status(), never FromStr/.parse() in reducers.
 
 use std::fmt;
 use std::str::FromStr;
@@ -179,8 +174,6 @@ pub struct SpawnOptions {
     pub cwd: Option<String>,
 }
 
-// ponytail: one test module, no helper abstractions. Upgrade to
-// proptest strategies if dialect surface grows past herdr + superlogical.
 #[cfg(test)]
 mod backend_types_s1 {
     use super::*;
@@ -196,7 +189,6 @@ mod backend_types_s1 {
 
     #[test]
     fn unknown_never_proves_completion() {
-        // Empty, future-dialect, wrong-case: all fail safe to Unknown.
         for raw in ["", "IDDLE", "Idle", "superlogical:busy", "w1:p1", "done "] {
             assert_eq!(
                 normalize_agent_status(raw),
@@ -208,7 +200,6 @@ mod backend_types_s1 {
 
     #[test]
     fn from_str_is_lenient_via_normalizer() {
-        // Any .parse() path fails safe too; named importer preferred.
         assert_eq!(
             "working".parse::<AgentStatus>().expect("parses"),
             AgentStatus::Working
@@ -223,7 +214,6 @@ mod backend_types_s1 {
 
     #[test]
     fn pane_id_opaque_compare_clone_only() {
-        // Adapters construct; cores compare/clone/as_str. No .0 access.
         let a = PaneId::new("w1:p1");
         let b = PaneId::from("w1:p1");
         let c: PaneId = "w1:p2".into();
@@ -232,7 +222,6 @@ mod backend_types_s1 {
         assert_eq!(a.as_str(), "w1:p1");
         assert_eq!(a.clone().into_string(), "w1:p1");
         assert!(PaneId::empty().is_empty());
-        // Serde stays transparent for the wire (no shape change).
         let json = serde_json::to_string(&a).expect("serializes");
         assert_eq!(json, "\"w1:p1\"");
         assert_eq!(serde_json::from_str::<PaneId>(&json).expect("parses"), a);

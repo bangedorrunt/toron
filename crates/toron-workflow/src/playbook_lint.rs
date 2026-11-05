@@ -37,7 +37,6 @@ use crate::schema::{Action, Graph, Step, Workflow};
 /// list in via [`lint_workflow_with_principles`] to keep the dep direction
 /// clean. Kept in sync by `test_default_registry_matches_spec5`.
 pub const DEFAULT_PRINCIPLE_NAMES: [&str; 21] = [
-    // Core
     "laziness-protocol",
     "foundational-thinking",
     "redesign-from-first-principles",
@@ -47,21 +46,17 @@ pub const DEFAULT_PRINCIPLE_NAMES: [&str; 21] = [
     "experience-first",
     "exhaust-the-design-space",
     "build-the-lever",
-    // Architecture
     "model-the-domain",
     "boundary-discipline",
     "type-system-discipline",
     "make-operations-idempotent",
     "migrate-callers-then-delete-legacy-apis",
     "separate-before-serializing-shared-state",
-    // Verification
     "prove-it-works",
     "fix-root-causes",
     "sequence-verifiable-units",
-    // Delegation
     "guard-the-context-window",
     "never-block-on-the-human",
-    // Meta
     "encode-lessons-in-structure",
 ];
 
@@ -97,7 +92,7 @@ pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[
     lint_phase_rules(report, wf);
 
     let Some(shape) = shape_of(&wf.name) else {
-        return; // Non-playbook workflows carry no structural constraint.
+        return;
     };
     match shape {
         PlaybookShape::Feature => lint_feature(report, wf),
@@ -106,10 +101,6 @@ pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[
         PlaybookShape::Forensics => lint_forensics(report, wf),
     }
 }
-
-// ---------------------------------------------------------------------------
-// ADR-0022 §3.5 phase gates (R-P1..R-P4)
-// ---------------------------------------------------------------------------
 
 /// ADR-0022 §3.5 Layer 5 phase gates. Phase-scoped, NOT playbook-shape
 /// scoped: they fire on any workflow whose `dispatch_job` specs carry a
@@ -134,8 +125,6 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
         return;
     };
 
-    // R-P1 — the graduation valve stays loud: unknown extra fields warn,
-    // naming the field (ADR-0022 §3.1: extra is a staging area, not a shim).
     for key in spec.extra.keys() {
         if PHASE_CARRIER_KEYS.contains(&key.as_str()) {
             continue;
@@ -150,13 +139,11 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
     }
 
     let Some(phase) = spec.phase.as_deref() else {
-        return; // Unphased dispatches are not gated.
+        return;
     };
 
     match phase {
         "implement" => {
-            // R-P2 — implement carries its acceptance command (extends the
-            // bug-fix repro rule family: evidence over claims).
             let has_acceptance = spec
                 .extra
                 .get("acceptance")
@@ -173,8 +160,6 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
             }
         }
         "review" => {
-            // R-P3 — review fan-outs declare n >= 2 statically (extends the
-            // prototype/arena n rule).
             match spec.extra.get("n").and_then(parse_u64) {
                 Some(n) if n >= 2 => {}
                 other => error(
@@ -188,7 +173,6 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
             }
         }
         "plan" => {
-            // R-P4 — plan declares inputs.data_shape and rides a planner role.
             let references_data_shape = spec
                 .string_values()
                 .iter()
@@ -221,10 +205,6 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
     }
 }
 
-// ---------------------------------------------------------------------------
-// feature: data_shape input required
-// ---------------------------------------------------------------------------
-
 /// ADR-0019 Spec 6 `foundational-thinking`: the `feature` workflow requires a
 /// `data_shape` input — declared in `inputs:` or provided at invoke
 /// (`{{inputs.data_shape}}` referenced by a step). Missing -> Error.
@@ -250,10 +230,6 @@ fn lint_feature(report: &mut LintReport, wf: &Workflow) {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// bug-fix: repro predecessor before any fix step
-// ---------------------------------------------------------------------------
 
 /// ADR-0019 Spec 6 `fix-root-causes`: a `bug-fix` workflow must reproduce
 /// before it fixes. Graph form: every node named `fix` must reach a `repro`
@@ -282,7 +258,6 @@ fn lint_bug_fix_graph(report: &mut LintReport, graph: &Graph) {
         );
         return;
     }
-    // Transitive needs-closure per node (repro reachable through any chain).
     for (name, node) in nodes {
         if name != "fix" {
             continue;
@@ -334,10 +309,6 @@ fn lint_bug_fix_steps(report: &mut LintReport, steps: &[Step]) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// prototype / arena: n >= 2 + mode rules
-// ---------------------------------------------------------------------------
 
 /// ADR-0019 Spec 6 `exhaust-the-design-space`: prototype/arena require n >= 2
 /// competing arms (n=1 -> Error). Mode rules (Spec 7.2 as amended
@@ -440,8 +411,6 @@ fn lint_sketch_mode(report: &mut LintReport, wf: &Workflow) {
     }
     if let Some(graph) = &wf.graph {
         for node in graph.nodes.values() {
-            // A node that itself opts into build-slot serialization is a
-            // compile-mode subtree — build paths are legitimate there.
             if node.build_slot {
                 continue;
             }
@@ -449,10 +418,6 @@ fn lint_sketch_mode(report: &mut LintReport, wf: &Workflow) {
         }
     }
     for s in &strings {
-        // Allow the explicit ban phrase "no .beads" — the task documents that
-        // sketches must NOT write to .beads, not that they do. The lint should
-        // not flag the ban itself as a violation (the test expects the ban is
-        // present, the lint expects no repo path is referenced).
         if s.to_lowercase().contains("no .beads") {
             continue;
         }
@@ -534,10 +499,6 @@ const REPO_BUILD_PATH_TOKENS: [&str; 9] = [
     "cargo check",
     "git checkout",
 ];
-
-// ---------------------------------------------------------------------------
-// forensics: NO fix/mutating step
-// ---------------------------------------------------------------------------
 
 /// ADR-0019 Spec 7.2 `forensics`: diagnosis is the artifact — NO fix step, no
 /// mutating step. A fix is a separate `bug-fix` after the captain accepts the
@@ -632,10 +593,6 @@ fn contains_fix_verb(text: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// principles: names validate against the registry
-// ---------------------------------------------------------------------------
-
 /// ADR-0019 wave-2: `principles:` names must be in the canonical 21-name
 /// registry (Spec 5). Unknown -> Error; duplicate -> Warning.
 fn lint_principles(report: &mut LintReport, wf: &Workflow, principle_names: &[&str]) {
@@ -661,10 +618,6 @@ fn lint_principles(report: &mut LintReport, wf: &Workflow, principle_names: &[&s
     }
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
 /// Parse an input default as an integer (accepts a YAML number or a numeric
 /// string).
 fn parse_u64(value: &serde_json::Value) -> Option<u64> {
@@ -689,8 +642,6 @@ fn collect_step_strings(step: &Step, out: &mut Vec<String>) {
 
 fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
     match action {
-        // bd-ynef: a park's strings can hold templates, so they are scanned
-        // like any other authored text.
         Action::Park {
             until_ms, reason, ..
         } => {
@@ -823,7 +774,6 @@ mod tests {
     #[test]
     fn default_registry_has_exactly_21_canonical_names() {
         let expected: [&str; 21] = [
-            // Core
             "laziness-protocol",
             "foundational-thinking",
             "redesign-from-first-principles",
@@ -833,28 +783,22 @@ mod tests {
             "experience-first",
             "exhaust-the-design-space",
             "build-the-lever",
-            // Architecture
             "model-the-domain",
             "boundary-discipline",
             "type-system-discipline",
             "make-operations-idempotent",
             "migrate-callers-then-delete-legacy-apis",
             "separate-before-serializing-shared-state",
-            // Verification
             "prove-it-works",
             "fix-root-causes",
             "sequence-verifiable-units",
-            // Delegation
             "guard-the-context-window",
             "never-block-on-the-human",
-            // Meta
             "encode-lessons-in-structure",
         ];
         assert_eq!(DEFAULT_PRINCIPLE_NAMES.len(), 21);
         assert_eq!(DEFAULT_PRINCIPLE_NAMES.as_slice(), expected);
-        // The plausible fake from the registry bead's acceptance must fail.
         assert!(!DEFAULT_PRINCIPLE_NAMES.contains(&"prove-it-work"));
-        // Each canonical name is known.
         for n in expected {
             assert!(DEFAULT_PRINCIPLE_NAMES.contains(&n));
         }
@@ -867,7 +811,6 @@ mod tests {
         assert_eq!(shape_of("prototype"), Some(PlaybookShape::Prototype));
         assert_eq!(shape_of("arena"), Some(PlaybookShape::Arena));
         assert_eq!(shape_of("forensics"), Some(PlaybookShape::Forensics));
-        // Non-playbook workflows are not constrained.
         assert_eq!(shape_of("goal"), None);
         assert_eq!(shape_of("perf"), None);
         assert_eq!(shape_of(""), None);
@@ -903,10 +846,6 @@ steps:
             report.issues
         );
     }
-
-    // -------------------------------------------------------------------
-    // ADR-0022 §3.5 phase gates R-P1..R-P4 (bd-adr22-phase-enum-lint-ahfh)
-    // -------------------------------------------------------------------
 
     /// R-P1: unknown extra fields on a dispatch_job spec warn, naming the
     /// field — the graduation valve must stay loud (ADR-0022 §3.1/§3.5).
@@ -1158,7 +1097,6 @@ steps:
     spec: { task: "ad hoc", mystery_knob: 3 }
 "#;
         let report = lint_yaml(yaml).unwrap();
-        // R-P1 still applies (extra-field warning), but no phase errors.
         assert!(
             !report.issues.iter().any(|i| i.level == Level::Error),
             "unphased specs get no phase errors: {:?}",

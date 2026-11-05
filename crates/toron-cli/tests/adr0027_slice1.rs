@@ -39,10 +39,6 @@ fn run_with_data_dir(args: &[&str], data_dir: &std::path::Path) -> std::process:
     let mut cmd = toron();
     cmd.env("TORON_MCP_DATA_DIR", data_dir)
         .env("TORON_DATA_DIR", data_dir)
-        // An ambient TORON_MCP_URL outranks the data-dir pin
-        // (`mailbox_source::decide_source` checks the daemon URL first), so
-        // the CLI would hit a live daemon instead of this test's store and
-        // reject the locally registered recipient (bd-5z0l).
         .env_remove("TORON_MCP_URL")
         .args(args)
         .output()
@@ -69,23 +65,8 @@ fn ensure_project(data_dir: &std::path::Path, slug: &str) {
 }
 
 const fn register_agent(data_dir: &PathBuf, project: &str, name: &str) {
-    // Use the `mail` registration via the mailbox directly is not via CLI;
-    // instead we rely on the CLI's ability to create the agent on first send?
-    // The toron CLI `mail send` requires a local key; we create it by using
-    // the underlying `toron-core` registration via a helper binary.
-    // For CLI e2e we use `flywheel` style: call `toron` with a helper?
-    // Simpler: use `toron-cli` test helper — we create the agent via the
-    // library's `register_agent` if needed, but for CLI we just ensure the
-    // project exists and let the first send create the sender's key if absent.
-    // Instead, we use `cargo test` helper that registers via mailbox library.
-    // For now, ensure the data_dir has a project manifest; the CLI will auto-
-    // create agent keys on demand when `mail send --as` is used with a new name
-    // (it generates an ncryptsec key if missing — check implementation).
-    // We just ensure the project exists.
     let _ = (data_dir, project, name);
 }
-
-// ── send flags exist and ride extra_tags (not envelope) ──
 
 #[test]
 fn adr0027_s1_toron_mail_send_flags_in_help() {
@@ -105,7 +86,6 @@ fn adr0027_s1_toron_mail_send_flags_in_help() {
             "toron mail send --help must list {flag}, got: {help}"
         );
     }
-    // verify the flags are typed (help mentions standing|tasked etc)
     assert!(
         help.contains("standing") || help.contains("wake"),
         "help should mention wake vocabulary"
@@ -114,10 +94,6 @@ fn adr0027_s1_toron_mail_send_flags_in_help() {
 
 #[test]
 fn adr0027_s1_toron_mail_send_corr_rides_rumor_not_envelope() {
-    // Mailbox-level proof that extra_tags ride the rumor (kind 14) not the
-    // sealed envelope (kind 1059) lives in `crates/toron-core/src/mailbox/send_tags.rs`
-    // `send_tags_mail_rumor_carries_and_not_envelope`. Here we verify the CLI
-    // wiring: flags are RECOGNIZED (not "unexpected argument") and help lists them.
     let out = run(&["mail", "send", "--help"]);
     let help =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
@@ -125,24 +101,19 @@ fn adr0027_s1_toron_mail_send_corr_rides_rumor_not_envelope() {
         help.contains("--corr") && help.contains("--wake"),
         "CLI must recognize --corr/--wake (bd-2u27), got help: {help}"
     );
-    // Deeper rumor vs envelope assertion is in core; this CLI test only pins recognition.
 }
 
 #[test]
 fn adr0027_s1_toron_mail_send_rejects_unknown_wake() {
-    // Typed vocabulary: wake must be standing|tasked, not free string. Use the
-    // library's SendTags parser (same boundary the CLI uses).
     use toron_core::mailbox::send_tags::{SendTags, Wake};
     use toron_core::nostr::Tag;
     let bad = Tag::parse(["wake", "bogus"]).expect("tag");
     let err = SendTags::parse(&[bad]).expect_err("unknown wake must error");
     assert!(err.message.contains("unknown wake"), "{err}");
-    // also check that the CLI help mentions the typed vocab (standing|tasked)
     let out = run(&["mail", "send", "--help"]);
     let help =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(help.contains("standing") || help.contains("tasked") || help.contains("wake"));
-    // ensure Wake::parse rejects
     assert!(Wake::parse("bogus").is_err());
 }
 
@@ -152,8 +123,6 @@ fn adr0027_s1_toron_mail_send_rejects_unknown_wake() {
 /// `send_tags_validate_send_guards`), same `SendTags` calls, no subprocess.
 /// `rejects_unknown_wake` stays: it additionally pins the CLI `--help`
 /// vocabulary surface, a risk the unit tests cannot reach.
-
-// ── receipts store (bd-gokp) ──
 
 #[test]
 fn adr0027_s1_toron_receipt_help_lists_get_and_list() {
@@ -175,8 +144,6 @@ fn adr0027_s1_toron_receipt_help_lists_get_and_list() {
 
 #[tokio::test]
 async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
-    // Direct ReceiptStore proof (the durable truth behind `toron receipt get`).
-    // This mirrors the S1 scenario: upsert corr=FM-GS-012, new process still sees it.
     use toron_core::index::schema;
     use toron_core::mailbox::send_tags::Wake;
     use toron_core::mailbox::{Receipt, ReceiptState};
@@ -201,7 +168,6 @@ async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
     let got = store.get("FM-GS-012").await.expect("get").expect("found");
     assert_eq!(got, r);
 
-    // Simulate walker death: new pool (new process) reading same sqlite file
     drop(store);
     drop(pool);
     let pool2 = schema::connect(db_path.to_str().unwrap())
@@ -218,7 +184,6 @@ async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
         "new process must still see owed/acked (receipts table, not HashMap)"
     );
 
-    // Empty tasked still writes a result (different corr) — one-line result + result_path
     let r2 = Receipt {
         corr: "FM-GS-012-empty".into(),
         state: ReceiptState::Resulted,
@@ -279,16 +244,11 @@ async fn adr0027_s1_toron_receipt_upsert_is_idempotent() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-// ── source-scan guards that are now GREEN (keep as regression guards) ──
-
 #[test]
 fn adr0027_s1_guard_toron_send_extra_tags_not_envelope() {
-    // The CLI sends via SendMessage.extra_tags (rumor) not envelope.
-    // Verify by file scan: cli.rs mail send field `extra_tags` wiring exists.
     let content =
         std::fs::read_to_string("crates/toron-core/src/mailbox/messaging.rs").unwrap_or_default();
     if content.is_empty() {
-        // when running from crates/toron-cli, the relative path differs
         let content =
             std::fs::read_to_string("../toron-core/src/mailbox/messaging.rs").unwrap_or_default();
         assert!(
@@ -300,13 +260,7 @@ fn adr0027_s1_guard_toron_send_extra_tags_not_envelope() {
     }
 }
 
-// ── bd-hign: no-seed e2e (real CLI flow, not seeded store) ──
-
 fn register_agents_in_dir(data_dir: &std::path::Path, project: &str, names: &[&str]) {
-    // Blocking helper that registers `names` into `data_dir/index.sqlite`
-    // so a later shelled-out `toron` with TORON_MCP_DATA_DIR sees them.
-    // Must use the SAME default passphrase and no operator as demo_mailbox,
-    // else the CLI cannot decrypt the ncryptsec files (was "no local key").
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         use std::sync::Arc;
@@ -323,7 +277,6 @@ fn register_agents_in_dir(data_dir: &std::path::Path, project: &str, names: &[&s
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
             .expect("bus for register");
-        // demo_mailbox uses no operator and default passphrase "toron-dev"
         let mailbox =
             Mailbox::new(Arc::new(bus), data_dir.to_path_buf(), None).with_index_pool(pool);
         for name in names {
@@ -344,8 +297,6 @@ fn register_agents_in_dir(data_dir: &std::path::Path, project: &str, names: &[&s
 
 #[test]
 fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
-    // No-seed proof: send via CLI with --corr, then receipt get shows owed WITHOUT
-    // any direct ReceiptStore seeding; ack -> acked; receipt set -> resulted.
     let data_dir = temp_data_dir("bd-hign-e2e");
     let project = "demo";
     register_agents_in_dir(&data_dir, project, &["SenderOne", "RecvOne"]);
@@ -358,7 +309,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
             .as_nanos()
     });
 
-    // 1. send with corr via CLI (real producer)
     let out = run_with_data_dir(
         &[
             "mail",
@@ -387,7 +337,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         String::from_utf8_lossy(&out.stderr)
     );
     let send_val: serde_json::Value = serde_json::from_slice(&out.stdout).expect("send emits JSON");
-    // send should have at least one delivery
     let deliveries = send_val
         .get("deliveries")
         .or_else(|| send_val.get("payload"));
@@ -396,7 +345,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "send output has deliveries/count, got: {send_val}"
     );
 
-    // 2. receipt get must show owed (no seeded row — real flow)
     let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
     assert!(
         out.status.success(),
@@ -415,7 +363,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "corr echo, got: {r}"
     );
 
-    // 3. find message id via inbox
     let out = run_with_data_dir(
         &[
             "mail",
@@ -446,7 +393,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         .to_string();
     assert!(!msg_id.is_empty(), "message id must be non-empty");
 
-    // 4. ack the message (RecvOne acks)
     let out = run_with_data_dir(
         &[
             "mail",
@@ -467,7 +413,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 5. receipt get must now show acked (owed -> acked transition)
     let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
     assert!(
         out.status.success(),
@@ -481,7 +426,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "after ack, receipt state must be acked, got: {r}"
     );
 
-    // ack idempotency: ack again stays acked
     let out = run_with_data_dir(
         &[
             "mail",
@@ -506,7 +450,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "second ack must stay acked (idempotent), got: {r}"
     );
 
-    // 6. receipt set to resulted (explicit verb)
     let out = run_with_data_dir(
         &[
             "receipt",
@@ -538,7 +481,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "result_path must be persisted, got: {r}"
     );
 
-    // 7. receipt get must show resulted
     let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
     let r: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("receipt get after resulted");
@@ -548,7 +490,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "final receipt state must be resulted, got: {r}"
     );
 
-    // 8. resulted never downgrades: ack after resulted must stay resulted
     let out = run_with_data_dir(
         &[
             "mail",
@@ -576,7 +517,6 @@ fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
         "resulted must never downgrade to acked, got: {r}"
     );
 
-    // 9. wait --corr must return immediately when receipt exists (E9 unchanged)
     let out = run_with_data_dir(
         &["wait", "--corr", &corr, "--project", project, "--json"],
         &data_dir,

@@ -68,11 +68,8 @@ impl Mailbox {
         reservation_reason: Option<&str>,
         inbox_limit: Option<usize>,
     ) -> anyhow::Result<StartSessionResult> {
-        // 1. Ensure the project manifest exists (idempotent).
         self.ensure_project(project_key).await?;
 
-        // 2. Register/create the agent (idempotent; create_agent_identity
-        //    would mint a fresh key each time, so use register for sessions).
         let profile = AgentProfile {
             name: agent_name.to_string(),
             program: Some(program.to_string()),
@@ -82,7 +79,6 @@ impl Mailbox {
         };
         let agent = self.register_agent(project_key, &profile).await?;
 
-        // 3. Optional reservation cycle.
         let granted = if let Some(paths) = reservation_paths {
             let res = self
                 .file_reservation_paths(
@@ -99,7 +95,6 @@ impl Mailbox {
             Vec::new()
         };
 
-        // 4. Inbox snapshot.
         let inbox = self
             .fetch_inbox(&FetchInbox {
                 project_slug: project_key.to_string(),
@@ -134,7 +129,6 @@ impl Mailbox {
         include_examples: bool,
         inbox_limit: Option<usize>,
     ) -> anyhow::Result<PrepareThreadResult> {
-        // Ensure registration (upsert if absent; no-op if the agent exists).
         if register_if_missing {
             let profile = AgentProfile {
                 name: agent_name.to_string(),
@@ -148,12 +142,10 @@ impl Mailbox {
         }
         let who = self.whois(project_key, agent_name).await?;
 
-        // Summarize the thread.
         let summary = self
             .summarize_thread(project_key, thread_id, include_examples, false, None)
             .await?;
 
-        // Recent inbox context.
         let inbox = self
             .fetch_inbox(&FetchInbox {
                 project_slug: project_key.to_string(),
@@ -330,7 +322,6 @@ mod tests {
         assert_eq!(result.granted_reservations[0].path_pattern, "src/**");
         assert_eq!(result.inbox_count, 0, "empty inbox snapshot");
 
-        // whois confirms the agent registered.
         let w = mailbox.whois("demo", "GreenCastle").await.expect("whois");
         assert_eq!(w.npub, result.npub);
 
@@ -361,7 +352,6 @@ mod tests {
         assert_eq!(result.granted.len(), 1);
         assert_eq!(result.released, 1, "auto_release released the lease");
 
-        // No active reservation remains.
         let active = mailbox.active_reservations("demo").await.expect("active");
         assert!(
             active.iter().all(|r| r.path_pattern != "src/**"),
@@ -414,7 +404,6 @@ mod tests {
     #[tokio::test]
     async fn test_macro_prepare_thread_composes() {
         let (mailbox, db_path, data_dir) = test_mailbox("thread").await;
-        // Seed a thread in the index so summarize has content.
         let pool = mailbox.index_pool().unwrap();
         sqlx::query(
             "INSERT INTO messages \

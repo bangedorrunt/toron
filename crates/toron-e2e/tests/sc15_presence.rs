@@ -48,14 +48,11 @@ async fn sc15_ephemeral_presence_not_archived() {
     let ttl = Duration::from_secs(30);
     let broker = PresenceBroker::start(Arc::new(bus.clone()), ttl);
 
-    // Let the broker's subscription register before publishing (replay→EOSE→
-    // live delivery needs the sub to be active).
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // --- 1. Agents broadcast kind-20001 heartbeats ---
     let pi = Keys::generate();
     let oc = Keys::generate();
-    let t0 = 1_700_000_000u64; // controlled heartbeat ts
+    let t0 = 1_700_000_000u64;
 
     for (keys, state, status) in [
         (&pi, PresenceState::Working, Some("reviewing".to_string())),
@@ -77,11 +74,9 @@ async fn sc15_ephemeral_presence_not_archived() {
         .expect("build presence event");
         assert_eq!(evt.kind.as_u16(), 20001, "kind-20001");
         let ok = bus.publish(evt).await.expect("publish presence");
-        // --- 2. Ephemeral: NOT stored (no SQLite projection) ---
         assert!(!ok.stored, "ephemeral presence must NOT be stored (SC-15)");
     }
 
-    // Broker picks up both heartbeats (drain replay/EOSE → live).
     tokio::time::sleep(Duration::from_millis(200)).await;
     let live = broker.live_agents(t0);
     assert_eq!(live.len(), 2, "both agents present");
@@ -94,12 +89,10 @@ async fn sc15_ephemeral_presence_not_archived() {
         "OCBeta present"
     );
 
-    // Presence state carried through the broker.
     let pi_state = broker.current(&pi.public_key(), t0).unwrap();
     assert_eq!(pi_state.state, PresenceState::Working);
     assert_eq!(pi_state.status.as_deref(), Some("reviewing"));
 
-    // --- 3. Expires when heartbeat stops: past TTL → stale/excluded ---
     let after_ttl = t0 + ttl.as_secs() + 1;
     assert!(
         broker.current(&pi.public_key(), after_ttl).is_none(),
@@ -108,7 +101,6 @@ async fn sc15_ephemeral_presence_not_archived() {
     let live_after = broker.live_agents(after_ttl);
     assert!(live_after.is_empty(), "no live agents after TTL");
 
-    // GC: expire_stale removes them from the map.
     broker.expire_stale(after_ttl);
     assert!(broker.live_agents(after_ttl).is_empty(), "GC'd");
 
@@ -118,7 +110,6 @@ async fn sc15_ephemeral_presence_not_archived() {
 
 #[tokio::test]
 async fn sc15_presence_not_in_sqlite_index() {
-    // Presence events never write to the messages/index tables.
     let dir = std::env::temp_dir().join(format!("toron-sc15b-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let (bus, pool) = boot(&dir).await;
@@ -136,7 +127,6 @@ async fn sc15_presence_not_in_sqlite_index() {
     .expect("build presence");
     bus.publish(evt).await.expect("publish");
 
-    // No rows in any indexed table (messages, bus_events store skips ephemeral).
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
         .fetch_one(&pool)
         .await

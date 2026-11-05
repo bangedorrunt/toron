@@ -125,8 +125,6 @@ const fn ttl_live(entry: &LeaseEntry, now_us: i64) -> bool {
 }
 
 const fn is_live(entry: &LeaseEntry, now_us: i64) -> bool {
-    // Oracle-vouched rows outlive their TTL (host sets the flag from the
-    // liveness oracle + SQL mirror; the kernel only honors it).
     if ttl_live(entry, now_us) {
         return true;
     }
@@ -212,9 +210,6 @@ pub fn tick(model: &KernelModel, msg: &KernelMsg) -> (KernelModel, Vec<KernelEff
                     }],
                 );
             }
-            // Every request respects other holders' live exclusive
-            // overlapping rows (conflict_view parity); shared leases
-            // themselves never block.
             let blocker = next
                 .leases
                 .values()
@@ -240,8 +235,6 @@ pub fn tick(model: &KernelModel, msg: &KernelMsg) -> (KernelModel, Vec<KernelEff
                     created_at_secs: *created_at_secs,
                     epoch: *epoch,
                     state: *state,
-                    // Fresh grants are TTL-live by admission; the oracle
-                    // flag arrives only via projected mirror rows.
                     liveness_extended: false,
                 },
             );
@@ -302,11 +295,6 @@ pub fn machine_config() -> serde_json::Value {
         "guards": ["ttl_live", "is_live", "intent_live", "entry_blocks"],
     })
 }
-
-// ── Glob matcher: verbatim copy of guard.rs ──────────────────────────────
-// (`pattern_matches` + `match_impl` + `parse_class` + `class_contains`,
-// plus `overlaps` from reservations.rs. One semantics; drift guarded by
-// the host-side copy test.)
 
 /// Symmetric-glob conflict: either side's glob matches the other.
 pub fn overlaps(a: &str, b: &str) -> bool {
@@ -397,8 +385,6 @@ fn class_contains(pat: &[char], lo: usize, hi: usize, c: char) -> bool {
     false
 }
 
-// ponytail: one test module covering fence + determinism + model paths.
-// New transitions bring their own cases here.
 #[cfg(test)]
 mod kernel_tests {
     use super::*;
@@ -505,10 +491,6 @@ mod kernel_tests {
         let (mb, fb) = replay(&KernelModel::new(), &log);
         assert_eq!(format!("{fa:?}"), format!("{fb:?}"));
         assert_eq!(ma, mb);
-        // Trace: a granted; b denied (alice's exclusive src/** blocks);
-        // c granted (shared, but bob's docs/** touches nothing exclusive...
-        // shared still respects others' exclusive leases: docs/** is free);
-        // renew ok; release ok; expire sweeps a (TTL out).
         assert_eq!(
             fa,
             vec![
@@ -533,8 +515,6 @@ mod kernel_tests {
     /// model; every visited state upholds the kernel invariants.
     #[test]
     fn bfs_model_paths_uphold_invariants() {
-        // Alphabet: two agents × two paths × {exclusive acquire, shared
-        // acquire, release, expire-tick at two clocks}.
         let holders = ["alice", "bob"];
         let paths = ["src/**", "docs/**"];
         let mut seq = 0u64;
@@ -555,7 +535,6 @@ mod kernel_tests {
             now_us: 99_999_999_999,
         });
 
-        // BFS to depth 4 over op indices (order matters; cap breadth).
         let mut visited = 0u32;
         let mut stack = vec![(KernelModel::new(), Vec::<usize>::new())];
         while let Some((model, path)) = stack.pop() {
@@ -565,9 +544,6 @@ mod kernel_tests {
                 continue;
             }
             for (i, op) in ops.iter().enumerate() {
-                // Bound the fan-out: full breadth for the first two
-                // levels, then a deterministic diagonal (still covers
-                // grant/deny/release/expire shapes across agents/paths).
                 if path.len() >= 2 && i != (path[0] + path.len()) % ops.len() {
                     continue;
                 }
@@ -582,7 +558,6 @@ mod kernel_tests {
 
     /// Invariants checked at every BFS state.
     fn assert_model_invariants(model: &KernelModel) {
-        // No two live exclusive leases from different holders overlap.
         let live: Vec<&LeaseEntry> = model.leases.values().collect();
         for (i, a) in live.iter().enumerate() {
             for b in &live[i + 1..] {
@@ -596,13 +571,11 @@ mod kernel_tests {
                 }
             }
         }
-        // Ids are unique by construction (BTreeMap keys).
         assert_eq!(model.leases.len(), live.len());
     }
 
     #[test]
     fn own_lease_never_conflicts() {
-        // Same holder re-acquiring an overlapping path always grants.
         let (m1, _) = tick(
             &KernelModel::new(),
             &acquire("a", "alice", "src/**", true, 1_000),
@@ -647,7 +620,6 @@ mod kernel_tests {
 
     #[test]
     fn expired_vouched_lease_still_blocks() {
-        // bd-lease-liveness-bo0g: TTL past but oracle-vouched → blocks.
         let mut model = KernelModel::new();
         model.leases.insert(
             "v".into(),
@@ -674,7 +646,6 @@ mod kernel_tests {
             ),
             "vouched expiry blocks: {fx:?}"
         );
-        // Same row unvouched: expiry frees the path.
         let mut model2 = model;
         model2.leases.get_mut("v").unwrap().liveness_extended = false;
         let (_, fx2) = tick(&model2, &acquire("b", "bob", "src/x.rs", true, 1_000));

@@ -209,7 +209,6 @@ async fn crew_steer_is_refused_and_writes_no_row() {
     assert!(s.lookup(&env.msg).await.unwrap().is_none());
     let d = s.delivery(&key, CREW).await.unwrap();
     assert_eq!(d.generation, 1, "the refusal does not fence the task");
-    // The same seq is still free: a notify the crew may send lands on it.
     let note = Envelope {
         v: 1,
         from: m.producer.clone(),
@@ -244,8 +243,6 @@ async fn captain_redirect_then_done_at_the_old_gen_writes_nothing() {
     let d = s.delivery(&key, CREW).await.unwrap();
     assert_eq!(d.generation, 2, "redirect bumps the task gen");
     assert_eq!(d.phase, Phase::Acknowledged);
-    // The pending gate (4a.2) refuses done until this ack. After it, the
-    // old gen is still stale and the done still writes nothing.
     ack_steer(&s).await;
     let touched = touched_at(&s, &key).await;
     let err = s.done(CREW, TASK, &["evidence".into()]).await.unwrap_err();
@@ -328,7 +325,6 @@ async fn progress_and_done_wait_until_the_steer_is_acked() {
         .await
         .unwrap_err();
     assert!(is_steer_pending(&progress), "{progress:?}");
-    // A non-steer ack of the task is the same refusal, ahead of the FSM.
     let ack = s.ack(CREW, &key, true, None).await.unwrap_err();
     assert!(is_steer_pending(&ack), "{ack:?}");
     let done = s.done(CREW, TASK, &["evidence".into()]).await.unwrap_err();
@@ -339,8 +335,6 @@ async fn progress_and_done_wait_until_the_steer_is_acked() {
         Phase::Acknowledged
     );
 
-    // A swarm fact would project crew verbs ("done") over the ack lines.
-    // The head item's pending steer replaces that with the two ack lines.
     let m = q.msg(OP);
     put(
         &s,
@@ -406,7 +400,6 @@ fn at_epoch(mut env: Envelope, epoch: u64) -> Envelope {
 #[tokio::test]
 async fn a_lower_sup_epoch_steer_writes_nothing_and_the_current_one_is_stored() {
     let (s, mut q) = swarm("epoch").await;
-    // The first lead is operator-signed. A captain cannot open the lease.
     let m = q.msg(CAP);
     let early = lead_env(m.clone(), CAP, 1);
     let err = s.append_envelope(&early).await.unwrap_err();
@@ -418,7 +411,6 @@ async fn a_lower_sup_epoch_steer_writes_nothing_and_the_current_one_is_stored() 
 
     let op = q.msg(OP);
     put(&s, &mut q, lead_env(op, CAP, 1)).await;
-    // The captain may raise it. Epoch 2 is current; epoch 1 is now stale.
     put(&s, &mut q, lead_env(m, CAP, 2)).await;
     let current: i64 = sqlx::query_scalar("SELECT sup_epoch FROM inbox_lead WHERE context = ?1")
         .bind(CTX)
@@ -582,8 +574,6 @@ async fn refused_and_absent(s: &InboxStore, env: &Envelope) -> Reject {
 async fn with_no_lead_row_only_the_operator_steers() {
     let (s, mut q) = swarm("nolead").await;
     let key = claimed(&s, &mut q).await;
-    // The captain and the supervisor may steer by role, and name the epoch a
-    // lead would carry. No lead@1 row exists, so neither holds the lead.
     for who in [CAP, SUP] {
         let env = steer_env(q.msg(who), "pause", None);
         let r = refused_and_absent(&s, &env).await;
@@ -596,7 +586,6 @@ async fn with_no_lead_row_only_the_operator_steers() {
         );
     }
     assert_eq!(steer_rows(&s).await, 0);
-    // The operator key steers with no lead: stored, projected, delivered.
     let op = steer_env(q.msg(OP), "pause", None);
     put(&s, &mut q, op.clone()).await;
     assert!(s.lookup(&op.msg).await.unwrap().is_some());
@@ -612,7 +601,6 @@ async fn a_non_holder_at_the_current_epoch_is_refused() {
     let (s, mut q) = swarm("nonholder").await;
     led(&s, &mut q).await;
     let key = claimed(&s, &mut q).await;
-    // SUP may steer by role and names the current epoch, but CAP holds it.
     let env = steer_env(
         q.msg(SUP),
         "redirect",
@@ -627,7 +615,6 @@ async fn a_non_holder_at_the_current_epoch_is_refused() {
             sup_epoch: 1,
         }
     );
-    // The operator is not the holder either.
     let op = steer_env(q.msg(OP), "cancel", None);
     let r = refused_and_absent(&s, &op).await;
     assert!(
@@ -644,12 +631,9 @@ async fn the_holder_at_the_current_epoch_is_accepted_and_a_stale_one_is_not() {
     let (s, mut q) = swarm("holder").await;
     led(&s, &mut q).await;
     let key = claimed(&s, &mut q).await;
-    // The captain raises the lease to epoch 2 and stays the holder.
     let m = q.msg(CAP);
     put(&s, &mut q, lead_env(m, CAP, 2)).await;
 
-    // Stale: the holder itself at the old epoch is still StaleSupEpoch, and
-    // so is a non-holder (the epoch is checked first).
     let stale = at_epoch(steer_env(q.msg(CAP), "pause", None), 1);
     let r = refused_and_absent(&s, &stale).await;
     assert_eq!(
@@ -664,7 +648,6 @@ async fn the_holder_at_the_current_epoch_is_accepted_and_a_stale_one_is_not() {
     assert!(matches!(r, Reject::StaleSupEpoch { .. }), "{r:?}");
     assert_eq!(steer_rows(&s).await, 0);
 
-    // Holder at the current epoch: stored, projected, delivered.
     let ok = at_epoch(steer_env(q.msg(CAP), "pause", None), 2);
     put(&s, &mut q, ok.clone()).await;
     assert!(s.lookup(&ok.msg).await.unwrap().is_some());
@@ -673,7 +656,6 @@ async fn the_holder_at_the_current_epoch_is_accepted_and_a_stale_one_is_not() {
     assert!(batch.items.iter().any(|i| i.envelope.msg == ok.msg));
     assert_eq!(s.delivery(&key, CREW).await.unwrap().generation, 1);
 
-    // The dry run (`authorize`) answers the same fence.
     let dry = steer_env(q.msg(SUP), "pause", None);
     let dry = at_epoch(dry, 2);
     let err = s.authorize(&dry).await.unwrap_err();

@@ -110,9 +110,6 @@ pub fn build_job_request_with_tags(
         tags.push(Tag::event(parent));
     }
     if let Some(assignee) = &payload.assignee {
-        // Do NOT use `t` — ADR-0003 A3/G6 reserves `#t` for project scoping.
-        // A `t=assignee-name` tag makes global bus subscribers drop the job
-        // (InProcessBus access_gate). Use a free-form `assignee` tag instead.
         tags.push(Tag::parse(["assignee", assignee]).expect("assignee tag"));
     }
     tags.extend(extra_tags);
@@ -283,7 +280,6 @@ fn job_state_inner(job: EventId, events: &[Event], arrivals: Option<&ClaimArriva
         .filter(|e| job_parent(e) == Some(job))
         .collect();
 
-    // Terminal states take priority (result, error, cancel).
     for ev in &job_events {
         match ev.kind.as_u16() {
             JOB_RESULT => {
@@ -304,7 +300,6 @@ fn job_state_inner(job: EventId, events: &[Event], arrivals: Option<&ClaimArriva
         }
     }
 
-    // Non-terminal: claim (and optional progress) drive the state.
     let job_events_owned: Vec<Event> = job_events.iter().map(|e| (*e).clone()).collect();
     let claimer = match arrivals {
         Some(a) => first_claimer_by_arrival(job, &job_events_owned, a),
@@ -335,7 +330,6 @@ pub fn build_and_serialize(
     build_job_request(requester, parent, payload, created_at).map(|e| e.as_json())
 }
 
-// Keep Kind import used for the trait-bound docs.
 #[allow(unused_imports)]
 use Kind as _Kind;
 
@@ -439,7 +433,6 @@ mod tests {
         let claim_a = build_job_claim(&a, job, Timestamp::from(TS)).expect("claim a");
         let claim_b = build_job_claim(&b, job, Timestamp::from(TS + 1)).expect("claim b");
 
-        // First observed claim (a) wins, regardless of insertion order.
         let winner = first_claimer(job, &[claim_b.clone(), claim_a.clone()]);
         assert_eq!(winner, Some(a.public_key().to_hex()));
         assert_eq!(
@@ -455,8 +448,6 @@ mod tests {
                 .expect("job id");
         let a = keys();
         let b = keys();
-        // B's clock is EARLIER and (one of the two orders) its id is lower, so
-        // the created_at rule picks B; but A arrived first.
         let claim_a = build_job_claim(&a, job, Timestamp::from(TS + 5)).expect("claim a");
         let claim_b = build_job_claim(&b, job, Timestamp::from(TS)).expect("claim b");
         assert_eq!(
@@ -475,14 +466,12 @@ mod tests {
                 "the lower arrival seq wins in any slice order"
             );
         }
-        // An evicted claim (no entry) is older than every logged one.
         let only_b: ClaimArrivals = [(claim_b.id, 8)].into_iter().collect();
         assert_eq!(
             first_claimer_by_arrival(job, &[claim_b.clone(), claim_a.clone()], &only_b),
             Some(a.public_key().to_hex()),
             "a claim missing from the arrival log is the oldest"
         );
-        // job_state reports the same winner.
         let state = job_state_by_arrival(job, &[claim_b, claim_a], &arrivals);
         assert_eq!(state, JobState::Claimed(a.public_key().to_hex()));
     }
@@ -622,10 +611,8 @@ mod tests {
         assert_eq!(spec.objective, "map the crate and find bugs");
         assert_eq!(spec.parts.as_ref().unwrap().len(), 2);
         assert_eq!(spec.requester, "SandySparrow");
-        // Round-trip: to_value -> parse is identity.
         let again = ComposeRequestSpec::parse(&spec.to_value()).expect("roundtrip");
         assert_eq!(again, spec);
-        // Parts optional.
         let bare = ComposeRequestSpec::parse(&serde_json::json!({"objective": "x"}))
             .expect("parts optional");
         assert!(bare.parts.is_none());
