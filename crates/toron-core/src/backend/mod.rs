@@ -7,6 +7,7 @@
 pub mod error;
 pub mod hc;
 pub mod mock;
+pub mod rex_map;
 pub mod types;
 pub mod wait;
 
