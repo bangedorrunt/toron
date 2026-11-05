@@ -11,6 +11,7 @@ pub mod contracts;
 pub mod delivery;
 pub mod dispatch_core;
 pub mod envelope;
+pub mod harness;
 pub mod inbox;
 pub mod inbox_program;
 pub mod index;
