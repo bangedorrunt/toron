@@ -8,6 +8,8 @@ pub mod error;
 pub mod hc;
 pub mod mock;
 pub mod rex;
+pub mod rex_cli;
+pub mod superlogical;
 pub mod types;
 pub mod wait;
 
