@@ -39,7 +39,6 @@ use crate::nostr::kinds::toron_kind;
 use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
-use crate::backend::hc::HcBackend;
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
@@ -434,38 +433,36 @@ impl Mailbox {
                         deliveries_json,
                         published,
                         rumor_created_at,
-                    }) => {
-                        match rumor_created_at {
-                            Some(ts) if !published => {
-                                let (rebuilt, rebuilt_visible) =
-                                    build_pending_rumors(&sender_keys, &args, &resolved, ts as u64);
-                                pending = rebuilt;
-                                visible_id = rebuilt_visible;
-                                claim = Some((key.clone(), {
-                                    let intended: Vec<(String, String)> = pending
-                                        .iter()
-                                        .map(|(r, _, id_hex)| (r.name.clone(), id_hex.clone()))
-                                        .collect();
-                                    serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into())
-                                }));
-                            }
-                            _ => {
-                                let stored: Vec<(String, String)> =
-                                    serde_json::from_str(&deliveries_json).unwrap_or_default();
-                                let deliveries = stored
-                                    .into_iter()
-                                    .map(|(recipient, event_id)| Delivery {
-                                        project: args.project_slug.clone(),
-                                        payload: DeliveryPayload {
-                                            recipient,
-                                            event_id,
-                                        },
-                                    })
-                                    .collect::<Vec<_>>();
-                                replay = Some(deliveries);
-                            }
+                    }) => match rumor_created_at {
+                        Some(ts) if !published => {
+                            let (rebuilt, rebuilt_visible) =
+                                build_pending_rumors(&sender_keys, &args, &resolved, ts as u64);
+                            pending = rebuilt;
+                            visible_id = rebuilt_visible;
+                            claim = Some((key.clone(), {
+                                let intended: Vec<(String, String)> = pending
+                                    .iter()
+                                    .map(|(r, _, id_hex)| (r.name.clone(), id_hex.clone()))
+                                    .collect();
+                                serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into())
+                            }));
                         }
-                    }
+                        _ => {
+                            let stored: Vec<(String, String)> =
+                                serde_json::from_str(&deliveries_json).unwrap_or_default();
+                            let deliveries = stored
+                                .into_iter()
+                                .map(|(recipient, event_id)| Delivery {
+                                    project: args.project_slug.clone(),
+                                    payload: DeliveryPayload {
+                                        recipient,
+                                        event_id,
+                                    },
+                                })
+                                .collect::<Vec<_>>();
+                            replay = Some(deliveries);
+                        }
+                    },
                     Ok(SendClaim::New) => {
                         let pool = store.pool().clone();
                         tokio::spawn(async move {
@@ -1466,20 +1463,19 @@ impl Mailbox {
             return Ok(());
         }
 
-        if let Ok(backend) = HcBackend::connect(None) {
-            let client = backend.client();
-            if let Ok(agents) = client.agent_list() {
-                let pane_of = |name: &str| {
-                    agents
-                        .iter()
-                        .find(|a| a.name.as_deref() == Some(name))
-                        .map(|a| a.pane_id.clone())
-                        .unwrap_or_default()
-                };
-                let (acker_pane, recipient_pane) = (pane_of(acker_name), pane_of(recipient_name));
-                if !acker_pane.is_empty() && acker_pane == recipient_pane {
-                    return Ok(());
-                }
+        if let Ok(backend) = crate::backend::plane::connect_default()
+            && let Ok(agents) = backend.agent_list()
+        {
+            let pane_of = |name: &str| {
+                agents
+                    .iter()
+                    .find(|a| a.name.as_deref() == Some(name))
+                    .map(|a| a.pane_id.clone())
+                    .unwrap_or_default()
+            };
+            let (acker_pane, recipient_pane) = (pane_of(acker_name), pane_of(recipient_name));
+            if !acker_pane.is_empty() && acker_pane == recipient_pane {
+                return Ok(());
             }
         }
 

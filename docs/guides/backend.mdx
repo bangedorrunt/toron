@@ -1,11 +1,85 @@
 ---
 title: The backend
-description: How toron drives herdr-core (hc). One shared OpenRPC client in toron-core, terminal primitives, OSC 7501 status, and the 0.1.16 gotchas.
+description: How toron selects its pane plane (rex first, herdr-core fallback), plus the shared hc OpenRPC client, terminal primitives, OSC 7501 status, and the 0.1.16 gotchas.
 ---
 
-The `Backend` trait abstracts process supervision. **hc** (herdr-core) is the
-only multiplexer backend; the old herdr TUI client and the tmux stub are gone.
-The client lives in `toron-core::backend::hc` and is shared with flywheel.
+The `Backend` trait abstracts process supervision. Two planes implement it:
+**rex** (Superlogical, over the `rex` CLI) as the primary, and **hc**
+(herdr-core, over one OpenRPC socket) as the transport fallback. The old herdr
+TUI client and the tmux stub are gone. Both clients live in
+`toron-core::backend` and are shared with flywheel.
+
+## Plane selection
+
+`toron_core::backend::plane` is the only place that decides which plane serves:
+
+| `TORON_BACKEND` | rex CLI | serves | fallback |
+|---|---|---|---|
+| unset / `auto` | found | rex | hc, on a transport failure |
+| unset / `auto` | missing | hc | n/a (resolved up front, reason printed once) |
+| `rex` / `superlogical` | found | rex | never (a pin) |
+| `rex` / `superlogical` | missing | error naming the missing CLI | never |
+| `hc` | any | hc | never (a choice) |
+| anything else | any | `Unsupported` naming `auto \| rex \| hc` | never |
+
+`resolve(&PlaneEnv)` is a **pure** function: the parsed choice plus a `RexCli`
+probe snapshot. The probe (`RexCli::detect`) reads `$REX_BIN_DIR/rex` when that
+variable is set (no PATH fall-through, matching `Rex::resolve`), else scans
+PATH, and never executes rex — `--autostart` defaults to true, so even
+`rex whoami` would start a server. `connect(&PlaneEnv)` is the one construction
+site; `connect_default()` reads the process environment for callers with no
+`Config`.
+
+## The fallback is per effect
+
+`FallbackBackend` (`name() == "auto"`) replays a call on hc only when the
+failure provably changed nothing:
+
+| call kind | replays on | why |
+|---|---|---|
+| read (`workspace_list`, `pane_list`, `agent_list`, `agent_read`, `subscribe`) | `Connect`, `Io`, `Timeout` | no state behind any failure |
+| bounded wait (`agent_wait`, `pane_wait_output`) | `Connect`, `Io` | its timeout is the caller's answer; a replay spends the budget twice |
+| write (`pane_split`, `pane_close`, `pane_run`, `prompt`, `agent_send_keys`, …) | `Connect` only | a timeout or mid-stream `Io` may already have committed; there is no idempotency key |
+
+`Unsupported`, semantic rejects, and malformed replies always surface. They are
+verdicts about the call, not transport faults, and falling back would mask a
+gap as a working call.
+
+Mail identity follows the plane: `resolve_pane_identity` and
+`cleanup_pane_identities` take `&dyn Backend`. hc writes
+`toron_pin`/`toron_project`/`toron_npub` labels; rex carries the pin as the
+block label from creation, so a bootstrap stamp is a no-op there. The rex
+adapter maps that label onto the canonical `toron_pin` token, so the pure
+identity cores need no rex special case, and a pane read answers from
+`pane_list` without the per-block `agent_list` sweep.
+
+## Bounded roster reads on rex
+
+`agent_list` costs one subprocess per block (`program_status`, plus a
+`process` probe when the program reports nothing). It is bounded twice:
+`AGENT_SCAN_CAP` (512 blocks) and `AGENT_STATUS_BUDGET` (3 s, checked between
+blocks). Past either bound the block is still listed, with `Unknown` — which
+can never prove completion, so a truncated scan cannot fake readiness. A
+single in-flight call is bounded separately by `REX_WAIT` (12 s), so the
+sweep ends within the budget plus at most one call.
+
+## Session scope on rex
+
+`subscribe` resolves each requested pane's session before it opens the stream
+and passes `-s`, because `rex events` without `-s` follows the **caller's**
+session. A pane set that spans sessions — or an empty set — is refused with a
+pointer to `subscribe_session`, never silently narrowed to one session.
+`workspace_close` refuses `close_group=false`: rex's one close primitive is
+`session kill`, which closes the whole session, and a narrower request must not
+be widened silently.
+
+## flywheel shares the resolver
+
+flywheel does not keep a second factory: `flywheel::backend::factory` wraps
+`resolve`/`connect` and passes only its configured name and its
+`[backend] socket_path` (via `PlaneEnv::with_hc_socket`). The duplicate
+`fallback.rs` and the local `Plane`/`ResolvedPlane` types are deleted, so a
+write-replay bug can only ever be fixed once.
 
 ## Why the hc client lives in toron-core
 

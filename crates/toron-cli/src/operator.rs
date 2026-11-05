@@ -306,15 +306,14 @@ fn identity_divergence_check(
 fn check_identity_divergence(cfg: &Config) -> CheckResult {
     let name = "identity_divergence";
     let stamps = {
-        let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None) else {
+        let Ok(backend) = toron_core::backend::plane::connect_default() else {
             return CheckResult {
                 name,
                 ok: true,
-                detail: "hc not reachable — no live panes to compare".into(),
+                detail: "pane plane not reachable — no live panes to compare".into(),
             };
         };
-        let client = backend.client();
-        let panes: Vec<toron_core::backend::PaneInfo> = client.pane_list().unwrap_or_default();
+        let panes: Vec<toron_core::backend::PaneInfo> = backend.pane_list(None).unwrap_or_default();
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)
@@ -1190,20 +1189,38 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
 }
 
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
-    let effective = cfg.effective_backend();
-    if effective != "hc" {
-        anyhow::bail!("unknown backend {effective:?} (want hc)");
+    use toron_core::backend::plane::{Plane, PlaneChoice, PlaneEnv};
+
+    let configured = cfg.effective_backend();
+    let rex_bin_dir = std::env::var_os("REX_BIN_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    let resolved =
+        toron_core::backend::plane::resolve(&PlaneEnv::detect(configured, rex_bin_dir.as_deref()));
+    if resolved.plane == Plane::Invalid {
+        anyhow::bail!("{}", resolved.reason);
     }
     match cmd {
         BackendCommand::List => {
             let hc = toron_core::backend::hc::HcBackend::connect(None).is_ok();
             print_json(&json!([
-                { "name": "hc", "available": hc },
+                { "name": "hc", "available": hc, "role": "fallback" },
+                {
+                    "name": "rex",
+                    "available": resolved.rex_reachable,
+                    "role": "primary when available",
+                },
             ]))
         }
-        BackendCommand::Status => print_json(&json!({ "backend": cfg.effective_backend() })),
+        BackendCommand::Status => print_json(&json!({
+            "backend": configured,
+            "serving": resolved.serving(),
+            "rex_reachable": resolved.rex_reachable,
+            "fallback": resolved.is_fallback(),
+            "reason": resolved.reason,
+        })),
         BackendCommand::Default(args) => print_json(&json!({
-            "backend": args.backend.as_str(),
+            "backend": PlaneChoice::parse(args.backend.as_str()).as_str(),
             "effective": cfg.effective_backend(),
             "note": "no persistence; set TORON_BACKEND or .toron.toml",
         })),
@@ -1212,7 +1229,7 @@ pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod backend_selection_tests {
-    //! Backend selection is a clean break: `hc`, no legacy alias.
+    //! Plane selection is a clean break: `auto` | `rex` | `hc`, no legacy alias.
     use super::*;
 
     fn cfg_with(backend: &str) -> Config {
@@ -1223,14 +1240,20 @@ mod backend_selection_tests {
     }
 
     #[test]
-    fn legacy_backend_is_refused_naming_hc() {
+    fn legacy_backend_is_refused_naming_the_choices() {
         let err = run_backend(&cfg_with("herdr"), &BackendCommand::Status)
             .expect_err("legacy herdr must be refused");
-        assert!(err.to_string().contains("want hc"), "{err}");
+        assert!(err.to_string().contains("want auto, rex, or hc"), "{err}");
     }
 
     #[test]
     fn hc_passes_backend_validation() {
         run_backend(&cfg_with("hc"), &BackendCommand::Status).expect("hc must validate");
+    }
+
+    /// `auto` is the default plane: it validates without any live socket.
+    #[test]
+    fn auto_passes_backend_validation() {
+        run_backend(&cfg_with("auto"), &BackendCommand::Status).expect("auto must validate");
     }
 }

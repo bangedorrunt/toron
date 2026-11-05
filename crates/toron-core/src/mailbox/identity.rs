@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use crate::nostr::{Keys, Timestamp};
 
-use crate::backend::hc::HcBackend;
+use crate::backend::Backend;
 use crate::backend::types::{AgentInfo, PaneInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use crate::bus::filter::kind_project_filter;
 use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
@@ -1770,20 +1770,27 @@ impl Mailbox {
     /// bd-u4e2: best-effort live pin → pane map for `whois`/`list_agents`.
     /// No herdr backend reachable → empty map, so those reads report `None`
     /// pane fields instead of failing. Pane visibility is ADVISORY (the same
-    /// posture as the other opportunistic `HcBackend::connect` callers) —
+    /// posture as the other opportunistic `plane::connect_default` callers) —
     /// a pane-less environment must never turn a roster read into an error.
     /// bd-zoir: a pin the direct sweep misses falls back to the flywheel
     /// spawn registry binding for `project`, so a pane re-bound under another
     /// display pin still answers for its mail identity.
     fn live_pin_pane_map(project: &str) -> std::collections::HashMap<String, PaneRef> {
-        let Ok(backend) = HcBackend::connect(None) else {
+        let Ok(backend) = crate::backend::plane::connect_default() else {
             return std::collections::HashMap::new();
         };
-        let client = backend.client();
-        let Ok(agents) = client.agent_list() else {
+        let Ok(panes) = backend.pane_list(None) else {
             return std::collections::HashMap::new();
         };
-        let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
+        // A stamped pane (an hc `toron_pin` token, or a rex block whose label
+        // the adapter maps to that token) needs no agent sweep. Only an
+        // unstamped pane does — and that sweep failing must not take the
+        // stamped bindings down with it (ADR-0045 §6).
+        let agents = if panes.iter().all(|pane| pane_token_pin(pane).is_some()) {
+            Vec::new()
+        } else {
+            backend.agent_list().unwrap_or_default()
+        };
         let mut map = pin_pane_map(&panes, &agents);
         augment_pane_map_with_registry(
             &mut map,
@@ -1793,8 +1800,8 @@ impl Mailbox {
         map
     }
 
-    /// `resolve_pane_identity`: hc terminal id → agent name. `None` when
-    /// the pane has no agent mapping.
+    /// `resolve_pane_identity`: pane id → agent name. `None` when the pane
+    /// has no agent mapping.
     ///
     /// bd-0sbf: token-first — a `toron:mail-identity` pane stamp
     /// (`toron_pin` token, written by `agent bootstrap`) wins over the
@@ -1802,33 +1809,31 @@ impl Mailbox {
     /// previous occupant's pin.
     pub fn resolve_pane_identity(
         &self,
-        backend: &HcBackend,
+        backend: &dyn Backend,
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let (agents, panes) = {
-            let client = backend.client();
-            let agents = client.agent_list()?;
-            let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
-            (agents, panes)
-        };
+        let panes: Vec<PaneInfo> = backend.pane_list(None).unwrap_or_default();
+        // Cheap path first: a token (hc) or an adapter-mapped label (rex)
+        // answers without the agent sweep. The legacy `agent.list` name
+        // fallback runs only on a miss.
+        if let Some(pin) = resolve_pin_for_pane(&panes, &[], pane_id) {
+            return Ok(Some(pin));
+        }
+        let agents = backend.agent_list()?;
         Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
     }
 
     /// `cleanup_pane_identities`: prune identities whose panes are absent from
-    /// hc's pane list. Returns the pruned agent names. toron holds no
-    /// per-pane identity files (hc labels are the mapping), so "prune" = report the
-    /// stale names for the projection to drop.
+    /// the live pane list. Returns the pruned agent names. toron holds no
+    /// per-pane identity files (pane labels are the mapping), so "prune" =
+    /// report the stale names for the projection to drop.
     ///
     /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead
     /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
     /// retires both, so neither is ever a silent live pin.
-    pub fn cleanup_pane_identities(&self, backend: &HcBackend) -> anyhow::Result<Vec<String>> {
-        let (agents, panes) = {
-            let client = backend.client();
-            let agents = client.agent_list()?;
-            let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
-            (agents, panes)
-        };
+    pub fn cleanup_pane_identities(&self, backend: &dyn Backend) -> anyhow::Result<Vec<String>> {
+        let agents = backend.agent_list()?;
+        let panes: Vec<PaneInfo> = backend.pane_list(None).unwrap_or_default();
         let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();
         let live_panes: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
         Ok(agents

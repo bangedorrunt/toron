@@ -534,6 +534,12 @@ fn stamp_bootstrap_pane(
     if npub.is_empty() {
         return None;
     }
+    let plane = toron_core::backend::plane::resolve_default();
+    if plane.plane == toron_core::backend::plane::Plane::Rex && plane.rex_reachable {
+        // A rex block carries the pin as its label from creation (ADR-0045),
+        // so there is no token stamp to write and no hc socket to open.
+        return Some(terminal);
+    }
     let labels = BTreeMap::from([
         (TOKEN_PIN.to_string(), pin.to_string()),
         (TOKEN_PROJECT.to_string(), project.to_string()),
@@ -1024,7 +1030,7 @@ pub async fn run_reserve(
         ReserveCommand::Acquire(args) => {
             let paths = normalize_reserve_paths(&args.paths);
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
-            warn_acquire_paths(&paths);
+            warn_acquire_paths(&paths).await;
             emit(
                 mailbox
                     .file_reservation_paths(
@@ -1226,17 +1232,28 @@ fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
 /// Pre-flight warnings for an acquire's `--paths`, both stderr-only so the
 /// lease behaviour is unchanged: a list that used the wrong separator (which
 /// silently becomes one useless glob), and a glob that matches no file.
-fn warn_acquire_paths(paths: &[String]) {
+async fn warn_acquire_paths(paths: &[String]) {
     for p in paths {
         if let Some(w) = toron_core::mailbox::guard::whitespace_path_warning(p) {
             eprintln!("{w}");
         }
     }
-    warn_zero_file_matches(paths);
+    warn_zero_file_matches(paths).await;
 }
 
-fn warn_zero_file_matches(paths: &[String]) {
-    let files = repo_relative_files();
+async fn warn_zero_file_matches(paths: &[String]) {
+    // `repo_relative_files` gates on a git worktree and bounds the walk: a
+    // non-repo cwd (where `reserve acquire` used to park for minutes) yields
+    // an empty list immediately.
+    let scan = tokio::task::spawn_blocking(repo_relative_files);
+    let Ok(Ok(files)) = tokio::time::timeout(
+        WARN_SCAN_BUDGET + std::time::Duration::from_millis(50),
+        scan,
+    )
+    .await
+    else {
+        return;
+    };
     if files.is_empty() {
         return;
     }
@@ -1248,43 +1265,154 @@ fn warn_zero_file_matches(paths: &[String]) {
     }
 }
 
-/// Best-effort repo file list: recursive walk of the cwd, slash-joined
-/// repo-relative paths. Skips `.git` and `target`; capped so a huge tree
-/// cannot stall an acquire. Public within the crate: `reserve with-lease`
-/// refuses zero-file-match globs on the same list.
+/// Best-effort repo file list: bounded recursive walk of the cwd, slash-joined
+/// repo-relative paths. Skips `.git`, `target`, `node_modules`, `.venv`,
+/// `dist`, and `build`; never follows symlinks (a link loop or a mount can
+/// otherwise park the walk). The deadline and [`WARN_SCAN_CAP`] are checked
+/// on every entry, so an enormous tree cannot stall an acquire; a partial
+/// list is fine because this feeds an advisory warning only. Public within
+/// the crate: `reserve with-lease` refuses zero-file-match globs on the same
+/// list.
 pub(crate) fn repo_relative_files() -> Vec<String> {
-    const CAP: usize = 100_000;
+    repo_relative_files_at(std::path::Path::new("."))
+}
+
+/// Gate + bounded walk for one root. A non-repo root has no meaningful
+/// repo-relative file list, and walking one is what parked `reserve acquire`
+/// from a 9 GB workspace root: skip it, don't merely cap it.
+fn repo_relative_files_at(root: &std::path::Path) -> Vec<String> {
+    if !inside_git_worktree(root) {
+        return Vec::new();
+    }
+    repo_relative_files_within(root, WARN_SCAN_BUDGET)
+}
+
+/// Time budget for the advisory zero-match scan. The acquire itself is one
+/// daemon call; its warning must never outlive a prompt.
+const WARN_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+const WARN_SCAN_CAP: usize = 100_000;
+
+fn repo_relative_files_within(root: &std::path::Path, budget: std::time::Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + budget;
     let mut out = Vec::new();
-    let mut stack = vec![std::path::PathBuf::from(".")];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if std::time::Instant::now() >= deadline || out.len() >= WARN_SCAN_CAP {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            if std::time::Instant::now() >= deadline || out.len() >= WARN_SCAN_CAP {
+                return out;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == ".git" || name == "target" {
+                if matches!(
+                    name.as_ref(),
+                    ".git" | "target" | "node_modules" | ".venv" | "dist" | "build"
+                ) {
                     continue;
                 }
                 stack.push(path);
-            } else if path.is_file() {
+            } else if file_type.is_file() {
                 let rel = path
-                    .strip_prefix(".")
-                    .unwrap_or(&path)
+                    .strip_prefix(root)
+                    .unwrap_or(path.as_path())
                     .to_string_lossy()
-                    .trim_start_matches('/')
                     .trim_start_matches("./")
                     .replace('\\', "/");
                 out.push(rel);
-                if out.len() >= CAP {
-                    return out;
-                }
             }
         }
     }
     out
+}
+
+/// True when `root` is inside a git worktree (a `.git` directory, or a `.git`
+/// file for a linked worktree). A non-repo cwd has no meaningful
+/// repo-relative file list, and walking it is what hung an acquire run from
+/// the workspace root.
+fn inside_git_worktree(root: &std::path::Path) -> bool {
+    let Ok(start) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    start.ancestors().any(|dir| {
+        let dot_git = dir.join(".git");
+        dot_git.is_dir() || dot_git.is_file()
+    })
+}
+
+#[cfg(test)]
+mod reserve_warn_scan_tests {
+    use super::{inside_git_worktree, repo_relative_files_at, repo_relative_files_within};
+    use std::time::Duration;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("toron-reserve-warn-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch root");
+        dir
+    }
+
+    #[test]
+    fn walk_is_bounded_skips_build_dirs_and_never_follows_symlinks() {
+        let root = scratch("walk");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        for dir in ["target", ".git", "node_modules"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("junk.rs"), "").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        let files = repo_relative_files_within(&root, Duration::from_secs(1));
+        assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
+        assert!(
+            !files.iter().any(|f| f.starts_with("target/")
+                || f.starts_with(".git/")
+                || f.starts_with("node_modules/")),
+            "build/vcs dirs must stay out of the list: {files:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            !files.iter().any(|f| f.starts_with("loop/")),
+            "a symlinked subtree must not be walked: {files:?}"
+        );
+
+        let none = repo_relative_files_within(&root, Duration::ZERO);
+        assert!(
+            none.is_empty(),
+            "an exhausted budget returns before walking"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_repo_root_is_not_a_file_list() {
+        let root = scratch("norepo");
+        std::fs::write(root.join("stray.rs"), "").unwrap();
+        assert!(!inside_git_worktree(&root));
+        assert!(
+            repo_relative_files_at(&root).is_empty(),
+            "a non-repo root must not be walked"
+        );
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert!(inside_git_worktree(&root));
+        assert_eq!(repo_relative_files_at(&root), vec!["stray.rs".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Daemon arm of `run_reserve` (bd-pin-public-plane-s-easy.14).
@@ -1299,10 +1427,12 @@ pub async fn run_reserve_daemon(
     match cmd {
         ReserveCommand::Acquire(args) => {
             let paths = normalize_reserve_paths(&args.paths);
-            if let Ok(mb) = toron_mcp::demo_mailbox().await {
-                warn_if_unregistered(&mb, &args.project, &args.agent).await;
-            }
-            warn_acquire_paths(&paths);
+            // The daemon owns the roster: never open a second embedded
+            // mailbox here. `demo_mailbox()` opened/migrated the live
+            // index.sqlite beside the daemon before the acquire reached its
+            // MCP call; the registration warning is advisory, and the
+            // daemon's roster is the authority.
+            warn_acquire_paths(&paths).await;
             daemon_tool(
                 dc,
                 "file_reservation_paths",

@@ -36,7 +36,7 @@ One root `AGENTS.md` only — enforced by `scripts/verify-gates.sh`.
 | Gift-wrap / kinds / identity | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | OSC 7501 board | `crates/toron-core/src/osc7501.rs` (`fold` + `FoldPolicy`; shared by hc + rex) |
-| Multiplexer backends | `crates/toron-core/src/backend/` (`hc` OpenRPC client; flywheel selects the plane) |
+| Multiplexer backends | `crates/toron-core/src/backend/` (`plane.rs` resolves rex-first with hc fallback; `hc` OpenRPC client; rex roster bounded, subscribe session-resolved) |
 | Workflow engine | `crates/toron-workflow/src/{schema,engine}/` — guide `docs/guides/workflow-engine.mdx` |
 | Effect journal / run-state | core index migrations + `RunStateStore`; CLI `toron run-state …` |
 | Durable engine store | `crates/toron-core/src/index/durable_engine.rs` (`EngineStorage` over additive `durable_engine_*` tables; sync bridge like `journal.rs`; `commit_run`/`commit_park` are one transaction each). Kernel re-export: `toron_core::kernel` |

@@ -13,20 +13,20 @@
 //! default, which names the method. A prompt's `wait` is not polled: that
 //! would be `agent_wait`.
 //!
-//! gated by: cargo feature `backend-superlogical` (off by default).
-//! The host box is the sync `Backend` `Result`. No elm-effect program.
+//! Always compiled (ADR-0045): `plane::resolve` selects it, and an explicit pin
+//! with no CLI fails loud at construction. The host box is the sync `Backend`
+//! `Result`. No elm-effect program.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use crate::backend::types::TOKEN_PIN;
 use crate::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
-use crate::backend::{
-    AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding,
-};
+use crate::backend::{AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding};
+use serde_json::{Value, json};
 
 #[path = "rex_cli.rs"]
 pub mod rex_cli;
-
 
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
@@ -39,6 +39,15 @@ use rex_cli::{
     parse_created_session, parse_sessions, process_args, program_status_args, rename_args,
     run_args, send_key_args, session_kill_args, split_args, split_labelled_args, write_args,
 };
+
+/// A roster read examines at most this many blocks. Past the cap the remaining
+/// blocks are still reported, but with `Unknown` — never a fabricated status.
+pub const AGENT_SCAN_CAP: usize = 512;
+
+/// Total time one `agent_list` call may spend on status enrichment. Checked
+/// between blocks; one in-flight rex call is bounded separately by `REX_WAIT`
+/// (12 s), so the sweep ends within this budget plus at most one call.
+pub const AGENT_STATUS_BUDGET: Duration = Duration::from_secs(3);
 
 /// bd-rex-reliability-ioyz D: a session-scoped event stream.
 ///
@@ -379,11 +388,7 @@ impl MultiplexerBackend for SuperlogicalBackend {
         Ok(())
     }
 
-    fn pane_run(
-        &self,
-        pane_id: &str,
-        command: &str,
-    ) -> Result<(), crate::backend::BackendError> {
+    fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), crate::backend::BackendError> {
         if command.is_empty() {
             return Err(RexFail::Rejected {
                 message: "rex run command is empty".into(),
@@ -407,10 +412,25 @@ impl MultiplexerBackend for SuperlogicalBackend {
         let rex = Self::rex()?;
         let sessions = parse_sessions(&rex.json(&ls_args()).map_err(RexFail::into_backend)?)
             .map_err(RexFail::into_backend)?;
+        let started = Instant::now();
+        let mut scanned = 0usize;
         let mut agents = Vec::new();
         for session in sessions {
             let blocks = Self::blocks(&rex, &session.session_id).map_err(RexFail::into_backend)?;
             for block in blocks {
+                // Status is one subprocess per block (program_status, plus a
+                // process probe when no record exists). Bound the sweep: past
+                // the cap or the budget the block is still listed, but with
+                // `Unknown`, which can never prove completion.
+                if !scan_allows(started.elapsed(), scanned) {
+                    agents.push(agent_from(
+                        &block,
+                        &session.session_id,
+                        AgentStatus::Unknown,
+                    ));
+                    continue;
+                }
+                scanned += 1;
                 let status = Self::block_status(&rex, &session.session_id, &block.block_id)
                     .map_err(RexFail::into_backend)?;
                 agents.push(agent_from(&block, &session.session_id, status));
@@ -449,8 +469,12 @@ impl MultiplexerBackend for SuperlogicalBackend {
     fn workspace_close(
         &self,
         workspace_id: &str,
-        _close_group: bool,
+        close_group: bool,
     ) -> Result<(), crate::backend::BackendError> {
+        // rex has ONE close primitive and it always closes the whole session.
+        // Refuse a narrower request instead of silently killing more than the
+        // caller asked for (the fallback treats Unsupported as no-replay).
+        workspace_close_scope(close_group)?;
         let rex = Self::rex()?;
         rex.text(&session_kill_args(workspace_id))
             .map_err(RexFail::into_backend)?;
@@ -609,17 +633,64 @@ impl MultiplexerBackend for SuperlogicalBackend {
         filters: &[Subscription],
     ) -> Result<Box<dyn EventStream>, crate::backend::BackendError> {
         let rex = Self::rex()?;
-        let panes: Vec<String> = filters
-            .iter()
-            .map(|filter| filter.pane_id.clone())
-            .filter(|id| !id.is_empty())
-            .collect();
+        // `rex events` without `-s` follows the CALLER's session, which is the
+        // wrong plane for a crew. Resolve the session from the panes instead,
+        // and refuse a cross-session set rather than silently following one.
+        let mut sessions = BTreeSet::new();
+        let mut panes = Vec::new();
+        for filter in filters {
+            if filter.pane_id.is_empty() {
+                continue;
+            }
+            let (session, block) =
+                Self::locate(&rex, &filter.pane_id).map_err(RexFail::into_backend)?;
+            sessions.insert(session.session_id);
+            panes.push(block.block_id);
+        }
+        let session = single_session(&sessions).map_err(RexFail::into_backend)?;
         let child = rex
-            .spawn(&events_args(None))
+            .spawn(&events_args(Some(&session)))
             .map_err(RexFail::into_backend)?;
         let stream = RexEventStream::start(child, panes).map_err(RexFail::into_backend)?;
         Ok(Box::new(stream))
     }
+}
+
+/// The one session a pane set names. Pure so the refusal is testable without a
+/// rex server: the trait carries no session, and guessing is how a crew
+/// subscribed to the caller's session instead of its own.
+fn single_session(sessions: &BTreeSet<String>) -> Result<String, RexFail> {
+    match sessions.len() {
+        0 => Err(RexFail::Rejected {
+            message: "rex subscribe needs at least one pane id (a session-less stream \
+                      follows the caller's session)"
+                .into(),
+        }),
+        1 => Ok(sessions
+            .iter()
+            .next()
+            .cloned()
+            .expect("length checked above")),
+        n => Err(RexFail::Rejected {
+            message: format!(
+                "rex subscribe: the panes span {n} sessions; subscribe one session at a time \
+                 (use subscribe_session for an explicit crew session)"
+            ),
+        }),
+    }
+}
+
+/// rex's `session kill` closes every block in the session. A caller asking for
+/// a narrower scope is refused, never widened silently.
+fn workspace_close_scope(close_group: bool) -> Result<(), BackendError> {
+    if close_group {
+        return Ok(());
+    }
+    Err(BackendError::new(
+        BackendErrorCode::Unsupported,
+        "rex workspace_close has one scope: session kill closes every block in the session; \
+         close_group=false is refused rather than killing more than asked",
+    ))
 }
 
 fn workspace_from(session: RexSession, index: usize) -> WorkspaceInfo {
@@ -637,6 +708,15 @@ fn workspace_from(session: RexSession, index: usize) -> WorkspaceInfo {
 }
 
 fn pane_from(block: &RexBlock, session: &str, status: AgentStatus) -> PaneInfo {
+    // ADR-0045 §6: a rex block is labelled with the pin at creation. Map it
+    // onto the canonical mail-identity token HERE, at the adapter edge, so the
+    // pure identity cores (`pane_token_pin`, `pin_pane_map`) need no rex
+    // special case. `toron_npub`/`toron_project` stay absent: a block label is
+    // not a full stamp, so `pane_stamp` declines it and divergence checks skip.
+    let mut tokens = serde_json::Map::new();
+    if !block.label.is_empty() {
+        tokens.insert(TOKEN_PIN.to_string(), Value::String(block.label.clone()));
+    }
     PaneInfo {
         pane_id: block.block_id.clone(),
         terminal_id: String::new(),
@@ -656,7 +736,7 @@ fn pane_from(block: &RexBlock, session: &str, status: AgentStatus) -> PaneInfo {
         state_labels: serde_json::Map::new(),
         terminal_title: none_if_empty(&block.label),
         terminal_title_stripped: none_if_empty(&block.label),
-        tokens: serde_json::Map::new(),
+        tokens,
     }
 }
 
@@ -683,6 +763,13 @@ fn agent_from(block: &RexBlock, session: &str, status: AgentStatus) -> AgentInfo
     }
 }
 
+/// Whether the roster sweep may spend another status call. Pure, so the bound
+/// is testable without a rex server: both the cap and the budget must hold
+/// before each block, and the loop can run past neither.
+fn scan_allows(elapsed: Duration, scanned: usize) -> bool {
+    scanned < AGENT_SCAN_CAP && elapsed < AGENT_STATUS_BUDGET
+}
+
 fn none_if_empty(text: &str) -> Option<String> {
     if text.is_empty() {
         None
@@ -691,3 +778,155 @@ fn none_if_empty(text: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod pane_identity_tests {
+    use super::*;
+
+    fn block(label: &str) -> RexBlock {
+        RexBlock {
+            block_id: "b7".to_string(),
+            label: label.to_string(),
+            creator_name: "rex".to_string(),
+            window_id: "w1".to_string(),
+        }
+    }
+
+    /// ADR-0045 §6: the adapter maps a rex block label onto `toron_pin`, so
+    /// the pure identity cores resolve a rex pane with no rex special case.
+    /// Mutation: drop the token mapping and this fails while `pane.label`
+    /// still carries the pin — the exact silent gap the mapping closes.
+    #[test]
+    fn a_labelled_block_carries_the_canonical_pin_token() {
+        let pane = pane_from(&block("DustySparrow"), "s1", AgentStatus::Idle);
+        assert_eq!(
+            crate::mailbox::identity::pane_token_pin(&pane),
+            Some("DustySparrow")
+        );
+    }
+
+    /// An unlabelled split block carries no pin: an empty label must never
+    /// become an empty identity.
+    #[test]
+    fn an_unlabelled_block_carries_no_pin_token() {
+        let pane = pane_from(&block(""), "s1", AgentStatus::Unknown);
+        assert_eq!(crate::mailbox::identity::pane_token_pin(&pane), None);
+    }
+
+    /// A rex label is not a full stamp (no npub), so the divergence check
+    /// declines it instead of comparing a half-stamp.
+    #[test]
+    fn a_block_label_is_not_a_full_stamp() {
+        let pane = pane_from(&block("DustySparrow"), "s1", AgentStatus::Idle);
+        assert_eq!(crate::mailbox::identity::pane_stamp(&pane), None);
+    }
+
+    /// `rex events` follows the caller's session unless `-s` is passed, so a
+    /// pane set must name exactly one session. Mutation: accept a multi-session
+    /// set and the subscription silently follows whichever session rex picks.
+    #[test]
+    fn a_pane_set_must_name_exactly_one_session() {
+        assert!(
+            single_session(&BTreeSet::new()).is_err(),
+            "empty is not all"
+        );
+        let one: BTreeSet<String> = ["s1".to_string()].into_iter().collect();
+        assert_eq!(single_session(&one).expect("one session"), "s1");
+        let two: BTreeSet<String> = ["s1".to_string(), "s2".to_string()].into_iter().collect();
+        let err = single_session(&two)
+            .err()
+            .expect("two sessions must refuse");
+        match err {
+            RexFail::Rejected { message } => assert!(
+                message.contains("subscribe one session at a time"),
+                "{message}"
+            ),
+            _ => panic!("a cross-session set must be a typed refusal, not a transport error"),
+        }
+    }
+
+    /// `session kill` closes the whole session; a narrower request must refuse
+    /// instead of widening to it.
+    #[test]
+    fn a_narrow_workspace_close_is_refused_not_widened() {
+        assert!(workspace_close_scope(true).is_ok());
+        let err = workspace_close_scope(false)
+            .err()
+            .expect("close_group=false must refuse");
+        assert!(err.to_string().contains("close_group=false"), "{err}");
+    }
+
+    /// Live probe (opt-in). Creates a throwaway rex session, runs one labelled
+    /// `sleep` block, and proves the label→pin mapping, the roster entry, and
+    /// that cleanup removed the session. Run with:
+    /// `mbx test -p toron-core --lib live_rex -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "live rex: creates and kills a throwaway session"]
+    fn live_rex_round_trip_labels_a_block_and_resolves_identity() {
+        struct LiveSession(String);
+        impl Drop for LiveSession {
+            fn drop(&mut self) {
+                let _ = SuperlogicalBackend.workspace_close(&self.0, true);
+            }
+        }
+
+        let backend = SuperlogicalBackend;
+        let label = format!("toron-live-{}", std::process::id());
+        let workspace = backend
+            .workspace_create(Some(&label))
+            .expect("create a throwaway rex session");
+        let guard = LiveSession(workspace.workspace_id.clone());
+
+        let pin = "LiveProbePin";
+        let block_id = create_agent_block(&workspace.workspace_id, pin, None, "sleep 120")
+            .expect("run one labelled keep-open block");
+        assert!(!block_id.is_empty());
+
+        let panes = backend
+            .pane_list(Some(&workspace.workspace_id))
+            .expect("pane list");
+        let pane = panes
+            .iter()
+            .find(|pane| pane.pane_id == block_id)
+            .expect("the new block is in pane_list");
+        assert_eq!(
+            crate::mailbox::identity::pane_token_pin(pane),
+            Some(pin),
+            "the block label is the canonical pin token"
+        );
+        assert!(
+            crate::mailbox::identity::pane_stamp(pane).is_none(),
+            "a label alone is not a full stamp"
+        );
+
+        let agents = backend.agent_list().expect("agent list");
+        let agent = agents
+            .iter()
+            .find(|agent| agent.pane_id == block_id)
+            .expect("the new block is in agent_list");
+        assert_eq!(agent.name.as_deref(), Some(pin));
+
+        let session = workspace.workspace_id.clone();
+        drop(guard);
+        let remaining = backend.workspace_list().expect("list after close");
+        assert!(
+            !remaining
+                .iter()
+                .any(|workspace| workspace.workspace_id == session),
+            "cleanup left the throwaway session behind"
+        );
+    }
+
+    /// `agent_list` used to pay one `program_status` per block with no bound.
+    /// Mutation: drop either conjunct and the corresponding assertion below
+    /// fails — an unbounded sweep either times out or reports every block.
+    #[test]
+    fn the_roster_sweep_is_bounded_by_cap_and_time() {
+        assert!(scan_allows(Duration::ZERO, 0));
+        assert!(scan_allows(
+            AGENT_STATUS_BUDGET - Duration::from_millis(1),
+            AGENT_SCAN_CAP - 1
+        ));
+        assert!(!scan_allows(AGENT_STATUS_BUDGET, 0));
+        assert!(!scan_allows(Duration::ZERO, AGENT_SCAN_CAP));
+    }
+}

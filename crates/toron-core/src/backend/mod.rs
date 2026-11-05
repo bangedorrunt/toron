@@ -5,8 +5,10 @@
 // 6. **Error type: this crate's `BackendError`** (machine-code typed,
 
 pub mod error;
+pub mod fallback;
 pub mod hc;
 pub mod mock;
+pub mod plane;
 pub mod rex;
 pub mod rex_cli;
 pub mod superlogical;
@@ -14,7 +16,11 @@ pub mod types;
 pub mod wait;
 
 pub use error::{BackendError, BackendErrorCode};
-pub use hc::{Client as HcClient, HC_GENERATION, HcBackend, ID_PREFIX, MIN_HC_VERSION, TESTED_HC_VERSION};
+pub use fallback::FallbackBackend;
+pub use hc::{
+    Client as HcClient, HC_GENERATION, HcBackend, ID_PREFIX, MIN_HC_VERSION, TESTED_HC_VERSION,
+};
+pub use plane::{Plane, PlaneChoice, PlaneEnv, ResolvedPlane, RexCli};
 pub use types::{
     AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, SpawnOptions,
     Subscription, WaitOptions, WorkspaceInfo, normalize_agent_status,

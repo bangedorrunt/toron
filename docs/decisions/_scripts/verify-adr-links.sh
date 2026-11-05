@@ -31,16 +31,21 @@ while IFS= read -r line; do
     ADR_FILES+=("$line")
 done < <(ls docs/decisions/ | sed -n 's/^\([0-9]\{4\}\)\-.*/\1/p' | sort -u)
 
+# The index also maps rows whose file has no numeric prefix (ADR-0002 is
+# `adopt-agent-adapter-architecture.md`). Resolve through the same discovery
+# surface humans use, so a marker naming a real ADR is not reported dangling.
+while IFS= read -r line; do
+    ADR_FILES+=("$line")
+done < <(sed -n 's/^| \[\([0-9]\{4\}\)\].*/\1/p' docs/decisions/README.md | sort -u)
+
 if [ "${#ADR_FILES[@]}" -eq 0 ]; then
     echo "FAIL: no ADR files found under docs/decisions/" >&2
     exit 1
 fi
 
-# Build a set of valid ADR numbers.
-valid=""
-for a in "${ADR_FILES[@]}"; do
-    valid="$valid $a"
-done
+# Build a set of valid ADR numbers (deduped: the index and the numeric
+# filenames overlap for every prefixed ADR).
+valid=$(printf '%s\n' "${ADR_FILES[@]}" | sort -u | tr '\n' ' ')
 
 echo "valid ADRs:${valid}"
 

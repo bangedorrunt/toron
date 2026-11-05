@@ -18,7 +18,6 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use toron_core::backend::hc::HcBackend;
 use toron_core::mailbox::ListAgentsOptions;
 use toron_core::nostr::identity::AgentProfile;
 
@@ -26,7 +25,6 @@ use super::{ToJson, ToolOutput, ToolServer, generate_agent_name};
 
 #[tool_router(router = system_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `health_check` (read-only): bus liveness + archive health.
     #[tool(
         name = "health_check",
@@ -166,7 +164,7 @@ impl ToolServer {
         )
     }
 
-    /// `resolve_pane_identity`: hc terminal id → agent name (ADR-0044).
+    /// `resolve_pane_identity`: pane id → agent name (ADR-0045).
     #[tool(
         name = "resolve_pane_identity",
         description = "Resolve a pane/terminal id to the agent name (G9).",
@@ -178,20 +176,23 @@ impl ToolServer {
         Parameters(args): Parameters<ResolvePaneIdentityArgs>,
     ) -> ToolOutput {
         let pane_id = args.pane_id.clone().unwrap_or_default();
-        match HcBackend::connect(None) {
-            Ok(backend) => match self.mailbox.resolve_pane_identity(&backend, &pane_id) {
+        match toron_core::backend::plane::connect_default() {
+            Ok(backend) => match self
+                .mailbox
+                .resolve_pane_identity(backend.as_ref(), &pane_id)
+            {
                 Ok(Some(name)) => ToolOutput::ok(json!({ "agent_name": name, "pane_id": pane_id })),
                 Ok(None) => ToolOutput::ok(json!({ "agent_name": null, "pane_id": pane_id })),
                 Err(e) => ToolOutput::err(e),
             },
             Err(e) => ToolOutput::ok(json!({
-                "note": format!("pane identity requires an hc backend; not wired: {e}"),
+                "note": format!("pane identity requires a pane plane; not wired: {e}"),
                 "pane_id": pane_id,
             })),
         }
     }
 
-    /// `cleanup_pane_identities`: prune identities whose hc panes are gone.
+    /// `cleanup_pane_identities`: prune identities whose panes are gone.
     #[tool(
         name = "cleanup_pane_identities",
         description = "Prune identities whose hc panes are absent from the live pane list.",
@@ -202,9 +203,9 @@ impl ToolServer {
         &self,
         Parameters(_args): Parameters<CleanupPaneIdentitiesArgs>,
     ) -> ToolOutput {
-        match HcBackend::connect(None) {
+        match toron_core::backend::plane::connect_default() {
             Ok(backend) => {
-                let pruned = self.mailbox.cleanup_pane_identities(&backend);
+                let pruned = self.mailbox.cleanup_pane_identities(backend.as_ref());
                 match pruned {
                     Ok(names) => {
                         let reaped = self
@@ -234,7 +235,7 @@ impl ToolServer {
                 }
             }
             Err(e) => ToolOutput::ok(json!({
-                "note": format!("pane cleanup requires an hc backend; not wired: {e}"),
+                "note": format!("pane cleanup requires a pane plane; not wired: {e}"),
             })),
         }
     }

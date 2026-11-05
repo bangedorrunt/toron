@@ -115,12 +115,12 @@ impl Config {
         self.comms.as_ref().and_then(|c| c.inbox_log)
     }
 
-    /// Effective backend (defaults to `hc`).
+    /// Effective pane plane (defaults to `auto`: rex first, hc fallback).
     ///
-    /// Unknown values are NOT defaulted: `run_backend` fails naming
-    /// `hc` (clean break, no legacy alias).
+    /// Unknown values are NOT defaulted: `run_backend` fails naming the valid
+    /// choices (clean break, no legacy alias).
     pub fn effective_backend(&self) -> &str {
-        self.backend.as_deref().unwrap_or("hc")
+        self.backend.as_deref().unwrap_or("auto")
     }
 
     /// Effective proof scheme (defaults to `schnorr`).
@@ -301,8 +301,8 @@ mod tests {
     }
 
     #[test]
-    fn default_backend_is_hc() {
-        assert_eq!(Config::default().effective_backend(), "hc");
+    fn default_backend_is_auto() {
+        assert_eq!(Config::default().effective_backend(), "auto");
     }
 
     #[test]
