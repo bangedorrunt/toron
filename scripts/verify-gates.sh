@@ -5,6 +5,7 @@
 #   - zero asupersync in live code + Cargo (runtime dropped by captain Tokio override)
 #   - zero fastmcp-rust (asupersync-based; forbidden)
 #   - every crate root has #![forbid(unsafe_code)]
+#   - one root AGENTS.md only — no nested copies (crates/, docs/, …)
 #
 # Scope = live workspace code + manifests (crates/**, root Cargo.toml, Cargo.lock).
 # Historical ADR/beads text and dead legacy files are excluded per ADR-0003
@@ -58,7 +59,17 @@ if ! bash docs/decisions/_scripts/verify-adr-links.sh; then
     fail=1
 fi
 
-# 5. Workspace-clean (bd-test-tmp-hygiene-pq5b): the test matrix must not
+# 5. One root AGENTS.md only — no nested copies anywhere in the repo.
+nested=$(find . -name AGENTS.md -not -path './.git/*' -not -path '*/target/*' | grep -v '^\./AGENTS.md$' || true)
+if [ -n "$nested" ]; then
+    echo "FAIL: nested AGENTS.md files:" >&2
+    echo "$nested" >&2
+    fail=1
+else
+    echo "ok: single root AGENTS.md"
+fi
+
+# 6. Workspace-clean (bd-test-tmp-hygiene-pq5b): the test matrix must not
 #    pollute the workspace root with mailbox-archive scratch dirs. Relative
 #    project keys resolve under the workspace root — tests/scripts must pass
 #    absolute TMPDIR paths (temp_dir / mktemp -d).

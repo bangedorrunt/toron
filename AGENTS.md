@@ -10,9 +10,6 @@ MCP surface: **41 tools** (38 AM-Rust parity + 3 toron additive:
 (`docs/catalog/toron-mcp.json`) is the 38-parity subset by contract.
 Ops crib: `~/.agents/skills/toron/SKILL.md`. ADRs: `docs/decisions/`.
 
-Orchestration door is flywheel (`arrive` → `briefing --json` → argv). Do not
-invent a second selector.
-
 ## Structure
 
 ```
@@ -27,7 +24,7 @@ workflows/             product YAML
 scripts/verify-gates.sh
 ```
 
-One root `AGENTS.md` only — no per-crate copies.
+One root `AGENTS.md` only — enforced by `scripts/verify-gates.sh`.
 
 ## Where to look
 
@@ -49,7 +46,7 @@ One root `AGENTS.md` only — no per-crate copies.
 | Daemon / CLI | `crates/toron-cli/src/{cli,daemon,main}.rs` |
 | Daemon build identity | `crates/toron-core/src/serve_build.rs` + mcp `serve_lock.rs` |
 
-### Crate essentials (folded from former nested AGENTS.md)
+### Crate essentials
 
 - **toron-core:** `Mailbox` concrete, `MailSurface` embedder trait. One SQLite
   write connection, WAL, i64-µs. Gift wraps: no project tags; unwrap verifies
@@ -72,8 +69,9 @@ never `git add -A`.
 
 ## Conventions
 
-- Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
-- New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
+- Edition 2024.
+- New/changed ADR markers and `#![forbid(unsafe_code)]` crate roots:
+  enforced by `scripts/verify-gates.sh` (ADR-0003).
 - Frozen: 41 tool names (38 AM-Rust parity + 3 additive), 25 resources,
   kind registry. No new kinds/tools
   without an ADR. Additive tools need ADR + catalog regen + tests.
@@ -91,8 +89,8 @@ never `git add -A`.
   `owed→acked→resulted` (monotonic).
 - Catalog: `PATH="$PWD/target/debug:$PATH" toron catalog --json` then
   `mbx test catalog_freshness`. Bare `toron` may be a stale install.
-- Commit: cite the bead you close (`Bead: <id>`). No live `bd-*` in published
-  MCP/resource strings (`catalog_no_internal_ids`).
+- Bead close ceremony: br skill. Published MCP strings stay `bd-*`-free
+  (`catalog_no_internal_ids`).
 - Beads: agents use `br --json` / `--robot-*`; bare `br` is the human TUI.
 - TDD for new features and bug fixes. No benches in this repo.
 - Engineering principles: `flywheel principles list`.
@@ -128,10 +126,8 @@ Wave-1: no new MCP tools; CLI-only nouns still sync steps 1/3/4.
 - `asupersync` / `fastmcp` (CI fails). MCP is `rmcp` + Tokio.
 - Cross-key NIP-09 delete. Nested `block_on`. Silent-success stubs.
 - Per-pid temp mailbox roots. Removing the atomic reservation conflict-check.
-- Headless faking pane lifecycle kinds. Treating cron as `trigger: schedule`.
+- Headless faking pane lifecycle kinds.
 - Editing `docs/decisions/0001-*` as live policy (superseded).
-- Reading empty dispatcher / `no live fleet` as an empty project — check inbox,
-  `.unanswered`, `/health.injection` first.
 
 ## Commands
 
@@ -151,7 +147,7 @@ mbx fmt --check
 mbx test --workspace --all-features
 ```
 
-`mbx test --exclude-ignored` is invalid. Release profile: `strip = "none"`.
+`mbx test --exclude-ignored` is invalid.
 
 ## Notes
 
