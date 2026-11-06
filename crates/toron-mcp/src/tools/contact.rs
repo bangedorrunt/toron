@@ -20,7 +20,6 @@ use super::{ToolOutput, ToolServer};
 
 #[tool_router(router = contact_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `request_contact`: request a contact link (AgentLink, G14).
     #[tool(
         name = "request_contact",

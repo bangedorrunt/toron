@@ -17,7 +17,6 @@ use super::{ToolOutput, ToolServer, nonneg_secs};
 
 #[tool_router(router = slot_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `acquire_build_slot` (destructive): advisory slot lease.
     #[tool(
         name = "acquire_build_slot",

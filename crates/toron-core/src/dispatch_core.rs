@@ -207,23 +207,21 @@ pub fn tick(model: &DispatchModel, msg: &DispatchMsg) -> (DispatchModel, Vec<Dis
                 }]
             }
         }
-        DispatchMsg::Release { assignee } => {
-            match next.in_flight.get_mut(assignee) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    if *count == 0 {
-                        next.in_flight.remove(assignee);
-                    }
-                    next.used = next.used.saturating_sub(1);
-                    vec![DispatchEffect::Released {
-                        assignee: assignee.clone(),
-                    }]
+        DispatchMsg::Release { assignee } => match next.in_flight.get_mut(assignee) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    next.in_flight.remove(assignee);
                 }
-                _ => vec![DispatchEffect::ReleaseIgnored {
+                next.used = next.used.saturating_sub(1);
+                vec![DispatchEffect::Released {
                     assignee: assignee.clone(),
-                }],
+                }]
             }
-        }
+            _ => vec![DispatchEffect::ReleaseIgnored {
+                assignee: assignee.clone(),
+            }],
+        },
         DispatchMsg::Poll => {
             let idx = next
                 .queue

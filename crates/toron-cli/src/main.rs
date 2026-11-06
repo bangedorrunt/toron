@@ -148,20 +148,18 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::React(_)
         | Command::Presence(_)
         | Command::Watch(_)
-        | Command::Wait(_) => {
-            match plane::run_plane_command(command) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) if e.downcast_ref::<plane::UsageError>().is_some() => {
-                    eprintln!("toron: error: {e:#}");
-                    ExitCode::from(2)
-                }
-                Err(e) if e.downcast_ref::<plane::IdleExit>().is_some() => {
-                    eprintln!("toron: {e}");
-                    ExitCode::from(4)
-                }
-                Err(e) => return Err(e),
+        | Command::Wait(_) => match plane::run_plane_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.downcast_ref::<plane::UsageError>().is_some() => {
+                eprintln!("toron: error: {e:#}");
+                ExitCode::from(2)
             }
-        }
+            Err(e) if e.downcast_ref::<plane::IdleExit>().is_some() => {
+                eprintln!("toron: {e}");
+                ExitCode::from(4)
+            }
+            Err(e) => return Err(e),
+        },
     };
     Ok(code)
 }

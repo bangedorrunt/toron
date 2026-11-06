@@ -5198,7 +5198,14 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         let before = Timestamp::now().as_secs() as i64;
         mailbox
-            .file_reservation_paths("demo", "BlueLake", &["src/a.rs".into()], None, true, Some("bd-ttl"))
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/a.rs".into()],
+                None,
+                true,
+                Some("bd-ttl"),
+            )
             .await
             .expect("acquire with the default TTL");
         let row = mailbox

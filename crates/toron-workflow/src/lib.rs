@@ -15,6 +15,7 @@
 //! The cron host loop and the kernel port reach the framework through
 //! `toron_core::kernel`; this crate never names an elm-effect crate directly.
 
+pub mod action_contract;
 pub mod channels;
 pub mod coalesce;
 pub mod cron;
@@ -25,6 +26,7 @@ pub mod delivery_cursor;
 pub mod dispatch;
 pub mod engine;
 pub mod guard;
+pub mod identity;
 pub mod jobs;
 pub mod lifecycle;
 pub mod lint;
@@ -32,16 +34,12 @@ pub mod mention;
 pub mod playbook_lint;
 pub mod schema;
 pub mod trigger_filter;
-pub mod action_contract;
-pub mod identity;
 
 pub use channels::{
     CHANNEL_CREATE, CHANNEL_CREATE_LEGACY, CHANNEL_MEMBERS, CHANNEL_MESSAGE,
     CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, Channel, ChannelEvent, ChannelStore, REACTION,
 };
-pub use cron::{
-    CronRegistration, latest_due_at_or_before, next_due,
-};
+pub use cron::{CronRegistration, latest_due_at_or_before, next_due};
 pub use cron_elm::{CronFire, ElmCron};
 pub use cron_failure::{
     FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed,

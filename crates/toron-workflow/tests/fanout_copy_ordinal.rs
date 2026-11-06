@@ -18,16 +18,7 @@ fn a_non_fanout_key_has_no_ordinal() {
 #[test]
 fn only_the_p_digit_form_parses() {
     for key in [
-        "p",
-        "px",
-        "p-1",
-        "p 1",
-        "p1 ",
-        "P1",
-        "pp1",
-        "1",
-        "",
-        "node-p1",
+        "p", "px", "p-1", "p 1", "p1 ", "P1", "pp1", "1", "", "node-p1",
     ] {
         assert_eq!(copy_ordinal(Some(key)), None, "{key:?} must not parse");
     }

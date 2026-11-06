@@ -566,7 +566,10 @@ mod tests {
         );
 
         child_failed.apply(&osc("state=working:id=live"));
-        assert_eq!(fold(&child_failed, FoldPolicy::Attention), AgentStatus::Working);
+        assert_eq!(
+            fold(&child_failed, FoldPolicy::Attention),
+            AgentStatus::Working
+        );
     }
 
     #[test]

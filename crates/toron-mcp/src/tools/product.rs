@@ -18,7 +18,6 @@ use super::{ToolOutput, ToolServer};
 
 #[tool_router(router = product_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `ensure_product`: idempotent product manifest (kind-30011).
     #[tool(
         name = "ensure_product",

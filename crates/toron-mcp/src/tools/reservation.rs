@@ -19,7 +19,6 @@ use super::{ToolOutput, ToolServer, nonneg_secs};
 
 #[tool_router(router = reservation_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `check_file_reservation_conflicts` (read-only): symmetric-glob report.
     #[tool(
         name = "check_file_reservation_conflicts",

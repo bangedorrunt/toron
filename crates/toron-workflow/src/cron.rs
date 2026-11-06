@@ -448,5 +448,4 @@ mod tests {
         let due = due_tick("*/10 * * * *", base, base + 60, CronCatchup::Skip).unwrap();
         assert_eq!(due, base + 600);
     }
-
 }

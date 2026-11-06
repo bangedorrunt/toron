@@ -159,19 +159,17 @@ fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: b
                 );
             }
         }
-        "review" => {
-            match spec.extra.get("n").and_then(parse_u64) {
-                Some(n) if n >= 2 => {}
-                other => error(
-                    report,
-                    format!(
-                        "phase: review fan-out must declare n >= 2 statically — got {}; put \
+        "review" => match spec.extra.get("n").and_then(parse_u64) {
+            Some(n) if n >= 2 => {}
+            other => error(
+                report,
+                format!(
+                    "phase: review fan-out must declare n >= 2 statically — got {}; put \
                          `n: <count>` on the spec (ADR-0022 §3.5 R-P3)",
-                        other.map_or("nothing".to_string(), |n| n.to_string())
-                    ),
+                    other.map_or("nothing".to_string(), |n| n.to_string())
                 ),
-            }
-        }
+            ),
+        },
         "plan" => {
             let references_data_shape = spec
                 .string_values()

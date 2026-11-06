@@ -613,8 +613,8 @@ mod tests {
         )
         .await;
         match out {
-            GuardOutcome::TimedOut { .. } => {  }
-            GuardOutcome::Bool(false) => {  }
+            GuardOutcome::TimedOut { .. } => {}
+            GuardOutcome::Bool(false) => {}
             other => panic!("expected TimedOut or Bool(false), got {other:?} (must not hang)"),
         }
     }

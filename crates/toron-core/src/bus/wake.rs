@@ -1164,8 +1164,7 @@ async fn serve_subscriber(
                 return stats;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return stats,
-            Err(_) => {
-            }
+            Err(_) => {}
         }
         if clock.now_ms() >= heartbeat_at {
             let hb = WakeFrame::Heartbeat {

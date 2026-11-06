@@ -24,7 +24,6 @@ use super::{ToJson, ToolOutput, ToolServer};
 
 #[tool_router(router = mail_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `send_message`: NIP-17 gift-wrapped fan-out.
     #[tool(
         name = "send_message",

@@ -22,11 +22,7 @@ pub const ADDITIVE_TOOL: &str = "release_file_reservations_by_reason";
 
 /// Every non-parity additive tool (ADR-0033 discipline): live on the MCP
 /// surface, excluded from the frozen 38-parity catalog.
-pub const ADDITIVE_TOOLS: &[&str] = &[
-    ADDITIVE_TOOL,
-    "list_file_reservations",
-    "ask_judgment",
-];
+pub const ADDITIVE_TOOLS: &[&str] = &[ADDITIVE_TOOL, "list_file_reservations", "ask_judgment"];
 
 /// Expected parity tool count (frozen: toron ADR-0007 C3).
 pub const PARITY_TOOL_COUNT: usize = 38;

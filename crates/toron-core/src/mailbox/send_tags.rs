@@ -316,8 +316,7 @@ impl SendTags {
                     }
                     out.bead = Some(v);
                 }
-                _ => {
-                }
+                _ => {}
             }
         }
         Ok(out)

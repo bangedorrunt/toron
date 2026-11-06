@@ -20,7 +20,6 @@ use super::{ToolOutput, ToolServer, generate_agent_name, nonneg_secs};
 
 #[tool_router(router = workflow_router, vis = "pub(crate)")]
 impl ToolServer {
-
     /// `macro_start_session`: ensure_project + register + reserve + inbox.
     #[tool(
         name = "macro_start_session",

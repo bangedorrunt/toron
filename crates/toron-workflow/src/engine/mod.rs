@@ -45,8 +45,8 @@ pub use boundary::{
     failure_for_control_misdispatch, failure_for_provider_error, failure_for_unsupported, invoke,
     invoke_compat, is_failure_value, normalize_dispatch_result, partition,
 };
-pub use control_flow::{build_workflow_run_terminal, stamp_workflow_emitted};
 pub use control_flow::{EFFECT_JOURNAL_BYPASSED, EFFECT_JOURNAL_SINK_UNCOVERED};
+pub use control_flow::{build_workflow_run_terminal, stamp_workflow_emitted};
 pub use reconcile::{
     CleanupKind, CleanupRequest, DispatchPlan, EffectView, FORCED_CLEANUP_CAPABILITY,
     ProviderCapability, ProviderOutcome, ReplayMismatch, RetentionPolicy, UnknownReport,
