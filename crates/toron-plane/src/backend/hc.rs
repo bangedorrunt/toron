@@ -1482,8 +1482,48 @@ impl Backend for HcBackend {
         "hc"
     }
 
+    /// Group live terminals by root address (the same root `agent_list`
+    /// calls a workspace). hc itself has no workspace object; returning
+    /// `[]` made every workspace-label lookup fail ("no flywheel swarm")
+    /// even for a live swarm. The `flywheel_workspace` label is the swarm
+    /// label, so label matching works again.
     fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
-        Ok(vec![])
+        let terminals = self.client.terminal_list(false)?;
+        let parents = parent_map(&terminals);
+        let known: BTreeSet<String> = terminals.iter().map(|t| t.address.clone()).collect();
+        let mut groups: BTreeMap<String, Vec<&Terminal>> = BTreeMap::new();
+        for t in &terminals {
+            groups
+                .entry(root_address(&parents, &known, &t.address))
+                .or_default()
+                .push(t);
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(root, rows)| {
+                let label = rows
+                    .iter()
+                    .find_map(|t| {
+                        t.labels
+                            .get("flywheel_workspace")
+                            .filter(|v| !v.is_empty())
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| root.clone());
+                let first = rows.first().expect("group is non-empty");
+                WorkspaceInfo {
+                    workspace_id: prefix_id(&root),
+                    number: 0,
+                    label,
+                    focused: false,
+                    pane_count: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    tab_count: 0,
+                    active_tab_id: String::new(),
+                    agent_status: first.agent_status(self.client.fold_policy),
+                    cwd: first.cwd.clone(),
+                }
+            })
+            .collect())
     }
 
     fn workspace_close(&self, workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
