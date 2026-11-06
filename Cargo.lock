@@ -3535,8 +3535,11 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "socket2",
+ "sqlx",
  "tokio",
  "toron-core",
+ "tower",
+ "tracing",
  "uuid",
 ]
 

@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 toron-core = { path = "../toron-core" }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 evalexpr = "13.1.0"
@@ -18,6 +19,8 @@ anyhow = "1.0.104"
 cron = "0.17.0"
 chrono = "0.4"
 sha2 = "0.10"
+tracing = "0.1"
+tower = { version = "0.5", features = ["timeout", "limit", "util"] }
 hex = "0.4"
 
 [dev-dependencies]

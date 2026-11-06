@@ -16,6 +16,7 @@
 //! in-process driver, [`control_flow`] the kept render/guard/leaf helpers,
 //! [`durable`]/[`durable_host`] the pure models and their host drivers.
 
+pub mod armor;
 mod boundary;
 pub mod branch;
 mod control_flow;
@@ -24,6 +25,7 @@ mod drive;
 pub mod durable;
 pub mod durable_host;
 pub mod elm;
+pub mod host;
 pub mod leaf;
 pub mod linear_step;
 pub mod park;
