@@ -479,6 +479,20 @@ pub fn stale_closed_leases<'a>(
         .collect()
 }
 
+/// Typed event-ref for a revocation `e` tag (lane-b): a missing or blank
+/// lease id is a caller-visible error, never a fabricated id. `lease.id`
+/// is the daemon-resolved winner id, so `Err` here means the projection
+/// handed back a row with no usable ref — failing closed beats revoking
+/// against a made-up coordinate.
+fn revocation_target(lease_id: &str) -> anyhow::Result<EventId> {
+    let trimmed = lease_id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("reservation lease id is missing — cannot build revocation ref");
+    }
+    EventId::from_hex(trimmed)
+        .map_err(|_| anyhow::anyhow!("reservation lease id is not a valid event id"))
+}
+
 /// Probe inputs for one kernel acquire decision (travel together).
 struct AcquireProbe {
     holder_hex: String,
@@ -976,26 +990,22 @@ impl Mailbox {
         }
 
         let d = format!("{project_slug}:{}", lease.path_pattern);
-        let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
-            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
-                .expect("id")
-        });
+        let target = revocation_target(&lease.id)?;
         let mut tags = with_project_scoping(
             toron_kind(FILE_RESERVATION),
             vec![
-                Tag::parse(["d", &d]).expect("d"),
-                Tag::parse(["status", "revoked"]).expect("status"),
+                Tag::identifier(&d),
+                Tag::custom("status", ["revoked"]),
                 Tag::event(target),
-                Tag::parse([
+                Tag::custom(
                     "a",
-                    &format!("30031:{}:{d}", operator.public_key().to_hex()),
-                ])
-                .expect("a"),
+                    [format!("30031:{}:{d}", operator.public_key().to_hex())],
+                ),
             ],
             Some(project_slug),
         );
         if let Some(n) = note {
-            tags.push(Tag::parse(["note", n]).expect("note"));
+            tags.push(Tag::custom("note", [n]));
         }
         let revoke = build_event(
             operator,
@@ -1100,29 +1110,21 @@ impl Mailbox {
                 let path_pattern = lease.path_pattern.clone();
                 let holder = lease.agent_name.clone();
                 let d = format!("{project_slug}:{path_pattern}");
-                let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
-                    EventId::from_hex(
-                        "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
-                    )
-                    .expect("id")
-                });
+                let target = revocation_target(&lease.id)?;
                 let mut tags = with_project_scoping(
                     toron_kind(FILE_RESERVATION),
                     vec![
-                        Tag::parse(["d", &d]).expect("d"),
-                        Tag::parse(["status", "revoked"]).expect("status"),
+                        Tag::identifier(&d),
+                        Tag::custom("status", ["revoked"]),
                         Tag::event(target),
-                        Tag::parse([
+                        Tag::custom(
                             "a",
-                            &format!("30031:{}:{d}", operator.public_key().to_hex()),
-                        ])
-                        .expect("a"),
+                            [format!("30031:{}:{d}", operator.public_key().to_hex())],
+                        ),
                     ],
                     Some(&project_slug),
                 );
-                tags.push(
-                    Tag::parse(["note", note.unwrap_or("ghost-pane-cleanup")]).expect("note"),
-                );
+                tags.push(Tag::custom("note", [note.unwrap_or("ghost-pane-cleanup")]));
                 let revoke = build_event(
                     operator,
                     toron_kind(FILE_RESERVATION),
@@ -1179,24 +1181,18 @@ impl Mailbox {
         let mut released_leases = Vec::new();
         for lease in leases {
             let d = format!("{project_slug}:{}", lease.path_pattern);
-            let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
-                EventId::from_hex(
-                    "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
-                )
-                .expect("id")
-            });
+            let target = revocation_target(&lease.id)?;
             let tags = with_project_scoping(
                 toron_kind(FILE_RESERVATION),
                 vec![
-                    Tag::parse(["d", &d]).expect("d"),
-                    Tag::parse(["status", "revoked"]).expect("status"),
+                    Tag::identifier(&d),
+                    Tag::custom("status", ["revoked"]),
                     Tag::event(target),
-                    Tag::parse([
+                    Tag::custom(
                         "a",
-                        &format!("30031:{}:{d}", operator.public_key().to_hex()),
-                    ])
-                    .expect("a"),
-                    Tag::parse(["note", &format!("bead-closed:{bead_id}")]).expect("note"),
+                        [format!("30031:{}:{d}", operator.public_key().to_hex())],
+                    ),
+                    Tag::custom("note", [format!("bead-closed:{bead_id}")]),
                 ],
                 Some(project_slug),
             );
@@ -5122,6 +5118,23 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// lane-b: no revocation path mints the fabricated fallback id — a
+    /// missing/blank/unparseable lease id is a typed error, and a valid
+    /// id round-trips through `revocation_target` unchanged.
+    #[test]
+    fn revocation_target_rejects_missing_or_bad_lease_id() {
+        for bad in ["", "   ", "not-hex", "zz", "b3282872"] {
+            let err = revocation_target(bad).expect_err("bad lease id must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("lease id"), "typed lease-id error, got: {msg}");
+        }
+        // The well-known golden-test id parses when actually present — the
+        // helper never *invents* it, it only passes through a real ref.
+        let golden = "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b";
+        let ok = revocation_target(golden).expect("real hex passes through");
+        assert_eq!(ok.to_hex(), golden);
     }
 
     /// bd-h3oj: release_by_reason revokes ONLY the leases whose reason

@@ -11,18 +11,25 @@
 //! oc-a `nostr::proof`) — and exposes a coverage pointer so conformance can
 //! grep the full surface.
 
+#[cfg(test)]
 use crate::nostr::kinds::{REGISTRATION_ATTESTATION, toron_kind};
+#[cfg(test)]
 use crate::nostr::proof::{
     Attestation, NonceStore, ProofClaim, ProofError, ProofGate, ProofScheme,
     build_attestation_event,
 };
+#[cfg(test)]
 use crate::nostr::{Keys, Timestamp};
+#[cfg(test)]
 use sqlx::SqlitePool;
 
 /// Run the fail-closed proof matrix. Returns the set of cases that
 /// INCORRECTLY passed (empty = all invalid proofs rejected + the valid
 /// control accepted).
-pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
+/// Only the in-module conformance test calls this; it ships in test
+/// builds alone so the lib surface carries no uncalled API.
+#[cfg(test)]
+async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     let mut leaked = Vec::new();
 
     async fn expect_reject(
