@@ -4,7 +4,9 @@
 //! `watch --live --watch-sock` reads wake frames from the daemon `wake.sock`
 //! (ADR-0036 Spec 6 JSONL) instead of the in-process bus. Absent socket
 //! degrades LOUD to today's in-process paths, never silent. NO deletions:
-//! the pump and the in-process live tail stay (wave 3 deletes).
+//! the pump and the in-process live tail are the `watch --live` consumer of the
+//! MCP serve's `start_wake_sidecar` producer; both are live (KEEP — see
+//! docs/known-divergences.md).
 //!
 //! EFFECT RULES (binding): no I/O in constructors (`new` only stores
 //! config); timeouts are config with env overrides (injectable, no wall
