@@ -514,12 +514,22 @@ fn backend_list_is_json_array_with_hc() {
     );
     let value = parse(&out.stdout);
     let arr = value.as_array().expect("backend list must be an array");
-    assert_eq!(arr.len(), 1, "hc is the only backend, got {value}");
-    assert_eq!(arr[0]["name"], serde_json::json!("hc"), "got {value}");
-    assert!(
-        arr[0]["available"].is_boolean(),
-        "availability is probed, got {value}"
+    // ADR-0045: rex is the primary when available, hc is the transport fallback.
+    let by_name = |name: &str| {
+        arr.iter()
+            .find(|b| b["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("{name} missing from {value}"))
+    };
+    let rex = by_name("rex");
+    let hc = by_name("hc");
+    assert_eq!(
+        rex["role"],
+        serde_json::json!("primary when available"),
+        "got {value}"
     );
+    assert_eq!(hc["role"], serde_json::json!("fallback"), "got {value}");
+    assert!(rex["available"].is_boolean(), "got {value}");
+    assert!(hc["available"].is_boolean(), "got {value}");
 }
 
 #[test]
@@ -527,5 +537,6 @@ fn backend_status_reports_effective() {
     let out = run(&["backend", "status", "--json"]);
     assert!(out.status.success());
     let value = parse(&out.stdout);
-    assert_eq!(value["backend"], serde_json::json!("hc"));
+    // ADR-0045: the shipped default resolves as auto (rex-primary, hc fallback).
+    assert_eq!(value["backend"], serde_json::json!("auto"));
 }
