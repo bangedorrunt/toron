@@ -313,7 +313,7 @@ fn with_the_flag_off_the_same_sequence_is_unchanged() {
         Some("t-1"),
         serde_json::json!({"title": "t", "brief": "b"}),
     );
-    for flag in [Some("0"), Some("off"), Some("false"), Some("nope")] {
+    for flag in [Some("0"), Some("off"), Some("false")] {
         for (name, env) in [("a.json", &boot), ("b.json", &t)] {
             let o = append(&dir, &key, flag, name, env);
             assert_eq!(o.status.code(), Some(2), "flag {flag:?}");
@@ -327,6 +327,21 @@ fn with_the_flag_off_the_same_sequence_is_unchanged() {
                 "nothing is rendered while the flag is off"
             );
         }
+    }
+    // Parse-or-refuse: a garbage value is a typed config error, not "off".
+    for (name, env) in [("a.json", &boot), ("b.json", &t)] {
+        let o = append(&dir, &key, Some("nope"), name, env);
+        assert!(
+            !o.status.success(),
+            "garbage flag must fail, got {:?}",
+            o.status.code()
+        );
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("TORON_COMMS_INBOX"),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(o.stdout.is_empty(), "nothing is rendered on a config error");
     }
 }
 
