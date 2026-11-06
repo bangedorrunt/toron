@@ -4000,3 +4000,33 @@ fn reserve_acquire_normalizes_space_separated_paths_and_auto_reuses_pin() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// wave2-b: the fallback helper is the only embedded entry — every
+/// `*_daemon` arm without an MCP equivalent goes through
+/// `embedded_mailbox()`, so `demo_mailbox()` appears exactly once in
+/// non-comment source (the helper body). Mirrors the bead VERIFY gate.
+#[test]
+fn embedded_fallback_exists_once() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/robot.rs"))
+        .expect("robot.rs source");
+    let hits: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            let code = l.split("//").next().unwrap_or("");
+            code.contains("demo_mailbox()")
+        })
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one embedded entry expected, found: {hits:?}"
+    );
+    assert!(
+        hits[0].1.contains("toron_mcp::demo_mailbox().await"),
+        "the single entry is the helper body (line {}): {}",
+        hits[0].0,
+        hits[0].1
+    );
+}

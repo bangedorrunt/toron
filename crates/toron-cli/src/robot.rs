@@ -50,6 +50,16 @@ async fn daemon_tool_within(
 /// Deadline for `reserve respond` (bd-gtqe VERIFY): completes or errors <5s.
 const RESPOND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The single embedded entry (wave2-b): tools with no daemon MCP equivalent
+/// run against the shared durable root the daemon itself uses — the same
+/// store, never a second one. Every `*_daemon` arm that cannot go through
+/// [`daemon_tool`] calls this helper, so the fallback exists once.
+
+/// Open the shared embedded mailbox via the one fallback helper.
+async fn embedded_mailbox() -> anyhow::Result<Mailbox> {
+    toron_mcp::demo_mailbox().await
+}
+
 /// Print a result's MCP-parity JSON shape to stdout (always pretty JSON).
 fn emit<T: ToJson>(result: T) -> anyhow::Result<()> {
     print_json(&result.to_json())
@@ -726,7 +736,7 @@ pub async fn run_agent_daemon(
                 }))?;
                 return Ok(());
             }
-            let local = toron_mcp::demo_mailbox().await?;
+            let local = embedded_mailbox().await?;
             let profile = toron_core::nostr::identity::AgentProfile {
                 name: args.agent.clone(),
                 program: args.program.clone(),
@@ -787,14 +797,14 @@ pub async fn run_agent_daemon(
             eprintln!(
                 "toron agent prune: no daemon tool; sweeping the shared durable root directly"
             );
-            let mb = toron_mcp::demo_mailbox().await?;
+            let mb = embedded_mailbox().await?;
             run_agent(&mb, cmd, dry_run).await
         }
         AgentCommand::Rename(_) => {
             eprintln!(
                 "toron agent rename: no daemon tool; renaming in the shared durable root directly"
             );
-            let mb = toron_mcp::demo_mailbox().await?;
+            let mb = embedded_mailbox().await?;
             run_agent(&mb, cmd, dry_run).await
         }
     }
@@ -822,7 +832,7 @@ pub async fn run_ack_sla(mailbox: &Mailbox, args: &AckSlaArgs) -> anyhow::Result
 /// process-local state, so the cross-process read is exact.
 pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow::Result<()> {
     eprintln!("toron ack-sla: no daemon tool; scanning the shared durable root directly");
-    let mb = toron_mcp::demo_mailbox().await?;
+    let mb = embedded_mailbox().await?;
     run_ack_sla(&mb, args).await
 }
 
@@ -1428,7 +1438,7 @@ pub async fn run_reserve_daemon(
         ReserveCommand::Acquire(args) => {
             let paths = normalize_reserve_paths(&args.paths);
             // The daemon owns the roster: never open a second embedded
-            // mailbox here. `demo_mailbox()` opened/migrated the live
+            // mailbox here. The embedded fallback opened/migrated the live
             // index.sqlite beside the daemon before the acquire reached its
             // MCP call; the registration warning is advisory, and the
             // daemon's roster is the authority.
@@ -1574,7 +1584,7 @@ pub async fn run_reserve_daemon(
             eprintln!(
                 "toron reserve yield/yields: no daemon tool; scanning the shared durable root directly"
             );
-            let mb = toron_mcp::demo_mailbox().await?;
+            let mb = embedded_mailbox().await?;
             run_reserve(&mb, cmd, dry_run).await
         }
         ReserveCommand::ForceRelease(args) => {
@@ -2395,7 +2405,7 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
                         args.project
                     )
                 })?;
-            let local = toron_mcp::demo_mailbox().await.ok();
+            let local = embedded_mailbox().await.ok();
             if let Some(mb) = local.as_ref() {
                 if let Some(name) = agent.as_deref()
                     && let Some(pk) = mb.agent_pubkey_hex(&args.project, name).await
