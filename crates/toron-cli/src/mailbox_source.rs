@@ -42,6 +42,67 @@ pub const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Ceiling for the daemon `server/discover` handshake (bd-gtqe).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Why the daemon could not be reached (wave5-b): connection refused or a
+/// timeout, typed at the origin so callers match the type instead of
+/// grepping remediation prose. `Display` keeps today's remediation text
+/// byte-for-byte (flywheel matches on it cross-repo).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonUnreachable {
+    /// Normalized `http://host:port/mcp` endpoint.
+    pub endpoint: String,
+    /// Which reachability failure this was.
+    pub kind: UnreachableKind,
+}
+
+/// The two ways a daemon is unreachable: refused up front, or silent past
+/// the deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreachableKind {
+    /// TCP-level refusal (nothing listening).
+    Refused,
+    /// Accepted (or unanswered) but silent past the deadline.
+    Timeout {
+        /// The tool call that hung, if this was a tool call.
+        tool: Option<String>,
+        secs: u64,
+    },
+}
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            UnreachableKind::Refused => write!(
+                f,
+                "daemon unreachable at {} (connection refused — is `toron serve --mcp-http` running?)",
+                self.endpoint
+            ),
+            UnreachableKind::Timeout { tool: None, secs } => write!(
+                f,
+                "daemon connect timed out after {secs}s (is `toron serve --mcp-http` running and responsive?)"
+            ),
+            UnreachableKind::Timeout {
+                tool: Some(tool),
+                secs,
+            } => write!(
+                f,
+                "call_tool({tool}) timed out after {secs}s — daemon unresponsive (bd-gtqe loud-fail; was a silent hang)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
+
+/// Classify a failed daemon `connect` as a typed refusal when the anyhow
+/// chain carries an `io::Error` with `ConnectionRefused` (type match, never
+/// prose grep). Returns false for failures that are not a refusal — those
+/// keep their existing context.
+fn is_refused(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
 fn tool_call_timeout() -> std::time::Duration {
     std::env::var("TORON_TOOL_TIMEOUT_MS")
         .ok()
@@ -93,12 +154,30 @@ impl DaemonClient {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
+            anyhow::Error::new(DaemonUnreachable {
+                endpoint: endpoint.clone(),
+                kind: UnreachableKind::Timeout {
+                    tool: None,
+                    secs: CONNECT_TIMEOUT.as_secs(),
+                },
+            })
+            .context(format!(
                 "daemon connect timed out after {}s (is `toron serve --mcp-http` running and responsive?)",
                 CONNECT_TIMEOUT.as_secs()
-            )
+            ))
         })?
-        .context("daemon connect (is `toron serve --mcp-http` running?)")?;
+        .context("daemon connect (is `toron serve --mcp-http` running?)")
+        .map_err(|e| {
+            if is_refused(&e) {
+                anyhow::Error::new(DaemonUnreachable {
+                    endpoint: endpoint.clone(),
+                    kind: UnreachableKind::Refused,
+                })
+                .context(format!("{e:#}"))
+            } else {
+                e
+            }
+        })?;
         Ok(Self {
             client: Arc::new(client),
             endpoint: endpoint.to_string(),
@@ -136,10 +215,17 @@ impl DaemonClient {
         let result = tokio::time::timeout(deadline, self.client.call_tool(params))
             .await
             .map_err(|_| {
-                anyhow::anyhow!(
+                anyhow::Error::new(DaemonUnreachable {
+                    endpoint: self.endpoint.clone(),
+                    kind: UnreachableKind::Timeout {
+                        tool: Some(tool.to_string()),
+                        secs: deadline.as_secs(),
+                    },
+                })
+                .context(format!(
                     "call_tool({tool}) timed out after {}s — daemon unresponsive (bd-gtqe loud-fail; was a silent hang)",
                     deadline.as_secs()
-                )
+                ))
             })?
             .with_context(|| format!("call_tool({tool}) transport error"))?;
         if result.is_error.unwrap_or(false) {
@@ -448,6 +534,66 @@ mod selector_tests {
             !lower.contains("refus"),
             "it must NOT claim to refuse: naming a daemon's own data root alongside its URL is \
              legitimate, and a refusal broke four conformance tests to fix a silence: {m}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_unreachable_tests {
+    use super::*;
+
+    fn refused_chain() -> anyhow::Error {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connect: connection refused",
+        );
+        anyhow::Error::new(io).context("daemon connect (is `toron serve --mcp-http` running?)")
+    }
+
+    #[test]
+    fn refused_connection_classifies_by_type_not_prose() {
+        assert!(is_refused(&refused_chain()));
+        let other: anyhow::Error = anyhow::anyhow!("daemon connect timed out").into();
+        assert!(!is_refused(&other));
+        // the words alone never classify — only the io::Error kind does
+        let prose_only =
+            anyhow::anyhow!("connection refused (is `toron serve --mcp-http` running?)");
+        assert!(!is_refused(&prose_only));
+    }
+
+    #[test]
+    fn display_keeps_todays_remediation_text() {
+        let ep = "http://127.0.0.1:18080/mcp";
+        let refused = DaemonUnreachable {
+            endpoint: ep.into(),
+            kind: UnreachableKind::Refused,
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("is `toron serve --mcp-http` running?")
+        );
+        let timeout = DaemonUnreachable {
+            endpoint: ep.into(),
+            kind: UnreachableKind::Timeout {
+                tool: None,
+                secs: 10,
+            },
+        };
+        assert_eq!(
+            timeout.to_string(),
+            "daemon connect timed out after 10s (is `toron serve --mcp-http` running and responsive?)"
+        );
+        let call_timeout = DaemonUnreachable {
+            endpoint: ep.into(),
+            kind: UnreachableKind::Timeout {
+                tool: Some("fetch_inbox".into()),
+                secs: 30,
+            },
+        };
+        assert_eq!(
+            call_timeout.to_string(),
+            "call_tool(fetch_inbox) timed out after 30s — daemon unresponsive (bd-gtqe loud-fail; was a silent hang)"
         );
     }
 }

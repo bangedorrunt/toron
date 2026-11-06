@@ -296,15 +296,53 @@ fn migration_content_mismatch_message(store: &str, version: i64) -> String {
     )
 }
 
+/// Typed store-skew refusal (wave5-b): this binary resolves migrations up to
+/// `binary`, but the store already has `store` applied (or carries different
+/// contents for it) — so the binary is older than the store and must refuse
+/// the open. Carried inside the anyhow chain (`downcast::<StoreSkew>()`
+/// finds it); the machine marker stays in `Display` for the cross-process
+/// consumers that match the literal, and the full remediation text rides as
+/// the anyhow context so the CLI output is byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSkew {
+    pub binary: u32,
+    pub store: u32,
+}
+
+impl std::fmt::Display for StoreSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { binary, store } = *self;
+        write!(
+            f,
+            "store skew: binary resolves at most migration {binary}, store has \
+             migration {store} applied ({STORE_SKEW_MARKER})"
+        )
+    }
+}
+
+impl std::error::Error for StoreSkew {}
+
 /// Map sqlx's migration failures into errors that carry the store, the skew,
 /// and the fix. Every other failure keeps its own message.
 fn map_migrate_error(store: &str, e: sqlx::migrate::MigrateError) -> anyhow::Error {
     match e {
         sqlx::migrate::MigrateError::VersionMissing(v) => {
-            anyhow::anyhow!(migration_skew_message(store, v, resolved_max_version()))
+            let skew = StoreSkew {
+                binary: resolved_max_version() as u32,
+                store: v as u32,
+            };
+            anyhow::Error::new(skew).context(migration_skew_message(
+                store,
+                v,
+                resolved_max_version(),
+            ))
         }
         sqlx::migrate::MigrateError::VersionMismatch(v) => {
-            anyhow::anyhow!(migration_content_mismatch_message(store, v))
+            let skew = StoreSkew {
+                binary: resolved_max_version() as u32,
+                store: v as u32,
+            };
+            anyhow::Error::new(skew).context(migration_content_mismatch_message(store, v))
         }
         other => other.into(),
     }
@@ -412,6 +450,53 @@ mod tests {
         ));
         let pool = connect(path.to_str().unwrap()).await.expect("connect");
         (pool, path)
+    }
+
+    /// wave5-b: the skew refusal carries its type, not just its marker.
+    /// `downcast::<StoreSkew>()` finds versions through the anyhow context,
+    /// the marker survives for literal-matchers, and the CLI text (path +
+    /// versions + fix) is byte-identical to the untyped message.
+    #[tokio::test]
+    async fn store_skew_is_typed_at_the_origin() {
+        let (pool, path) = temp_pool("typed-skew").await;
+        migrate(&pool).await.expect("baseline migrate");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (99, 'written by a newer toron', CURRENT_TIMESTAMP, TRUE, X'00', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("fabricate a migration only a newer binary could have applied");
+
+        let err = migrate(&pool)
+            .await
+            .expect_err("a store ahead of the binary must refuse to open");
+        let skew = err
+            .downcast_ref::<StoreSkew>()
+            .expect("the skew type rides the anyhow chain");
+        assert_eq!(skew.store, 99, "store version is the applied one");
+        assert_eq!(
+            skew.binary,
+            resolved_max_version() as u32,
+            "binary version is what this build resolves"
+        );
+        assert!(
+            skew.to_string().contains(STORE_SKEW_MARKER),
+            "Display keeps the machine marker: {skew}"
+        );
+        let msg = format!("{err:#}");
+        for needle in [
+            "99",
+            &resolved_max_version().to_string(),
+            path.to_str().expect("tmp path"),
+            STORE_SKEW_MARKER,
+            "rebuild",
+        ] {
+            assert!(msg.contains(needle), "CLI text keeps {needle:?}: {msg}");
+        }
+        drop(pool);
+        let _ = std::fs::remove_file(path);
     }
 
     /// bd-0lyz: a queued writer must outlive a multi-second hold of the

@@ -240,6 +240,17 @@ pub(crate) fn build_send_tags(
     Ok(tags.to_tags())
 }
 
+/// Resolve an inbox `--since` argument to the daemon-facing string via the
+/// shared [`toron_core::time_spec`] parser: `None` stays `None`, `last`
+/// passes through (the daemon owns the cursor), RFC3339 passes through
+/// byte-identical, and relative offsets resolve against now. Garbage fails
+/// here, loudly, before any store is touched.
+fn resolve_inbox_since(since: &Option<String>) -> anyhow::Result<Option<String>> {
+    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    toron_core::time_spec::resolve_since_arg(since.as_deref(), now_secs)
+        .map_err(|e| anyhow::anyhow!("--since {e}"))
+}
+
 pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
@@ -332,7 +343,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 limit: args.limit,
                 include_bodies: args.bodies,
                 urgent_only: false,
-                since_ts: args.since.clone(),
+                since_ts: resolve_inbox_since(&args.since)?,
                 thread_id: args.thread_id.clone(),
                 ack_overdue_only: false,
             };
@@ -440,6 +451,7 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
             .await
         }
         MailCommand::Inbox(args) => {
+            let since_ts = resolve_inbox_since(&args.since)?;
             daemon_tool(
                 dc,
                 "fetch_inbox",
@@ -450,7 +462,7 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "limit": args.limit,
                     "include_bodies": args.bodies,
                     "urgent_only": false,
-                    "since_ts": args.since,
+                    "since_ts": since_ts,
                     "thread_id": args.thread_id,
                 }),
             )

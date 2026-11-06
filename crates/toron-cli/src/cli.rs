@@ -736,10 +736,10 @@ pub struct MailInboxArgs {
     #[arg(long)]
     pub thread_id: Option<String>,
     /// Only messages strictly newer than this RFC3339 timestamp (e.g.
-    /// 2026-08-18T00:00:00Z), or the literal `last` (bd-since-cursor-70cf):
-    /// the daemon-side high-water cursor, read then atomically bumped —
-    /// crash-proof incremental polling. A malformed value is an error,
-    /// never ignored.
+    /// 2026-08-18T00:00:00Z), a relative offset (30s, 15m, 6h, 7d),
+    /// or the literal `last` (bd-since-cursor-70cf): the daemon-side high-water
+    /// cursor, read then atomically bumped — crash-proof incremental polling.
+    /// A malformed value is an error, never ignored.
     #[arg(long)]
     pub since: Option<String>,
 }
@@ -1560,7 +1560,9 @@ pub struct ChannelReadArgs {
     /// Maximum messages to return.
     #[arg(long)]
     pub limit: Option<usize>,
-    /// Include messages at/after this RFC3339 timestamp.
+    /// Include messages at/after this timestamp: RFC3339 or a relative
+    /// offset (30s, 15m, 6h, 7d). `last` is rejected here — a channel read
+    /// tracks no high-water cursor.
     #[arg(long)]
     pub since: Option<String>,
     /// Only events authored by this agent (bd-delivery-visibility-g96y:

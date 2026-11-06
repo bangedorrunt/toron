@@ -284,11 +284,15 @@ pub(crate) fn pane_agent(flag: Option<&str>) -> Option<String> {
     resolve_presence_as(flag, &live_env)
 }
 
-/// `--since` RFC3339 → unix seconds.
+/// `--since` to unix seconds via the shared [`toron_core::time_spec`] parser:
+/// RFC3339 (byte-identical to the old behavior), relative offsets (`30s`,
+/// `15m`, `6h`, `7d`), or `last` — which has no high-water cursor on the
+/// channel-read path and fails loudly instead of silently meaning 0.
 fn parse_since(s: &str) -> anyhow::Result<u64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s)
-        .map_err(|e| anyhow::anyhow!("bad --since {s:?}: {e}"))?;
-    Ok(dt.timestamp().max(0) as u64)
+    let spec = toron_core::time_spec::parse(s).map_err(|e| anyhow::anyhow!("--since {e}"))?;
+    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    spec.resolve_since(now_secs, None)
+        .map_err(|e| anyhow::anyhow!("--since {e}"))
 }
 
 /// Publish the channel-create lifecycle event (kind 39000).
