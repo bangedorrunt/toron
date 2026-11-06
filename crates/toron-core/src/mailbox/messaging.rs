@@ -1463,8 +1463,8 @@ impl Mailbox {
             return Ok(());
         }
 
-        if let Ok(backend) = crate::backend::plane::connect_default()
-            && let Ok(agents) = backend.agent_list()
+        if let Some(plane) = self.plane.as_deref()
+            && let Ok(agents) = plane.agent_list()
         {
             let pane_of = |name: &str| {
                 agents
@@ -5006,5 +5006,124 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
         drop(pool);
+    }
+
+    /// wave6-b: the messaging presence path (`authorize_ack` same-pane arm)
+    /// reads the injected port. Same pane admits; a stranger on another pane
+    /// with no thread role is refused.
+    #[tokio::test]
+    async fn authorize_ack_reads_injected_plane() {
+        use crate::plane_port::AgentInfo;
+        use crate::plane_port::AgentStatus;
+        use crate::plane_port::PaneInfo;
+        use crate::plane_port::{MockPanePlane, TOKEN_PIN};
+        fn agent(name: &str, pane_id: &str) -> AgentInfo {
+            AgentInfo {
+                agent: None,
+                agent_status: AgentStatus::Unknown,
+                cwd: None,
+                display_agent: None,
+                focused: false,
+                foreground_cwd: None,
+                interactive_ready: false,
+                launch_pending: false,
+                name: Some(name.into()),
+                pane_id: pane_id.into(),
+                revision: 0,
+                state_change_seq: 0,
+                completion_seq: None,
+                state_labels: serde_json::Map::new(),
+                tab_id: String::new(),
+                terminal_id: String::new(),
+                terminal_title: None,
+                workspace_id: String::new(),
+            }
+        }
+        fn pane(pane_id: &str, pin: &str) -> PaneInfo {
+            let mut tokens = serde_json::Map::new();
+            tokens.insert(TOKEN_PIN.into(), serde_json::Value::String(pin.into()));
+            PaneInfo {
+                pane_id: pane_id.into(),
+                terminal_id: String::new(),
+                workspace_id: String::new(),
+                tab_id: String::new(),
+                focused: false,
+                agent_status: crate::plane_port::AgentStatus::Unknown,
+                revision: 0,
+                title: None,
+                cwd: None,
+                agent: None,
+                agent_session: None,
+                display_agent: None,
+                foreground_cwd: None,
+                label: None,
+                scroll: None,
+                state_labels: serde_json::Map::new(),
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens,
+            }
+        }
+        let (mailbox, _db, _dir) = test_mailbox("plane-ack").await;
+        for (pin, program) in [
+            ("BlueLake", None),
+            ("GreenCastle", None),
+            ("DustySparrow", None),
+        ] {
+            let mut p = profile(pin);
+            p.program = program;
+            mailbox.register_agent("demo", &p).await.expect("register");
+        }
+        // GreenCastle sends BlueLake one message; BlueLake's keys unwrap it.
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "ping".into(),
+                body_md: "ack me".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        let acker = mailbox
+            .whois("demo", "BlueLake")
+            .await
+            .expect("whois acker");
+        let acker_npub = crate::nostr::PublicKey::from_hex(&acker.npub).expect("acker npub");
+        let wraps = wraps_to(&mailbox, &acker_npub, 1).await;
+        assert_eq!(wraps.len(), 1);
+        let re = mailbox
+            .register_agent("demo", &profile("BlueLake"))
+            .await
+            .expect("re-read keys");
+        let acker_keys = mailbox
+            .load_agent_key(std::path::Path::new(&re.key_path))
+            .expect("acker keys");
+        let gift = unwrap_for_recipient(&acker_keys, &wraps[0]).expect("unwrap");
+        // Same pane for acker + recipient: admitted via the injected plane.
+        // (The ack arm reads the agent roster: both pins ride pane b:1.)
+        let together = MockPanePlane::new(
+            vec![pane("b:1", "BlueLake"), pane("b:1", "GreenCastle")],
+            vec![agent("BlueLake", "b:1"), agent("GreenCastle", "b:1")],
+        );
+        let mailboxed = mailbox.with_plane(Arc::new(together));
+        mailboxed
+            .authorize_ack("demo", "BlueLake", "GreenCastle", &gift)
+            .await
+            .expect("same pane admits");
+        // Stranger on another pane, no thread role: refused.
+        let apart = MockPanePlane::new(
+            vec![pane("b:1", "BlueLake"), pane("b:2", "DustySparrow")],
+            vec![agent("BlueLake", "b:1"), agent("DustySparrow", "b:2")],
+        );
+        let mailboxed = mailboxed.with_plane(Arc::new(apart));
+        assert!(
+            mailboxed
+                .authorize_ack("demo", "DustySparrow", "GreenCastle", &gift)
+                .await
+                .is_err(),
+            "stranger on another pane is refused"
+        );
     }
 }

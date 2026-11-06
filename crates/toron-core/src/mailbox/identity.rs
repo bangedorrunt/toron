@@ -21,11 +21,10 @@ use std::path::PathBuf;
 
 use crate::nostr::{Keys, Timestamp};
 
-use crate::backend::Backend;
-use crate::backend::types::{AgentInfo, PaneInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use crate::bus::filter::kind_project_filter;
 use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
 use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
+use crate::plane_port::{AgentInfo, PaneInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 
 use super::Mailbox;
 use super::{AltKeyMemo, collect_replay};
@@ -1498,7 +1497,7 @@ impl Mailbox {
     /// any-name resolution (AM-Rust parity).
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
         let canonical = self.canonical_project(project_slug).await;
-        let panes = Self::live_pin_pane_map(&canonical);
+        let panes = Self::live_pin_pane_map(self.plane.as_deref(), &canonical);
         self.whois_inner(&canonical, name, panes).await
     }
 
@@ -1726,7 +1725,7 @@ impl Mailbox {
             agents.retain(|a| a.last_active_ts_us >= cutoff);
         }
         agents.sort_by_key(|b| std::cmp::Reverse(b.last_active_ts_us));
-        let mut panes = Self::live_pin_pane_map(&canonical);
+        let mut panes = Self::live_pin_pane_map(self.plane.as_deref(), &canonical);
         for agent in &mut agents {
             if let Some(pane) = panes.remove(&agent.name) {
                 agent.identity_divergent = pane
@@ -1775,11 +1774,14 @@ impl Mailbox {
     /// bd-zoir: a pin the direct sweep misses falls back to the flywheel
     /// spawn registry binding for `project`, so a pane re-bound under another
     /// display pin still answers for its mail identity.
-    fn live_pin_pane_map(project: &str) -> std::collections::HashMap<String, PaneRef> {
-        let Ok(backend) = crate::backend::plane::connect_default() else {
+    fn live_pin_pane_map(
+        plane: Option<&dyn crate::plane_port::PanePlane>,
+        project: &str,
+    ) -> std::collections::HashMap<String, PaneRef> {
+        let Some(plane) = plane else {
             return std::collections::HashMap::new();
         };
-        let Ok(panes) = backend.pane_list(None) else {
+        let Ok(panes) = plane.pane_list() else {
             return std::collections::HashMap::new();
         };
         // A stamped pane (an hc `toron_pin` token, or a rex block whose label
@@ -1789,7 +1791,7 @@ impl Mailbox {
         let agents = if panes.iter().all(|pane| pane_token_pin(pane).is_some()) {
             Vec::new()
         } else {
-            backend.agent_list().unwrap_or_default()
+            plane.agent_list().unwrap_or_default()
         };
         let mut map = pin_pane_map(&panes, &agents);
         augment_pane_map_with_registry(
@@ -1809,17 +1811,17 @@ impl Mailbox {
     /// previous occupant's pin.
     pub fn resolve_pane_identity(
         &self,
-        backend: &dyn Backend,
+        plane: &dyn crate::plane_port::PanePlane,
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let panes: Vec<PaneInfo> = backend.pane_list(None).unwrap_or_default();
+        let panes: Vec<PaneInfo> = plane.pane_list().unwrap_or_default();
         // Cheap path first: a token (hc) or an adapter-mapped label (rex)
         // answers without the agent sweep. The legacy `agent.list` name
         // fallback runs only on a miss.
         if let Some(pin) = resolve_pin_for_pane(&panes, &[], pane_id) {
             return Ok(Some(pin));
         }
-        let agents = backend.agent_list()?;
+        let agents = plane.agent_list()?;
         Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
     }
 
@@ -1831,9 +1833,12 @@ impl Mailbox {
     /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead
     /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
     /// retires both, so neither is ever a silent live pin.
-    pub fn cleanup_pane_identities(&self, backend: &dyn Backend) -> anyhow::Result<Vec<String>> {
-        let agents = backend.agent_list()?;
-        let panes: Vec<PaneInfo> = backend.pane_list(None).unwrap_or_default();
+    pub fn cleanup_pane_identities(
+        &self,
+        plane: &dyn crate::plane_port::PanePlane,
+    ) -> anyhow::Result<Vec<String>> {
+        let agents = plane.agent_list()?;
+        let panes: Vec<PaneInfo> = plane.pane_list().unwrap_or_default();
         let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();
         let live_panes: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
         Ok(agents
@@ -4779,5 +4784,63 @@ mod tests {
         assert_eq!(pins, vec!["EmberOtter", "SilverPond"]);
         assert!(spawn_registry_bindings_in(&dir.join("nope"), "elm-effect-rs").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wave6-b: the kernel reads pane facts through the injected port, never by
+    /// constructing a backend. A stamped mock pane enriches the map; an
+    /// unreachable plane (or none) maps nothing — the same degrade-as-absent
+    /// posture as the old per-call `connect_default` failure.
+    #[test]
+    fn live_pin_pane_map_reads_injected_plane() {
+        use crate::plane_port::MockPanePlane;
+        let npub = "cc".repeat(32);
+        let mock = MockPanePlane::new(
+            vec![test_pane_stamped("b:9", "WaveSixA", "proj", &npub)],
+            vec![],
+        );
+        let map = Mailbox::live_pin_pane_map(Some(&mock), "proj");
+        let hit = map.get("WaveSixA").expect("stamped pin maps");
+        assert_eq!(hit.pane_id, "b:9");
+        let empty = Mailbox::live_pin_pane_map(Some(&MockPanePlane::unreachable()), "proj");
+        assert!(empty.is_empty(), "unreachable plane maps nothing");
+        let gone = Mailbox::live_pin_pane_map(None, "proj");
+        assert!(gone.is_empty(), "absent plane maps nothing");
+    }
+
+    /// wave6-b: `resolve_pane_identity` answers from the injected plane
+    /// (presence probe): a stamped pane resolves, an unknown pane does not.
+    #[tokio::test]
+    async fn resolve_pane_identity_reads_injected_plane() {
+        use crate::plane_port::MockPanePlane;
+        let (mailbox, _db, _dir) = test_mailbox("plane-probe").await;
+        let npub = "dd".repeat(32);
+        let plane = Arc::new(MockPanePlane::new(
+            vec![test_pane_stamped("b:7", "WaveSixB", "proj", &npub)],
+            vec![],
+        ));
+        let mailboxed = mailbox.with_plane(plane.clone());
+        let stored = mailboxed
+            .plane
+            .clone()
+            .expect("with_plane stores the plane");
+        assert!(
+            std::ptr::eq(
+                Arc::as_ptr(&stored) as *const (),
+                Arc::as_ptr(&plane) as *const ()
+            ),
+            "same plane instance"
+        );
+        assert_eq!(
+            mailboxed
+                .resolve_pane_identity(plane.as_ref(), "b:7")
+                .expect("resolve"),
+            Some("WaveSixB".to_string())
+        );
+        assert_eq!(
+            mailboxed
+                .resolve_pane_identity(plane.as_ref(), "b:nope")
+                .expect("miss"),
+            None
+        );
     }
 }

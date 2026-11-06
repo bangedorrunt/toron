@@ -128,6 +128,12 @@ pub struct Mailbox {
     data_dir: PathBuf,
     operator: Option<Keys>,
     agent_passphrase: Option<String>,
+    /// Pane-plane facts for the kernel (wave6-b port). Default = the live
+    /// plane at construction (`LivePanePlane::connect_default`, `None` when
+    /// no plane is reachable — the same degrade-as-absent posture as the old
+    /// per-call `connect_default` sites). Tests/embedders override with
+    /// [`Mailbox::with_plane`]. No env read happens on any later call path.
+    plane: Option<std::sync::Arc<dyn crate::plane_port::PanePlane>>,
     /// NIP-17 wrap idempotency only (event-id keys). Not SLA truth —
     /// assignment receipts live in `receipts` sqlite (ADR-0027 E2).
     wrap_idempotency: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
@@ -225,6 +231,11 @@ impl Mailbox {
             data_dir,
             operator,
             agent_passphrase: None,
+            plane: crate::plane_port::LivePanePlane::connect_default()
+                .ok()
+                .map(|p| {
+                    std::sync::Arc::new(p) as std::sync::Arc<dyn crate::plane_port::PanePlane>
+                }),
             wrap_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             loop_tracker: crate::mailbox::surface::LoopTracker::default(),
             index_pool: None,
@@ -242,6 +253,13 @@ impl Mailbox {
             alt_key_paths: Arc::new(papaya::HashMap::new()),
             alt_key_walks: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Override the pane-plane port (tests, embedders holding their own
+    /// plane). The default from [`Mailbox::new`] is the live plane.
+    pub fn with_plane(mut self, plane: std::sync::Arc<dyn crate::plane_port::PanePlane>) -> Self {
+        self.plane = Some(plane);
+        self
     }
 
     /// bd-py9o: decrypt a gift wrap through the per-(recipient, event) memo.

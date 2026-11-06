@@ -1088,20 +1088,26 @@ impl MailSurface for ToronMailSurface {
         _project: &str,
         pane_id: &str,
     ) -> Result<Option<String>, MailError> {
-        let backend = crate::backend::plane::connect_default()
-            .map_err(|e| anyhow::anyhow!("pane plane unavailable: {e}"))
+        let plane = self
+            .mailbox
+            .plane
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("pane plane unavailable"))
             .map_mail_error()?;
         self.mailbox
-            .resolve_pane_identity(backend.as_ref(), pane_id)
+            .resolve_pane_identity(plane.as_ref(), pane_id)
             .map_mail_error()
     }
 
     async fn cleanup_pane_identities(&self, _project: &str) -> Result<Vec<String>, MailError> {
-        let backend = crate::backend::plane::connect_default()
-            .map_err(|e| anyhow::anyhow!("pane plane unavailable: {e}"))
+        let plane = self
+            .mailbox
+            .plane
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("pane plane unavailable"))
             .map_mail_error()?;
         self.mailbox
-            .cleanup_pane_identities(backend.as_ref())
+            .cleanup_pane_identities(plane.as_ref())
             .map_mail_error()
     }
 
