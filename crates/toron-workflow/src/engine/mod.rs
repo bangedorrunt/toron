@@ -19,6 +19,7 @@
 mod boundary;
 pub mod branch;
 mod control_flow;
+pub mod dispatch;
 mod drive;
 pub mod durable;
 pub mod durable_host;
