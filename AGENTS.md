@@ -42,7 +42,7 @@ One root `AGENTS.md` only — enforced by `scripts/verify-gates.sh`.
 | Durable engine store | `crates/toron-core/src/index/durable_engine.rs` (`EngineStorage` over additive `durable_engine_*` tables; sync bridge like `journal.rs`; `commit_run`/`commit_park` are one transaction each). Kernel re-export: `toron_core::kernel` |
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs` |
 | MCP tools / resources | `crates/toron-mcp/src/{tools,resources}.rs` |
-| TUI (Elm core) | `crates/toron-cli/src/tui/` — pure `tick`; theme `theme.rs` |
+| TUI (Elm core) | `crates/toron-cli/src/tui/` — pure `tick`; theme at `src/theme.rs` |
 | Daemon / CLI | `crates/toron-cli/src/{cli,daemon,main}.rs` |
 | Daemon build identity | `crates/toron-core/src/serve_build.rs` + mcp `serve_lock.rs` |
 
