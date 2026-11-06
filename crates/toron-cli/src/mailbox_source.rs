@@ -133,6 +133,17 @@ impl DaemonClient {
         } else {
             format!("{base}/mcp")
         };
+        // wave8-b: first-hand refusal check. rmcp wraps the transport error
+        // message-only, so the chain walk in `is_refused` never sees the
+        // RST; a bounded TCP open classifies refusal at the origin instead.
+        // Only a definite refusal short-circuits — anything else (timeout,
+        // DNS, unreachable) falls through to the normal handshake path.
+        if refused_now(&endpoint) {
+            return Err(anyhow::Error::new(DaemonUnreachable {
+                endpoint: endpoint.clone(),
+                kind: UnreachableKind::Refused,
+            }));
+        }
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(endpoint.clone()),
         );
@@ -282,12 +293,17 @@ pub enum MailboxSource {
 }
 
 /// Pure selector decision (bd-nsr7: testable without sockets or env).
+/// wave8-b: a live default port DISCOVERS the daemon (`DaemonDefault`) —
+/// the old `RefuseSecondStore` arm is gone; refusing a healthy local daemon
+/// was the bug. `DaemonExplicit` (env/config) connects or fails loud;
+/// `DaemonDefault` connects and falls back to embedded with a loud note on
+/// the probe-to-connect race.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceDecision {
-    DaemonUrl(String),
+    DaemonExplicit(String),
+    DaemonDefault,
     EmbeddedPinned,
     EmbeddedXdg,
-    RefuseSecondStore,
 }
 
 /// bd-qpm0: the refusal text, as a CONSTANT so a fence can read it.
@@ -309,61 +325,99 @@ fn decide_source(
     default_port_live: bool,
 ) -> SourceDecision {
     if let Some(url) = env_url {
-        return SourceDecision::DaemonUrl(url);
+        return SourceDecision::DaemonExplicit(url);
     }
     if data_dir_pinned {
         return SourceDecision::EmbeddedPinned;
     }
     if let Some(url) = flywheel_url {
-        return SourceDecision::DaemonUrl(url);
+        return SourceDecision::DaemonExplicit(url);
     }
     if default_port_live {
-        return SourceDecision::RefuseSecondStore;
+        return SourceDecision::DaemonDefault;
     }
     SourceDecision::EmbeddedXdg
+}
+
+/// Injectable inputs for [`MailboxSource::resolve_with`] (wave8-b): the
+/// fake-prober seam. Production builds this from process env plus a bounded
+/// TCP probe of the default port; tests pass fake values and never touch
+/// a live daemon.
+#[derive(Debug, Clone)]
+pub struct ResolveInputs {
+    /// `TORON_MCP_URL` (already parse-or-refused by the caller).
+    pub env_url: Option<String>,
+    /// `TORON_MCP_DATA_DIR` is set (test-isolation pin).
+    pub data_dir_pinned: bool,
+    /// flywheel `[mail.toron] url`.
+    pub config_url: Option<String>,
+    /// Default-port probe: the URL probed plus whether it answered.
+    pub default_probe: (String, bool),
 }
 
 impl MailboxSource {
     /// Resolve the robot path's mailbox source with the flywheel selector.
     ///
-    /// One selector, fail-loud (ADR-0035 Spec 4.5, bd-nsr7): an explicit
-    /// daemon URL connects or errors — never a silent second store. When no
-    /// daemon is configured, a live default-port daemon refuses embedded
-    /// fallback instead of diverging beside it.
+    /// One selector (ADR-0035 Spec 4.5, bd-nsr7; wave8-b discovery): an
+    /// explicit daemon URL connects or errors loud — never a silent second
+    /// store. With no configured URL, a healthy default-port daemon is USED
+    /// (discovered, not refused); only a quiet port falls back to embedded.
+    /// A discovered daemon that dies between probe and connect falls back
+    /// to embedded with a loud note.
     ///
     /// Precedence:
-    /// 0. BOTH `TORON_MCP_DATA_DIR` and `TORON_MCP_URL` — a contradiction, and
-    ///    REFUSED loud (bd-qpm0). Two explicit answers to "which store?" is not
-    ///    a precedence question; tie-breaking it silently is what made this
-    ///    selector a bug factory twice.
+    /// 0. BOTH `TORON_MCP_DATA_DIR` and `TORON_MCP_URL` — a contradiction,
+    ///    WARNED loud (bd-qpm0); the daemon still wins.
     /// 1. `TORON_MCP_DATA_DIR` — explicit durable-root pin (test isolation).
     /// 2. `TORON_MCP_URL` — explicit daemon URL (connect failure is loud).
     /// 3. flywheel `[mail.toron] url` — configured daemon (connect loud).
-    /// 4. Embedded against the durable XDG root — refused loud when the
-    ///    default port serves (that daemon owns the store; set
-    ///    `TORON_MCP_URL` to use it or stop it).
+    /// 4. Default `http://127.0.0.1:18080/mcp` — used when its health probe
+    ///    answers; connect-race failure falls back loud, never refuses.
+    /// 5. Embedded against the durable XDG root (no daemon anywhere).
     pub async fn resolve() -> anyhow::Result<Self> {
         // bd-qpm0: report the ambiguity LOUDLY, but do not change the decision.
         if try_daemon_url_from_env()?.is_some() && data_dir_pinned_from_env() {
             eprintln!("{CONTRADICTION_MESSAGE}");
         }
+        Self::resolve_with(ResolveInputs {
+            env_url: try_daemon_url_from_env()?,
+            data_dir_pinned: data_dir_pinned_from_env(),
+            config_url: flywheel_toron_url(),
+            default_probe: (DEFAULT_DAEMON_URL.to_string(), default_port_serving()),
+        })
+        .await
+    }
+
+    /// [`Self::resolve`] with injected inputs (wave8-b fake-prober seam):
+    /// the endpoint precedence without process env or live sockets, except
+    /// the connect itself. Tests pass a dead loopback URL for the failure
+    /// arms (refused instantly, no daemon) and a dead probe for the
+    /// embedded arms (no socket touched at all).
+    pub async fn resolve_with(inputs: ResolveInputs) -> anyhow::Result<Self> {
         let decision = decide_source(
-            try_daemon_url_from_env()?,
-            std::env::var_os("TORON_MCP_DATA_DIR").is_some(),
-            flywheel_toron_url(),
-            default_port_serving(),
+            inputs.env_url,
+            inputs.data_dir_pinned,
+            inputs.config_url,
+            inputs.default_probe.1,
         );
         match decision {
-            SourceDecision::DaemonUrl(url) => Ok(Self::Daemon(DaemonClient::connect(&url).await?)),
+            SourceDecision::DaemonExplicit(url) => {
+                Ok(Self::Daemon(DaemonClient::connect(&url).await?))
+            }
+            SourceDecision::DaemonDefault => {
+                let url = inputs.default_probe.0;
+                match DaemonClient::connect(&url).await {
+                    Ok(dc) => Ok(Self::Daemon(dc)),
+                    Err(e) => {
+                        eprintln!(
+                            "toron: default daemon at {url} probed live but the connect failed ({e:#}); falling back to embedded for this command (one store per project — start the daemon or set TORON_MCP_URL to use it)."
+                        );
+                        Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
+                    }
+                }
+            }
             SourceDecision::EmbeddedPinned | SourceDecision::EmbeddedXdg => {
                 Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
-            }
-            SourceDecision::RefuseSecondStore => {
-                anyhow::bail!(
-                    "a toron daemon serves {DEFAULT_DAEMON_URL} but no daemon URL is configured: \
-                     set TORON_MCP_URL to use it or stop it. Refusing to open a second \
-                     embedded store beside a live daemon (one store per project)."
-                );
             }
         }
     }
@@ -403,6 +457,32 @@ fn port_serving(addr: &str) -> bool {
         return false;
     };
     std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200)).is_ok()
+}
+
+/// First-hand refusal probe for [`DaemonClient::connect`] (wave8-b): open a
+/// bounded TCP connection to the endpoint's host:port. `true` only on a
+/// definite RST — timeouts, DNS failures, and unparseable endpoints return
+/// `false` so the normal handshake path (with its own typed timeout) decides.
+fn refused_now(endpoint: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let host_port = endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or(endpoint)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let mut addrs = match host_port.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return false,
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)) {
+        Ok(_) => false,
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+    }
 }
 
 /// Whether the default daemon port serves (TCP probe, short timeout).
@@ -448,7 +528,7 @@ mod selector_tests {
                     Some("http://y/mcp".to_string()),
                     true,
                 ),
-                SourceDecision::DaemonUrl("http://x/mcp".to_string()),
+                SourceDecision::DaemonExplicit("http://x/mcp".to_string()),
             ),
             (
                 "env url when nothing is pinned",
@@ -458,7 +538,7 @@ mod selector_tests {
                     Some("http://y/mcp".to_string()),
                     true,
                 ),
-                SourceDecision::DaemonUrl("http://x/mcp".to_string()),
+                SourceDecision::DaemonExplicit("http://x/mcp".to_string()),
             ),
             (
                 "data dir pin",
@@ -468,12 +548,12 @@ mod selector_tests {
             (
                 "flywheel url",
                 (None, false, Some("http://y/mcp".to_string()), false),
-                SourceDecision::DaemonUrl("http://y/mcp".to_string()),
+                SourceDecision::DaemonExplicit("http://y/mcp".to_string()),
             ),
             (
-                "live default refuses",
+                "live default discovers the daemon",
                 (None, false, None, true),
-                SourceDecision::RefuseSecondStore,
+                SourceDecision::DaemonDefault,
             ),
             (
                 "quiet embeds",
@@ -538,6 +618,97 @@ mod selector_tests {
              legitimate, and a refusal broke four conformance tests to fix a silence: {m}"
         );
     }
+
+    /// wave8-b: the injectable seam resolves end-to-end without env or a
+    /// live daemon. Loopback port 9 is refused (never a daemon); a dead
+    /// default probe touches no socket at all.
+    const DEAD_URL: &str = "http://127.0.0.1:9/mcp";
+
+    fn dead_default(live: bool) -> (String, bool) {
+        (DEAD_URL.to_string(), live)
+    }
+
+    #[tokio::test]
+    async fn explicit_dead_url_fails_typed_with_remedy() {
+        for inputs in [
+            ResolveInputs {
+                env_url: Some(DEAD_URL.to_string()),
+                data_dir_pinned: false,
+                config_url: Some(DEAD_URL.to_string()),
+                default_probe: dead_default(false),
+            },
+            ResolveInputs {
+                env_url: None,
+                data_dir_pinned: false,
+                config_url: Some(DEAD_URL.to_string()),
+                default_probe: dead_default(true),
+            },
+        ] {
+            let err = match MailboxSource::resolve_with(inputs).await {
+                Ok(_) => {
+                    panic!("a configured-but-dead daemon must fail loud, never embed silently")
+                }
+                Err(e) => e,
+            };
+            let typed = err
+                .downcast_ref::<DaemonUnreachable>()
+                .expect("the failure must be the typed DaemonUnreachable");
+            assert_eq!(typed.endpoint, DEAD_URL);
+            assert_eq!(typed.kind, UnreachableKind::Refused);
+            assert!(
+                format!("{typed}").contains("toron serve --mcp-http"),
+                "the typed error must carry the one-line remedy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_port_embeds_without_touching_the_net() {
+        let source = MailboxSource::resolve_with(ResolveInputs {
+            env_url: None,
+            data_dir_pinned: false,
+            config_url: None,
+            default_probe: dead_default(false),
+        })
+        .await
+        .expect("no daemon anywhere must embed");
+        assert!(
+            matches!(source, MailboxSource::Embedded(_)),
+            "quiet default port embeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_beats_a_live_default_probe() {
+        let source = MailboxSource::resolve_with(ResolveInputs {
+            env_url: None,
+            data_dir_pinned: true,
+            config_url: None,
+            default_probe: dead_default(true),
+        })
+        .await
+        .expect("the isolation pin must embed even with a live probe");
+        assert!(
+            matches!(source, MailboxSource::Embedded(_)),
+            "pinned embeds without attempting the probed daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_default_that_dies_falls_back_loud() {
+        let source = MailboxSource::resolve_with(ResolveInputs {
+            env_url: None,
+            data_dir_pinned: false,
+            config_url: None,
+            default_probe: dead_default(true),
+        })
+        .await
+        .expect("the probe-to-connect race must fall back, never refuse");
+        assert!(
+            matches!(source, MailboxSource::Embedded(_)),
+            "dead-on-arrival default daemon falls back to embedded"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -555,7 +726,7 @@ mod daemon_unreachable_tests {
     #[test]
     fn refused_connection_classifies_by_type_not_prose() {
         assert!(is_refused(&refused_chain()));
-        let other: anyhow::Error = anyhow::anyhow!("daemon connect timed out").into();
+        let other: anyhow::Error = anyhow::anyhow!("daemon connect timed out");
         assert!(!is_refused(&other));
         // the words alone never classify — only the io::Error kind does
         let prose_only =
