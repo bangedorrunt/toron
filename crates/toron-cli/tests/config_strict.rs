@@ -177,8 +177,8 @@ fn doctor_names_the_freshness_triple() {
         .as_array()
         .expect("checks array")
         .iter()
-        .find(|c| c["name"] == "freshness")
-        .expect("doctor must carry a freshness check");
+        .find(|c| c["name"] == "local_binary")
+        .expect("doctor must carry a local_binary check");
     assert_eq!(freshness["ok"], true);
     let detail = freshness["detail"].as_str().expect("detail string");
     for part in ["head=", "binary=", "store="] {
@@ -215,8 +215,8 @@ fn doctor_names_the_remedy_for_a_store_newer_than_the_binary() {
         .as_array()
         .expect("checks array")
         .iter()
-        .find(|c| c["name"] == "freshness")
-        .expect("freshness check");
+        .find(|c| c["name"] == "local_binary")
+        .expect("local_binary check");
     assert_eq!(freshness["ok"], false);
     let detail = freshness["detail"].as_str().expect("detail string");
     for part in ["head=", "binary=", "store=", "remedy"] {

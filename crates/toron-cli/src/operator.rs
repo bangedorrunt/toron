@@ -54,9 +54,142 @@ struct CheckResult {
 /// second identity beside the pin; mail sealed to its npub is unreachable).
 /// Informational (ok stays true): doctor NAMES the rows, cleanup is the
 /// fold path's job (`fold_agent_name_alias` absorbs idempotently).
-/// Source HEAD for the freshness triple, when discoverable: the checkout
-/// the operator invoked from. `None` anywhere else (installed binary run
-/// outside a checkout) — the triple names the absence instead of guessing.
+/// Source time for the live-daemon judgment (wave9-c): HEAD commit time in
+/// this checkout, else the newest source mtime under a `Cargo.toml` root
+/// (exported trees have no git), else `None` = undiscoverable. The walk
+/// skips `target/`, `.git/`, `node_modules/` and caps at 20k entries — a
+/// doctor probe, not an inventory.
+fn discover_source_time() -> Option<i64> {
+    if let Some(ct) = head_commit_time() {
+        return Some(ct);
+    }
+    let root = std::env::current_dir().ok()?;
+    if !root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let mut newest: Option<i64> = None;
+    let mut stack = vec![root];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                return newest;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if !matches!(name, "target" | ".git" | "node_modules") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|md| md.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            newest = newest.max(mtime);
+        }
+    }
+    newest
+}
+
+/// HEAD commit unix time in the current checkout, else `None`.
+fn head_commit_time() -> Option<i64> {
+    let out = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%ct"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// Live-daemon leg (wave9-c): judge the RUNNING daemon's build against the
+/// source, not the local target. No serving daemon (or no boot record) keeps
+/// the existing not-running result — never a false failure. A stale daemon
+/// fails with the one remedy: reinstall toron from this source, then
+/// `toron daemon restart`. Never revives anything.
+fn check_daemon_freshness() -> CheckResult {
+    use toron_core::serve_build::{DaemonFreshness, daemon_freshness_verdict};
+    let name = "daemon_freshness";
+    let record_path = crate::daemon::build_record_path();
+    let Some(snap) = toron_core::serve_build::read(&record_path) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no boot record — no toron serve has booted against this data root".into(),
+        };
+    };
+    let serving = crate::daemon::port_holder_pid(crate::daemon::DEFAULT_ADDR);
+    let on_disk = toron_core::serve_build::artifact_id(&snap.binary);
+    let source = discover_source_time();
+    let daemon_ts = crate::daemon::ts(snap.built_at_unix);
+    match daemon_freshness_verdict(serving, &snap, on_disk, source) {
+        DaemonFreshness::Fresh => CheckResult {
+            name,
+            ok: true,
+            detail: format!(
+                "daemon pid {} runs {} (build written {}) vs source {} — current",
+                snap.pid,
+                snap.binary.display(),
+                daemon_ts,
+                source
+                    .map(crate::daemon::ts)
+                    .as_deref()
+                    .unwrap_or("<undiscoverable>")
+            ),
+        },
+        DaemonFreshness::NotRunning => CheckResult {
+            name,
+            ok: true,
+            detail: format!(
+                "build record is from pid {} — no live toron-managed daemon serves now",
+                snap.pid
+            ),
+        },
+        DaemonFreshness::Stale => {
+            let cause = if on_disk != Some(snap.artifact()) {
+                "the file on disk is a different build (redeployed under it)".to_string()
+            } else {
+                format!(
+                    "older than the source {}",
+                    source
+                        .map(crate::daemon::ts)
+                        .as_deref()
+                        .unwrap_or("<undiscoverable>")
+                )
+            };
+            CheckResult {
+                name,
+                ok: false,
+                detail: format!(
+                    "daemon pid {} runs {} (build written {}) {cause} — \
+                     remedy: reinstall toron from this source, then `toron daemon restart`",
+                    snap.pid,
+                    snap.binary.display(),
+                    daemon_ts,
+                ),
+            }
+        }
+    }
+}
+
+/// Source HEAD for the local-binary leg (wave7-c), when discoverable: the
+/// checkout the operator invoked from. `None` anywhere else (installed binary
+/// run outside a checkout) — the triple names the absence instead of guessing.
 fn discover_head() -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("rev-parse")
@@ -71,15 +204,17 @@ fn discover_head() -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
-/// Freshness triple (wave7-c): source HEAD (if discoverable), installed
-/// binary (path + version + mtime), store schema (applied vs what this
-/// binary resolves). A store newer than the binary FAILS with the remedy
-/// (upgrade toron / open with the newer binary); a green triple carries no
-/// remedy — it is silent. Binary-vs-HEAD staleness is NOT judged here:
+/// Local-binary leg (wave7-c, relabeled wave9-c): source HEAD (if
+/// discoverable), installed binary (path + version + mtime), store schema
+/// (applied vs what this binary resolves). This judges the TARGET on disk —
+/// the live daemon has its own leg (`daemon_freshness`). A store newer than
+/// the binary FAILS with the remedy (upgrade toron / open with the newer
+/// binary); a green triple carries no remedy — it is silent. Binary-vs-HEAD
+/// staleness is NOT judged here:
 /// mtimes lie (see `serve_build` docs) — the pair is named so the operator
 /// judges, and a live stale daemon stays the `daemon_build` check's job.
 fn check_freshness(cfg: &Config) -> CheckResult {
-    let name = "freshness";
+    let name = "local_binary";
     let binary = std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
@@ -617,6 +752,7 @@ pub fn run_doctor(
         check_git(),
         check_keys(cfg),
         check_daemon_build(),
+        check_daemon_freshness(),
         check_freshness(cfg),
         check_engine_store(cfg),
         check_legacy_slug_identities(cfg),

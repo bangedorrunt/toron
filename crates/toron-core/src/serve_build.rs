@@ -106,6 +106,47 @@ pub fn build_verdict(
     }
 }
 
+/// Whether the LIVE daemon's build is fresh relative to the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonFreshness {
+    /// No toron-managed daemon serves now: nothing to judge (never a failure).
+    NotRunning,
+    /// The serving daemon's build is at least as new as the source.
+    Fresh,
+    /// The serving daemon predates the source (or its disk artifact):
+    /// reinstall + restart.
+    Stale,
+}
+
+/// Judge the RUNNING binary, not the local target: `serving_pid` is whoever
+/// holds the daemon address, `snap` the boot record, `on_disk` the current
+/// identity of `snap.binary`, `source_built_at` the source time (HEAD commit
+/// time, else newest source mtime, else `None` = undiscoverable). Pure: no
+/// clock, no filesystem, no environment.
+///
+/// Comparison is strict (`>`): a rebuild landing in the same second as the
+/// source passes rather than flapping. A `touch` without content change can
+/// read stale — safe direction (rebuild + restart), never a missed stale.
+pub fn daemon_freshness_verdict(
+    serving_pid: Option<u32>,
+    snap: &BuildSnapshot,
+    on_disk: Option<ArtifactId>,
+    source_built_at: Option<i64>,
+) -> DaemonFreshness {
+    if serving_pid != Some(snap.pid) {
+        return DaemonFreshness::NotRunning;
+    }
+    if on_disk != Some(snap.artifact()) {
+        return DaemonFreshness::Stale;
+    }
+    if let Some(source) = source_built_at
+        && source > snap.built_at_unix
+    {
+        return DaemonFreshness::Stale;
+    }
+    DaemonFreshness::Fresh
+}
+
 /// Identity of `path`, or `None` when it cannot be stat'd.
 pub fn artifact_id(path: &Path) -> Option<ArtifactId> {
     let md = std::fs::metadata(path).ok()?;
@@ -279,6 +320,67 @@ mod tests {
             build_verdict(&s, None, Some(s.artifact())),
             BuildVerdict::NotServing
         );
+    }
+
+    /// The wave9-c judgment: a serving daemon older than the source is stale.
+    #[test]
+    fn daemon_is_stale_when_the_source_is_newer_than_the_running_build() {
+        let s = snap(42, 1_048_576);
+        assert_eq!(
+            daemon_freshness_verdict(
+                Some(73527),
+                &s,
+                Some(s.artifact()),
+                Some(s.built_at_unix + 1)
+            ),
+            DaemonFreshness::Stale
+        );
+    }
+
+    /// Same-second source and strict `>`: a rebuild landing in the commit's
+    /// own second passes rather than flapping.
+    #[test]
+    fn daemon_is_fresh_when_it_matches_or_beats_the_source() {
+        let s = snap(42, 1_048_576);
+        for source in [None, Some(s.built_at_unix), Some(s.built_at_unix - 1)] {
+            assert_eq!(
+                daemon_freshness_verdict(Some(73527), &s, Some(s.artifact()), source),
+                DaemonFreshness::Fresh,
+                "source {source:?} must not fail a current daemon"
+            );
+        }
+    }
+
+    /// A replaced disk artifact fails even when the source is undiscoverable:
+    /// the running build is not even what is on disk.
+    #[test]
+    fn daemon_is_stale_when_its_disk_artifact_was_replaced() {
+        let s = snap(42, 1_048_576);
+        let rebuilt = ArtifactId {
+            ino: s.ino + 1,
+            size: s.size,
+        };
+        assert_eq!(
+            daemon_freshness_verdict(Some(73527), &s, Some(rebuilt), None),
+            DaemonFreshness::Stale
+        );
+    }
+
+    /// No toron-managed daemon serves: pass as not-running, never a failure.
+    #[test]
+    fn daemon_is_not_running_when_the_record_is_from_another_process() {
+        let s = snap(42, 1_048_576);
+        for serving in [None, Some(999)] {
+            assert_eq!(
+                daemon_freshness_verdict(
+                    serving,
+                    &s,
+                    Some(s.artifact()),
+                    Some(s.built_at_unix + 1)
+                ),
+                DaemonFreshness::NotRunning
+            );
+        }
     }
 
     /// The identity must actually move when a file is rewritten — otherwise the
