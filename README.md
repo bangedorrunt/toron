@@ -380,6 +380,7 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 - Rust SDK: [`rust-nostr/nostr`](https://github.com/rust-nostr/nostr) (= `nostrdevkit/nostr`)
 - Backend: rex plane + [hc](https://herdr.dev/core/) fallback · consumer: [`flywheel`](../flywheel)
 - Durability: in-house engine ([ADR-0043](docs/decisions/0043-replace-resonate-with-the-in-house-durable-engine.md))
+- Known divergences (deliberate prose-vs-stack deltas): [known-divergences](../flywheel/docs/known-divergences.md)
 
 ## License
 
