@@ -308,7 +308,8 @@ write nothing. Consumed nonces persist across restarts.
 ```
 toron/                           # Cargo workspace (governed-by ADR-0003)
 ├── crates/
-│   ├── toron-core/              # lib: nostr, bus, index, archive, mailbox, backend, keys
+│   ├── toron-core/              # lib: nostr, bus, index, archive, mailbox, pane types + port, keys
+│   ├── toron-plane/             # lib: pane plane (backend adapters, osc7501, live port)
 │   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 parity tools + 3 additive + 25 resources
 │   ├── toron-cli/               # bin: daemon + CLI (robot mode, metrics; TUI Phase 2)
 │   ├── toron-workflow/          # Phase 2: durable YAML automation (in-house engine)

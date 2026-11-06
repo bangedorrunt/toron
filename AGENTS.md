@@ -13,7 +13,8 @@ Ops crib: `~/.agents/skills/toron/SKILL.md`. ADRs: `docs/decisions/`.
 ## Structure
 
 ```
-crates/toron-core/      mailbox, bus, nostr, archive, index, osc7501, backends
+crates/toron-core/      mailbox, bus, nostr, archive, index, pane types + port, keys
+crates/toron-plane/     pane plane: backend adapters (rex/hc), osc7501, live port
 crates/toron-workflow/ YAML engine, cron, channels/jobs
 crates/toron-mcp/      rmcp server (stdio + HTTP /mcp)
 crates/toron-cli/      bin `toron` (+ TUI)
@@ -35,8 +36,8 @@ One root `AGENTS.md` only — enforced by `scripts/verify-gates.sh`.
 | Wait / receipts / roles | `crates/toron-core/src/mailbox/{receipts,send_tags,identity}.rs` |
 | Gift-wrap / kinds / identity | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
-| OSC 7501 board | `crates/toron-core/src/osc7501.rs` (`fold` + `FoldPolicy`; shared by hc + rex) |
-| Multiplexer backends | `crates/toron-core/src/backend/` (`plane.rs` resolves rex-first with hc fallback; `hc` OpenRPC client; rex roster bounded, subscribe session-resolved) |
+| OSC 7501 board | `crates/toron-plane/src/osc7501.rs` (`fold` + `FoldPolicy`; shared by hc + rex) |
+| Multiplexer backends | `crates/toron-plane/src/backend/` (`plane.rs` resolves rex-first with hc fallback; `hc` OpenRPC client; rex roster bounded, subscribe session-resolved) — kernel takes them through the injected `toron-core::plane_port::PanePlane` port |
 | Workflow engine | `crates/toron-workflow/src/{schema,engine}/` — guide `docs/guides/workflow-engine.mdx` |
 | Effect journal / run-state | core index migrations + `RunStateStore`; CLI `toron run-state …` |
 | Durable engine store | `crates/toron-core/src/index/durable_engine.rs` (`EngineStorage` over additive `durable_engine_*` tables; sync bridge like `journal.rs`; `commit_run`/`commit_park` are one transaction each). Kernel re-export: `toron_core::kernel` |

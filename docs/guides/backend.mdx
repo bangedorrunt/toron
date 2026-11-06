@@ -11,7 +11,7 @@ TUI client and the tmux stub are gone. Both clients live in
 
 ## Plane selection
 
-`toron_core::backend::plane` is the only place that decides which plane serves:
+`toron_plane::backend::plane` is the only place that decides which plane serves:
 
 | `TORON_BACKEND` | rex CLI | serves | fallback |
 |---|---|---|---|
@@ -81,12 +81,13 @@ flywheel does not keep a second factory: `flywheel::backend::factory` wraps
 `fallback.rs` and the local `Plane`/`ResolvedPlane` types are deleted, so a
 write-replay bug can only ever be fixed once.
 
-## Why the hc client lives in toron-core
+## Why the hc client lives in toron-plane
 
 Dependency direction is one way: flywheel depends on toron, never the reverse.
 Both flywheel (spawn and dispatch) and toron (mailbox, workflow engine) need an
-hc client, so the client lives on the side everyone already reaches:
-`toron_core::backend::hc::Client`. There is exactly one `fn agent_prompt`
+hc client, so the client lives in the leaf crate everyone already reaches
+without a cycle (`toron-plane` depends only on `toron-core`):
+`toron_plane::backend::hc::Client`. There is exactly one `fn agent_prompt`
 definition and one shared socket client; flywheel's old copy is deleted.
 
 ## Terminals, not workspaces
@@ -115,7 +116,7 @@ creating a second terminal.
 ## OSC 7501 is the status source
 
 A program writes one report on its pty; hc stores it on the terminal. The fold
-is `toron_core::osc7501::fold` with `FoldPolicy::Attention` (blocked beats
+is `toron_plane::osc7501::fold` with `FoldPolicy::Attention` (blocked beats
 working beats done beats idle) or `RootWins` (the root record speaks). `error`
 maps to `Unknown`, never `done`; OSC `idle` is "at rest", not the
 finished-and-seen idle of a turn. `Report::osc_status()` returns `None` for
