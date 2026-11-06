@@ -1259,20 +1259,27 @@ pub fn added_lines_for_hunk_attribution(repo_path: &Path) -> String {
 }
 
 /// Journal path for GitFacts: `$XDG_STATE_HOME/flywheel/journals/git-facts.jsonl`
-/// when `XDG_STATE_HOME` is set (hermetic for tests), else the hard-coded
-/// fallback `/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl`
-/// named in bd-jhes (which is `$XDG_STATE_HOME` default on this host).
+/// when `XDG_STATE_HOME` is set (hermetic for tests), else
+/// `$HOME/.local/state/flywheel/journals/git-facts.jsonl`, else a temp-dir
+/// fallback. Never a hard-coded personal path (bd-jhes originally named one).
 pub fn git_fact_journal_path() -> std::path::PathBuf {
     let xdg = crate::config::home_env("XDG_STATE_HOME")
         .or_else(|| crate::config::sandbox_home().map(|home| home.join(".local").join("state")));
-    git_fact_journal_path_with_xdg(xdg.as_deref())
+    let home = crate::config::home_env("HOME");
+    git_fact_journal_path_with_xdg_and_home(xdg.as_deref(), home.as_deref())
 }
 
-fn git_fact_journal_path_with_xdg(xdg: Option<&Path>) -> std::path::PathBuf {
-    if let Some(xdg) = xdg {
-        return xdg.join("flywheel/journals/git-facts.jsonl");
+fn git_fact_journal_path_with_xdg_and_home(
+    xdg: Option<&Path>,
+    home: Option<&Path>,
+) -> std::path::PathBuf {
+    match xdg
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|h| h.join(".local").join("state")))
+    {
+        Some(state_root) => state_root.join("flywheel/journals/git-facts.jsonl"),
+        None => std::env::temp_dir().join("flywheel/journals/git-facts.jsonl"),
     }
-    std::path::PathBuf::from("/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl")
 }
 
 /// Extract the first `bd-*` token from a commit message (e.g. `fix: thing
@@ -2596,14 +2603,18 @@ mod tests {
     #[test]
     fn git_fact_journal_path_respects_xdg_state_home() {
         let tmp = std::path::Path::new("/tmp/xdg-test-abc");
-        let p = git_fact_journal_path_with_xdg(Some(tmp));
+        let p = git_fact_journal_path_with_xdg_and_home(Some(tmp), None);
         assert_eq!(p, tmp.join("flywheel/journals/git-facts.jsonl"));
-        let p2 = git_fact_journal_path_with_xdg(None);
+        let home = std::path::Path::new("/tmp/home-test-abc");
+        let p2 = git_fact_journal_path_with_xdg_and_home(None, Some(home));
         assert_eq!(
             p2,
-            std::path::PathBuf::from(
-                "/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl"
-            )
+            home.join(".local/state/flywheel/journals/git-facts.jsonl")
+        );
+        let p3 = git_fact_journal_path_with_xdg_and_home(None, None);
+        assert_eq!(
+            p3,
+            std::env::temp_dir().join("flywheel/journals/git-facts.jsonl")
         );
     }
 
