@@ -43,7 +43,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
-    let cfg = Config::load(cli.globals.config.as_deref());
+    let cfg = Config::load(cli.globals.config.as_deref())?;
+    crate::config::validate_startup_env()?;
     let format = OutputFormat::from_globals(&cli.globals);
     let color = ColorChoice::from_globals(&cli.globals, stdout_is_tty());
 

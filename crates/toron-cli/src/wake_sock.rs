@@ -31,21 +31,22 @@ const HANDSHAKE_DEFAULT: Duration = Duration::from_secs(5);
 /// quiet bus). Default 60s.
 const IDLE_DEFAULT: Duration = Duration::from_secs(60);
 
-fn env_ms(name: &str, fallback: Duration) -> Duration {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(fallback)
-}
-
 /// Where the daemon sidecar listens (ADR-0036 Spec 7). Env read only —
-/// no I/O, safe to call anywhere.
+/// no I/O, safe to call anywhere. `TORON_WAKE_SOCK` accepts any non-empty
+/// path (parsed through the strict helper so the accepted form is uniform);
+/// empty/unset falls back to the daemon state dir.
 pub fn discover_sock_path() -> PathBuf {
     if let Some(p) = WAKE_SOCK_TEST_PIN.get() {
         return p.clone();
     }
-    discover_from(std::env::var(WAKE_SOCK_ENV).ok())
+    // `parse_env_path` is infallible for set values (any non-empty string is
+    // a path); the `unwrap_or` only serves its uniform `Result` shape. A
+    // non-UTF8 value degrades to the state dir, exactly as the old
+    // `env::var`-based read did.
+    let override_path = toron_core::config::parse_env_path(WAKE_SOCK_ENV)
+        .unwrap_or(None)
+        .map(|p| p.into_os_string().into_string().unwrap_or_default());
+    discover_from(override_path)
 }
 
 /// Test-binary pin backing the seam in [`discover_sock_path`]. Unconditional
@@ -190,21 +191,47 @@ pub struct WakeSockConfig {
 }
 
 impl WakeSockConfig {
-    /// No I/O: stores config only.
+    /// No I/O: stores config only, with default timeouts (no env reads —
+    /// tests use this so ambient env can never leak into expectations).
+    #[allow(dead_code)]
     pub fn new(sock_path: PathBuf, kinds: Vec<u16>) -> Self {
         Self {
             sock_path,
             kinds,
             since_cursor: None,
             project: None,
-            handshake_timeout: env_ms("TORON_WAKE_SOCK_HANDSHAKE_MS", HANDSHAKE_DEFAULT),
-            idle_timeout: env_ms("TORON_WAKE_SOCK_IDLE_MS", IDLE_DEFAULT),
+            handshake_timeout: HANDSHAKE_DEFAULT,
+            idle_timeout: IDLE_DEFAULT,
         }
     }
 
-    /// No I/O beyond env reads: discovery + kinds in one call.
-    pub fn discover(kinds: Vec<u16>) -> Self {
-        Self::new(discover_sock_path(), kinds)
+    /// [`Self::new`] plus the strict timeout knobs: a set-but-garbage
+    /// `TORON_WAKE_SOCK_HANDSHAKE_MS` / `TORON_WAKE_SOCK_IDLE_MS` is a
+    /// `ConfigError`, never a silent default.
+    pub fn try_new(
+        sock_path: PathBuf,
+        kinds: Vec<u16>,
+    ) -> Result<Self, toron_core::config::ConfigError> {
+        use toron_core::config::parse_env_u64;
+        let handshake_timeout = parse_env_u64("TORON_WAKE_SOCK_HANDSHAKE_MS")?
+            .map(Duration::from_millis)
+            .unwrap_or(HANDSHAKE_DEFAULT);
+        let idle_timeout = parse_env_u64("TORON_WAKE_SOCK_IDLE_MS")?
+            .map(Duration::from_millis)
+            .unwrap_or(IDLE_DEFAULT);
+        Ok(Self {
+            sock_path,
+            kinds,
+            since_cursor: None,
+            project: None,
+            handshake_timeout,
+            idle_timeout,
+        })
+    }
+
+    /// No I/O beyond env reads: discovery + strict knobs in one call.
+    pub fn try_discover(kinds: Vec<u16>) -> Result<Self, toron_core::config::ConfigError> {
+        Self::try_new(discover_sock_path(), kinds)
     }
 }
 

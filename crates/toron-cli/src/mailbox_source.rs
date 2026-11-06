@@ -103,12 +103,12 @@ fn is_refused(err: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
-fn tool_call_timeout() -> std::time::Duration {
-    std::env::var("TORON_TOOL_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+/// Parse-or-refuse form: a set-but-garbage `TORON_TOOL_TIMEOUT_MS` is a
+/// [`ConfigError`](toron_core::config::ConfigError), never a silent default.
+fn try_tool_call_timeout() -> Result<std::time::Duration, toron_core::config::ConfigError> {
+    Ok(toron_core::config::parse_env_u64("TORON_TOOL_TIMEOUT_MS")?
         .map(std::time::Duration::from_millis)
-        .unwrap_or(TOOL_CALL_TIMEOUT)
+        .unwrap_or(TOOL_CALL_TIMEOUT))
 }
 
 /// One live toron daemon connection (rmcp client over Streamable HTTP).
@@ -195,12 +195,13 @@ impl DaemonClient {
     /// Call an MCP tool by name, returning the parsed JSON payload of the
     /// first text content block. Tool errors surface as anyhow errors.
     ///
-    /// Bounded by [`tool_call_timeout`] (bd-gtqe): a daemon that accepts the
+    /// Bounded by [`try_tool_call_timeout`] (bd-gtqe): a daemon that accepts the
     /// request but never answers produces a loud timeout error instead of an
     /// unbounded silent park. Use [`Self::call_tool_within`] for paths that
     /// need a tighter deadline.
     pub async fn call_tool(&self, tool: &str, args: Value) -> anyhow::Result<Value> {
-        self.call_tool_within(tool, args, tool_call_timeout()).await
+        let timeout = try_tool_call_timeout()?;
+        self.call_tool_within(tool, args, timeout).await
     }
 
     /// [`Self::call_tool`] with an explicit deadline (bd-gtqe).
@@ -343,11 +344,11 @@ impl MailboxSource {
     ///    `TORON_MCP_URL` to use it or stop it).
     pub async fn resolve() -> anyhow::Result<Self> {
         // bd-qpm0: report the ambiguity LOUDLY, but do not change the decision.
-        if daemon_url_from_env().is_some() && data_dir_pinned_from_env() {
+        if try_daemon_url_from_env()?.is_some() && data_dir_pinned_from_env() {
             eprintln!("{CONTRADICTION_MESSAGE}");
         }
         let decision = decide_source(
-            daemon_url_from_env(),
+            try_daemon_url_from_env()?,
             std::env::var_os("TORON_MCP_DATA_DIR").is_some(),
             flywheel_toron_url(),
             default_port_serving(),
@@ -383,10 +384,11 @@ pub fn daemon_url_is_loopback(url: &str) -> bool {
         .trim_matches(|c| c == '[' || c == ']');
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
-fn daemon_url_from_env() -> Option<String> {
-    std::env::var("TORON_MCP_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
+/// Parse-or-refuse form: a set-but-garbage `TORON_MCP_URL` (not http/https)
+/// is a [`ConfigError`](toron_core::config::ConfigError) naming the accepted
+/// forms, instead of a confusing connect failure later.
+fn try_daemon_url_from_env() -> Result<Option<String>, toron_core::config::ConfigError> {
+    toron_core::config::parse_env_url("TORON_MCP_URL")
 }
 
 /// bd-qpm0: is the durable-root pin set? Its own reader, so the warning cannot

@@ -20,7 +20,7 @@ pub async fn run_comms(
     format: OutputFormat,
     cfg: &crate::config::Config,
 ) -> anyhow::Result<ExitCode> {
-    if !toron_core::inbox::enabled_with(cfg.comms_inbox_log()) {
+    if !toron_core::inbox::try_enabled_with(cfg.comms_inbox_log())? {
         eprintln!("toron: error: {}", InboxError::Disabled);
         return Ok(ExitCode::from(2));
     }

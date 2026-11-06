@@ -15,12 +15,12 @@ use std::path::Path;
 
 use anyhow::Context;
 use serde_json::{Value, json};
-use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse,
     RequestContact, RequestRelease, RespondContact, SearchMessages, SendMessage,
 };
 use toron_mcp::ToJson;
+use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 
 use crate::cli::{
     AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand,
@@ -2320,15 +2320,19 @@ fn finish_guard_check(
     fold: &HolderFold,
 ) -> anyhow::Result<()> {
     let resolve = |n: &str| fold.resolve(n);
-    let strict = match std::env::var("TORON_GUARD_STRICT") {
-        Ok(v) if v == "0" => {
+    // Parse-or-refuse: 0|false|off disables strict for this session (loud
+    // escape hatch); 1|true|on forces it; unset defers to the flag; anything
+    // else is a ConfigError naming the accepted forms — a typo like `=no`
+    // must not silently pick a side.
+    let strict = match toron_core::config::parse_env_bool("TORON_GUARD_STRICT")? {
+        Some(false) => {
             eprintln!(
                 "toron: TORON_GUARD_STRICT=0 — strict guard disabled for this session (operator escape hatch)"
             );
             false
         }
-        Ok(_) => true,
-        Err(_) => args.strict,
+        Some(true) => true,
+        None => args.strict,
     };
     if !strict {
         print_json(&json!({

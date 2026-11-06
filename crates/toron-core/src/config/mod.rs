@@ -250,6 +250,72 @@ fn env_non_empty(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// A `TORON_*` knob that refused to parse: the name, what was set, and the
+/// accepted forms. Parse-or-refuse (wave7-c): unknown is an error, never a
+/// silent default.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{name}={value:?} is not valid (accepted: {accepted})")]
+pub struct ConfigError {
+    pub name: &'static str,
+    pub value: String,
+    pub accepted: &'static str,
+}
+
+/// One strict parse of a `TORON_*` knob: unset/empty → `Ok(None)` (the caller
+/// applies its default); set → `parse` or a [`ConfigError`] naming `accepted`.
+/// The single interpretation site per knob — domain code calls the typed
+/// accessor, never `env::var` plus an ad-hoc parse.
+pub fn parse_env_opt<T>(
+    name: &'static str,
+    accepted: &'static str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, ConfigError> {
+    let Some(os) = std::env::var_os(name).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let raw = os.to_string_lossy();
+    parse(&raw).map(Some).ok_or_else(|| ConfigError {
+        name,
+        value: raw.into_owned(),
+        accepted,
+    })
+}
+
+/// `1|true|on` → true, `0|false|off` → false (ASCII case-insensitive).
+pub fn parse_env_bool(name: &'static str) -> Result<Option<bool>, ConfigError> {
+    parse_env_opt(name, "1|true|on|0|false|off", |raw| {
+        match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// A non-negative integer (leading/trailing whitespace tolerated).
+pub fn parse_env_u64(name: &'static str) -> Result<Option<u64>, ConfigError> {
+    parse_env_opt(name, "a non-negative integer", |raw| {
+        raw.trim().parse::<u64>().ok()
+    })
+}
+
+/// A non-empty path.
+pub fn parse_env_path(name: &'static str) -> Result<Option<PathBuf>, ConfigError> {
+    parse_env_opt(name, "a non-empty path", |raw| Some(PathBuf::from(raw)))
+}
+
+/// A non-empty string.
+pub fn parse_env_string(name: &'static str) -> Result<Option<String>, ConfigError> {
+    parse_env_opt(name, "a non-empty value", |raw| Some(raw.to_string()))
+}
+
+/// An `http://` or `https://` URL.
+pub fn parse_env_url(name: &'static str) -> Result<Option<String>, ConfigError> {
+    parse_env_opt(name, "an http:// or https:// URL", |raw| {
+        (raw.starts_with("http://") || raw.starts_with("https://")).then(|| raw.to_string())
+    })
+}
+
 /// Resolve the durable data root (ADR-0007 D3): `TORON_DATA_DIR` >
 /// `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Last resort is a
 /// relative `toron-data` dir — still never a per-pid temp root.

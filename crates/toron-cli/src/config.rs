@@ -86,7 +86,11 @@ pub struct ProjectTtl {
 
 impl Config {
     /// Load config by merging system → user → project → env.
-    pub fn load(cli_config: Option<&Path>) -> Self {
+    ///
+    /// Fails on a malformed `TORON_*` knob ([`ConfigError`] names the accepted
+    /// forms); the binary surfaces it and exits nonzero — unknown is an
+    /// error, never a silent default.
+    pub fn load(cli_config: Option<&Path>) -> anyhow::Result<Self> {
         let mut cfg = Self::default();
         cfg.merge_file(&system_config_path());
         cfg.merge_file(&user_config_path());
@@ -95,8 +99,8 @@ impl Config {
         } else {
             cfg.merge_file(&project_config_path());
         }
-        cfg.merge_env();
-        cfg
+        cfg.try_merge_env()?;
+        Ok(cfg)
     }
 
     /// Effective envelope TTL for a project (per-project override or global default).
@@ -110,7 +114,7 @@ impl Config {
     }
 
     /// The `[comms] inbox_log` value (`None` = key absent), for
-    /// `toron_core::inbox::enabled_with`.
+    /// `toron_core::inbox::try_enabled_with`.
     pub fn comms_inbox_log(&self) -> Option<bool> {
         self.comms.as_ref().and_then(|c| c.inbox_log)
     }
@@ -202,41 +206,54 @@ impl Config {
         }
     }
 
-    fn merge_env(&mut self) {
+    /// Strict env layer: every typed knob parses-or-refuses through one
+    /// helper per shape. Unset/empty falls through to the file layers and
+    /// defaults; anything set-but-garbage is a [`ConfigError`]. No default
+    /// changes here — only garbage gets loud.
+    fn try_merge_env(&mut self) -> Result<(), toron_core::config::ConfigError> {
+        use toron_core::config::{
+            ConfigError, parse_env_bool, parse_env_path, parse_env_string, parse_env_u64,
+        };
+
         if let Ok(v) = env::var("TORON_CONFIG")
             && !v.is_empty()
         {
             self.merge_file(Path::new(&v));
         }
-        if let Ok(v) = env::var("TORON_DATA_DIR")
-            && !v.is_empty()
-        {
-            self.data_dir = Some(PathBuf::from(v));
+        if let Some(dir) = parse_env_path("TORON_DATA_DIR")? {
+            self.data_dir = Some(dir);
         }
-        if let Ok(v) = env::var("TORON_BACKEND")
-            && !v.is_empty()
-        {
-            self.backend = Some(v);
+        if let Some(raw) = parse_env_string("TORON_BACKEND")? {
+            let choice = toron_plane::backend::plane::PlaneChoice::parse(&raw);
+            if matches!(choice, toron_plane::backend::plane::PlaneChoice::Unknown(_)) {
+                return Err(ConfigError {
+                    name: "TORON_BACKEND",
+                    value: raw,
+                    accepted: "auto|rex|superlogical|hc",
+                });
+            }
+            self.backend = Some(raw);
         }
-        if let Ok(v) = env::var("TORON_OPERATOR_KEY")
-            && !v.is_empty()
-        {
-            self.operator_key = Some(PathBuf::from(v));
+        if let Some(key) = parse_env_path("TORON_OPERATOR_KEY")? {
+            self.operator_key = Some(key);
         }
-        if let Ok(v) = env::var("TORON_ENVELOPE_TTL_DAYS")
-            && let Ok(days) = v.parse::<u64>()
-        {
+        if let Some(days) = parse_env_u64("TORON_ENVELOPE_TTL_DAYS")? {
             self.envelope_ttl_days = Some(days);
         }
-        if let Ok(v) = env::var("TORON_PROOF_GATE_ENABLED")
-            && let Ok(b) = v.parse::<bool>()
-        {
+        if let Some(b) = parse_env_bool("TORON_PROOF_GATE_ENABLED")? {
             self.proof_gate_enabled = Some(b);
         }
-        if let Ok(v) = env::var("TORON_PROOF_SCHEME")
-            && !v.is_empty()
-        {
-            self.proof_scheme = Some(v);
+        if let Some(raw) = parse_env_string("TORON_PROOF_SCHEME")? {
+            match raw.as_str() {
+                "schnorr" | "ed25519" => self.proof_scheme = Some(raw),
+                _ => {
+                    return Err(ConfigError {
+                        name: "TORON_PROOF_SCHEME",
+                        value: raw,
+                        accepted: "schnorr|ed25519",
+                    });
+                }
+            }
         }
         if let Ok(v) = env::var("TORON_MCP_ALLOWED_HOSTS")
             && !v.is_empty()
@@ -247,7 +264,37 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        Ok(())
     }
+}
+
+/// One parse per knob at startup (wave7-c): every `TORON_*` knob whose
+/// reader is infallible by API contract (timeouts, TTLs, tool paths) or
+/// whose shape is statically checkable (URL, strict bools) is pre-flighted
+/// here, before any command runs. Garbage exits nonzero naming the accepted
+/// forms; valid values flow through untouched. Fallible readers
+/// (`Config::load`, `try_enabled_with`, …) refuse at use through the SAME
+/// helper — startup pre-empts them in the CLI, and they guard embeddings and
+/// other binaries. One helper per shape: interpretation never forks.
+pub fn validate_startup_env() -> Result<(), toron_core::config::ConfigError> {
+    use toron_core::config::{parse_env_bool, parse_env_path, parse_env_u64, parse_env_url};
+    for knob in [
+        "TORON_GUARD_TIMEOUT_MS",
+        "TORON_COALESCE_WINDOW_MS",
+        "TORON_COALESCE_SUBWINDOW_MS",
+        "TORON_TOOL_TIMEOUT_MS",
+        "TORON_TUI_TIMEOUT_MS",
+        "TORON_PRESENCE_TTL_SECS",
+        "TORON_WAKE_SOCK_HANDSHAKE_MS",
+        "TORON_WAKE_SOCK_IDLE_MS",
+    ] {
+        parse_env_u64(knob)?;
+    }
+    parse_env_path("TORON_GIT_BINARY")?;
+    parse_env_url("TORON_MCP_URL")?;
+    parse_env_bool("TORON_COMMS_INBOX")?;
+    parse_env_bool("TORON_GUARD_STRICT")?;
+    Ok(())
 }
 
 fn system_config_path() -> PathBuf {
@@ -296,7 +343,7 @@ mod tests {
     fn project_config_overrides_system_defaults() {
         let dir = scratch("project");
         let cfg_path = write_config(&dir, ".toron.toml", "backend = \"hc\"\n");
-        let cfg = Config::load(Some(&cfg_path));
+        let cfg = Config::load(Some(&cfg_path)).expect("test config loads");
         assert_eq!(cfg.backend.as_deref(), Some("hc"));
     }
 
@@ -310,7 +357,7 @@ mod tests {
         let dir = scratch("flag");
         let _project = write_config(&dir, ".toron.toml", "backend = \"bogus\"\n");
         let flag = write_config(&dir, "override.toml", "backend = \"hc\"\n");
-        let cfg = Config::load(Some(&flag));
+        let cfg = Config::load(Some(&flag)).expect("test config loads");
         assert_eq!(cfg.backend.as_deref(), Some("hc"));
     }
 
@@ -322,7 +369,7 @@ mod tests {
             ".toron.toml",
             "envelope_ttl_days = 90\n[[project_ttl_days]]\nproject = \"demo\"\ndays = 14\n",
         );
-        let cfg = Config::load(Some(&cfg_path));
+        let cfg = Config::load(Some(&cfg_path)).expect("test config loads");
         assert_eq!(cfg.envelope_ttl_days(None), 90);
         assert_eq!(cfg.envelope_ttl_days(Some("demo")), 14);
         assert_eq!(cfg.envelope_ttl_days(Some("other")), 90);
@@ -336,7 +383,7 @@ mod tests {
             ".toron.toml",
             "mcp_allowed_hosts = [\"toron.example-tailnet.ts.net\"]\n",
         );
-        let cfg = Config::load(Some(&cfg_path));
+        let cfg = Config::load(Some(&cfg_path)).expect("test config loads");
         assert_eq!(cfg.mcp_allowed_hosts, vec!["toron.example-tailnet.ts.net"]);
         let cfg = Config::default();
         assert!(cfg.mcp_allowed_hosts.is_empty());

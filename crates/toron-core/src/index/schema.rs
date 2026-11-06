@@ -250,8 +250,9 @@ pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
 }
 
 /// Highest migration version this binary resolves. Compared against the
-/// store's applied set when a skew refuses the open (bd-jivw).
-fn resolved_max_version() -> i64 {
+/// store's applied set when a skew refuses the open (bd-jivw), and named by
+/// `toron doctor` beside the store's applied version (wave7-c freshness).
+pub fn resolved_max_version() -> i64 {
     MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
 }
 

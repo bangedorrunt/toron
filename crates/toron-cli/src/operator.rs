@@ -54,6 +54,105 @@ struct CheckResult {
 /// second identity beside the pin; mail sealed to its npub is unreachable).
 /// Informational (ok stays true): doctor NAMES the rows, cleanup is the
 /// fold path's job (`fold_agent_name_alias` absorbs idempotently).
+/// Source HEAD for the freshness triple, when discoverable: the checkout
+/// the operator invoked from. `None` anywhere else (installed binary run
+/// outside a checkout) — the triple names the absence instead of guessing.
+fn discover_head() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?;
+    let sha = sha.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Freshness triple (wave7-c): source HEAD (if discoverable), installed
+/// binary (path + version + mtime), store schema (applied vs what this
+/// binary resolves). A store newer than the binary FAILS with the remedy
+/// (upgrade toron / open with the newer binary); a green triple carries no
+/// remedy — it is silent. Binary-vs-HEAD staleness is NOT judged here:
+/// mtimes lie (see `serve_build` docs) — the pair is named so the operator
+/// judges, and a live stale daemon stays the `daemon_build` check's job.
+fn check_freshness(cfg: &Config) -> CheckResult {
+    let name = "freshness";
+    let binary = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+    let version = env!("CARGO_PKG_VERSION");
+    let head = discover_head().unwrap_or_else(|| "<undiscoverable — not in a checkout>".into());
+    let triple = format!("head={head} binary={binary}@{version}");
+
+    let Some(dir) = resolve_data_dir(cfg, None) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: format!("{triple} store=<no data dir yet>"),
+        };
+    };
+    let db = dir.join("index.sqlite");
+    if !db.exists() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: format!(
+                "{triple} store={} (no index yet — created on first run)",
+                db.display()
+            ),
+        };
+    }
+    let known = toron_core::index::schema::resolved_max_version();
+    let applied = (|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(async {
+            let pool = toron_core::index::schema::connect(db.to_str()?)
+                .await
+                .ok()?;
+            toron_core::index::schema::store_version(&pool).await.ok()
+        })
+    })();
+    let Some(applied) = applied else {
+        return CheckResult {
+            name,
+            ok: false,
+            detail: format!(
+                "{triple} store={} unreadable — remedy: check the file, restore from backup, or delete it for a fresh store",
+                db.display()
+            ),
+        };
+    };
+    if applied.min_binary > known {
+        return CheckResult {
+            name,
+            ok: false,
+            detail: format!(
+                "{triple} store={} schema applied={} newer than this binary resolves={} — remedy: upgrade toron, or open the store with the newer binary (downgrade needs a rebuild)",
+                db.display(),
+                applied.min_binary,
+                known
+            ),
+        };
+    }
+    CheckResult {
+        name,
+        ok: true,
+        detail: format!(
+            "{triple} store={} schema applied={} resolved={}",
+            db.display(),
+            applied.min_binary,
+            known
+        ),
+    }
+}
+
 fn check_engine_store(cfg: &Config) -> CheckResult {
     let Some(dir) = resolve_data_dir(cfg, None) else {
         return CheckResult {
@@ -313,7 +412,8 @@ fn check_identity_divergence(cfg: &Config) -> CheckResult {
                 detail: "pane plane not reachable — no live panes to compare".into(),
             };
         };
-        let panes: Vec<toron_plane::backend::PaneInfo> = backend.pane_list(None).unwrap_or_default();
+        let panes: Vec<toron_plane::backend::PaneInfo> =
+            backend.pane_list(None).unwrap_or_default();
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)
@@ -517,6 +617,7 @@ pub fn run_doctor(
         check_git(),
         check_keys(cfg),
         check_daemon_build(),
+        check_freshness(cfg),
         check_engine_store(cfg),
         check_legacy_slug_identities(cfg),
         check_name_collisions(cfg),
@@ -562,9 +663,14 @@ struct ReconstructReport {
 /// `~/.local/share/toron`, ADR-0007 D3). Never a temp per-pid root — the
 /// default is always Some.
 fn resolve_data_dir(cfg: &Config, override_dir: Option<&Path>) -> Option<PathBuf> {
+    // Single interpretation: the emptiness rule lives in `parse_env_path`
+    // (infallible for set values — any non-empty string is a path), so an
+    // empty `TORON_DATA_DIR` falls through here exactly as it does in
+    // `Config::load`.
+    let env_pin = toron_core::config::parse_env_path("TORON_DATA_DIR").unwrap_or(None);
     override_dir
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("TORON_DATA_DIR").map(PathBuf::from))
+        .or(env_pin)
         .or_else(|| cfg.data_dir.clone())
         .or_else(|| Some(toron_core::config::durable_data_dir()))
 }
@@ -1124,7 +1230,7 @@ fn run_key_inspect(cfg: &Config, args: &KeyInspectArgs) -> anyhow::Result<()> {
 }
 
 fn run_project_list() -> anyhow::Result<()> {
-    let cfg = Config::load(None);
+    let cfg = Config::load(None)?;
     let Some(data_dir) = resolve_data_dir(&cfg, None) else {
         anyhow::bail!("no data dir");
     };

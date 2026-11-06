@@ -1582,7 +1582,7 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watching kinds={}", args.kinds);
     {
-        let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
+        let mut cfg = crate::wake_sock::WakeSockConfig::try_discover(kinds.clone())?;
         cfg.project = Some(args.project.clone());
         let sock_path = cfg.sock_path.clone();
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
@@ -1705,7 +1705,7 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         return Ok(());
     }
     {
-        let mut cfg = crate::wake_sock::WakeSockConfig::discover(WAIT_WAKE_KINDS.to_vec());
+        let mut cfg = crate::wake_sock::WakeSockConfig::try_discover(WAIT_WAKE_KINDS.to_vec())?;
         cfg.project = Some(canonical.clone());
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
         match tail.connect().await {
@@ -1805,7 +1805,7 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watch --live kinds={}", args.kinds);
     {
-        let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
+        let mut cfg = crate::wake_sock::WakeSockConfig::try_discover(kinds.clone())?;
         cfg.project = Some(args.project.clone());
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
         let mut seen: HashSet<String> = HashSet::new();

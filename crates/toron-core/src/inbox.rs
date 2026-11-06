@@ -59,15 +59,26 @@ pub fn resolve_enabled(env: Option<&str>, config: Option<bool>) -> bool {
     }
 }
 
-/// The flag from the environment alone (no config in hand). On unless
-/// `TORON_COMMS_INBOX` is `0`, `false`, `off`, or any other set value.
-pub fn enabled() -> bool {
-    enabled_with(None)
-}
-
-/// The flag with the loaded `[comms] inbox_log` value (`None` = key absent).
-pub fn enabled_with(config: Option<bool>) -> bool {
-    resolve_enabled(std::env::var("TORON_COMMS_INBOX").ok().as_deref(), config)
+/// Parse-or-refuse form: `1|true|on` is on, `0|false|off` is off, unset/empty
+/// defers to the config key (absent = on); any other set value is a
+/// [`ConfigError`](crate::config::ConfigError) naming the accepted forms.
+/// command handlers call this; the pure [`resolve_enabled`] table stays for
+/// read-only classification.
+pub fn try_enabled_with(config: Option<bool>) -> Result<bool, crate::config::ConfigError> {
+    let raw = std::env::var_os("TORON_COMMS_INBOX").filter(|v| !v.is_empty());
+    let Some(os) = raw else {
+        return Ok(config.unwrap_or(true));
+    };
+    let value = os.to_string_lossy();
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(crate::config::ConfigError {
+            name: "TORON_COMMS_INBOX",
+            value: value.into_owned(),
+            accepted: "1|true|on|0|false|off",
+        }),
+    }
 }
 
 /// Failures of the inbox verbs.
