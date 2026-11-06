@@ -15,7 +15,7 @@ with no orchestrator in the hot path.
    │                                                                         │
    │   Mailbox (38 tools, 25 resources) ──▶ Nostr events ──▶ Bus            │
    │   Workflow engine (in-house durable) ──▶ triggers/actions │               │
-   │   Backend trait ──▶ hc                                                  ▼ │
+   │   Backend trait ──▶ rex (hc fallback)                                   ▼ │
    │                                      InProcessBus (tokio broadcast+SQLite)│
    │   toron-mcp server ◀── MCP (stdio/HTTP) ── agents    │ (opt. RelayBus→relay)│
    └───────────▲──────────────────────────────│──────────────────────────────┘
@@ -52,7 +52,7 @@ raises the ceiling with Nostr:
 | Footprint | one process | Postgres + Redis + relay | **one embedded process** |
 
 toron = AM-Rust's tool surface + Nostr's trust/privacy/federation + in-house
-durable execution + flywheel's hc swarm orchestration.
+durable execution + flywheel's swarm orchestration.
 
 ---
 
@@ -176,8 +176,7 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
 ```
 
 flywheel's daily loop (P1→P8) becomes a toron-workflow: it watches @mentions +
-`br` beads, dispatches jobs, monitors hc
-agent states, and respawns on context exhaustion — all as bus events.
+`br` beads, dispatches jobs, monitors agent states on the serving plane, and respawns on context exhaustion — all as bus events.
 
 ### Reactive collaboration (how agents react)
 
@@ -205,7 +204,7 @@ CI gate: P1 green tags v1; P2 green tags Phase 2.
 ### Prerequisites
 
 - Rust (stable), Cargo.
-- A running **hc** server (socket under `herdr-core/`) for the default backend. `flywheel deps` checks it.
+- A running pane plane for the default backend (rex-first per ADR-0045; hc socket under `herdr-core/` on the hc fallback). `flywheel deps` checks it.
 
 ### Build
 
@@ -327,7 +326,7 @@ directly; the search layer never calls the archive; etc.
 
 - **Phase 1 (v1)** — AM-Rust parity + integrated mode + core kind vocabulary.
   Ships the 38 tools + 25 resources, in-process bus, Git+SQLite projection (dual-sink,
-  git-first per G11), hc backend,
+  git-first per G11), rex-first pane plane (hc fallback),
   flywheel embedding.
 - **Phase 2** (ordered: workflow+@mention → channels → persona/presence) —
   `toron-workflow` (in-house durable engine) + @mention dispatch + job lifecycle (`43001`→`43002`→`43003`→`43004`),
@@ -367,10 +366,10 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 | [0010](docs/decisions/0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, Headless Mode | **Accepted** |
 | [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Accepted** |
 | [0012](docs/decisions/0012-standalone-cron-type.md) | Standalone Cron Type — Scheduled Primitive, Distinct from Workflow | **Accepted** |
-| [0013](docs/decisions/0013-website-architecture-and-feature-presentation.md) | toron.dev Website Architecture and Feature Presentation | **Accepted** |
+| [0013](https://github.com/bangedorrunt/toron.dev/blob/main/docs/decisions/0001-website-architecture-and-feature-presentation.md) | toron.dev Website Architecture and Feature Presentation | **Moved** (2026-08-14) to the toron.dev repo, renumbered **ADR-0001** |
 | [0027](docs/decisions/0027-one-workspace-tick-control-plane.md) | One Workspace Tick — Control Plane as Elm/Redux on Doorbell + 30013 | **Accepted** (2026-09-01, captain word; slices ship as green) |
 
-> Full index (0001–0013, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
+> Full index (0001–0045, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
 > Orchestration vocabulary (profiles/crews/workflows/cron) lives in [`flywheel`](../flywheel); see [`flywheel/docs/workflow-authoring.md`](../flywheel/docs/workflow-authoring.md).
 
 ## References
@@ -379,7 +378,7 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 - Prior art (Nostr-native hive-mind): [`block/buzz`](https://github.com/block/buzz)
 - Nostr protocol: [nostr.how](https://nostr.how/en/the-protocol) · [NIPs](https://github.com/nostr-protocol/nips) (01/09/17/25/29/40/44/49/50/59)
 - Rust SDK: [`rust-nostr/nostr`](https://github.com/rust-nostr/nostr) (= `nostrdevkit/nostr`)
-- Backend: [hc](https://herdr.dev/core/) · consumer: [`flywheel`](../flywheel)
+- Backend: rex plane + [hc](https://herdr.dev/core/) fallback · consumer: [`flywheel`](../flywheel)
 - Durability: in-house engine ([ADR-0043](docs/decisions/0043-replace-resonate-with-the-in-house-durable-engine.md))
 
 ## License
