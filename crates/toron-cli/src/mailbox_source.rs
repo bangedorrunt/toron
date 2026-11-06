@@ -17,6 +17,7 @@
 //!
 //! The daemon is the writer; the CLI is a client. No second SQLite.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -298,12 +299,114 @@ pub enum MailboxSource {
 /// was the bug. `DaemonExplicit` (env/config) connects or fails loud;
 /// `DaemonDefault` connects and falls back to embedded with a loud note on
 /// the probe-to-connect race.
+/// wave13-b: the default probe is store-scoped — an explicitly pinned store
+/// root that does not resolve onto the default durable root never discovers
+/// (`EmbeddedIsolated`), so a temp-dir test can never talk to the live
+/// daemon's store. Explicit `TORON_MCP_URL` still wins unconditionally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceDecision {
     DaemonExplicit(String),
     DaemonDefault,
-    EmbeddedPinned,
+    EmbeddedIsolated,
     EmbeddedXdg,
+}
+
+/// What store the embedded mailbox would open, and whether it was
+/// explicitly pinned (wave13-b). Mirrors `build_mailbox` root precedence
+/// (`TORON_MCP_DATA_DIR` > `TORON_DATA_DIR` > durable default); demo mode
+/// always counts as pinned (unique temp root per call, never the daemon's).
+///
+/// The test harness injects `TORON_DATA_DIR=<sandbox root>` into every
+/// spawned child: a short pin that merely names the sandbox root is the
+/// harness default, not an operator pin, so it does NOT count as explicit
+/// (otherwise no test could ever discover). Any other short pin does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreIdentity {
+    pub root: PathBuf,
+    pub explicit: bool,
+}
+
+/// The CLI's store identity from the ambient environment.
+pub fn embedded_store_identity() -> StoreIdentity {
+    use std::path::PathBuf;
+    if toron_core::config::ToronPaths::demo_mode() {
+        return StoreIdentity {
+            root: std::env::temp_dir(),
+            explicit: true,
+        };
+    }
+    if let Some(dir) = std::env::var_os("TORON_MCP_DATA_DIR") {
+        return StoreIdentity {
+            root: PathBuf::from(dir),
+            explicit: true,
+        };
+    }
+    if let Some(dir) = toron_core::config::parse_env_path("TORON_DATA_DIR").unwrap_or(None) {
+        let harness_default = toron_core::config::ambient_sandbox()
+            .is_some_and(|sandbox| same_store_root(&dir, &sandbox.root));
+        if !harness_default {
+            return StoreIdentity {
+                root: dir,
+                explicit: true,
+            };
+        }
+    }
+    StoreIdentity {
+        root: toron_core::config::durable_data_dir(),
+        explicit: false,
+    }
+}
+
+/// The durable default root: what [`embedded_store_identity`] resolves
+/// when nothing is pinned. The default daemon serves this root, so only
+/// an explicit root that resolves here may discover it.
+pub fn default_store_root() -> PathBuf {
+    fn var_non_empty(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+    toron_core::config::resolve_data_root(&toron_core::config::DataRootEnv {
+        toron_data_dir: None,
+        xdg_data_home: var_non_empty("XDG_DATA_HOME"),
+        home: var_non_empty("HOME"),
+        sandbox: toron_core::config::ambient_sandbox(),
+    })
+}
+
+/// Do two store roots name the same directory? Canonicalizes (follows the
+/// symlinks a scratch dir may hide behind); unresolvable paths fall back
+/// to a lexical absolute comparison, which still separates a temp pin
+/// from the durable root.
+pub fn same_store_root(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => absolutize(a) == absolutize(b),
+    }
+}
+
+/// Absolute + lexically cleaned path for comparison when canonicalization
+/// fails (missing dir). Never touches the fs beyond `current_dir`.
+fn absolutize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 /// bd-qpm0: the refusal text, as a CONSTANT so a fence can read it.
@@ -320,15 +423,20 @@ two agree and there is nothing to fix.)";
 
 fn decide_source(
     env_url: Option<String>,
-    data_dir_pinned: bool,
+    cli_root: &Path,
+    root_explicit: bool,
+    default_root: &Path,
     flywheel_url: Option<String>,
     default_port_live: bool,
 ) -> SourceDecision {
     if let Some(url) = env_url {
         return SourceDecision::DaemonExplicit(url);
     }
-    if data_dir_pinned {
-        return SourceDecision::EmbeddedPinned;
+    // wave13-b: an explicitly pinned store root that does not resolve onto
+    // the default durable root can never be the default daemon's store —
+    // skip discovery (never cross-store), even when the port is live.
+    if root_explicit && !same_store_root(cli_root, default_root) {
+        return SourceDecision::EmbeddedIsolated;
     }
     if let Some(url) = flywheel_url {
         return SourceDecision::DaemonExplicit(url);
@@ -343,12 +451,20 @@ fn decide_source(
 /// fake-prober seam. Production builds this from process env plus a bounded
 /// TCP probe of the default port; tests pass fake values and never touch
 /// a live daemon.
+///
+/// wave13-b: the store roots ride along so the fake-prober matrix covers
+/// same-root/different-root/explicit-env without sockets.
 #[derive(Debug, Clone)]
 pub struct ResolveInputs {
     /// `TORON_MCP_URL` (already parse-or-refused by the caller).
     pub env_url: Option<String>,
-    /// `TORON_MCP_DATA_DIR` is set (test-isolation pin).
-    pub data_dir_pinned: bool,
+    /// The store root the embedded mailbox would open.
+    pub cli_store_root: PathBuf,
+    /// Whether that root was explicitly pinned (env/demo), as opposed to
+    /// the durable default.
+    pub store_root_explicit: bool,
+    /// The durable default root (no pins); the default daemon serves this.
+    pub default_store_root: PathBuf,
     /// flywheel `[mail.toron] url`.
     pub config_url: Option<String>,
     /// Default-port probe: the URL probed plus whether it answered.
@@ -358,30 +474,40 @@ pub struct ResolveInputs {
 impl MailboxSource {
     /// Resolve the robot path's mailbox source with the flywheel selector.
     ///
-    /// One selector (ADR-0035 Spec 4.5, bd-nsr7; wave8-b discovery): an
-    /// explicit daemon URL connects or errors loud — never a silent second
-    /// store. With no configured URL, a healthy default-port daemon is USED
-    /// (discovered, not refused); only a quiet port falls back to embedded.
+    /// One selector (ADR-0035 Spec 4.5, bd-nsr7; wave8-b discovery; wave13-b
+    /// store identity): an explicit daemon URL connects or errors loud —
+    /// never a silent second store. With no configured URL, a healthy
+    /// default-port daemon is USED (discovered, not refused) — but ONLY
+    /// when the CLI's resolved store root matches the durable default the
+    /// daemon serves. An explicitly pinned root elsewhere never discovers
+    /// (never cross-store); only a quiet port falls back to embedded.
     /// A discovered daemon that dies between probe and connect falls back
     /// to embedded with a loud note.
     ///
     /// Precedence:
-    /// 0. BOTH `TORON_MCP_DATA_DIR` and `TORON_MCP_URL` — a contradiction,
+    /// 0. BOTH `TORON_MCP_URL` and `TORON_MCP_DATA_DIR` — a contradiction,
     ///    WARNED loud (bd-qpm0); the daemon still wins.
-    /// 1. `TORON_MCP_DATA_DIR` — explicit durable-root pin (test isolation).
-    /// 2. `TORON_MCP_URL` — explicit daemon URL (connect failure is loud).
+    /// 1. `TORON_MCP_URL` — explicit daemon URL (connect failure is loud,
+    ///    wins over everything including a store mismatch).
+    /// 2. Explicit store root (`TORON_MCP_DATA_DIR` / `TORON_DATA_DIR` /
+    ///    `TORON_DEMO`) that resolves away from the durable default —
+    ///    embedded with a loud note, never discovered, never cross-store.
     /// 3. flywheel `[mail.toron] url` — configured daemon (connect loud).
     /// 4. Default `http://127.0.0.1:18080/mcp` — used when its health probe
     ///    answers; connect-race failure falls back loud, never refuses.
-    /// 5. Embedded against the durable XDG root (no daemon anywhere).
+    /// 5. Embedded against the durable root (no daemon anywhere, or an
+    ///    isolated pin).
     pub async fn resolve() -> anyhow::Result<Self> {
         // bd-qpm0: report the ambiguity LOUDLY, but do not change the decision.
         if try_daemon_url_from_env()?.is_some() && data_dir_pinned_from_env() {
             eprintln!("{CONTRADICTION_MESSAGE}");
         }
+        let identity = embedded_store_identity();
         Self::resolve_with(ResolveInputs {
             env_url: try_daemon_url_from_env()?,
-            data_dir_pinned: data_dir_pinned_from_env(),
+            cli_store_root: identity.root,
+            store_root_explicit: identity.explicit,
+            default_store_root: default_store_root(),
             config_url: flywheel_toron_url(),
             default_probe: (DEFAULT_DAEMON_URL.to_string(), default_port_serving()),
         })
@@ -392,11 +518,15 @@ impl MailboxSource {
     /// the endpoint precedence without process env or live sockets, except
     /// the connect itself. Tests pass a dead loopback URL for the failure
     /// arms (refused instantly, no daemon) and a dead probe for the
-    /// embedded arms (no socket touched at all).
+    /// embedded arms (no socket touched at all). wave13-b adds the store
+    /// roots so temp-root + healthy-probe resolves embedded without ever
+    /// connecting.
     pub async fn resolve_with(inputs: ResolveInputs) -> anyhow::Result<Self> {
         let decision = decide_source(
             inputs.env_url,
-            inputs.data_dir_pinned,
+            &inputs.cli_store_root,
+            inputs.store_root_explicit,
+            &inputs.default_store_root,
             inputs.config_url,
             inputs.default_probe.1,
         );
@@ -416,7 +546,15 @@ impl MailboxSource {
                     }
                 }
             }
-            SourceDecision::EmbeddedPinned | SourceDecision::EmbeddedXdg => {
+            SourceDecision::EmbeddedIsolated => {
+                eprintln!(
+                    "toron: explicit store root {} differs from the default daemon store {}; using embedded (never cross-store — set TORON_MCP_URL to use a daemon deliberately).",
+                    inputs.cli_store_root.display(),
+                    inputs.default_store_root.display()
+                );
+                Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
+            }
+            SourceDecision::EmbeddedXdg => {
                 Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
             }
         }
@@ -518,13 +656,26 @@ mod selector_tests {
 
     #[test]
     fn decide_source_precedence() {
-        type EnvRow = (Option<String>, bool, Option<String>, bool);
+        use std::path::Path;
+        let def = Path::new("/xdg/toron");
+        let temp = Path::new("/tmp/cli-temp");
+        // (env_url, cli_root, explicit, default_root, config_url, live)
+        type EnvRow = (
+            Option<String>,
+            &'static Path,
+            bool,
+            &'static Path,
+            Option<String>,
+            bool,
+        );
         let cases: Vec<(&str, EnvRow, SourceDecision)> = vec![
             (
-                "url wins over a pin, and the ambiguity is warned about",
+                "url wins over everything, even an isolated pin",
                 (
                     Some("http://x/mcp".to_string()),
+                    temp,
                     true,
+                    def,
                     Some("http://y/mcp".to_string()),
                     true,
                 ),
@@ -534,35 +685,56 @@ mod selector_tests {
                 "env url when nothing is pinned",
                 (
                     Some("http://x/mcp".to_string()),
+                    def,
                     false,
+                    def,
                     Some("http://y/mcp".to_string()),
                     true,
                 ),
                 SourceDecision::DaemonExplicit("http://x/mcp".to_string()),
             ),
             (
-                "data dir pin",
-                (None, true, Some("http://y/mcp".to_string()), true),
-                SourceDecision::EmbeddedPinned,
+                "isolated temp pin beats config url and live probe",
+                (
+                    None,
+                    temp,
+                    true,
+                    def,
+                    Some("http://y/mcp".to_string()),
+                    true,
+                ),
+                SourceDecision::EmbeddedIsolated,
             ),
             (
-                "flywheel url",
-                (None, false, Some("http://y/mcp".to_string()), false),
+                "explicit root that matches the default still discovers",
+                (None, def, true, def, None, true),
+                SourceDecision::DaemonDefault,
+            ),
+            (
+                "config url when the store is default",
+                (
+                    None,
+                    def,
+                    false,
+                    def,
+                    Some("http://y/mcp".to_string()),
+                    false,
+                ),
                 SourceDecision::DaemonExplicit("http://y/mcp".to_string()),
             ),
             (
                 "live default discovers the daemon",
-                (None, false, None, true),
+                (None, def, false, def, None, true),
                 SourceDecision::DaemonDefault,
             ),
             (
                 "quiet embeds",
-                (None, false, None, false),
+                (None, def, false, def, None, false),
                 SourceDecision::EmbeddedXdg,
             ),
         ];
-        for (name, (a0, a1, a2, a3), want) in cases {
-            assert_eq!(decide_source(a0, a1, a2, a3), want, "{name}");
+        for (name, (a0, a1, a2, a3, a4, a5), want) in cases {
+            assert_eq!(decide_source(a0, a1, a2, a3, a4, a5), want, "{name}");
         }
     }
 
@@ -622,27 +794,57 @@ mod selector_tests {
     /// wave8-b: the injectable seam resolves end-to-end without env or a
     /// live daemon. Loopback port 9 is refused (never a daemon); a dead
     /// default probe touches no socket at all.
+    /// wave13-b: the seam also carries store identity — a temp root plus a
+    /// live probe resolves embedded without ever connecting.
     const DEAD_URL: &str = "http://127.0.0.1:9/mcp";
 
     fn dead_default(live: bool) -> (String, bool) {
         (DEAD_URL.to_string(), live)
     }
 
+    fn roots(cli: &str, explicit: bool, default: &str) -> (PathBuf, bool, PathBuf) {
+        (PathBuf::from(cli), explicit, PathBuf::from(default))
+    }
+
+    fn inputs_with_roots(
+        env_url: Option<String>,
+        cli: &str,
+        explicit: bool,
+        default: &str,
+        config_url: Option<String>,
+        live: bool,
+    ) -> ResolveInputs {
+        let (cli_store_root, store_root_explicit, default_store_root) =
+            roots(cli, explicit, default);
+        ResolveInputs {
+            env_url,
+            cli_store_root,
+            store_root_explicit,
+            default_store_root,
+            config_url,
+            default_probe: dead_default(live),
+        }
+    }
+
     #[tokio::test]
     async fn explicit_dead_url_fails_typed_with_remedy() {
         for inputs in [
-            ResolveInputs {
-                env_url: Some(DEAD_URL.to_string()),
-                data_dir_pinned: false,
-                config_url: Some(DEAD_URL.to_string()),
-                default_probe: dead_default(false),
-            },
-            ResolveInputs {
-                env_url: None,
-                data_dir_pinned: false,
-                config_url: Some(DEAD_URL.to_string()),
-                default_probe: dead_default(true),
-            },
+            inputs_with_roots(
+                Some(DEAD_URL.to_string()),
+                "/tmp/cli-temp",
+                true,
+                "/xdg/toron",
+                Some(DEAD_URL.to_string()),
+                false,
+            ),
+            inputs_with_roots(
+                None,
+                "/xdg/toron",
+                false,
+                "/xdg/toron",
+                Some(DEAD_URL.to_string()),
+                true,
+            ),
         ] {
             let err = match MailboxSource::resolve_with(inputs).await {
                 Ok(_) => {
@@ -664,12 +866,14 @@ mod selector_tests {
 
     #[tokio::test]
     async fn quiet_port_embeds_without_touching_the_net() {
-        let source = MailboxSource::resolve_with(ResolveInputs {
-            env_url: None,
-            data_dir_pinned: false,
-            config_url: None,
-            default_probe: dead_default(false),
-        })
+        let source = MailboxSource::resolve_with(inputs_with_roots(
+            None,
+            "/xdg/toron",
+            false,
+            "/xdg/toron",
+            None,
+            false,
+        ))
         .await
         .expect("no daemon anywhere must embed");
         assert!(
@@ -679,35 +883,85 @@ mod selector_tests {
     }
 
     #[tokio::test]
-    async fn pin_beats_a_live_default_probe() {
-        let source = MailboxSource::resolve_with(ResolveInputs {
-            env_url: None,
-            data_dir_pinned: true,
-            config_url: None,
-            default_probe: dead_default(true),
-        })
+    async fn isolated_temp_root_skips_a_live_default_probe() {
+        // The wave13-b core: a temp store plus a *live* probe still embeds.
+        // With a live operator daemon this proves no connect was attempted
+        // (it would have succeeded); without one the probe flag alone
+        // proves the decision skipped the daemon arm.
+        let source = MailboxSource::resolve_with(inputs_with_roots(
+            None,
+            "/tmp/cli-temp-isolated",
+            true,
+            "/xdg/toron",
+            None,
+            true,
+        ))
         .await
-        .expect("the isolation pin must embed even with a live probe");
+        .expect("an isolated temp root must never discover");
         assert!(
             matches!(source, MailboxSource::Embedded(_)),
-            "pinned embeds without attempting the probed daemon"
+            "isolated temp embeds without attempting the probed daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_env_wins_over_store_isolation() {
+        // Explicit TORON_MCP_URL still wins unconditionally, even with an
+        // isolated store: the operator asked for that daemon.
+        let err = match MailboxSource::resolve_with(inputs_with_roots(
+            Some(DEAD_URL.to_string()),
+            "/tmp/cli-temp",
+            true,
+            "/xdg/toron",
+            None,
+            true,
+        ))
+        .await
+        {
+            Ok(_) => panic!("explicit env must attempt the daemon even when isolated"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<DaemonUnreachable>().is_some(),
+            "explicit env failure stays typed: {err:?}"
         );
     }
 
     #[tokio::test]
     async fn discovered_default_that_dies_falls_back_loud() {
-        let source = MailboxSource::resolve_with(ResolveInputs {
-            env_url: None,
-            data_dir_pinned: false,
-            config_url: None,
-            default_probe: dead_default(true),
-        })
+        let source = MailboxSource::resolve_with(inputs_with_roots(
+            None,
+            "/xdg/toron",
+            false,
+            "/xdg/toron",
+            None,
+            true,
+        ))
         .await
         .expect("the probe-to-connect race must fall back, never refuse");
         assert!(
             matches!(source, MailboxSource::Embedded(_)),
             "dead-on-arrival default daemon falls back to embedded"
         );
+    }
+
+    #[test]
+    fn same_store_root_matches_identical_and_symlinked_dirs() {
+        let dir = std::env::temp_dir().join(format!("toron-root-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(same_store_root(&dir, &dir));
+        assert!(same_store_root(&dir.join("sub").join(".."), &dir.join(".")));
+        assert!(!same_store_root(&dir, &dir.join("other-missing")));
+        assert!(!same_store_root(
+            &PathBuf::from("/tmp/toron-a-absent"),
+            &PathBuf::from("/tmp/toron-b-absent")
+        ));
+        assert!(same_store_root(
+            &PathBuf::from("/tmp/toron-same-absent"),
+            &PathBuf::from("/tmp/toron-same-absent")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
