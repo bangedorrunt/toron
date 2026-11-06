@@ -57,6 +57,10 @@ pub static ADDITIVE_TABLES: &[AdditiveTable] = &[
         ddl: include_str!("../../schema/additive/inbox_stream_close.sql"),
     },
     AdditiveTable {
+        name: "mail_ingest",
+        ddl: include_str!("../../schema/additive/mail_ingest.sql"),
+    },
+    AdditiveTable {
         name: "durable_engine_runs",
         ddl: include_str!("../../schema/additive/durable_engine.sql"),
     },

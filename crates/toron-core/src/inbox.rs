@@ -220,6 +220,37 @@ macro_rules! urgent_where {
 /// `?1` stream, `?2` recipient, `?3` the offset to read past.
 pub const UNREAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset");
 
+/// Stragglers behind the cursor that are still live
+/// (bd-next-envelope-ingest-yl0cx): rows the reader was served but never
+/// finished (Delivered short of its class terminal, no exit phase). `next`
+/// unions these ahead of the past-cursor rows, so an ack advances exactly
+/// the acked message and never hides its siblings — the door is per-message,
+/// not a high-water view. `?1` stream, `?2` recipient, `?3` the committed
+/// cursor (stragglers sit at or behind it). The delivery join is 1:1
+/// (`inbox_delivery` PK is `(msg_key, recipient)`); rows with no delivery
+/// row stay invisible here and keep the loud `NoSuchDelivery` on the main
+/// read. Terminal = rank-6 exits plus each class's success terminal
+/// (`DeliveryState::is_terminal`; the SQL spells it out so no migration is
+/// needed and old stores read identically).
+pub const STRAGGLER_SQL: &str = concat!(
+    "SELECT l.log_offset, l.msg_key, l.payload FROM inbox_log AS l \
+     JOIN inbox_delivery AS d ON d.msg_key = l.msg_key AND d.recipient = l.recipient \
+     WHERE l.stream = ?1 AND l.recipient = ?2 AND l.log_offset <= ?3 \
+     AND ( \
+         d.phase IN ('intent','unknown','sent') \
+         OR (d.phase = 'delivered' \
+             AND (json_extract(l.payload,'$.class') NOT IN ('notify','receipt') \
+                  OR json_extract(l.payload,'$.class') IS NULL)) \
+         OR (d.phase = 'acknowledged' \
+             AND (json_extract(l.payload,'$.class') NOT IN ('request','reply','control') \
+                  OR json_extract(l.payload,'$.class') IS NULL)) \
+         OR d.phase = 'acted' \
+         OR (d.phase = 'proved' \
+             AND (json_extract(l.payload,'$.class') != 'task' \
+                  OR json_extract(l.payload,'$.class') IS NULL)) \
+     ) ORDER BY l.log_offset"
+);
+
 /// [`UNREAD_SQL`] as a point read: one seek of `inbox_log_by_recipient
 /// (stream, recipient, log_offset)`, one row. Exported so a test can pin its
 /// plan.
@@ -735,6 +766,103 @@ impl InboxStore {
             .map_err(InboxError::from)
     }
 
+    /// Mail-ingest dedupe (bd-next-envelope-ingest-yl0cx): the msg_key a
+    /// rumor already landed under, if this recipient ingested it before.
+    pub async fn mail_ingest_get(
+        &self,
+        recipient: &str,
+        rumor_hex: &str,
+    ) -> Result<Option<String>, InboxError> {
+        sqlx::query_scalar(
+            "SELECT msg_key FROM mail_ingest WHERE recipient = ?1 AND rumor_hex = ?2",
+        )
+        .bind(recipient)
+        .bind(rumor_hex)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(InboxError::from)
+    }
+
+    /// Claim a rumor for ingest: true when this call won (row inserted),
+    /// false when a concurrent ingester claimed it first.
+    pub async fn mail_ingest_claim(
+        &self,
+        recipient: &str,
+        rumor_hex: &str,
+        msg_key: &str,
+    ) -> Result<bool, InboxError> {
+        let n: i64 = sqlx::query_scalar(
+            "INSERT OR IGNORE INTO mail_ingest (recipient, rumor_hex, msg_key) VALUES (?1, ?2, ?3) RETURNING 1",
+        )
+        .bind(recipient)
+        .bind(rumor_hex)
+        .bind(msg_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
+        Ok(n == 1)
+    }
+
+    /// Re-point a claim at the retried triple (SeqGap moved the seq).
+    pub async fn mail_ingest_set_key(
+        &self,
+        recipient: &str,
+        rumor_hex: &str,
+        msg_key: &str,
+    ) -> Result<(), InboxError> {
+        sqlx::query("UPDATE mail_ingest SET msg_key = ?3 WHERE recipient = ?1 AND rumor_hex = ?2")
+            .bind(recipient)
+            .bind(rumor_hex)
+            .bind(msg_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Does the envelope log hold this row for the reader (heals a claim
+    /// left stale by a crash between claim and append)?
+    pub async fn has_log_row(
+        &self,
+        stream: &str,
+        recipient: &str,
+        msg_key: &str,
+    ) -> Result<bool, InboxError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT 1 FROM inbox_log WHERE stream = ?1 AND recipient = ?2 AND msg_key = ?3 LIMIT 1",
+        )
+        .bind(stream)
+        .bind(recipient)
+        .bind(msg_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
+        Ok(n == 1)
+    }
+
+    /// The next (epoch, seq) this producer may claim: the fenced epoch and
+    /// one past its last seq (0 when the epoch is fresh).
+    pub async fn ingest_seq_for(&self, producer: &str) -> Result<(u64, u64), InboxError> {
+        let state: Option<(i64, i64)> =
+            sqlx::query_as("SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1")
+                .bind(producer)
+                .fetch_optional(&self.pool)
+                .await?;
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
+                .bind(producer)
+                .fetch_optional(&self.pool)
+                .await?;
+        let epoch = state
+            .map(|(e, _)| e as u64)
+            .unwrap_or(0)
+            .max(claimed.unwrap_or(0) as u64);
+        let seq = match state {
+            Some((e, last)) if e as u64 == epoch => last as u64 + 1,
+            _ => 0,
+        };
+        Ok((epoch, seq))
+    }
+
     /// Would [`Self::append_envelope`] pass the authority check for `env`
     /// right now? A dry run for senders (flywheel's pre-flight): it reads the
     /// role facts and writes nothing. It does not look at the epoch, the seq
@@ -1057,12 +1185,22 @@ impl InboxStore {
         .fetch_optional(&mut *tx)
         .await?
         .unwrap_or(0);
-        let rows = sqlx::query(UNREAD_SQL)
+        let mut fresh = sqlx::query(UNREAD_SQL)
             .bind(INBOX_STREAM)
             .bind(stream)
             .bind(before)
             .fetch_all(&mut *tx)
             .await?;
+        // Stragglers first: live rows at or behind the cursor (served but
+        // never finished) precede fresh rows, so an ack advances exactly
+        // the acked message. Disjoint by offset; both halves arrive ordered.
+        let mut rows = sqlx::query(STRAGGLER_SQL)
+            .bind(INBOX_STREAM)
+            .bind(stream)
+            .bind(before)
+            .fetch_all(&mut *tx)
+            .await?;
+        rows.append(&mut fresh);
         let after = rows.last().map_or(before, |r| r.get::<i64, _>(0));
         let now = now_us();
         let mut items = Vec::with_capacity(rows.len());

@@ -713,13 +713,16 @@ impl Mailbox {
         Ok(())
     }
 
-    /// `fetch_inbox`: project + agent projection of unwrapped kind-1059 mail to
-    /// the agent's local key, ordered by rumor time (G7), never envelope time.
-    pub async fn fetch_inbox(&self, args: &FetchInbox) -> anyhow::Result<Vec<InboxMessage>> {
-        let mut args = args.clone();
-        args.project_slug = self.canonical_project(&args.project_slug).await;
+    /// The reader's delivered kind-1059 mail, unwrapped (shared collection
+    /// behind `fetch_inbox` and the `next` ingest: contact handshakes are
+    /// protocol, not mail, in both views).
+    async fn collect_unwrapped_mail(
+        &self,
+        project_slug: &str,
+        agent_name: &str,
+    ) -> anyhow::Result<(crate::nostr::PublicKey, Vec<UnwrappedMail>)> {
         let agent_keys = self
-            .agent_keys_for_resolved(&args.project_slug, &args.agent_name)
+            .agent_keys_for_resolved(project_slug, agent_name)
             .await?;
         let npub = agent_keys.public_key();
 
@@ -749,6 +752,91 @@ impl Mailbox {
                 });
             }
         }
+        Ok((npub, mails))
+    }
+
+    /// bd-next-envelope-ingest-yl0cx: every delivered DM becomes visible to
+    /// `next` — one `request@1` envelope row per message in the reader's
+    /// inbox log, so `next` commits cursor + Delivered PER MESSAGE. Exact
+    /// dedupe by rumor id (re-ingest adds nothing); a stale claim heals by
+    /// re-appending instead of going invisible. Returns rows added. This is
+    /// not a high-water view: each message keeps its own row and delivery.
+    pub async fn ingest_delivered_mail(
+        &self,
+        project: &str,
+        agent_name: &str,
+        store: &crate::inbox::InboxStore,
+    ) -> anyhow::Result<usize> {
+        use crate::inbox::{INBOX_STREAM, InboxError};
+        use crate::kernel::AppendError;
+        let project_slug = self.canonical_project(project).await;
+        let (npub, mails) = self
+            .collect_unwrapped_mail(&project_slug, agent_name)
+            .await?;
+        let reader = npub.to_hex();
+        let mut added = 0usize;
+        for (mail, _seq) in order_by_rumor_time(mails) {
+            let Some(msg) = inbox_from(mail) else {
+                continue;
+            };
+            let rumor_hex = msg.id.clone();
+            let sender = msg.sender.clone();
+            let mut env =
+                mail_envelope(&project_slug, &sender, &reader, &msg.subject, &msg.body_md);
+            // Exact dedupe: a landed claim with a live row means done; a
+            // stale claim (crash between claim and append) heals below.
+            if let Some(k) = store.mail_ingest_get(&reader, &rumor_hex).await? {
+                if store.has_log_row(INBOX_STREAM, &reader, &k).await? {
+                    continue;
+                }
+            }
+            let mut done = false;
+            for _ in 0..8 {
+                let (epoch, seq) = store.ingest_seq_for(&sender).await?;
+                env.msg.epoch = epoch;
+                env.msg.seq = seq;
+                let k = env.msg.key();
+                if !store.mail_ingest_claim(&reader, &rumor_hex, &k).await? {
+                    // Lost the claim race: the winner landed the row (done)
+                    // or crashed first (steal the claim and append below).
+                    if let Some(wk) = store.mail_ingest_get(&reader, &rumor_hex).await? {
+                        if store.has_log_row(INBOX_STREAM, &reader, &wk).await? {
+                            done = true;
+                            break;
+                        }
+                    }
+                    store.mail_ingest_set_key(&reader, &rumor_hex, &k).await?;
+                }
+                match store.append_envelope(&env).await {
+                    Ok(_) => {
+                        added += 1;
+                        done = true;
+                        break;
+                    }
+                    // Our triple moved under us (concurrent ingester) or is
+                    // foreign-occupied: recompute and retry.
+                    Err(InboxError::Append(AppendError::SeqGap { .. }))
+                    | Err(InboxError::PayloadConflict { .. }) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !done {
+                anyhow::bail!(
+                    "mail ingest contention for {rumor_hex}: 8 tries lost the producer race"
+                );
+            }
+        }
+        Ok(added)
+    }
+
+    /// `fetch_inbox`: project + agent projection of unwrapped kind-1059 mail to
+    /// the agent's local key, ordered by rumor time (G7), never envelope time.
+    pub async fn fetch_inbox(&self, args: &FetchInbox) -> anyhow::Result<Vec<InboxMessage>> {
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await;
+        let (npub, mails) = self
+            .collect_unwrapped_mail(&args.project_slug, &args.agent_name)
+            .await?;
 
         let ordered = order_by_rumor_time(mails);
         self.heal_search_projection(&ordered).await;
@@ -1961,6 +2049,56 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
 }
 
 /// Project an unwrapped mail into the inbox view.
+/// A delivered DM as a `request@1` envelope for the reader's inbox log
+/// (bd-next-envelope-ingest-yl0cx). Producer and sender are the author's
+/// npub (the log's identity rule); the reader rides `to`; the project is
+/// the context. Request (not notify): the per-message door ends each mail
+/// with an ack, and only obligation classes admit one — `allowed_now`
+/// already suggests `toron ack` for a delivered request. Pure and total:
+/// empty subject+body still yields a valid envelope (nothing delivered
+/// stays invisible).
+fn mail_envelope(
+    project: &str,
+    sender_hex: &str,
+    reader_hex: &str,
+    subject: &str,
+    body_md: &str,
+) -> crate::envelope::Envelope {
+    use crate::envelope::{Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient};
+    let mut text = String::new();
+    if !subject.trim().is_empty() {
+        text.push_str(subject.trim());
+    }
+    if !body_md.trim().is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(body_md.trim());
+    }
+    if text.is_empty() {
+        text.push_str("(no content)");
+    }
+    Envelope {
+        v: ENVELOPE_V,
+        msg: MsgId {
+            producer: sender_hex.into(),
+            epoch: 0,
+            seq: 0,
+        },
+        from: sender_hex.into(),
+        to: Recipient::Npub(reader_hex.into()),
+        class: Class::Request,
+        contract: ContractId::new("request", 1),
+        context: ContextId(project.into()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body: serde_json::json!({ "goal": text }),
+    }
+}
+
 fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
     use std::str::FromStr;
     let tags = &mail.rumor.tags;
@@ -3341,6 +3479,72 @@ mod tests {
             "no pool → read_ts_us unknown (None)"
         );
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-next-envelope-ingest-yl0cx: every delivered DM is visible to
+    /// `next` — two mails in, both out; ack one, the other remains; a second
+    /// ingest adds nothing (no high-water skip, no duplicate rows).
+    #[tokio::test]
+    async fn next_ingest_two_mails_ack_one_returns_other() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("next-ingest").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        let (_recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+        let reader = npub.to_hex();
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
+            .await
+            .expect("send one");
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
+            .await
+            .expect("send two");
+        let store = mailbox.inbox_store().expect("store");
+        let blind = store.next(&reader, None, false).await.expect("next");
+        assert!(
+            blind.items.is_empty(),
+            "without ingest the envelope log holds no mail"
+        );
+        let added = mailbox
+            .ingest_delivered_mail("demo", "BlueLake", &store)
+            .await
+            .expect("ingest");
+        assert_eq!(added, 2, "one row per delivered message");
+        let batch = store.next(&reader, None, false).await.expect("next");
+        assert_eq!(batch.items.len(), 2, "both messages visible");
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|i| i.phase == crate::delivery::Phase::Delivered),
+            "next commits Delivered per message"
+        );
+        store
+            .ack(&reader, &batch.items[0].msg_key, true, None)
+            .await
+            .expect("ack");
+        let rest = store.next(&reader, None, false).await.expect("next");
+        assert_eq!(rest.items.len(), 1, "ack advances exactly one message");
+        assert_eq!(rest.items[0].msg_key, batch.items[1].msg_key);
+        let added_again = mailbox
+            .ingest_delivered_mail("demo", "BlueLake", &store)
+            .await
+            .expect("re-ingest");
+        assert_eq!(added_again, 0, "re-ingest adds nothing");
+        store
+            .ack(&reader, &rest.items[0].msg_key, true, None)
+            .await
+            .expect("ack the other");
+        let drained = store.next(&reader, None, false).await.expect("next");
+        assert!(
+            drained.items.is_empty(),
+            "everything acked: nothing repeats, no duplicate rows"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

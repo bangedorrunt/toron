@@ -33,6 +33,16 @@ pub async fn run_comms(
                 return Ok(ExitCode::from(2));
             }
             let reader = mailbox.comms_npub(&a.project, &a.who).await?;
+            // Every delivered DM ingests into the reader's log first, so
+            // `next` sees each message (per-message cursor + Delivered).
+            // Ingest trouble must not take `next` down with it: loud, then
+            // serve the rows already in the log.
+            if let Err(e) = mailbox
+                .ingest_delivered_mail(&a.project, &a.who, &store)
+                .await
+            {
+                eprintln!("toron: mail ingest failed ({e:#}); serving logged rows only");
+            }
             let batch = store.next(&reader, a.stream.as_deref(), a.peek).await;
             if batch.is_ok() {
                 let now_us = toron_core::mailbox::lease_liveness::host_now_us();
