@@ -1,0 +1,7 @@
+bead: bd-next-envelope-ingest-yl0cx
+sha: 6860f1818eec5491c07a9805bb62f76e4c0a2374
+leg1 core lib: 919 passed 0 failed (incl next_ingest_two_mails_ack_one_returns_other)
+leg2 cli_robot: 49 passed 0 failed
+leg3 workspace check --all-targets: exit 0
+live: WindyCreek next [] -> 6 items cursor 0->532; SunnyMarsh 0->547 15 items; no ack performed
+report: .flywheel/reports/next-envelope-ingest.md
