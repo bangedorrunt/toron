@@ -128,11 +128,9 @@ pub struct Mailbox {
     data_dir: PathBuf,
     operator: Option<Keys>,
     agent_passphrase: Option<String>,
-    /// Pane-plane facts for the kernel (wave6-b port). Default = the live
-    /// plane at construction (`LivePanePlane::connect_default`, `None` when
-    /// no plane is reachable — the same degrade-as-absent posture as the old
-    /// per-call `connect_default` sites). Tests/embedders override with
-    /// [`Mailbox::with_plane`]. No env read happens on any later call path.
+    /// Pane plane: `None` until an embedder injects one (see below). A mailbox
+    /// without a plane degrades exactly like an unreachable one (empty maps,
+    /// refused resolutions) — production builders inject the live plane.
     plane: Option<std::sync::Arc<dyn crate::plane_port::PanePlane>>,
     /// NIP-17 wrap idempotency only (event-id keys). Not SLA truth —
     /// assignment receipts live in `receipts` sqlite (ADR-0027 E2).
@@ -231,11 +229,7 @@ impl Mailbox {
             data_dir,
             operator,
             agent_passphrase: None,
-            plane: crate::plane_port::LivePanePlane::connect_default()
-                .ok()
-                .map(|p| {
-                    std::sync::Arc::new(p) as std::sync::Arc<dyn crate::plane_port::PanePlane>
-                }),
+            plane: None,
             wrap_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             loop_tracker: crate::mailbox::surface::LoopTracker::default(),
             index_pool: None,
@@ -256,7 +250,7 @@ impl Mailbox {
     }
 
     /// Override the pane-plane port (tests, embedders holding their own
-    /// plane). The default from [`Mailbox::new`] is the live plane.
+    /// plane). Builders that need live pane facts inject the plane here.
     pub fn with_plane(mut self, plane: std::sync::Arc<dyn crate::plane_port::PanePlane>) -> Self {
         self.plane = Some(plane);
         self

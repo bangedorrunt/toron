@@ -176,7 +176,7 @@ impl ToolServer {
         Parameters(args): Parameters<ResolvePaneIdentityArgs>,
     ) -> ToolOutput {
         let pane_id = args.pane_id.clone().unwrap_or_default();
-        match toron_core::plane_port::LivePanePlane::connect_default() {
+        match toron_plane::LivePanePlane::connect_default() {
             Ok(plane) => match self.mailbox.resolve_pane_identity(&plane, &pane_id) {
                 Ok(Some(name)) => ToolOutput::ok(json!({ "agent_name": name, "pane_id": pane_id })),
                 Ok(None) => ToolOutput::ok(json!({ "agent_name": null, "pane_id": pane_id })),
@@ -200,7 +200,7 @@ impl ToolServer {
         &self,
         Parameters(_args): Parameters<CleanupPaneIdentitiesArgs>,
     ) -> ToolOutput {
-        match toron_core::plane_port::LivePanePlane::connect_default() {
+        match toron_plane::LivePanePlane::connect_default() {
             Ok(plane) => {
                 let pruned = self.mailbox.cleanup_pane_identities(&plane);
                 match pruned {

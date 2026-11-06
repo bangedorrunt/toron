@@ -3,7 +3,6 @@
 
 pub mod archive;
 pub mod authority;
-pub mod backend;
 pub mod bus;
 pub mod busy_owner;
 pub mod config;
@@ -23,8 +22,8 @@ pub mod kernel;
 pub mod keys;
 pub mod mailbox;
 pub mod nostr;
-pub mod osc7501;
 pub mod outbox;
+pub mod pane_types;
 pub mod plane_port;
 pub mod policy;
 pub mod proc;

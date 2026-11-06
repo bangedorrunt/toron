@@ -21,10 +21,10 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::backend::types::TOKEN_PIN;
 use crate::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
 use crate::backend::{AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding};
 use serde_json::{Value, json};
+use toron_core::pane_types::TOKEN_PIN;
 
 use crate::backend::rex_cli;
 
@@ -799,7 +799,7 @@ mod pane_identity_tests {
     fn a_labelled_block_carries_the_canonical_pin_token() {
         let pane = pane_from(&block("DustySparrow"), "s1", AgentStatus::Idle);
         assert_eq!(
-            crate::mailbox::identity::pane_token_pin(&pane),
+            toron_core::mailbox::identity::pane_token_pin(&pane),
             Some("DustySparrow")
         );
     }
@@ -809,7 +809,7 @@ mod pane_identity_tests {
     #[test]
     fn an_unlabelled_block_carries_no_pin_token() {
         let pane = pane_from(&block(""), "s1", AgentStatus::Unknown);
-        assert_eq!(crate::mailbox::identity::pane_token_pin(&pane), None);
+        assert_eq!(toron_core::mailbox::identity::pane_token_pin(&pane), None);
     }
 
     /// A rex label is not a full stamp (no npub), so the divergence check
@@ -817,7 +817,7 @@ mod pane_identity_tests {
     #[test]
     fn a_block_label_is_not_a_full_stamp() {
         let pane = pane_from(&block("DustySparrow"), "s1", AgentStatus::Idle);
-        assert_eq!(crate::mailbox::identity::pane_stamp(&pane), None);
+        assert_eq!(toron_core::mailbox::identity::pane_stamp(&pane), None);
     }
 
     /// `rex events` follows the caller's session unless `-s` is passed, so a
@@ -885,12 +885,12 @@ mod pane_identity_tests {
             .find(|pane| pane.pane_id == block_id)
             .expect("the new block is in pane_list");
         assert_eq!(
-            crate::mailbox::identity::pane_token_pin(pane),
+            toron_core::mailbox::identity::pane_token_pin(pane),
             Some(pin),
             "the block label is the canonical pin token"
         );
         assert!(
-            crate::mailbox::identity::pane_stamp(pane).is_none(),
+            toron_core::mailbox::identity::pane_stamp(pane).is_none(),
             "a label alone is not a full stamp"
         );
 

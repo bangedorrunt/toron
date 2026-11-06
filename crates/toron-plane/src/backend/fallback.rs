@@ -27,10 +27,9 @@ use std::fmt;
 use serde_json::Value;
 
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{
-    AgentInfo, AgentStatus, PaneInfo, PromptLanding, Subscription, WaitOptions, WorkspaceInfo,
-};
+use super::types::{PromptLanding, Subscription, WaitOptions, WorkspaceInfo};
 use super::{Backend, EventStream};
+use toron_core::pane_types::{AgentInfo, AgentStatus, PaneInfo};
 
 /// When a failed call may be replayed on the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::backend::{BackendError, BackendErrorCode, BackendEvent};
 use serde_json::Value;
 
-use crate::proc::{ProcError, run_bounded};
+use toron_core::proc::{ProcError, run_bounded};
 
 /// Wall bound around rex's own `--timeout 10s`, so a rex-side timeout can
 /// exit before we kill the process group.
@@ -810,8 +810,8 @@ pub mod rex_map {
     /// Working, a shell is at a prompt. Explicit records always win over
     /// this — callers only reach it on an empty board.
     pub fn process_status(view: &ProcessView) -> AgentStatus {
-        match crate::harness::Harness::from_kind(&view.foreground) {
-            crate::harness::Harness::Other => {
+        match toron_core::harness::Harness::from_kind(&view.foreground) {
+            toron_core::harness::Harness::Other => {
                 if SHELLS.contains(&view.foreground.as_str()) {
                     AgentStatus::Idle
                 } else {

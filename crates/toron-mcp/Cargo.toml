@@ -14,6 +14,7 @@ rmcp = { version = "3.4.0", features = [
     "client",
 ] }
 toron-core = { path = "../toron-core" }
+toron-plane = { path = "../toron-plane" }
 toron-workflow = { path = "../toron-workflow" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

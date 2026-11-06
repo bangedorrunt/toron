@@ -27,7 +27,8 @@
 //! flywheel/doorbell imports. Flywheel prompt paths adopt it as callers;
 //! other loops follow only if the pattern earns it.
 
-use super::types::{AgentStatus, PaneId};
+use super::types::PaneId;
+use toron_core::pane_types::AgentStatus;
 
 /// Post-submit activity-observation budget (herdr §3.1: 5s).
 pub const ACTIVITY_GATE_MS: u64 = 5_000;

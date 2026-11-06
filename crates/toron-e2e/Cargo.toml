@@ -16,6 +16,7 @@ p4 = ["p5"]
 
 [dependencies]
 toron-core = { path = "../toron-core" }
+toron-plane = { path = "../toron-plane" }
 tokio = { version = "1", features = ["full"] }
 nostr-sdk = "0.45.2"
 nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }

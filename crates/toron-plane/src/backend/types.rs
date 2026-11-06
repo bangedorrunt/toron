@@ -1,12 +1,16 @@
 // governed-by: ADR-0003, ADR-0031
 
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use super::error::BackendError;
+pub use toron_core::pane_types::{AgentStatus, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
+// Moved vocabulary stays addressable under its old path so retargets are
+// pure crate-prefix swaps (the canonical home is `toron_core::pane_types`).
+pub use toron_core::pane_types::{
+    AgentInfo, AgentSessionInfo, AgentSessionRefKind, PaneInfo, PaneScrollInfo,
+    normalize_agent_status,
+};
 
 /// Identifies a supervised pane/worktree in the backend.
 ///
@@ -67,64 +71,6 @@ impl fmt::Display for PaneId {
     }
 }
 
-/// Agent lifecycle state (herdr protocol v20 wire values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentStatus {
-    Idle,
-    Working,
-    Blocked,
-    Done,
-    Unknown,
-}
-
-impl AgentStatus {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            AgentStatus::Idle => "idle",
-            AgentStatus::Working => "working",
-            AgentStatus::Blocked => "blocked",
-            AgentStatus::Done => "done",
-            AgentStatus::Unknown => "unknown",
-        }
-    }
-}
-
-impl FromStr for AgentStatus {
-    type Err = BackendError;
-
-    /// Lenient by design (ADR-0031 S1): unknown dialect strings map to
-    /// `Unknown`, never `Err`. `Unknown` never proves completion, so a new
-    /// backend word fails safe. Reducers should still prefer
-    /// [`normalize_agent_status`] as the single named importer.
-    ///
-    /// Agents read [`AgentStatus::as_str`] for display; reducers call
-    /// [`normalize_agent_status`] for input.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(normalize_agent_status(s))
-    }
-}
-
-/// Canonical importer for raw backend status strings (ADR-0031 S1/A4).
-///
-/// The only function allowed to translate dialect into the five canonical
-/// states. Unknown, empty, or future-dialect input maps to
-/// [`AgentStatus::Unknown`], which never proves completion. Everything
-/// downstream of this function sees only the canonical five.
-///
-/// `blocked` is an await-signal, not do-not-disturb; `done` is finished +
-/// unseen, `idle` finished + seen (herdr seen-split, ADR-0031 A2).
-pub fn normalize_agent_status(raw: &str) -> AgentStatus {
-    match raw {
-        "idle" => AgentStatus::Idle,
-        "working" => AgentStatus::Working,
-        "blocked" => AgentStatus::Blocked,
-        "done" => AgentStatus::Done,
-        "unknown" => AgentStatus::Unknown,
-        _ => AgentStatus::Unknown,
-    }
-}
-
 /// Push event emitted by a backend's `subscribe` stream (unified in toron-core
 /// by ADR-0005 P1 — flywheel's `__poll_events` leaf consumes this shape).
 ///
@@ -179,40 +125,6 @@ mod backend_types_s1 {
     use super::*;
 
     #[test]
-    fn canonical_five_normalize() {
-        assert_eq!(normalize_agent_status("working"), AgentStatus::Working);
-        assert_eq!(normalize_agent_status("blocked"), AgentStatus::Blocked);
-        assert_eq!(normalize_agent_status("done"), AgentStatus::Done);
-        assert_eq!(normalize_agent_status("idle"), AgentStatus::Idle);
-        assert_eq!(normalize_agent_status("unknown"), AgentStatus::Unknown);
-    }
-
-    #[test]
-    fn unknown_never_proves_completion() {
-        for raw in ["", "IDDLE", "Idle", "superlogical:busy", "w1:p1", "done "] {
-            assert_eq!(
-                normalize_agent_status(raw),
-                AgentStatus::Unknown,
-                "raw {raw:?} must not classify as completion"
-            );
-        }
-    }
-
-    #[test]
-    fn from_str_is_lenient_via_normalizer() {
-        assert_eq!(
-            "working".parse::<AgentStatus>().expect("parses"),
-            AgentStatus::Working
-        );
-        assert_eq!(
-            "future-dialect-word"
-                .parse::<AgentStatus>()
-                .expect("lenient"),
-            AgentStatus::Unknown
-        );
-    }
-
-    #[test]
     fn pane_id_opaque_compare_clone_only() {
         let a = PaneId::new("w1:p1");
         let b = PaneId::from("w1:p1");
@@ -231,40 +143,6 @@ mod backend_types_s1 {
 /// Source id for toron mail-identity pane stamps (bd-6f57). Display-only
 /// metadata — never steals lifecycle authority from the multiplexer.
 pub const MAIL_IDENTITY_SOURCE: &str = "toron:mail-identity";
-/// Token keys for the mail-identity stamp (ASCII alnum/`_`/`-`, ≤32 chars).
-pub const TOKEN_PIN: &str = "toron_pin";
-pub const TOKEN_PROJECT: &str = "toron_project";
-pub const TOKEN_NPUB: &str = "toron_npub";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentInfo {
-    pub agent: Option<String>,
-    pub agent_status: AgentStatus,
-    pub cwd: Option<String>,
-    pub display_agent: Option<String>,
-    pub focused: bool,
-    pub foreground_cwd: Option<String>,
-    #[serde(default)]
-    pub interactive_ready: bool,
-    #[serde(default)]
-    pub launch_pending: bool,
-    pub name: Option<String>,
-    pub pane_id: String,
-    pub revision: u64,
-    #[serde(default)]
-    pub state_change_seq: u64,
-    /// Monotonic finished-turn counter (herdr). Older servers omit it
-    /// (`None`). Prefer this over watching working→idle for done/hand-off:
-    /// a fast turn can start and finish entirely between two polls.
-    #[serde(default)]
-    pub completion_seq: Option<u64>,
-    #[serde(default)]
-    pub state_labels: serde_json::Map<String, Value>,
-    pub tab_id: String,
-    pub terminal_id: String,
-    pub terminal_title: Option<String>,
-    pub workspace_id: String,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceInfo {
@@ -278,57 +156,6 @@ pub struct WorkspaceInfo {
     pub agent_status: AgentStatus,
     #[serde(default)]
     pub cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PaneInfo {
-    pub pane_id: String,
-    pub terminal_id: String,
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub focused: bool,
-    pub agent_status: AgentStatus,
-    pub revision: u64,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub agent: Option<String>,
-    pub agent_session: Option<AgentSessionInfo>,
-    pub display_agent: Option<String>,
-    pub foreground_cwd: Option<String>,
-    pub label: Option<String>,
-    pub scroll: Option<PaneScrollInfo>,
-    #[serde(default)]
-    pub state_labels: serde_json::Map<String, Value>,
-    pub terminal_title: Option<String>,
-    pub terminal_title_stripped: Option<String>,
-    #[serde(default)]
-    pub tokens: serde_json::Map<String, Value>,
-}
-
-/// Agent-session reference (`agent_session` on AgentInfo/PaneInfo). Rex
-/// reports one; hc (tested 0.1.18) reports none, so the field stays `None` there.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentSessionInfo {
-    pub source: String,
-    pub agent: String,
-    pub kind: AgentSessionRefKind,
-    pub value: String,
-}
-
-/// Agent-session reference kind (`id` | `path`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentSessionRefKind {
-    Id,
-    Path,
-}
-
-/// herdr pane scroll state (`scroll` on PaneInfo).
-#[derive(Debug, Clone, Deserialize)]
-pub struct PaneScrollInfo {
-    pub offset_from_bottom: u64,
-    pub max_offset_from_bottom: u64,
-    pub viewport_rows: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

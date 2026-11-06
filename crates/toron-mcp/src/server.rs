@@ -59,6 +59,10 @@ impl ToronServer {
     pub fn with_bus(mut self, bus: Arc<dyn Bus>) -> Self {
         let data_dir = std::env::temp_dir().join("toron-mcp-demo");
         let mailbox = Mailbox::new(bus.clone(), data_dir, None);
+        let mailbox = match toron_plane::LivePanePlane::connect_default() {
+            Ok(live) => mailbox.with_plane(std::sync::Arc::new(live)),
+            Err(_) => mailbox,
+        };
         self.bus = Some(bus);
         self.tools = Some(ToolServer::new(Arc::new(mailbox)));
         self
@@ -360,6 +364,9 @@ pub async fn build_mailbox_with_opts(
     let mut mailbox =
         toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, operator)
             .with_index_pool(pool);
+    if let Ok(live) = toron_plane::LivePanePlane::connect_default() {
+        mailbox = mailbox.with_plane(std::sync::Arc::new(live));
+    }
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
         mailbox.spawn_unwrap_loop();
@@ -409,6 +416,9 @@ async fn build_mailbox(
         .await
         .context("bus event store ddl/backfill")?;
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
+    if let Ok(live) = toron_plane::LivePanePlane::connect_default() {
+        mailbox = mailbox.with_plane(std::sync::Arc::new(live));
+    }
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
         mailbox.spawn_unwrap_loop();

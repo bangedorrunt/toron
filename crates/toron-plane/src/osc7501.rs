@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::plane_port::AgentStatus;
+use toron_core::pane_types::AgentStatus;
 
 const MAX_SEQUENCE: usize = 4096;
 const MAX_KEY: usize = 16;

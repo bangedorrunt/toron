@@ -306,14 +306,14 @@ fn identity_divergence_check(
 fn check_identity_divergence(cfg: &Config) -> CheckResult {
     let name = "identity_divergence";
     let stamps = {
-        let Ok(backend) = toron_core::backend::plane::connect_default() else {
+        let Ok(backend) = toron_plane::backend::plane::connect_default() else {
             return CheckResult {
                 name,
                 ok: true,
                 detail: "pane plane not reachable — no live panes to compare".into(),
             };
         };
-        let panes: Vec<toron_core::backend::PaneInfo> = backend.pane_list(None).unwrap_or_default();
+        let panes: Vec<toron_plane::backend::PaneInfo> = backend.pane_list(None).unwrap_or_default();
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)
@@ -408,7 +408,7 @@ fn check_daemon_build() -> CheckResult {
 }
 
 fn check_hc() -> CheckResult {
-    let path = toron_core::backend::hc::resolve_socket_path(
+    let path = toron_plane::backend::hc::resolve_socket_path(
         None,
         std::env::var("HC_SOCKET_PATH").ok().as_deref(),
         std::env::var_os("XDG_STATE_HOME")
@@ -419,7 +419,7 @@ fn check_hc() -> CheckResult {
             .as_deref(),
         std::env::var("HC_SESSION").ok().as_deref(),
     );
-    match toron_core::backend::hc::HcBackend::connect(None) {
+    match toron_plane::backend::hc::HcBackend::connect(None) {
         Ok(_) => CheckResult {
             name: "hc",
             ok: true,
@@ -1189,20 +1189,20 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
 }
 
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
-    use toron_core::backend::plane::{Plane, PlaneChoice, PlaneEnv};
+    use toron_plane::backend::plane::{Plane, PlaneChoice, PlaneEnv};
 
     let configured = cfg.effective_backend();
     let rex_bin_dir = std::env::var_os("REX_BIN_DIR")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from);
     let resolved =
-        toron_core::backend::plane::resolve(&PlaneEnv::detect(configured, rex_bin_dir.as_deref()));
+        toron_plane::backend::plane::resolve(&PlaneEnv::detect(configured, rex_bin_dir.as_deref()));
     if resolved.plane == Plane::Invalid {
         anyhow::bail!("{}", resolved.reason);
     }
     match cmd {
         BackendCommand::List => {
-            let hc = toron_core::backend::hc::HcBackend::connect(None).is_ok();
+            let hc = toron_plane::backend::hc::HcBackend::connect(None).is_ok();
             print_json(&json!([
                 { "name": "hc", "available": hc, "role": "fallback" },
                 {

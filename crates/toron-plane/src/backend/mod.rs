@@ -15,15 +15,17 @@ pub mod superlogical;
 pub mod types;
 pub mod wait;
 
-pub use error::{BackendError, BackendErrorCode};
 pub use fallback::FallbackBackend;
 pub use hc::{
     Client as HcClient, HC_GENERATION, HcBackend, ID_PREFIX, MIN_HC_VERSION, TESTED_HC_VERSION,
 };
 pub use plane::{Plane, PlaneChoice, PlaneEnv, ResolvedPlane, RexCli};
+pub use toron_core::pane_types::{
+    AgentInfo, AgentSessionInfo, AgentSessionRefKind, AgentStatus, BackendError, BackendErrorCode,
+    PaneInfo, PaneScrollInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT,
+};
 pub use types::{
-    AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, SpawnOptions,
-    Subscription, WaitOptions, WorkspaceInfo, normalize_agent_status,
+    BackendEvent, PaneId, PromptLanding, SpawnOptions, Subscription, WaitOptions, WorkspaceInfo,
 };
 pub use wait::{ACTIVITY_GATE_MS, PromptHost, PromptTarget, WaitOutcome, prompt_wait};
 

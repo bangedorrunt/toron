@@ -3,6 +3,7 @@
 resolver = "2"
 members = [
     "crates/toron-core",
+    "crates/toron-plane",
     "crates/toron-mcp",
     "crates/toron-cli",
     "crates/toron-e2e",

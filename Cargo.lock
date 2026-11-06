@@ -3435,6 +3435,7 @@ dependencies = [
  "toml",
  "toron-core",
  "toron-mcp",
+ "toron-plane",
  "toron-workflow",
  "tracing",
  "tracing-subscriber",
@@ -3487,6 +3488,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toron-core",
+ "toron-plane",
  "toron-workflow",
  "uuid",
 ]
@@ -3512,10 +3514,24 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toron-core",
+ "toron-plane",
  "toron-workflow",
  "tower",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "toron-plane"
+version = "1.6.1"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toron-core",
+ "tracing",
 ]
 
 [[package]]

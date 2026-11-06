@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use serde_json::{Value, json};
-use toron_core::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
+use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse,
     RequestContact, RequestRelease, RespondContact, SearchMessages, SendMessage,
@@ -556,8 +556,8 @@ fn stamp_bootstrap_pane(
     if npub.is_empty() {
         return None;
     }
-    let plane = toron_core::backend::plane::resolve_default();
-    if plane.plane == toron_core::backend::plane::Plane::Rex && plane.rex_reachable {
+    let plane = toron_plane::backend::plane::resolve_default();
+    if plane.plane == toron_plane::backend::plane::Plane::Rex && plane.rex_reachable {
         // A rex block carries the pin as its label from creation (ADR-0045),
         // so there is no token stamp to write and no hc socket to open.
         return Some(terminal);
@@ -567,9 +567,9 @@ fn stamp_bootstrap_pane(
         (TOKEN_PROJECT.to_string(), project.to_string()),
         (TOKEN_NPUB.to_string(), npub.to_string()),
     ]);
-    match toron_core::backend::hc::HcBackend::connect(None) {
+    match toron_plane::backend::hc::HcBackend::connect(None) {
         Ok(backend) => match backend.client().terminal_label(&terminal, &labels) {
-            Ok(labelled) => Some(toron_core::backend::hc::prefix_id(&labelled.address)),
+            Ok(labelled) => Some(toron_plane::backend::hc::prefix_id(&labelled.address)),
             Err(e) => {
                 eprintln!("toron: pane stamp skipped ({e})");
                 None

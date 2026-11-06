@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use toron_core::backend::mock::MockBackend;
+use toron_plane::backend::mock::MockBackend;
 use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::{Bus, InProcessBus, SubscriptionEvent};
 use toron_core::index::schema;

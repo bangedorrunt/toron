@@ -23,6 +23,7 @@ rmcp = { version = "3.4.0", features = [
     "transport-streamable-http-client-reqwest",
 ] }
 toron-core = { path = "../toron-core" }
+toron-plane = { path = "../toron-plane" }
 toron-mcp = { path = "../toron-mcp" }
 toron-workflow = { path = "../toron-workflow" }
 nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }

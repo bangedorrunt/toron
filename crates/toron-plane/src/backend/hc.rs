@@ -56,11 +56,9 @@ use serde_json::{Value, json};
 use crate::osc7501::{Board, FoldPolicy, HcStatusView, fold};
 
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{
-    AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, Subscription, TOKEN_PIN,
-    WaitOptions, WorkspaceInfo, normalize_agent_status,
-};
+use super::types::{BackendEvent, PaneId, PromptLanding, Subscription, WaitOptions, WorkspaceInfo};
 use super::{Backend, EventStream};
+use toron_core::pane_types::{AgentInfo, AgentStatus, PaneInfo, TOKEN_PIN, normalize_agent_status};
 
 /// Stable prefix on every pane/agent id this backend returns.
 pub const ID_PREFIX: &str = "hc:";
@@ -2247,15 +2245,15 @@ mod tests {
         let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
         let mut labels = BTreeMap::new();
         labels.insert(
-            crate::backend::types::TOKEN_PIN.to_string(),
+            toron_core::pane_types::TOKEN_PIN.to_string(),
             "DustySparrow".to_string(),
         );
         labels.insert(
-            crate::backend::types::TOKEN_PROJECT.to_string(),
+            toron_core::pane_types::TOKEN_PROJECT.to_string(),
             "demo".to_string(),
         );
         labels.insert(
-            crate::backend::types::TOKEN_NPUB.to_string(),
+            toron_core::pane_types::TOKEN_NPUB.to_string(),
             "npub1x".to_string(),
         );
         let term = client.terminal_label("hc:t7", &labels).expect("label");
@@ -2290,7 +2288,7 @@ mod tests {
         .expect("terminal");
         let pane = term.to_pane_info(FoldPolicy::Attention);
         assert_eq!(
-            crate::mailbox::identity::pane_token_pin(&pane),
+            toron_core::mailbox::identity::pane_token_pin(&pane),
             Some("DustySparrow")
         );
     }
@@ -2395,7 +2393,7 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane_id, "hc:t7");
         assert_eq!(
-            crate::mailbox::identity::pane_token_pin(&panes[0]),
+            toron_core::mailbox::identity::pane_token_pin(&panes[0]),
             Some("DustySparrow")
         );
         backend.pane_run("hc:t7", "echo hi").expect("run");

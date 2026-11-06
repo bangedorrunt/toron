@@ -7,8 +7,10 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::error::BackendError;
-use super::types::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
-use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions};
+use super::types::{BackendEvent, PaneId, PromptLanding, SpawnOptions};
+use super::types::{Subscription, WaitOptions, WorkspaceInfo};
+use toron_core::pane_types::AgentStatus;
+use toron_core::pane_types::{AgentInfo, PaneInfo};
 
 #[derive(Debug, Clone)]
 struct MockState {

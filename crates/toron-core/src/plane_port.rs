@@ -1,26 +1,17 @@
 //! Narrow pane-plane port: the only facts the mail/comms kernel may take from
-//! the pane plane (wave6-b).
+//! the pane plane (wave6-b, split wave7-b).
 //!
-//! The kernel used to reach `crate::backend` directly (construct a backend per
-//! call in messaging/identity/surface, import vocabulary types in osc7501).
-//! That reach is why the plane could never become its own crate without a
-//! cycle. This module is the single seam:
-//!
-//! - [`PanePlane`] names exactly the two facts the kernel uses (`pane_list`,
-//!   `agent_list`) over plain data types. The `Backend` trait itself never
-//!   crosses into the kernel.
-//! - Vocabulary types (`AgentInfo`, `PaneInfo`, token consts, `AgentStatus`)
-//!   are re-exported here so kernel modules name `crate::plane_port`, never
-//!   `crate::backend`.
-//! - [`LivePanePlane`] adapts the real backend (`plane::connect_default()`);
-//!   [`MockPanePlane`] (tests) feeds canned panes/agents with no plane.
+//! The kernel used to reach the pane implementation directly. This module is
+//! the single seam: [`PanePlane`] names exactly the two facts the kernel uses
+//! (`pane_list`, `agent_list`) over shared data types from [`crate::pane_types`].
+//! The live adapter lives in the `toron-plane` crate (which depends on core,
+//! never the reverse); [`MockPanePlane`] (tests) feeds canned data.
 //!
 //! Injection: [`crate::mailbox::Mailbox`] owns
 //! `Option<Arc<dyn PanePlane>>` (default = live at construction, `None` when
 //! no plane is reachable), overridable via `with_plane` for tests/embedders.
 
-use crate::backend::Backend;
-pub use crate::backend::types::{
+pub use crate::pane_types::{
     AgentInfo, AgentStatus, PaneInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT,
 };
 
@@ -29,36 +20,6 @@ pub use crate::backend::types::{
 pub trait PanePlane: Send + Sync {
     fn pane_list(&self) -> anyhow::Result<Vec<PaneInfo>>;
     fn agent_list(&self) -> anyhow::Result<Vec<AgentInfo>>;
-}
-
-/// Production adapter: one constructed backend behind the narrow port.
-pub struct LivePanePlane {
-    inner: Box<dyn Backend>,
-}
-
-impl LivePanePlane {
-    /// Connect like every former call site did (`plane::connect_default()`).
-    /// `Err` (no plane reachable) is a value the caller degrades on, never a
-    /// panic — same posture as the pre-port `let Ok(backend)` sites.
-    pub fn connect_default() -> anyhow::Result<Self> {
-        let inner = crate::backend::plane::connect_default()?;
-        Ok(Self { inner })
-    }
-
-    /// Wrap an already-constructed backend (tests, embedders holding one).
-    pub fn wrap(inner: Box<dyn Backend>) -> Self {
-        Self { inner }
-    }
-}
-
-impl PanePlane for LivePanePlane {
-    fn pane_list(&self) -> anyhow::Result<Vec<PaneInfo>> {
-        self.inner.pane_list(None).map_err(anyhow::Error::new)
-    }
-
-    fn agent_list(&self) -> anyhow::Result<Vec<AgentInfo>> {
-        self.inner.agent_list().map_err(anyhow::Error::new)
-    }
 }
 
 /// Canned panes/agents for kernel tests. No backend, no env, no I/O.
@@ -145,11 +106,5 @@ mod port_tests {
         let plane = MockPanePlane::unreachable();
         assert!(plane.pane_list().is_err());
         assert!(plane.agent_list().is_err());
-    }
-
-    #[test]
-    fn real_backend_is_wired_behind_the_port() {
-        fn is_port<T: PanePlane>() {}
-        is_port::<LivePanePlane>();
     }
 }
