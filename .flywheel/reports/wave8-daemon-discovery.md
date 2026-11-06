@@ -45,6 +45,11 @@ terminal: done
 ## Commit
 sha=d705525a35f017b7539770f02d76db6eef330907 (1 commit, bead id in message)
 
+## Close
+- `br gate report --gate unit-test-verified` (leading `sha=` + `cmd/exit/tail/receipt`; `tail` points at the receipt file per the command-proof rule) + `br close`.
+- `flywheel ledger check bd-wave8-daemon-discovery-nxzx`: LEGAL (sha d705525a…0907).
+- Lesson (same class as wave2): `tail=` must be an existing non-empty file, not a prose slug — first gate row recorded, ledger rejected, re-recorded, LEGAL.
+
 ## Residual
 - None.
 
