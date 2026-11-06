@@ -16,12 +16,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use toron_plane::backend::{AgentInfo, PaneInfo};
 use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
 use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
 use toron_core::mailbox::identity::spawn_registry_bindings;
 use toron_core::nostr::identity::AgentProfile;
+use toron_plane::backend::{AgentInfo, PaneInfo};
 
 async fn test_mailbox(tag: &str) -> (Mailbox, PathBuf, PathBuf) {
     let db_path = std::env::temp_dir().join(format!(
