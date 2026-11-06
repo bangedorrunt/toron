@@ -3457,6 +3457,82 @@ fn reserve_with_lease_scoped_command_refuses_zero_match_before_running() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// wave14-b: the zero-match refusal works with no `.git` anywhere.
+/// A clean-export/tarball cwd falls back to the bounded filesystem walk,
+/// so the same zero-match glob refuses with exit 3 and the child never
+/// runs. A matching glob in the same dir still acquires (the list is real,
+/// not a vacuous always-refuse).
+#[test]
+fn reserve_with_lease_zero_match_refuses_without_git() {
+    let data_dir = with_lease_dir("nongit-store");
+    with_lease_bootstrap(&data_dir, "LeaseWarden");
+    let cwd = std::env::temp_dir().join(format!("toron-with-lease-nongit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(&cwd).expect("non-git cwd");
+    std::fs::write(cwd.join("dummy.txt"), "leased work").expect("dummy file");
+    // No .git anywhere above the temp root: the fallback walk applies.
+    assert!(
+        !cwd.join(".git").exists(),
+        "test precondition: temp cwd has no .git"
+    );
+    let run_in = |extra: &[&str]| {
+        let mut cmd = toron();
+        cmd.env("TORON_MCP_DATA_DIR", &data_dir)
+            .current_dir(&cwd)
+            .args(
+                [
+                    "reserve",
+                    "with-lease",
+                    "--project",
+                    "demo",
+                    "--as",
+                    "LeaseWarden",
+                    "--paths",
+                ]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .chain([
+                    "--reason",
+                    "withlease-nongit",
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!("echo ran >> '{}'", cwd.join("must-not-run.log").display()),
+                ])
+                .collect::<Vec<_>>(),
+            )
+            .output()
+            .expect("run toron with-lease outside git")
+    };
+    let out = run_in(&["zz-no-such-*.rs"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "zero match without .git must still refuse, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !cwd.join("must-not-run.log").exists(),
+        "the command must NOT run on refusal"
+    );
+    assert!(
+        !with_lease_board_has_reason(&data_dir, "withlease-nongit"),
+        "a refused acquire leaves no lease behind"
+    );
+    let out = run_in(&["dummy.txt"]);
+    assert!(
+        out.status.success(),
+        "a matching glob in the same non-git dir must acquire and run, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        cwd.join("must-not-run.log").exists(),
+        "the command runs once its path matches"
+    );
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// A path held exclusively by ANOTHER pin refuses (with `--wait-secs 0`), runs
 /// nothing, and — critically — never releases the peer's lease.
 #[test]

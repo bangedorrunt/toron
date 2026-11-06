@@ -1264,9 +1264,9 @@ async fn warn_acquire_paths(paths: &[String]) {
 }
 
 async fn warn_zero_file_matches(paths: &[String]) {
-    // `repo_relative_files` gates on a git worktree and bounds the walk: a
-    // non-repo cwd (where `reserve acquire` used to park for minutes) yields
-    // an empty list immediately.
+    // `repo_relative_files` bounds the walk (budget + cap) with a loud
+    // report on truncation; non-git cwds fall back to the same bounded
+    // walk instead of an empty list.
     let scan = tokio::task::spawn_blocking(repo_relative_files);
     let Ok(Ok(files)) = tokio::time::timeout(
         WARN_SCAN_BUDGET + std::time::Duration::from_millis(50),
@@ -1288,29 +1288,59 @@ async fn warn_zero_file_matches(paths: &[String]) {
 }
 
 /// Best-effort repo file list: bounded recursive walk of the cwd, slash-joined
-/// repo-relative paths. Skips `.git`, `target`, `node_modules`, `.venv`,
-/// `dist`, and `build`; never follows symlinks (a link loop or a mount can
+/// repo-relative paths. Skips `.git` and build/output dirs (see
+/// [`WALK_SKIP_DIRS`); never follows symlinks (a link loop or a mount can
 /// otherwise park the walk). The deadline and [`WARN_SCAN_CAP`] are checked
-/// on every entry, so an enormous tree cannot stall an acquire; a partial
-/// list is fine because this feeds an advisory warning only. Public within
-/// the crate: `reserve with-lease` refuses zero-file-match globs on the same
-/// list.
+/// on every entry, so an enormous tree cannot stall an acquire; hitting
+/// either is reported loudly (never a silent truncation). The list is
+/// sorted, so two runs over the same tree agree. Public within the crate:
+/// `reserve with-lease` refuses zero-file-match globs on the same list.
 pub(crate) fn repo_relative_files() -> Vec<String> {
     repo_relative_files_at(std::path::Path::new("."))
 }
 
-/// Gate + bounded walk for one root. A non-repo root has no meaningful
-/// repo-relative file list, and walking one is what parked `reserve acquire`
-/// from a 9 GB workspace root: skip it, don't merely cap it.
+/// Gate + bounded walk for one root. A git worktree uses the fast exact
+/// walk; any other directory (clean-export tarball, scratch dir) gets the
+/// same bounded walk as fallback (wave14-b) — the filesystem is the source
+/// of truth, git is only an optimization. The 9 GB workspace root that
+/// motivated the old skip is still protected by the budget + cap.
 fn repo_relative_files_at(root: &std::path::Path) -> Vec<String> {
-    if !inside_git_worktree(root) {
-        return Vec::new();
-    }
     repo_relative_files_within(root, WARN_SCAN_BUDGET)
 }
 
+/// Directories the file walk never descends into (wave14-b): VCS metadata,
+/// language build outputs, and hidden tool caches. Anything else — including
+/// hidden dirs that are NOT on this list (`.github`, `.config`) — is walked,
+/// so a lease on an unusual path cannot false-refuse.
+const WALK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".tox",
+    ".next",
+    ".nuxt",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".hypothesis",
+    ".parcel-cache",
+    ".svelte-kit",
+    ".idea",
+    ".vscode",
+];
+
 /// Time budget for the advisory zero-match scan. The acquire itself is one
 /// daemon call; its warning must never outlive a prompt.
+///
+/// wave14-b: hitting the budget or the cap is LOUD (stderr names the root
+/// and the limit) — a silently truncated list could refuse a lease whose
+/// files simply were not reached yet. The scan stays advisory: callers
+/// decide what a partial list means.
 const WARN_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 const WARN_SCAN_CAP: usize = 100_000;
 
@@ -1318,16 +1348,21 @@ fn repo_relative_files_within(root: &std::path::Path, budget: std::time::Duratio
     let deadline = std::time::Instant::now() + budget;
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    let mut capped = false;
     while let Some(dir) = stack.pop() {
         if std::time::Instant::now() >= deadline || out.len() >= WARN_SCAN_CAP {
+            capped = true;
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let mut names: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        names.sort_by_key(|e| e.file_name());
+        for entry in names {
             if std::time::Instant::now() >= deadline || out.len() >= WARN_SCAN_CAP {
-                return out;
+                capped = true;
+                break;
             }
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -1339,10 +1374,7 @@ fn repo_relative_files_within(root: &std::path::Path, budget: std::time::Duratio
             if file_type.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if matches!(
-                    name.as_ref(),
-                    ".git" | "target" | "node_modules" | ".venv" | "dist" | "build"
-                ) {
+                if WALK_SKIP_DIRS.contains(&name.as_ref()) {
                     continue;
                 }
                 stack.push(path);
@@ -1357,26 +1389,21 @@ fn repo_relative_files_within(root: &std::path::Path, budget: std::time::Duratio
             }
         }
     }
+    if capped {
+        eprintln!(
+            "toron reserve: repo scan of {} hit the walk limit ({} entries / {:?} budget) — file list may be partial; zero-match refusal stays fail-closed.",
+            root.display(),
+            WARN_SCAN_CAP,
+            budget
+        );
+    }
+    out.sort();
     out
-}
-
-/// True when `root` is inside a git worktree (a `.git` directory, or a `.git`
-/// file for a linked worktree). A non-repo cwd has no meaningful
-/// repo-relative file list, and walking it is what hung an acquire run from
-/// the workspace root.
-fn inside_git_worktree(root: &std::path::Path) -> bool {
-    let Ok(start) = std::fs::canonicalize(root) else {
-        return false;
-    };
-    start.ancestors().any(|dir| {
-        let dot_git = dir.join(".git");
-        dot_git.is_dir() || dot_git.is_file()
-    })
 }
 
 #[cfg(test)]
 mod reserve_warn_scan_tests {
-    use super::{inside_git_worktree, repo_relative_files_at, repo_relative_files_within};
+    use super::{repo_relative_files_at, repo_relative_files_within};
     use std::time::Duration;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -1422,17 +1449,43 @@ mod reserve_warn_scan_tests {
     }
 
     #[test]
-    fn a_non_repo_root_is_not_a_file_list() {
+    fn a_non_repo_root_still_lists_files_for_the_zero_match_check() {
         let root = scratch("norepo");
         std::fs::write(root.join("stray.rs"), "").unwrap();
-        assert!(!inside_git_worktree(&root));
-        assert!(
-            repo_relative_files_at(&root).is_empty(),
-            "a non-repo root must not be walked"
+        assert_eq!(
+            repo_relative_files_at(&root),
+            vec!["stray.rs".to_string()],
+            "a non-git dir falls back to the bounded walk (wave14-b)"
         );
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        assert!(inside_git_worktree(&root));
         assert_eq!(repo_relative_files_at(&root), vec!["stray.rs".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fallback_walk_is_sorted_deterministic_and_skips_hidden_caches() {
+        let root = scratch("sorted");
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("b/z.rs"), "").unwrap();
+        std::fs::write(root.join("a/a.rs"), "").unwrap();
+        std::fs::write(root.join("top.rs"), "").unwrap();
+        for dir in [".mypy_cache", ".idea", "__pycache__", ".next"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("junk.rs"), "").unwrap();
+        }
+        let files = repo_relative_files_at(&root);
+        assert_eq!(
+            files,
+            vec![
+                "a/a.rs".to_string(),
+                "b/z.rs".to_string(),
+                "top.rs".to_string()
+            ],
+            "sorted, caches skipped: {files:?}"
+        );
+        let again = repo_relative_files_at(&root);
+        assert_eq!(files, again, "two runs agree");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
