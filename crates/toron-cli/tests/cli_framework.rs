@@ -87,7 +87,9 @@ fn config_show_emits_effective_defaults() {
         "zero egress by default"
     );
     assert_eq!(value["envelope_ttl_days"], serde_json::json!(90));
-    assert_eq!(value["backend"], serde_json::json!("hc"));
+    // ADR-0045 rex-first: the shipped default is `auto` (rex primary, hc
+    // fallback), not the pre-rex `hc` literal (bd-config-default-test-red-98gy).
+    assert_eq!(value["backend"], serde_json::json!("auto"));
     assert_eq!(value["federation_auth"], serde_json::json!(false));
     assert_eq!(value["proof_scheme"], serde_json::json!("schnorr"));
 }
