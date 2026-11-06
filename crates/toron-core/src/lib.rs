@@ -17,6 +17,7 @@ pub mod inbox_program;
 pub mod index;
 pub mod job_kinds;
 pub mod journal;
+pub mod json;
 pub mod jsonl;
 pub mod kernel;
 pub mod keys;
@@ -28,6 +29,7 @@ pub mod policy;
 pub mod proc;
 pub mod serve_build;
 pub mod testkit;
+pub mod time_spec;
 pub mod topology;
 pub mod wake;
 

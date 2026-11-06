@@ -14,8 +14,7 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ToJson, ToolOutput, ToolServer};
-use toron_core::mailbox::judgment::JudgmentOutcome;
+use super::{ToolOutput, ToolServer};
 
 #[tool_router(router = judgment_router, vis = "pub(crate)")]
 impl ToolServer {
@@ -67,23 +66,4 @@ pub struct AskJudgmentArgs {
     pub transport: Option<String>,
     /// Child budget, default 30, max 300.
     pub timeout_seconds: Option<i64>,
-}
-
-impl ToJson for JudgmentOutcome {
-    fn to_json(&self) -> Value {
-        let r = &self.record;
-        serde_json::json!({
-            "effect_key": r.effect_key,
-            "pack_id": r.pack_id,
-            "pack_version": r.pack_version,
-            "model_id": r.model_id,
-            "confidence": r.confidence,
-            "usage": r.usage,
-            "fallback_flag": r.fallback_flag,
-            "escalated": r.escalated,
-            "note": r.note,
-            "answers": r.answers,
-            "replayed": self.replayed,
-        })
-    }
 }
