@@ -12,7 +12,7 @@
 //!
 //! This is the "is toron a trustworthy agent-mail replacement?" gate. It
 //! exists because the sibling `acceptance.rs` proves the surface is enumerable
-//! (38 tools / 25 resources / outputSchema present) but never INVOKES a tool.
+//! (38 parity tools / 25 resources / outputSchema present) but never INVOKES a tool.
 //! Enumeration ≠ function.
 //!
 //! Run: `cargo test -p toron-mcp --test am_parity_e2e`.

@@ -1,6 +1,13 @@
-# AM-Rust Tool & Resource Catalog (Canonical)
+# AM-Rust Tool & Resource Catalog (Historical Record)
 
 // governed-by: ADR-0003
+
+> **Historical record, not the live spec.** This catalog freezes the 38 tool
+> AM-Rust parity subset (provenance for the Phase-1 beads). The live surface
+> is 38 parity + 3 additive tools — `toron catalog --json` is the spec and
+> the 41-tool `catalog_shapes` gate pins it. Shape divergences live in the
+> sibling file and upstream: [known-divergences](known-divergences.md),
+> [flywheel known-divergences](../../flywheel/docs/known-divergences.md).
 
 > First-party parity catalog for toron. Source: the **public interface** of
 > `Dicklesworthstone/mcp_agent_mail_rust` (README tool/resource tables + the

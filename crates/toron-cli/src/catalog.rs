@@ -260,7 +260,7 @@ mod tests {
                 .iter()
                 .filter_map(|t| t["name"].as_str())
                 .any(|n| n == toron_mcp::catalog::ADDITIVE_TOOL),
-            "additive {} excluded from the 38-tool catalog",
+            "additive {} excluded from the parity catalog",
             toron_mcp::catalog::ADDITIVE_TOOL
         );
         let groups: Vec<&str> = tools.iter().filter_map(|t| t["group"].as_str()).collect();

@@ -11,7 +11,7 @@
 > Source: the 3-agent real-e2e opencode probe (2026-08-06, bead bd-96a), cross-checked
 > against `crates/toron-mcp/src/tools.rs` `ToJson` impls and `crates/toron-core/src/mailbox/*`
 > on 2026-08-07. Companion catalog: `docs/parity/am-rust-tool-catalog.md` (the tool surface
-> contract — names/counts are the frozen 38-tool contract; this file documents response
+> contract — names/counts are the frozen historical 38 tool parity record; this file documents response
 > SHAPE differences only).
 >
 > Canonical bead: **bd-96a** / **bd-3mp**. Unblocks bd-jgd (outputSchema on the 38 tools)

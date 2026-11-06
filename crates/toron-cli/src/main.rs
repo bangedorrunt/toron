@@ -183,9 +183,9 @@ fn run_robot_flag(globals: &cli::Globals, format: OutputFormat) -> anyhow::Resul
     Ok(ExitCode::SUCCESS)
 }
 
-/// `toron bench <case>` (bd-led.8.4, AM-Rust parity): measure a mailbox
-/// scenario's latency against a live in-process bus and emit a percentile
-/// report (startup/inbox/send/search/threads).
+/// `toron bench <case>` (bd-led.8.4): measure a mailbox scenario's latency
+/// against a live in-process bus and emit a percentile report
+/// (startup/inbox/send/search/threads). A live benchmark, kept with purpose.
 #[tokio::main]
 async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Result<ExitCode> {
     use toron_core::mailbox::{BenchReport, FetchInbox, SearchMessages, SendMessage};
@@ -356,8 +356,10 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     }
 }
 
-/// `toron catalog` — the MCP surface catalog (ADR-0002 D3): 38 tools, 25
-/// resources, CLI commands. `--output <path>` writes the committed
+/// `toron catalog` — the MCP surface catalog (ADR-0002 D3): frozen 38 parity
+/// tools, 25 resources, CLI commands. The live surface adds 3 additive tools;
+/// `catalog --json` is the spec and the 41-tool shapes gate pins it.
+/// `--output <path>` writes the committed
 /// `docs/catalog/toron-mcp.json`; otherwise the catalog prints to stdout.
 fn run_catalog(output: Option<PathBuf>) -> anyhow::Result<()> {
     let catalog = catalog::catalog_now()?;

@@ -5,8 +5,8 @@
 //!
 //! Validates toron's index + projection against the first-party golden
 //! fixtures captured in bd-77u.1 (`tests/conformance/fixtures/`):
-//! 1. **Tool surface** — all 38 tools present in the golden schema with
-//!    name + inputSchema; all 25 MCP resources present.
+//! 1. **Tool surface** — the frozen 38 tool parity subset present in the golden
+//!    schema with name + inputSchema; all 25 MCP resources present.
 //! 2. **Filter/importance/thread/date semantics** — golden enumeration
 //!    matches the projection's semantic surface.
 //! 3. **Tokenizer contract** — FTS5 tokenizer (`porter unicode61
@@ -57,7 +57,11 @@ fn conformance_38_tools_in_golden_schema() {
         "GOLDEN TOOL SCHEMA INCOMPLETE:\n  {}",
         missing.join("\n  ")
     );
-    assert_eq!(tools.len(), 38, "38 tools — canonical AM-Rust surface");
+    assert_eq!(
+        tools.len(),
+        38,
+        "38 tools — frozen AM-Rust parity subset, not the live surface (38+3; see catalog_shapes)"
+    );
 
     let ack = tools
         .iter()

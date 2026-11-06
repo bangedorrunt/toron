@@ -58,9 +58,11 @@ durable execution + flywheel's swarm orchestration.
 
 ## Features
 
-### Phase 1 — Mailbox parity (AM-Rust, 100%) + integrated runtime
+### Phase 1 — Mailbox parity (AM-Rust lineage) + integrated runtime
 
-The frozen 38-tool MCP surface, byte-identical to AM-Rust:
+Provenance, not contract: the frozen 38 parity tools below are the AM-Rust
+lineage. The live surface is 38 parity + 3 additive tools — run
+`toron catalog --json` for the spec (the 41-tool shapes gate pins it):
 
 - **Identity** — `register_agent`, `create_agent_identity`, `whois`,
   `list_agents`, `resolve_pane_identity`, `cleanup_pane_identities`. Schnorr-signed
@@ -307,7 +309,7 @@ write nothing. Consumed nonces persist across restarts.
 toron/                           # Cargo workspace (governed-by ADR-0003)
 ├── crates/
 │   ├── toron-core/              # lib: nostr, bus, index, archive, mailbox, backend, keys
-│   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 tools + 25 resources
+│   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 parity tools + 3 additive + 25 resources
 │   ├── toron-cli/               # bin: daemon + CLI (robot mode, metrics; TUI Phase 2)
 │   ├── toron-workflow/          # Phase 2: durable YAML automation (in-house engine)
 │   └── toron-e2e/              # scenario suite (SC-1..SC-25, feature-gated gates)
@@ -325,7 +327,7 @@ directly; the search layer never calls the archive; etc.
 ## Roadmap
 
 - **Phase 1 (v1)** — AM-Rust parity + integrated mode + core kind vocabulary.
-  Ships the 38 tools + 25 resources, in-process bus, Git+SQLite projection (dual-sink,
+  Ships the 38 parity tools (+3 additive) + 25 resources, in-process bus, Git+SQLite projection (dual-sink,
   git-first per G11), rex-first pane plane (hc fallback),
   flywheel embedding.
 - **Phase 2** (ordered: workflow+@mention → channels → persona/presence) —

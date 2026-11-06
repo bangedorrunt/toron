@@ -10,7 +10,8 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// Two personas from one surface:
 ///   - Operators: daemon lifecycle, keys, projects, relays, backend, doctor.
-///   - Agents/scripts (robot mode): the full 38-tool AM-Rust parity surface.
+///   - Agents/scripts (robot mode): the agent-mailbox tool surface (AM-Rust
+///     lineage; the live spec is `toron catalog --json`, 38 parity + 3 additive).
 ///
 /// Examples
 /// --------
@@ -88,7 +89,8 @@ pub enum Command {
     /// Quick health/config overview (human by default, --json for machines).
     Status,
 
-    /// Emit the MCP surface catalog (38 tools, 25 resources, CLI commands).
+    /// Emit the MCP surface catalog (frozen 38 parity tools, 25 resources, CLI
+    /// commands). The live surface adds 3 tools; `catalog --json` is the spec.
     /// The toron.dev catalog contract (ADR-0002 D3).
     Catalog,
 
@@ -168,7 +170,8 @@ pub enum Command {
     #[command(subcommand)]
     Backend(BackendCommand),
 
-    /// Bench a mailbox scenario (startup/inbox/send/search/threads). AM-Rust parity.
+    /// Bench a mailbox scenario (startup/inbox/send/search/threads): live
+    /// latency percentiles over an in-process bus, not a parity check.
     Bench(BenchArgs),
 
     /// Operator console (ratatui): mail, channels, agents, dashboard,
