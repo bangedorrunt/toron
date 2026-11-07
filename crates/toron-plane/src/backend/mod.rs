@@ -11,6 +11,7 @@ pub mod mock;
 pub mod plane;
 pub mod rex;
 pub mod rex_cli;
+pub mod rex_schema;
 pub mod superlogical;
 pub mod types;
 pub mod wait;

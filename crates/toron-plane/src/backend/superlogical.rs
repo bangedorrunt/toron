@@ -31,13 +31,14 @@ use crate::backend::rex_cli;
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
     board_of, capture_format, child_exit_from_line, parse_process_view, split_direction,
-    status_for_block, status_from_program_status, tail_lines,
+    state_labels_from_board, status_for_block, status_from_program_status,
 };
 use rex_cli::{
-    Rex, RexBlock, RexEventStream, RexFail, RexSession, block_close_args, capture_args,
-    events_args, list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
-    parse_created_session, parse_sessions, process_args, program_status_args, rename_args,
-    run_args, send_key_args, session_kill_args, split_args, split_labelled_args, write_args,
+    Rex, RexBlock, RexEventStream, RexFail, RexSession, RexTarget, block_close_args, events_args,
+    list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
+    parse_created_session, parse_sessions, parse_target_resolve, process_args, program_status_args,
+    read_tail_format, read_whole_format, rename_args, run_args, send_key_args, session_kill_args,
+    split_args, split_labelled_args, target_resolve_args, write_args,
 };
 
 /// A roster read examines at most this many blocks. Past the cap the remaining
@@ -118,7 +119,6 @@ pub fn create_agent_block(
         .map_err(RexFail::into_backend)?;
     parse_created_block_id(&value).map_err(RexFail::into_backend)
 }
-
 /// bd-rex-reliability-ioyz D: parse one `terminal.child_exited` event line
 /// into (block_id, exit_code). The event stream keeps the exit as `Raw`
 /// (see `rex_map::event_from_line`) so the code survives to the caller.
@@ -177,57 +177,64 @@ impl SuperlogicalBackend {
                 message: "rex block id is empty".into(),
             });
         }
-        let sessions = parse_sessions(&rex.json(&ls_args())?)?;
-        let mut by_id = Vec::new();
-        let mut by_label = Vec::new();
-        for session in sessions {
-            let blocks = parse_blocks(&rex.json(&list_blocks_args(&session.session_id))?)?;
-            for block in blocks {
-                if block.block_id == target {
-                    by_id.push((session.clone(), block));
-                } else if !block.label.is_empty() && block.label == target {
-                    by_label.push((session.clone(), block));
-                }
-            }
-        }
-        if by_id.len() == 1 {
-            return Ok(by_id.remove(0));
-        }
-        if by_id.len() > 1 {
+        // target.resolve searches every session when no caller session is
+        // attached. It also accepts suffixes and case-insensitive labels, so
+        // verify the exact id or label before accepting: identity semantics
+        // stay stricter than the resolver's convenience matching.
+        let hit = parse_target_resolve(&rex.json(&target_resolve_args(target))?, target)?;
+        if !exact_target(&hit, target) {
             return Err(RexFail::Rejected {
-                message: format!("rex block {target} is in {} sessions", by_id.len()),
+                message: format!("rex block {target} not found"),
             });
         }
-        if by_label.len() == 1 {
-            return Ok(by_label.remove(0));
-        }
-        if by_label.len() > 1 {
-            return Err(RexFail::Rejected {
-                message: format!("rex label {target} is in {} sessions", by_label.len()),
+        let session = RexSession {
+            session_id: hit.session_id.clone(),
+            label: String::new(),
+            pane_count: 0,
+            tab_count: 0,
+            focused: false,
+            active_tab_id: String::new(),
+            cwd: None,
+        };
+        // Resolve once, then fetch that session's blocks for creator/window
+        // metadata. This is two calls instead of one list_blocks per session.
+        let block = Self::blocks(rex, &hit.session_id)?
+            .into_iter()
+            .find(|block| block.block_id == hit.block_id)
+            .unwrap_or_else(|| RexBlock {
+                block_id: hit.block_id,
+                label: hit.label,
+                creator_name: String::new(),
+                window_id: hit.window_id,
             });
-        }
-        Err(RexFail::Rejected {
-            message: format!("rex block {target} not found"),
-        })
+        Ok((session, block))
     }
 
     fn blocks(rex: &Rex, session: &str) -> Result<Vec<RexBlock>, RexFail> {
         parse_blocks(&rex.json(&list_blocks_args(session))?)
     }
 
-    fn block_status(rex: &Rex, session: &str, block: &str) -> Result<AgentStatus, RexFail> {
+    fn block_state(
+        rex: &Rex,
+        session: &str,
+        block: &str,
+    ) -> Result<(AgentStatus, serde_json::Map<String, Value>), RexFail> {
         let records = rex.json(&program_status_args(session, block))?;
         let (board, order) = board_of(&records);
+        let labels = state_labels_from_board(&board);
         if board.is_empty() {
             let process = rex.json(&process_args(session, block))?;
-            Ok(status_for_block(
-                &board,
-                &order,
-                &parse_process_view(&process),
+            Ok((
+                status_for_block(&board, &order, &parse_process_view(&process)),
+                labels,
             ))
         } else {
-            Ok(status_from_program_status(&records))
+            Ok((status_from_program_status(&records), labels))
         }
+    }
+
+    fn block_status(rex: &Rex, session: &str, block: &str) -> Result<AgentStatus, RexFail> {
+        Self::block_state(rex, session, block).map(|(status, _)| status)
     }
 
     /// C: readiness gate with an explicit bound (production: 10 s).
@@ -427,13 +434,15 @@ impl MultiplexerBackend for SuperlogicalBackend {
                         &block,
                         &session.session_id,
                         AgentStatus::Unknown,
+                        serde_json::Map::new(),
                     ));
                     continue;
                 }
                 scanned += 1;
-                let status = Self::block_status(&rex, &session.session_id, &block.block_id)
-                    .map_err(RexFail::into_backend)?;
-                agents.push(agent_from(&block, &session.session_id, status));
+                let (status, labels) =
+                    Self::block_state(&rex, &session.session_id, &block.block_id)
+                        .map_err(RexFail::into_backend)?;
+                agents.push(agent_from(&block, &session.session_id, status, labels));
             }
         }
         Ok(agents)
@@ -456,14 +465,14 @@ impl MultiplexerBackend for SuperlogicalBackend {
     ) -> Result<Value, crate::backend::BackendError> {
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        let text = rex
-            .text(&capture_args(
-                &session.session_id,
-                &block.block_id,
-                capture_format(source),
-            ))
-            .map_err(RexFail::into_backend)?;
-        Ok(json!({ "text": tail_lines(&text, lines) }))
+        let format = capture_format(source);
+        let text = if lines == 0 {
+            read_whole_format(&rex, &session.session_id, &block.block_id, format)
+        } else {
+            read_tail_format(&rex, &session.session_id, &block.block_id, format, lines)
+        }
+        .map_err(RexFail::into_backend)?;
+        Ok(json!({ "text": text }))
     }
 
     fn workspace_close(
@@ -532,9 +541,9 @@ impl MultiplexerBackend for SuperlogicalBackend {
         }
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
-        let status = Self::block_status(&rex, &session.session_id, &block.block_id)
-            .unwrap_or(AgentStatus::Unknown);
-        let mut agent = agent_from(&block, &session.session_id, status);
+        let (status, labels) = Self::block_state(&rex, &session.session_id, &block.block_id)
+            .unwrap_or((AgentStatus::Unknown, serde_json::Map::new()));
+        let mut agent = agent_from(&block, &session.session_id, status, labels);
         if !name.is_empty() {
             agent.name = Some(name.to_string());
         }
@@ -551,10 +560,10 @@ impl MultiplexerBackend for SuperlogicalBackend {
         loop {
             let rex = Self::rex()?;
             let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-            let status = Self::block_status(&rex, &session.session_id, &block.block_id)
+            let (status, labels) = Self::block_state(&rex, &session.session_id, &block.block_id)
                 .map_err(RexFail::into_backend)?;
             if until.is_empty() || until.contains(&status) {
-                return Ok(agent_from(&block, &session.session_id, status));
+                return Ok(agent_from(&block, &session.session_id, status, labels));
             }
             match deadline {
                 None => {
@@ -693,6 +702,13 @@ fn workspace_close_scope(close_group: bool) -> Result<(), BackendError> {
     ))
 }
 
+/// `target.resolve` also accepts suffixes and case-insensitive labels. The
+/// adapter keeps the older, stricter identity contract: a query must equal the
+/// block id or its label exactly.
+fn exact_target(hit: &RexTarget, target: &str) -> bool {
+    hit.block_id == target || hit.label == target
+}
+
 fn workspace_from(session: RexSession, index: usize) -> WorkspaceInfo {
     WorkspaceInfo {
         workspace_id: session.session_id,
@@ -740,7 +756,12 @@ fn pane_from(block: &RexBlock, session: &str, status: AgentStatus) -> PaneInfo {
     }
 }
 
-fn agent_from(block: &RexBlock, session: &str, status: AgentStatus) -> AgentInfo {
+fn agent_from(
+    block: &RexBlock,
+    session: &str,
+    status: AgentStatus,
+    state_labels: serde_json::Map<String, Value>,
+) -> AgentInfo {
     AgentInfo {
         agent: none_if_empty(&block.creator_name),
         agent_status: status,
@@ -755,7 +776,7 @@ fn agent_from(block: &RexBlock, session: &str, status: AgentStatus) -> AgentInfo
         revision: 0,
         state_change_seq: 0,
         completion_seq: None,
-        state_labels: serde_json::Map::new(),
+        state_labels,
         tab_id: block.window_id.clone(),
         terminal_id: String::new(),
         terminal_title: none_if_empty(&block.label),
@@ -909,6 +930,84 @@ mod pane_identity_tests {
                 .iter()
                 .any(|workspace| workspace.workspace_id == session),
             "cleanup left the throwaway session behind"
+        );
+    }
+
+    /// `target.resolve` is deliberately more permissive than the adapter's
+    /// identity contract; this pins the boundary.
+    #[test]
+    fn target_resolution_requires_an_exact_id_or_label() {
+        let hit = RexTarget {
+            session_id: "s1".into(),
+            block_id: "block:abc".into(),
+            window_id: "w1".into(),
+            label: "DustySparrow".into(),
+        };
+        assert!(exact_target(&hit, "block:abc"));
+        assert!(exact_target(&hit, "DustySparrow"));
+        assert!(!exact_target(&hit, "dusterysparrow"));
+        assert!(!exact_target(&hit, "abc"));
+    }
+
+    /// Live probe (opt-in): format, tail-over-blob, and label lookup through
+    /// target.resolve. Run with:
+    /// `mbx test -p toron-plane live_rex_format -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "live rex: creates and kills a throwaway session"]
+    fn live_rex_format_blob_and_target_resolve_round_trip() {
+        struct LiveSession(String);
+        impl Drop for LiveSession {
+            fn drop(&mut self) {
+                let _ = SuperlogicalBackend.workspace_close(&self.0, true);
+            }
+        }
+
+        let backend = SuperlogicalBackend;
+        let label = format!("toron-format-{}", std::process::id());
+        let workspace = backend
+            .workspace_create(Some(&label))
+            .expect("create a throwaway rex session");
+        let _guard = LiveSession(workspace.workspace_id.clone());
+        let pin = "FormatLivePin";
+        let block = create_agent_block(&workspace.workspace_id, pin, None, "seq 1 20000")
+            .expect("run a labelled block");
+
+        backend
+            .pane_wait_output(&block, "20000", 15_000)
+            .expect("the generated output must land in the pane");
+
+        let whole = backend
+            .agent_read(&block, "text", 0)
+            .expect("whole read through format");
+        let whole = whole["text"].as_str().expect("text field");
+        assert!(whole.starts_with("1\n"), "whole read starts at the top");
+        assert!(whole.contains("20000"), "whole read reaches the bottom");
+
+        let tail = backend
+            .agent_read(&block, "text", 3)
+            .expect("tail read through format + blob_read");
+        let tail = tail["text"].as_str().expect("text field");
+        assert!(
+            tail.contains("19999"),
+            "tail keeps the last lines: {tail:?}"
+        );
+        assert!(
+            tail.contains("20000"),
+            "tail keeps the final line: {tail:?}"
+        );
+        assert!(
+            !tail.contains("10000"),
+            "tail must not fetch the top: {tail:?}"
+        );
+
+        let by_label = backend
+            .agent_read(pin, "text", 0)
+            .expect("label lookup through target.resolve");
+        assert!(
+            by_label["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("20000")),
+            "label lookup reached the same block"
         );
     }
 

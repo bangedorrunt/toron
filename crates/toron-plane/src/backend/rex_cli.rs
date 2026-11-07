@@ -14,6 +14,7 @@ use std::process::Output;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::backend::rex_schema;
 use crate::backend::{BackendError, BackendErrorCode, BackendEvent};
 use serde_json::Value;
 
@@ -99,6 +100,33 @@ pub struct RexBlock {
     pub label: String,
     pub creator_name: String,
     pub window_id: String,
+}
+
+/// One block resolved by `target.resolve`. Only the ids and label are needed;
+/// the adapter fetches the full block from that session for creator metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RexTarget {
+    pub session_id: String,
+    pub block_id: String,
+    pub window_id: String,
+    pub label: String,
+}
+
+/// First part of a `format` reply. `id` means more remains at `blob_read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RexFormatChunk {
+    pub content: String,
+    pub id: Option<u64>,
+    pub total: Option<u64>,
+}
+
+/// One `blob_read` continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RexBlobChunk {
+    pub id: u64,
+    pub data: String,
+    pub total: u64,
+    pub eof: bool,
 }
 
 impl Rex {
@@ -414,6 +442,56 @@ pub fn capture_args(session: &str, block: &str, format: &str) -> Vec<String> {
     ]
 }
 
+/// One all-session block lookup. No `-s`: with no caller session the server
+/// searches every session (the probe with `-s` is session-scoped).
+pub fn target_resolve_args(query: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "call".into(),
+        "target.resolve".into(),
+        serde_json::json!({ "kinds": ["block"], "queries": [query] }).to_string(),
+    ]
+}
+
+/// Bounded `format`: the reply is one chunk, and `id` names the blob holding
+/// the rest. The request body nests the method's own arguments under `args`.
+pub fn format_args(session: &str, block: &str, format: &str, max_bytes: u64) -> Vec<String> {
+    vec![
+        "api".into(),
+        "call".into(),
+        "-s".into(),
+        session.into(),
+        "com.superlogical.terminal.format".into(),
+        serde_json::json!({
+            "block_id": block,
+            "args": { "format": format, "trim": true, "max_bytes": max_bytes }
+        })
+        .to_string(),
+    ]
+}
+
+/// Continue a `format` reply. `offset` is in bytes of the returned content.
+pub fn blob_read_args(
+    session: &str,
+    block: &str,
+    id: u64,
+    offset: u64,
+    max_bytes: u64,
+) -> Vec<String> {
+    vec![
+        "api".into(),
+        "call".into(),
+        "-s".into(),
+        session.into(),
+        "com.superlogical.terminal.blob_read".into(),
+        serde_json::json!({
+            "block_id": block,
+            "args": { "id": id, "offset": offset, "max_bytes": max_bytes }
+        })
+        .to_string(),
+    ]
+}
+
 pub fn split_args(session: &str, block: &str, direction: &str, cwd: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "split".into(),
@@ -548,6 +626,9 @@ const REQUIRED_API_GROUPS: &[&[&str]] = &[
     &["events", "block.event"],
     &["session.list"],
     &["session.kill"],
+    &["target.resolve"],
+    &["com.superlogical.terminal.format"],
+    &["com.superlogical.terminal.blob_read"],
 ];
 
 /// E: first required method missing from `rex api list -q` output, if any.
@@ -680,6 +761,212 @@ pub fn parse_created_block_id(value: &Value) -> Result<String, RexFail> {
     })
 }
 
+fn schema_check(method: &str, value: &Value) -> Result<(), RexFail> {
+    rex_schema::validate_response(method, value).map_err(|err| RexFail::BadOutput {
+        message: err.to_string(),
+    })
+}
+
+/// Parse one `target.resolve` reply. Only `resolved` yields a target; both
+/// `not_found` and unknown statuses become the same typed refusal.
+pub fn parse_target_resolve(value: &Value, query: &str) -> Result<RexTarget, RexFail> {
+    schema_check("target.resolve", value)?;
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RexFail::BadOutput {
+            message: "rex target.resolve JSON missing results".into(),
+        })?;
+    let result = results.first().ok_or_else(|| RexFail::BadOutput {
+        message: "rex target.resolve returned no result".into(),
+    })?;
+    match result.get("status").and_then(Value::as_str) {
+        Some("resolved") => {
+            let target = result.get("target").ok_or_else(|| RexFail::BadOutput {
+                message: "rex target.resolve resolved without a target".into(),
+            })?;
+            if target.get("kind").and_then(Value::as_str) != Some("block") {
+                return Err(RexFail::Rejected {
+                    message: format!("rex query {query} did not resolve to a block"),
+                });
+            }
+            let session_id = field(target, &["session_id"]).ok_or_else(|| RexFail::BadOutput {
+                message: "rex target.resolve target missing session_id".into(),
+            })?;
+            let block_id = field(target, &["block_id"]).ok_or_else(|| RexFail::BadOutput {
+                message: "rex target.resolve target missing block_id".into(),
+            })?;
+            Ok(RexTarget {
+                session_id,
+                block_id,
+                window_id: field(target, &["window_id"]).unwrap_or_default(),
+                label: target
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
+        Some("ambiguous") => {
+            let count = result
+                .get("candidates")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Err(RexFail::Rejected {
+                message: format!("rex block {query} is ambiguous ({count} candidates)"),
+            })
+        }
+        _ => Err(RexFail::Rejected {
+            message: format!("rex block {query} not found"),
+        }),
+    }
+}
+
+pub fn parse_format_chunk(value: &Value) -> Result<RexFormatChunk, RexFail> {
+    schema_check("com.superlogical.terminal.format", value)?;
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RexFail::BadOutput {
+            message: "rex format JSON missing content".into(),
+        })?
+        .to_string();
+    let id = match value.get("id") {
+        Some(raw) => Some(raw.as_u64().ok_or_else(|| RexFail::BadOutput {
+            message: "rex format id is not an integer".into(),
+        })?),
+        None => None,
+    };
+    let total = match value.get("total") {
+        Some(raw) => Some(raw.as_u64().ok_or_else(|| RexFail::BadOutput {
+            message: "rex format total is not an integer".into(),
+        })?),
+        None => None,
+    };
+    Ok(RexFormatChunk { content, id, total })
+}
+
+pub fn parse_blob_chunk(value: &Value) -> Result<RexBlobChunk, RexFail> {
+    schema_check("com.superlogical.terminal.blob_read", value)?;
+    let number = |key: &str| -> Result<u64, RexFail> {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RexFail::BadOutput {
+                message: format!("rex blob_read missing integer {key}"),
+            })
+    };
+    Ok(RexBlobChunk {
+        id: number("id")?,
+        data: value
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RexFail::BadOutput {
+                message: "rex blob_read missing data".into(),
+            })?
+            .to_string(),
+        total: number("total")?,
+        eof: value
+            .get("eof")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RexFail::BadOutput {
+                message: "rex blob_read missing eof".into(),
+            })?,
+    })
+}
+
+/// Largest single `format`/`blob_read` response the server accepts.
+pub const FORMAT_MAX_BYTES: u64 = 960 * 1024;
+/// Enough lines for a tail read without fetching the whole scrollback.
+pub const TAIL_READ_BYTES: u64 = 64 * 1024;
+
+pub fn read_format(
+    rex: &Rex,
+    session: &str,
+    block: &str,
+    format: &str,
+    max_bytes: u64,
+) -> Result<RexFormatChunk, RexFail> {
+    let value = rex.json(&format_args(session, block, format, max_bytes))?;
+    parse_format_chunk(&value)
+}
+
+pub fn read_blob(
+    rex: &Rex,
+    session: &str,
+    block: &str,
+    id: u64,
+    offset: u64,
+    max_bytes: u64,
+) -> Result<RexBlobChunk, RexFail> {
+    let value = rex.json(&blob_read_args(session, block, id, offset, max_bytes))?;
+    parse_blob_chunk(&value)
+}
+
+/// Read through every blob chunk. Used when the caller asked for the whole
+/// screen (`lines == 0`).
+pub fn read_whole_format(
+    rex: &Rex,
+    session: &str,
+    block: &str,
+    format: &str,
+) -> Result<String, RexFail> {
+    let first = read_format(rex, session, block, format, FORMAT_MAX_BYTES)?;
+    let mut out = first.content;
+    let mut next = first.id;
+    while let Some(id) = next {
+        let chunk = read_blob(rex, session, block, id, out.len() as u64, FORMAT_MAX_BYTES)?;
+        if chunk.data.is_empty() {
+            return Err(RexFail::BadOutput {
+                message: "rex blob_read made no progress".into(),
+            });
+        }
+        out.push_str(&chunk.data);
+        next = if chunk.eof { None } else { Some(chunk.id) };
+    }
+    Ok(out)
+}
+
+/// Read only the end of a large output. The first reply tells us `total`; seek
+/// there with `blob_read`, then continue until `eof`. Falls back to the first
+/// reply when it was whole.
+pub fn read_tail_format(
+    rex: &Rex,
+    session: &str,
+    block: &str,
+    format: &str,
+    lines: u32,
+) -> Result<String, RexFail> {
+    let first = read_format(rex, session, block, format, TAIL_READ_BYTES)?;
+    let Some(id) = first.id else {
+        return Ok(rex_map::tail_lines(&first.content, lines));
+    };
+    let total = first.total.ok_or_else(|| RexFail::BadOutput {
+        message: "rex format returned id without total".into(),
+    })?;
+    let start = total.saturating_sub(TAIL_READ_BYTES);
+    let mut chunk = read_blob(rex, session, block, id, start, TAIL_READ_BYTES)?;
+    let mut out = chunk.data.clone();
+    while !chunk.eof {
+        let next = read_blob(
+            rex,
+            session,
+            block,
+            chunk.id,
+            start.saturating_add(out.len() as u64),
+            TAIL_READ_BYTES,
+        )?;
+        if next.data.is_empty() {
+            return Err(RexFail::BadOutput {
+                message: "rex blob_read made no progress".into(),
+            });
+        }
+        out.push_str(&next.data);
+        chunk = next;
+    }
+    Ok(rex_map::tail_lines(&out, lines))
+}
+
 fn session_row(row: &Value) -> Result<RexSession, RexFail> {
     let session_id = field(row, &["session_id", "id"]).ok_or_else(|| RexFail::BadOutput {
         message: "rex session missing session_id".into(),
@@ -751,7 +1038,7 @@ fn bound_label(waited: Duration) -> String {
 /// folding together; there is no second copy of this module.
 pub mod rex_map {
     use crate::backend::{AgentStatus, BackendEvent, PaneId};
-    use crate::osc7501::{Board, ProgramState, parse_report};
+    use crate::osc7501::{BlockKind, Board, HcStatusView, ProgramState, Report, parse_report};
     use serde_json::Value;
 
     use crate::backend::rex::fold_status;
@@ -776,6 +1063,77 @@ pub mod rex_map {
             apply_record(&mut board, &mut order, record);
         }
         (board, order)
+    }
+
+    /// Labels for the report that decided the Attention fold: blocked child,
+    /// else working, error, done, idle. `program_status` is an object, not a
+    /// flat status word, so optional kind/progress/app/title/msg survive
+    /// without inventing empty keys. Empty board means no label.
+    pub fn state_labels_from_board(board: &Board) -> serde_json::Map<String, Value> {
+        let mut labels = serde_json::Map::new();
+        let Some((id, report)) = deciding_report(board) else {
+            return labels;
+        };
+        let mut row = serde_json::Map::new();
+        row.insert("id".into(), Value::String(id.to_string()));
+        row.insert(
+            "state".into(),
+            Value::String(state_word(report.state).to_string()),
+        );
+        if let Some(kind) = report.kind {
+            row.insert("kind".into(), Value::String(kind_word(kind).to_string()));
+        }
+        if let Some(progress) = report.progress {
+            row.insert("progress".into(), Value::from(progress));
+        }
+        if let Some(app) = report.app.as_ref() {
+            row.insert("app".into(), Value::String(app.clone()));
+        }
+        if let Some(title) = report.title.as_ref() {
+            row.insert("title".into(), Value::String(title.clone()));
+        }
+        if let Some(msg) = report.msg.as_ref() {
+            row.insert("msg".into(), Value::String(msg.clone()));
+        }
+        labels.insert("program_status".into(), Value::Object(row));
+        labels
+    }
+
+    fn deciding_report(board: &Board) -> Option<(&str, &Report)> {
+        let mut working: Option<(&str, &Report)> = None;
+        let mut error: Option<(&str, &Report)> = None;
+        let mut done: Option<(&str, &Report)> = None;
+        let mut idle: Option<(&str, &Report)> = None;
+        for (id, report) in board.iter() {
+            match report.state {
+                ProgramState::Blocked => return Some((id, report)),
+                ProgramState::Working => working = working.or(Some((id, report))),
+                ProgramState::Error => error = error.or(Some((id, report))),
+                ProgramState::Done => done = done.or(Some((id, report))),
+                ProgramState::Idle => idle = idle.or(Some((id, report))),
+                ProgramState::Clear => {}
+            }
+        }
+        working.or(error).or(done).or(idle)
+    }
+
+    fn state_word(state: ProgramState) -> &'static str {
+        match state {
+            ProgramState::Idle => "idle",
+            ProgramState::Working => "working",
+            ProgramState::Done => "done",
+            ProgramState::Blocked => "blocked",
+            ProgramState::Error => "error",
+            ProgramState::Clear => "clear",
+        }
+    }
+
+    fn kind_word(kind: BlockKind) -> &'static str {
+        match kind {
+            BlockKind::Permission => "permission",
+            BlockKind::Question => "question",
+            BlockKind::Auth => "auth",
+        }
     }
 
     /// What the terminal's foreground process looks like. Empty when the
@@ -912,15 +1270,39 @@ pub mod rex_map {
                     return;
                 }
                 let id = map.get("id").and_then(Value::as_str).unwrap_or("");
-                let raw = if id.is_empty() {
-                    format!("\u{1b}]7501;state={state}\u{1b}\\")
-                } else {
-                    format!("\u{1b}]7501;state={state}:id={id}\u{1b}\\")
-                };
-                if let Some(report) = parse_report(&raw) {
-                    order.push(report.id.clone().unwrap_or_default());
-                    board.apply(&raw);
+                if state == "clear" {
+                    let raw = if id.is_empty() {
+                        format!("\u{1b}]7501;state={state}\u{1b}\\")
+                    } else {
+                        format!("\u{1b}]7501;state={state}:id={id}\u{1b}\\")
+                    };
+                    if let Some(report) = parse_report(&raw) {
+                        order.push(report.id.clone().unwrap_or_default());
+                        board.apply(&raw);
+                    }
+                    return;
                 }
+                // Object records carry the same fields as an OSC report.
+                // Rebuilding a raw sequence here would drop them (the old
+                // path kept only state/id); insert the structured view so a
+                // blocked child's kind/msg reach state_labels.
+                let field = |key: &str| map.get(key).and_then(Value::as_str);
+                let progress = map
+                    .get("progress")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u8::try_from(n).ok());
+                board.insert_hc(
+                    id,
+                    &HcStatusView {
+                        state,
+                        kind: field("kind"),
+                        progress,
+                        app: field("app"),
+                        title: field("title"),
+                        msg: field("msg"),
+                    },
+                );
+                order.push(id.to_string());
             }
             _ => {}
         }
@@ -1021,5 +1403,170 @@ pub mod rex_map {
             return record.clone();
         }
         serde_json::json!({ "records": [record] })
+    }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    use crate::backend::AgentStatus;
+    use serde_json::json;
+
+    fn body(args: &[String]) -> Value {
+        serde_json::from_str(args.last().expect("call carries a JSON body"))
+            .expect("call body is JSON")
+    }
+
+    #[test]
+    fn target_resolve_searches_all_sessions_and_asks_for_blocks() {
+        let args = target_resolve_args("DustySparrow");
+        assert_eq!(args[0], "api");
+        assert_eq!(args[2], "target.resolve");
+        assert!(
+            !args.iter().any(|arg| arg == "-s"),
+            "a caller session would scope the search and miss a cross-session block"
+        );
+        let body = body(&args);
+        assert_eq!(body["kinds"], json!(["block"]));
+        assert_eq!(body["queries"], json!(["DustySparrow"]));
+    }
+
+    #[test]
+    fn format_args_bound_the_reply_and_nest_method_arguments() {
+        let args = format_args("s1", "b1", "text", 4096);
+        assert_eq!(args[2], "-s");
+        assert_eq!(args[3], "s1");
+        assert_eq!(args[4], "com.superlogical.terminal.format");
+        let body = body(&args);
+        assert_eq!(body["block_id"], "b1");
+        assert_eq!(body["args"]["format"], "text");
+        assert_eq!(body["args"]["trim"], true);
+        assert_eq!(body["args"]["max_bytes"], 4096);
+    }
+
+    #[test]
+    fn blob_read_carries_the_blob_id_and_byte_offset() {
+        let args = blob_read_args("s1", "b1", 7, 4096, 8192);
+        assert_eq!(args[4], "com.superlogical.terminal.blob_read");
+        let body = body(&args);
+        assert_eq!(body["block_id"], "b1");
+        assert_eq!(body["args"]["id"], 7);
+        assert_eq!(body["args"]["offset"], 4096);
+        assert_eq!(body["args"]["max_bytes"], 8192);
+    }
+
+    #[test]
+    fn target_resolve_parses_a_resolved_block() {
+        let value = json!({
+            "results": [{
+                "query": "DustySparrow",
+                "status": "resolved",
+                "target": {
+                    "kind": "block",
+                    "session_id": "session:1",
+                    "window_id": "window:2",
+                    "block_id": "block:3",
+                    "label": "DustySparrow"
+                }
+            }]
+        });
+        let hit = parse_target_resolve(&value, "DustySparrow").expect("resolved block");
+        assert_eq!(hit.session_id, "session:1");
+        assert_eq!(hit.window_id, "window:2");
+        assert_eq!(hit.block_id, "block:3");
+        assert_eq!(hit.label, "DustySparrow");
+    }
+
+    #[test]
+    fn target_resolve_refuses_ambiguous_and_missing_blocks() {
+        let ambiguous = json!({"results": [{
+            "query": "shell",
+            "status": "ambiguous",
+            "candidates": [{"kind":"block","label":"a"},{"kind":"block","label":"b"}]
+        }]});
+        match parse_target_resolve(&ambiguous, "shell") {
+            Err(RexFail::Rejected { message }) => {
+                assert!(message.contains("ambiguous"), "{message}");
+                assert!(message.contains('2'), "{message}");
+            }
+            other => panic!("ambiguous must be a typed refusal, got {other:?}"),
+        }
+
+        let missing = json!({"results": [{"query": "nope", "status": "not_found"}]});
+        match parse_target_resolve(&missing, "nope") {
+            Err(RexFail::Rejected { message }) => {
+                assert!(message.contains("not found"), "{message}")
+            }
+            other => panic!("missing must be a typed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_resolve_missing_results_is_malformed_not_not_found() {
+        let err = parse_target_resolve(&json!({}), "x").expect_err("missing results");
+        assert!(matches!(err, RexFail::BadOutput { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn state_labels_name_the_deciding_report() {
+        let blocked = json!({"records": [
+            {"state": "working", "id": "", "app": "pi"},
+            {"state": "blocked", "id": "child", "kind": "permission", "progress": 42,
+             "app": "terraform", "title": "Apply plan", "msg": "approve 3 changes"}
+        ]});
+        let (board, _) = rex_map::board_of(&blocked);
+        assert_eq!(
+            rex_map::status_from_program_status(&blocked),
+            AgentStatus::Blocked
+        );
+        let labels = rex_map::state_labels_from_board(&board);
+        let report = &labels["program_status"];
+        assert_eq!(report["id"], "child");
+        assert_eq!(report["state"], "blocked");
+        assert_eq!(report["kind"], "permission");
+        assert_eq!(report["progress"], 42);
+        assert_eq!(report["app"], "terraform");
+        assert_eq!(report["title"], "Apply plan");
+        assert_eq!(report["msg"], "approve 3 changes");
+
+        let root = json!({"records": [{"state": "working", "app": "claude"}]});
+        let (board, _) = rex_map::board_of(&root);
+        let labels = rex_map::state_labels_from_board(&board);
+        let report = &labels["program_status"];
+        assert_eq!(report["id"], "");
+        assert_eq!(report["state"], "working");
+        assert_eq!(report["app"], "claude");
+        assert!(report.get("msg").is_none());
+
+        let (empty, _) = rex_map::board_of(&json!({"records": []}));
+        assert!(rex_map::state_labels_from_board(&empty).is_empty());
+    }
+
+    #[test]
+    fn format_chunk_preserves_the_blob_continuation() {
+        let chunk = parse_format_chunk(&json!({"content": "abc", "id": 9, "total": 100}))
+            .expect("bounded format");
+        assert_eq!(chunk.content, "abc");
+        assert_eq!(chunk.id, Some(9));
+        assert_eq!(chunk.total, Some(100));
+        let whole = parse_format_chunk(&json!({"content": "abc"})).expect("whole format");
+        assert_eq!(whole.id, None);
+        assert_eq!(whole.total, None);
+    }
+
+    #[test]
+    fn format_and_blob_require_their_declared_fields() {
+        assert!(matches!(
+            parse_format_chunk(&json!({})),
+            Err(RexFail::BadOutput { .. })
+        ));
+        assert!(matches!(
+            parse_blob_chunk(&json!({"id": 1, "data": "x", "total": 1})),
+            Err(RexFail::BadOutput { .. })
+        ));
+        let chunk = parse_blob_chunk(&json!({"id": 1, "data": "x", "total": 1, "eof": true}))
+            .expect("complete blob");
+        assert_eq!(chunk.data, "x");
+        assert!(chunk.eof);
     }
 }
