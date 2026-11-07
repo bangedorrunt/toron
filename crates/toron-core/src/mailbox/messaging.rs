@@ -785,25 +785,27 @@ impl Mailbox {
                 mail_envelope(&project_slug, &sender, &reader, &msg.subject, &msg.body_md);
             // Exact dedupe: a landed claim with a live row means done; a
             // stale claim (crash between claim and append) heals below.
-            if let Some(k) = store.mail_ingest_get(&reader, &rumor_hex).await? {
-                if store.has_log_row(INBOX_STREAM, &reader, &k).await? {
-                    continue;
-                }
+            if let Some(k) = store.mail_ingest_get(&reader, &rumor_hex).await?
+                && store.has_log_row(INBOX_STREAM, &reader, &k).await?
+            {
+                continue;
             }
             let mut done = false;
             for _ in 0..8 {
-                let (epoch, seq) = store.ingest_seq_for(&sender).await?;
+                // Per-scope sequence: one sender into many readers never
+                // shares a row, so cross-reader ingest never contends.
+                let (epoch, seq) = store.ingest_seq_for(&sender, &reader).await?;
                 env.msg.epoch = epoch;
                 env.msg.seq = seq;
                 let k = env.msg.key();
                 if !store.mail_ingest_claim(&reader, &rumor_hex, &k).await? {
                     // Lost the claim race: the winner landed the row (done)
                     // or crashed first (steal the claim and append below).
-                    if let Some(wk) = store.mail_ingest_get(&reader, &rumor_hex).await? {
-                        if store.has_log_row(INBOX_STREAM, &reader, &wk).await? {
-                            done = true;
-                            break;
-                        }
+                    if let Some(wk) = store.mail_ingest_get(&reader, &rumor_hex).await?
+                        && store.has_log_row(INBOX_STREAM, &reader, &wk).await?
+                    {
+                        done = true;
+                        break;
                     }
                     store.mail_ingest_set_key(&reader, &rumor_hex, &k).await?;
                 }
@@ -3545,6 +3547,58 @@ mod tests {
             drained.items.is_empty(),
             "everything acked: nothing repeats, no duplicate rows"
         );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// One sender into many readers ingests concurrently without the retry
+    /// bail: the sequence belongs to the appended scope `(sender, reader)`
+    /// (bd-next-readpath-p0-9k47), so scopes never share a row. Ten readers
+    /// on one broadcast exceed the 8-retry budget under the old global
+    /// counter; per-scope sequences complete with no contention at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn inbox_concurrent_ingest_one_sender_many_readers_no_bail() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("concurrent-ingest").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        const READERS: usize = 10;
+        let mut names = Vec::new();
+        for i in 0..READERS {
+            let name = format!("Reader{i:02}");
+            register(&mailbox, "demo", &name).await;
+            names.push(name);
+        }
+        let to: Vec<&str> = names.iter().map(String::as_str).collect();
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &to))
+            .await
+            .expect("broadcast to all readers");
+        let store = mailbox.inbox_store().expect("store");
+        let mut tasks = Vec::new();
+        for name in names.clone() {
+            let m = mailbox.clone();
+            let s = store.clone();
+            tasks.push(tokio::spawn(async move {
+                m.ingest_delivered_mail("demo", &name, &s).await
+            }));
+        }
+        for t in tasks {
+            let added = t.await.expect("join").expect("ingest must not bail");
+            assert_eq!(added, 1, "one row per reader");
+        }
+        for name in names {
+            let npub = mailbox
+                .agent_keys_for_resolved("demo", &name)
+                .await
+                .expect("keys")
+                .public_key()
+                .to_hex();
+            let batch = store.next(&npub, None, true).await.expect("peek");
+            assert_eq!(batch.items.len(), 1, "{name} sees its mail");
+        }
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

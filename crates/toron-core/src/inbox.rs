@@ -42,6 +42,39 @@ pub const INBOX_STREAM: &str = "inbox";
 /// The stream a sender loop's durable intents live on.
 pub const JOURNAL_STREAM: &str = "journal";
 
+/// Separator between a producer and its appended scope inside
+/// `inbox_producer_state`. Hex npubs never contain it, and it is not a
+/// `LIKE` wildcard, so `producer LIKE '<hex>\x1f%'` lists exactly one
+/// sender's scopes.
+const SCOPE_SEP: char = '\u{1f}';
+
+/// The sequence a triple is allocated from. The inbox log multiplexes many
+/// recipients through one `producer`, so the sequence belongs to the
+/// appended scope: `(producer, recipient)` for inbox envelopes, the bare
+/// `producer` for every other stream (journal). Scopes share one fence
+/// (the max over the producer's global row, all its scopes, and its
+/// claimed epoch) so a stale epoch never appends, but steady-state
+/// appends for different recipients never touch the same row.
+fn scope_key(producer: &str, stream: &str, recipient: &str) -> String {
+    if stream == INBOX_STREAM {
+        format!("{producer}{SCOPE_SEP}{recipient}")
+    } else {
+        producer.to_string()
+    }
+}
+
+/// `LIKE` pattern listing one producer's scopes (global row excluded).
+fn scope_pattern(producer: &str) -> String {
+    format!("{producer}{SCOPE_SEP}%")
+}
+
+/// Sequencer row allocating distinct epochs to fresh scopes. It lives in
+/// `inbox_epoch_claim` under a key no scope `LIKE` matches (`\u{1e}`, not
+/// `\u{1f}`), so allocations never fence steady-state appends.
+fn seq_key(producer: &str) -> String {
+    format!("{producer}\u{1e}SEQ")
+}
+
 /// The comms flag (ADR-0041), decided from the `TORON_COMMS_INBOX` value and
 /// the `[comms] inbox_log` config key (bd-652a). Pure, so the whole table is
 /// testable.
@@ -232,8 +265,7 @@ pub const UNREAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset");
 /// read. Terminal = rank-6 exits plus each class's success terminal
 /// (`DeliveryState::is_terminal`; the SQL spells it out so no migration is
 /// needed and old stores read identically).
-pub const STRAGGLER_SQL: &str = concat!(
-    "SELECT l.log_offset, l.msg_key, l.payload FROM inbox_log AS l \
+pub const STRAGGLER_SQL: &str = "SELECT l.log_offset, l.msg_key, l.payload FROM inbox_log AS l \
      JOIN inbox_delivery AS d ON d.msg_key = l.msg_key AND d.recipient = l.recipient \
      WHERE l.stream = ?1 AND l.recipient = ?2 AND l.log_offset <= ?3 \
      AND ( \
@@ -248,8 +280,7 @@ pub const STRAGGLER_SQL: &str = concat!(
          OR (d.phase = 'proved' \
              AND (json_extract(l.payload,'$.class') != 'task' \
                   OR json_extract(l.payload,'$.class') IS NULL)) \
-     ) ORDER BY l.log_offset"
-);
+     ) ORDER BY l.log_offset";
 
 /// [`UNREAD_SQL`] as a point read: one seek of `inbox_log_by_recipient
 /// (stream, recipient, log_offset)`, one row. Exported so a test can pin its
@@ -616,19 +647,53 @@ impl InboxStore {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(unavailable)?;
-        let state: Option<(i64, i64)> =
-            sqlx::query_as("SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1")
-                .bind(&producer)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(unavailable)?;
-        let claimed: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
-                .bind(&producer)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(unavailable)?;
-        let fence = state.map(|(e, _)| e).max(claimed);
+        let scope = scope_key(&producer, stream, &recipient);
+        // Per-scope sequencing: inbox envelopes draw `(epoch, seq)` from
+        // their `(producer, recipient)` scope; every other stream uses the
+        // bare producer. The fence for a scope is its own row plus the
+        // producer's bare row (pre-scope history) and bare claim — never a
+        // sibling scope, so readers never starve each other. The bare claim
+        // stays in the fence so `claim_epoch` still fences a direct append
+        // (bd-epoch-claim-z5m5).
+        let (scoped, fence) = if stream == INBOX_STREAM {
+            let scoped: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1",
+            )
+            .bind(&scope)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(unavailable)?;
+            let global: Option<i64> =
+                sqlx::query_scalar("SELECT epoch FROM inbox_producer_state WHERE producer = ?1")
+                    .bind(&producer)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+            let claimed: Option<i64> =
+                sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
+                    .bind(&producer)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+            let fence = global.max(scoped.map(|(e, _)| e)).max(claimed);
+            (scoped, fence)
+        } else {
+            let state: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1",
+            )
+            .bind(&producer)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(unavailable)?;
+            let claimed: Option<i64> =
+                sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
+                    .bind(&producer)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+            let fence = state.map(|(e, _)| e).max(claimed);
+            (state, fence)
+        };
         if let Some(current) = fence
             && epoch < current as u64
         {
@@ -677,7 +742,7 @@ impl InboxStore {
             Some(env) => self.authorize_in(&mut tx, env).await?,
             None => AppendFacts::none(),
         };
-        let last = match state {
+        let last = match scoped {
             Some((current, last)) if current as u64 == epoch => Some(last as u64),
             _ => None,
         };
@@ -705,7 +770,7 @@ impl InboxStore {
             "INSERT INTO inbox_producer_state (producer, epoch, last_seq) VALUES (?1, ?2, ?3) \
              ON CONFLICT (producer) DO UPDATE SET epoch = excluded.epoch, last_seq = excluded.last_seq",
         )
-        .bind(&producer)
+        .bind(&scope)
         .bind(epoch as i64)
         .bind(seq as i64)
         .execute(&mut *tx)
@@ -839,28 +904,66 @@ impl InboxStore {
         Ok(n == 1)
     }
 
-    /// The next (epoch, seq) this producer may claim: the fenced epoch and
-    /// one past its last seq (0 when the epoch is fresh).
-    pub async fn ingest_seq_for(&self, producer: &str) -> Result<(u64, u64), InboxError> {
-        let state: Option<(i64, i64)> =
-            sqlx::query_as("SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1")
-                .bind(producer)
-                .fetch_optional(&self.pool)
-                .await?;
-        let claimed: Option<i64> =
+    /// The next (epoch, seq) this producer may claim in a scope: the
+    /// scope's epoch and one past its last seq (0 when the scope is fresh).
+    /// Scopes are independent — two recipients of one sender never share a
+    /// row — and a fresh scope takes a distinct epoch above every epoch the
+    /// producer has ever used, via an atomic sequencer, so triples stay
+    /// globally unique without serializing steady-state appends.
+    pub async fn ingest_seq_for(
+        &self,
+        producer: &str,
+        recipient: &str,
+    ) -> Result<(u64, u64), InboxError> {
+        let scope = scope_key(producer, INBOX_STREAM, recipient);
+        if let Some((e, last)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1",
+        )
+        .bind(&scope)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok((e as u64, last as u64 + 1));
+        }
+        // Fresh scope: allocate a distinct epoch atomically. `BEGIN
+        // IMMEDIATE` serializes allocators; the sequencer row (never read
+        // by the append fence) hands out strictly increasing epochs, each
+        // above every epoch this producer has ever used.
+        let seqk = seq_key(producer);
+        let pattern = scope_pattern(producer);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let used: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(epoch) FROM (
+                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1 OR producer LIKE ?2
+                 UNION ALL
+                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1 OR producer LIKE ?2
+             )",
+        )
+        .bind(producer)
+        .bind(&pattern)
+        .bind(producer)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+        let seq: Option<i64> =
             sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
-                .bind(producer)
-                .fetch_optional(&self.pool)
+                .bind(&seqk)
+                .fetch_optional(&mut *tx)
                 .await?;
-        let epoch = state
-            .map(|(e, _)| e as u64)
-            .unwrap_or(0)
-            .max(claimed.unwrap_or(0) as u64);
-        let seq = match state {
-            Some((e, last)) if e as u64 == epoch => last as u64 + 1,
-            _ => 0,
-        };
-        Ok((epoch, seq))
+        let next = used.map_or(0, |u| u + 1).max(seq.map_or(0, |s| s + 1));
+        sqlx::query(
+            "INSERT INTO inbox_epoch_claim (producer, epoch, holder, claimed_ts_us) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (producer) DO UPDATE SET epoch = excluded.epoch, holder = excluded.holder, \
+             claimed_ts_us = excluded.claimed_ts_us",
+        )
+        .bind(&seqk)
+        .bind(next)
+        .bind(recipient)
+        .bind(now_us())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((next as u64, 0))
     }
 
     /// Would [`Self::append_envelope`] pass the authority check for `env`
@@ -1201,7 +1304,15 @@ impl InboxStore {
             .fetch_all(&mut *tx)
             .await?;
         rows.append(&mut fresh);
-        let after = rows.last().map_or(before, |r| r.get::<i64, _>(0));
+        // Monotone cursor: stragglers sit at or behind the committed
+        // cursor, so a straggler-only batch must not report a regression.
+        // The DB already guards the write (WHERE excluded > current); the
+        // reported `cursor_after` matches it.
+        let after = rows
+            .last()
+            .map(|r| r.get::<i64, _>(0))
+            .map(|o| o.max(before))
+            .unwrap_or(before);
         let now = now_us();
         let mut items = Vec::with_capacity(rows.len());
         for r in rows {
@@ -1497,15 +1608,21 @@ impl InboxStore {
     /// A producer's current epoch: the higher of its last appended epoch and
     /// its highest claimed one (`None` = never appended or claimed). A
     /// restarted sender journals under `epoch + 1`, which fences its old self.
+    /// Scopes (`producer\u{1f}recipient`) count: a sender with ingested mail
+    /// reports the highest epoch across all its scopes.
     pub async fn producer_epoch(&self, producer: &str) -> Result<Option<u64>, sqlx::Error> {
+        let pattern = scope_pattern(producer);
         let e: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(epoch) FROM (
-                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1
+                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1 OR producer LIKE ?2
                  UNION ALL
-                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1
+                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1 OR producer LIKE ?2
              )",
         )
         .bind(producer)
+        .bind(&pattern)
+        .bind(producer)
+        .bind(&pattern)
         .fetch_one(&self.pool)
         .await?;
         Ok(e.map(|e| e as u64))
@@ -1527,14 +1644,20 @@ impl InboxStore {
         holder: &str,
     ) -> Result<EpochClaim, sqlx::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Scopes count: a bare claim starts above every scope, so a direct
+        // append never reuses an epoch mail ingest already spent.
+        let pattern = scope_pattern(producer);
         let previous: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(epoch) FROM (
-                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1
+                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1 OR producer LIKE ?2
                  UNION ALL
-                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1
+                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1 OR producer LIKE ?2
              )",
         )
         .bind(producer)
+        .bind(&pattern)
+        .bind(producer)
+        .bind(&pattern)
         .fetch_one(&mut *tx)
         .await?;
         let epoch = previous.map_or(0, |p| p + 1);
@@ -2320,6 +2443,183 @@ impl DurableLog for ToronLog {
                 tracing::warn!("ToronLog status: {e}; answering UpToDate");
                 Status::UpToDate
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delivery::Phase;
+    use crate::envelope::{Class, ContextId, ContractId, Recipient, TaskId};
+
+    const TA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TV: &str = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "toron-inbox-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    async fn open_store(tag: &str) -> InboxStore {
+        let path = temp_db(tag);
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        InboxStore::new(pool)
+    }
+
+    fn task_to(epoch: u64, seq: u64, task: &str) -> Envelope {
+        Envelope {
+            v: 1,
+            msg: MsgId {
+                producer: TA.into(),
+                epoch,
+                seq,
+            },
+            from: TA.into(),
+            to: Recipient::Npub(TB.into()),
+            class: Class::Task,
+            contract: ContractId::new("task", 1),
+            context: ContextId("ctx-test".into()),
+            task: Some(TaskId(task.into())),
+            generation: 1,
+            causation: None,
+            deadline_ts_us: None,
+            lease_ms: None,
+            body: serde_json::json!({"title": "t", "brief": "b", "scope_paths": ["src/**"]}),
+        }
+    }
+
+    /// A batch holding only stragglers must not move the cursor backward:
+    /// the DB guard refuses the regression, and the reported `cursor_after`
+    /// matches it. Repro: complete the newest message to terminal, leaving
+    /// older live rows behind the cursor; the next batch is straggler-only
+    /// with its last offset below the cursor.
+    #[tokio::test]
+    async fn straggler_only_batch_never_regresses_cursor() {
+        let s = open_store("cursor").await;
+        for seq in 0..3u64 {
+            s.append_envelope(&task_to(0, seq, &format!("t-{seq}")))
+                .await
+                .expect("append");
+        }
+        let first = s.next(TB, None, false).await.expect("next");
+        assert_eq!(first.items.len(), 3);
+        let cursor = first.cursor_after;
+        assert!(cursor > 0);
+        // Complete the newest message to terminal (Task runs to Proved).
+        let last_key = first.items[2].msg_key.clone();
+        let last_task = first.items[2].envelope.task.clone().expect("task").0;
+        s.ack(TB, &last_key, true, None).await.expect("ack");
+        s.done(TB, &last_task, &["ok".to_string()])
+            .await
+            .expect("done");
+        s.step(
+            &last_key,
+            TB,
+            &DeliveryEvent::Verdict {
+                by: TV.into(),
+                pass: true,
+                rework: false,
+            },
+            None,
+        )
+        .await
+        .expect("verdict");
+        // Only older live rows remain: a straggler-only batch whose last
+        // offset sits below the cursor.
+        let rest = s.next(TB, None, false).await.expect("next");
+        assert_eq!(rest.items.len(), 2, "terminal row drops out");
+        assert_eq!(rest.cursor_before, cursor);
+        assert_eq!(
+            rest.cursor_after, rest.cursor_before,
+            "straggler-only batch reports no regression"
+        );
+        assert_eq!(
+            s.cursor(TB, TB).await.expect("cursor"),
+            cursor,
+            "the DB guard held the cursor"
+        );
+    }
+
+    /// `STRAGGLER_SQL` spells `DeliveryState::is_terminal` in SQL. Every
+    /// `Class x Phase` pair must agree: the query returns exactly the
+    /// non-terminal rows. A drift (SQL says live, FSM says terminal, or the
+    /// reverse) fails here, not in production.
+    #[tokio::test]
+    async fn straggler_sql_matches_is_terminal_for_every_class_phase() {
+        let s = open_store("drift").await;
+        let recipient = "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr";
+        let producer = "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
+        let mut keys = Vec::new();
+        let mut idx = 0i64;
+        for class in Class::ALL {
+            for phase in Phase::ALL {
+                idx += 1;
+                let key = format!("k-{}-{}", class.as_str(), phase.as_str());
+                let payload = serde_json::json!({"class": class.as_str()}).to_string();
+                sqlx::query(
+                    "INSERT INTO inbox_log (stream, recipient, producer, epoch, seq, msg_key, payload, appended_ts_us) \
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, 0)",
+                )
+                .bind(INBOX_STREAM)
+                .bind(recipient)
+                .bind(producer)
+                .bind(idx)
+                .bind(&key)
+                .bind(&payload)
+                .execute(s.pool())
+                .await
+                .expect("log row");
+                sqlx::query(
+                    "INSERT INTO inbox_delivery (msg_key, recipient, phase, gen, task_id, state_json, evidence_json, updated_ts_us) \
+                     VALUES (?1, ?2, ?3, 0, NULL, '{}', NULL, 0)",
+                )
+                .bind(&key)
+                .bind(recipient)
+                .bind(phase.as_str())
+                .execute(s.pool())
+                .await
+                .expect("delivery row");
+                keys.push((key, class, phase));
+            }
+        }
+        let rows = sqlx::query(STRAGGLER_SQL)
+            .bind(INBOX_STREAM)
+            .bind(recipient)
+            .bind(1_000_000i64)
+            .fetch_all(s.pool())
+            .await
+            .expect("straggler query");
+        let live: std::collections::HashSet<String> =
+            rows.into_iter().map(|r| r.get::<String, _>(1)).collect();
+        for (key, class, phase) in keys {
+            let state = DeliveryState {
+                phase,
+                class,
+                recipient: recipient.into(),
+                offset: None,
+                generation: 0,
+                holder: None,
+                doer: None,
+            };
+            assert_eq!(
+                live.contains(&key),
+                !state.is_terminal(),
+                "class {} phase {}: SQL liveness must equal !is_terminal",
+                class.as_str(),
+                phase.as_str()
+            );
         }
     }
 }

@@ -2,8 +2,10 @@
 //! `toron next | ack | done | inbox append | send | task` (ADR-0041): CLI-only comms
 //! verbs over the shared durable root, behind `TORON_COMMS_INBOX` or `[comms] inbox_log`.
 //!
-//! Exit codes: 0 ok, 2 flag off / usage, 3 refused by the delivery FSM or
-//! the envelope rules (the refusal JSON is printed on stdout).
+//! Exit codes: 0 ok, 1 no urgent (urgent-peek only), 2 flag off / usage,
+//! 3 refused by the delivery FSM or the envelope rules (the refusal JSON is
+//! printed on stdout), 4 ingest degraded (mail ingest failed; the served
+//! rows are stale and must never read as empty).
 
 use std::io::Read as _;
 use std::process::ExitCode;
@@ -26,6 +28,9 @@ pub async fn run_comms(
     }
     let mailbox = toron_mcp::demo_mailbox().await?;
     let store = mailbox.inbox_store_with(cfg.comms_inbox_log())?;
+    // Ingest degradation rides out of the `Next` arm (JSON field + human
+    // line + exit 4); other verbs never set it.
+    let mut next_degraded: Option<String> = None;
     let out = match command {
         Command::Next(a) => {
             if a.urgent && !a.peek {
@@ -36,13 +41,19 @@ pub async fn run_comms(
             // Every delivered DM ingests into the reader's log first, so
             // `next` sees each message (per-message cursor + Delivered).
             // Ingest trouble must not take `next` down with it: loud, then
-            // serve the rows already in the log.
-            if let Err(e) = mailbox
+            // serve the rows already in the log — but never as a clean read.
+            // A degraded read exits 4 so the harness hook (`next --urgent
+            // --peek >/dev/null 2>&1`) cannot mistake it for "no mail".
+            next_degraded = match mailbox
                 .ingest_delivered_mail(&a.project, &a.who, &store)
                 .await
             {
-                eprintln!("toron: mail ingest failed ({e:#}); serving logged rows only");
-            }
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("toron: mail ingest failed ({e:#}); serving logged rows only");
+                    Some(format!("{e:#}"))
+                }
+            };
             let batch = store.next(&reader, a.stream.as_deref(), a.peek).await;
             if batch.is_ok() {
                 let now_us = toron_core::mailbox::lease_liveness::host_now_us();
@@ -50,6 +61,10 @@ pub async fn run_comms(
             }
             match batch {
                 Ok(b) if a.urgent => {
+                    if let Some(err) = next_degraded.as_deref() {
+                        println!("degraded: mail ingest failed ({err})");
+                        return Ok(ExitCode::from(4));
+                    }
                     if toron_core::inbox::urgent_pending(&b.items) {
                         println!("urgent");
                         return Ok(ExitCode::SUCCESS);
@@ -58,6 +73,10 @@ pub async fn run_comms(
                 }
                 Ok(b) if format == OutputFormat::Human => {
                     print_next_human(&b, a.peek);
+                    if let Some(err) = next_degraded.as_deref() {
+                        println!("degraded: mail ingest failed ({err})");
+                        return Ok(ExitCode::from(4));
+                    }
                     return Ok(ExitCode::SUCCESS);
                 }
                 other => other.map(|b| serde_json::to_value(b).unwrap_or_default()),
@@ -141,14 +160,32 @@ pub async fn run_comms(
     };
     match out {
         Ok(v) => {
+            if let Some(err) = next_degraded {
+                render_json(&with_degraded(v, &err), format);
+                return Ok(ExitCode::from(4));
+            }
             render_json(&v, format);
             Ok(ExitCode::SUCCESS)
         }
         Err(InboxError::Reject(r)) => {
+            if let Some(err) = next_degraded {
+                render_json(
+                    &json!({"refused": r, "error": r.to_string(), "ingest_degraded": err}),
+                    format,
+                );
+                return Ok(ExitCode::from(4));
+            }
             render_json(&json!({"refused": r, "error": r.to_string()}), format);
             Ok(ExitCode::from(3))
         }
         Err(e @ InboxError::NoSuchDelivery { .. }) => {
+            if let Some(err) = next_degraded {
+                render_json(
+                    &json!({"refused": "no_such_delivery", "error": e.to_string(), "ingest_degraded": err}),
+                    format,
+                );
+                return Ok(ExitCode::from(4));
+            }
             render_json(
                 &json!({"refused": "no_such_delivery", "error": e.to_string()}),
                 format,
@@ -156,6 +193,13 @@ pub async fn run_comms(
             Ok(ExitCode::from(3))
         }
         Err(InboxError::Append(e)) => {
+            if let Some(err) = next_degraded {
+                render_json(
+                    &json!({"refused": "append", "error": e.to_string(), "ingest_degraded": err}),
+                    format,
+                );
+                return Ok(ExitCode::from(4));
+            }
             render_json(
                 &json!({"refused": "append", "error": e.to_string()}),
                 format,
@@ -213,5 +257,42 @@ fn read_input(file: &str) -> std::io::Result<String> {
         Ok(s)
     } else {
         std::fs::read_to_string(file)
+    }
+}
+
+/// Attach the ingest-degradation signal to a `next` JSON result. Healthy
+/// results carry no such field; degraded ones name the failure so a quiet
+/// read is never mistaken for an empty one.
+fn with_degraded(mut v: serde_json::Value, err: &str) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("ingest_degraded".into(), err.into());
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_next_json_carries_no_degraded_field() {
+        let v = json!({"reader": "r", "items": []});
+        assert!(v.get("ingest_degraded").is_none());
+    }
+
+    #[test]
+    fn degraded_next_json_names_the_failure() {
+        let v = with_degraded(json!({"reader": "r", "items": []}), "boom");
+        assert_eq!(
+            v.get("ingest_degraded").and_then(|e| e.as_str()),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn degraded_exit_is_four_not_zero() {
+        assert_ne!(ExitCode::from(4), ExitCode::SUCCESS);
+        assert_ne!(ExitCode::from(4), ExitCode::from(1));
+        assert_ne!(ExitCode::from(4), ExitCode::from(3));
     }
 }

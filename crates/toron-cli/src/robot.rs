@@ -54,7 +54,7 @@ const RESPOND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// run against the shared durable root the daemon itself uses — the same
 /// store, never a second one. Every `*_daemon` arm that cannot go through
 /// [`daemon_tool`] calls this helper, so the fallback exists once.
-
+///
 /// Open the shared embedded mailbox via the one fallback helper.
 async fn embedded_mailbox() -> anyhow::Result<Mailbox> {
     toron_mcp::demo_mailbox().await
