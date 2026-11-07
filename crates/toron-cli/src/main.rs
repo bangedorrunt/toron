@@ -12,6 +12,7 @@ mod output;
 mod plane;
 mod platform;
 mod robot;
+mod self_watch;
 mod theme;
 mod tracker;
 mod tui;
@@ -273,6 +274,7 @@ async fn run_serve(
     _format: OutputFormat,
     _color: ColorChoice,
 ) -> anyhow::Result<()> {
+    crate::self_watch::spawn("serve");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
