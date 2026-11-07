@@ -2089,15 +2089,15 @@ fn mail_envelope(
         },
         from: sender_hex.into(),
         to: Recipient::Npub(reader_hex.into()),
-        class: Class::Request,
-        contract: ContractId::new("request", 1),
+        class: Class::Notify,
+        contract: ContractId::new("notify", 1),
         context: ContextId(project.into()),
         task: None,
         generation: 0,
         causation: None,
         deadline_ts_us: None,
         lease_ms: None,
-        body: serde_json::json!({ "goal": text }),
+        body: serde_json::json!({ "text": text }),
     }
 }
 
@@ -3486,10 +3486,12 @@ mod tests {
     }
 
     /// bd-next-envelope-ingest-yl0cx: every delivered DM is visible to
-    /// `next` — two mails in, both out; ack one, the other remains; a second
-    /// ingest adds nothing (no high-water skip, no duplicate rows).
+    /// `next` as a NOTICE, not a task. A captain mail is not an obligation;
+    /// a notify is terminal on delivery, so the reader does not ack it and
+    /// the opaque `request@1` rows that made a peer ask "needs-decision"
+    /// cannot recur. The NIP-17 mail inbox remains the read/ack door.
     #[tokio::test]
-    async fn next_ingest_two_mails_ack_one_returns_other() {
+    async fn next_ingest_two_mails_are_notify_and_drain_once() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("next-ingest").await;
         mailbox.ensure_project("demo").await.expect("ensure");
         mailbox
@@ -3523,30 +3525,19 @@ mod tests {
             batch
                 .items
                 .iter()
-                .all(|i| i.phase == crate::delivery::Phase::Delivered),
-            "next commits Delivered per message"
+                .all(|i| i.envelope.class == crate::envelope::Class::Notify),
+            "mail is a notice, not a request/task"
         );
-        store
-            .ack(&reader, &batch.items[0].msg_key, true, None)
-            .await
-            .expect("ack");
-        let rest = store.next(&reader, None, false).await.expect("next");
-        assert_eq!(rest.items.len(), 1, "ack advances exactly one message");
-        assert_eq!(rest.items[0].msg_key, batch.items[1].msg_key);
+        let drained = store.next(&reader, None, false).await.expect("next");
+        assert!(
+            drained.items.is_empty(),
+            "a notify is terminal on delivery; no ack is required and nothing repeats"
+        );
         let added_again = mailbox
             .ingest_delivered_mail("demo", "BlueLake", &store)
             .await
             .expect("re-ingest");
         assert_eq!(added_again, 0, "re-ingest adds nothing");
-        store
-            .ack(&reader, &rest.items[0].msg_key, true, None)
-            .await
-            .expect("ack the other");
-        let drained = store.next(&reader, None, false).await.expect("next");
-        assert!(
-            drained.items.is_empty(),
-            "everything acked: nothing repeats, no duplicate rows"
-        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
