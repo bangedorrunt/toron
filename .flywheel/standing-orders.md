@@ -12,3 +12,5 @@
   three-part gate (non-obvious ∧ durable ∧ material) decides; most work clean-skips.
 - **Independence**: two lenses reasoned in one pane are two perspectives, never
   "independently confirmed" — claim corroboration only across separately-dispatched contexts.
+- **Ledger gate**: a close is illegal unless `flywheel ledger check <bead>` prints LEGAL.
+  A warning at close is not permission — reopen, record the sha-bound gate row, re-close.
