@@ -45,10 +45,12 @@ enum Policy {
 fn may_replay(code: &BackendErrorCode, policy: Policy) -> bool {
     match policy {
         Policy::Write => matches!(code, BackendErrorCode::Connect),
-        Policy::Read => matches!(
-            code,
-            BackendErrorCode::Connect | BackendErrorCode::Io | BackendErrorCode::Timeout
-        ),
+        // A snapshot read may itself be harmless, but its RESULT is not:
+        // identity/reconciliation callers act on it (pane_list drives pane
+        // cleanup and lease reaping). A timeout or mid-stream Io must surface,
+        // never silently answer from the other plane's different id space.
+        // Only a refused connection proves the primary was never consulted.
+        Policy::Read => matches!(code, BackendErrorCode::Connect),
         Policy::Wait => matches!(code, BackendErrorCode::Connect | BackendErrorCode::Io),
     }
 }
@@ -92,6 +94,23 @@ impl FallbackBackend {
             other => other,
         }
     }
+
+    /// Route an id-bound call to the plane that OWNS the id. hc ids carry the
+    /// `hc:` prefix; a workspace created on hc during a rex outage must keep
+    /// addressing hc even after rex recovers (bd-fallback-coldcreate).
+    fn run_for_id<T>(
+        &self,
+        id: &str,
+        policy: Policy,
+        op: impl Fn(&dyn Backend) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        if id.starts_with("hc:")
+            && let Some(fallback) = &self.fallback
+        {
+            return op(&**fallback);
+        }
+        self.run(policy, op)
+    }
 }
 
 impl fmt::Debug for FallbackBackend {
@@ -117,7 +136,7 @@ impl Backend for FallbackBackend {
     }
 
     fn workspace_close(&self, workspace_id: &str, close_group: bool) -> Result<(), BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(workspace_id, Policy::Write, |backend| {
             backend.workspace_close(workspace_id, close_group)
         })
     }
@@ -128,21 +147,30 @@ impl Backend for FallbackBackend {
         direction: &str,
         cwd: Option<&str>,
     ) -> Result<PaneInfo, BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(parent_pane_id, Policy::Write, |backend| {
             backend.pane_split(parent_pane_id, direction, cwd)
         })
     }
 
     fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
-        self.run(Policy::Read, |backend| backend.pane_list(workspace_id))
+        match workspace_id {
+            Some(id) => {
+                self.run_for_id(id, Policy::Read, |backend| backend.pane_list(workspace_id))
+            }
+            None => self.run(Policy::Read, |backend| backend.pane_list(None)),
+        }
     }
 
     fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
-        self.run(Policy::Write, |backend| backend.pane_close(pane_id))
+        self.run_for_id(pane_id, Policy::Write, |backend| {
+            backend.pane_close(pane_id)
+        })
     }
 
     fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
-        self.run(Policy::Write, |backend| backend.pane_run(pane_id, command))
+        self.run_for_id(pane_id, Policy::Write, |backend| {
+            backend.pane_run(pane_id, command)
+        })
     }
 
     fn pane_wait_output(
@@ -151,7 +179,7 @@ impl Backend for FallbackBackend {
         needle: &str,
         timeout_ms: u64,
     ) -> Result<Value, BackendError> {
-        self.run(Policy::Wait, |backend| {
+        self.run_for_id(pane_id, Policy::Wait, |backend| {
             backend.pane_wait_output(pane_id, needle, timeout_ms)
         })
     }
@@ -167,13 +195,13 @@ impl Backend for FallbackBackend {
         pane_id: &str,
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(pane_id, Policy::Write, |backend| {
             backend.agent_start(name, kind, pane_id, args)
         })
     }
 
     fn agent_rename(&self, target: &str, new_name: Option<&str>) -> Result<(), BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(target, Policy::Write, |backend| {
             backend.agent_rename(target, new_name)
         })
     }
@@ -184,7 +212,9 @@ impl Backend for FallbackBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<Value, BackendError> {
-        self.run(Policy::Write, |backend| backend.prompt(target, text, wait))
+        self.run_for_id(target, Policy::Write, |backend| {
+            backend.prompt(target, text, wait)
+        })
     }
 
     fn prompt_coded(
@@ -193,7 +223,7 @@ impl Backend for FallbackBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding, BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(target, Policy::Write, |backend| {
             backend.prompt_coded(target, text, wait)
         })
     }
@@ -204,19 +234,19 @@ impl Backend for FallbackBackend {
         until: &[AgentStatus],
         timeout_ms: Option<u64>,
     ) -> Result<AgentInfo, BackendError> {
-        self.run(Policy::Wait, |backend| {
+        self.run_for_id(target, Policy::Wait, |backend| {
             backend.agent_wait(target, until, timeout_ms)
         })
     }
 
     fn agent_read(&self, target: &str, source: &str, lines: u32) -> Result<Value, BackendError> {
-        self.run(Policy::Read, |backend| {
+        self.run_for_id(target, Policy::Read, |backend| {
             backend.agent_read(target, source, lines)
         })
     }
 
     fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<(), BackendError> {
-        self.run(Policy::Write, |backend| {
+        self.run_for_id(target, Policy::Write, |backend| {
             backend.agent_send_keys(target, keys)
         })
     }
@@ -317,11 +347,26 @@ mod fallback_tests {
         )
     }
 
-    /// Mutation: replay a timeout on a read and this still passes today, so the
-    /// test also pins the fallback was reached exactly once.
+    /// A read whose primary TIMED OUT may have been answered by the primary;
+    /// replaying it on the other plane would hand reconciliation callers a
+    /// different id space (and wipe rex identities/leases). Only a refused
+    /// connection proves the primary was never consulted.
     #[test]
-    fn a_read_replays_a_timeout() {
+    fn a_read_timeout_surfaces_and_never_crosses_planes() {
         let primary = Scripted::failing("rex", BackendErrorCode::Timeout);
+        let fallback = Scripted::ok("hc");
+        let backend = backend(primary.clone(), Some(fallback.clone()));
+        let error = backend
+            .workspace_list()
+            .expect_err("a timeout must surface");
+        assert_eq!(error.code(), &BackendErrorCode::Timeout);
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(fallback.calls(), 0, "a timeout must not cross planes");
+    }
+
+    #[test]
+    fn a_read_replays_a_connect_refusal() {
+        let primary = Scripted::failing("rex", BackendErrorCode::Connect);
         let fallback = Scripted::ok("hc");
         let backend = backend(primary.clone(), Some(fallback.clone()));
         assert!(
@@ -331,6 +376,16 @@ mod fallback_tests {
                 .is_empty()
         );
         assert_eq!(primary.calls(), 1);
+        assert_eq!(fallback.calls(), 1);
+    }
+
+    #[test]
+    fn an_hc_prefixed_id_routes_to_the_fallback_plane() {
+        let primary = Scripted::ok("rex");
+        let fallback = Scripted::ok("hc");
+        let backend = backend(primary.clone(), Some(fallback.clone()));
+        backend.pane_close("hc:t1").expect("hc id closes on hc");
+        assert_eq!(primary.calls(), 0, "an hc id never reaches rex");
         assert_eq!(fallback.calls(), 1);
     }
 

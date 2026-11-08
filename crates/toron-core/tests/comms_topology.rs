@@ -31,6 +31,8 @@ async fn store(tag: &str) -> InboxStore {
     InboxStore::new(pool).with_operator(OP)
 }
 
+/// The inbox sequences per `(producer, recipient)` scope. Give every fixture
+/// message a fresh epoch and seq 0: each scope starts legitimately.
 struct Seqs(BTreeMap<String, u64>);
 
 impl Seqs {
@@ -38,15 +40,14 @@ impl Seqs {
         Self(BTreeMap::new())
     }
     fn msg(&mut self, from: &str) -> MsgId {
-        let n = self.0.entry(from.to_string()).or_insert(0);
-        MsgId {
+        let epoch = self.0.entry(from.to_string()).or_insert(0);
+        let msg = MsgId {
             producer: from.into(),
-            epoch: 0,
-            seq: *n,
-        }
-    }
-    fn used(&mut self, from: &str) {
-        *self.0.get_mut(from).unwrap() += 1;
+            epoch: *epoch,
+            seq: 0,
+        };
+        *epoch += 1;
+        msg
     }
 }
 
@@ -85,12 +86,10 @@ fn task(m: MsgId, to: &str) -> Envelope {
     }
 }
 
-async fn put(s: &InboxStore, q: &mut Seqs, env: Envelope) {
-    let from = env.from.clone();
+async fn put(s: &InboxStore, _q: &mut Seqs, env: Envelope) {
     s.append_envelope(&env)
         .await
         .unwrap_or_else(|e| panic!("append {} failed: {e}", env.contract));
-    q.used(&from);
 }
 
 fn sample_delivery() -> (DeliveryState, Envelope) {

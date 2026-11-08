@@ -498,9 +498,6 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     let _wake = start_wake_sidecar(&mailbox).await;
-    let _liveness =
-        toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(mailbox.index_pool())
-            .await;
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -631,9 +628,6 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
     let _wake = start_wake_sidecar(&mailbox).await;
-    let _liveness =
-        toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(mailbox.index_pool())
-            .await;
     let (router, hosts) = router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

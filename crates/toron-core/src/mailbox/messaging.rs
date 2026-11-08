@@ -1283,7 +1283,7 @@ impl Mailbox {
                     let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT COUNT(DISTINCT recipient) FROM message_reads \
-                         WHERE message_id = ? AND recipient IN ({placeholders})"
+                         WHERE message_id = ? AND acked = 1 AND recipient IN ({placeholders})"
                     );
                     let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(&post_id);
                     for recipient in chunk {
@@ -1473,7 +1473,8 @@ impl Mailbox {
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
-        self.record_read_state(project_slug, npub, &id, ts_us).await;
+        self.record_read_state(project_slug, npub, &id, ts_us, kind == "ack")
+            .await;
         if let Some(corr_s) = corr_opt
             && let Ok(corr) = crate::mailbox::ids::Corr::from_str(&corr_s)
             && let Ok(store) = self.receipt_store()
@@ -1885,19 +1886,22 @@ impl Mailbox {
         recipient_npub: PublicKey,
         message_id: &EventId,
         ts_us: i64,
+        acked: bool,
     ) {
         let Some(pool) = self.index_pool.as_ref() else {
             return;
         };
         if let Err(e) = sqlx::query(
-            "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (message_id, recipient) DO NOTHING",
+            "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us, acked) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (message_id, recipient) DO UPDATE SET \
+             acked = MAX(message_reads.acked, excluded.acked)",
         )
         .bind(project_slug)
         .bind(message_id.to_hex())
         .bind(recipient_npub.to_hex())
         .bind(ts_us)
+        .bind(acked)
         .execute(pool)
         .await
         {
@@ -4125,7 +4129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sla_scan_all_recipients_read_silences() {
+    async fn sla_scan_read_is_not_ack_and_ack_silences() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-allread").await;
         mailbox.ensure_project("demo").await.expect("ensure");
         let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
@@ -4160,8 +4164,34 @@ mod tests {
             .await
             .expect("check");
         assert!(
+            emitted.contains(&"post-both".to_string()),
+            "read alone must not satisfy the ack SLA"
+        );
+
+        // Acking both recipients is the fact that silences the obligation.
+        for npub in [bnpub.to_hex(), cnpub.to_hex()] {
+            sqlx::query(
+                "UPDATE message_reads SET acked = 1 \
+                 WHERE message_id = 'post-both' AND recipient = ?1",
+            )
+            .bind(npub)
+            .execute(&pool)
+            .await
+            .expect("ack");
+        }
+        // Let the SLA window elapse again so the scan can re-decide.
+        sqlx::query("UPDATE ack_sla_wakes SET emitted_us = ?1")
+            .bind(old_us)
+            .execute(&pool)
+            .await
+            .expect("backdate wake");
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("check after ack");
+        assert!(
             !emitted.contains(&"post-both".to_string()),
-            "all read → silent"
+            "all acked → silent"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -4174,7 +4204,7 @@ mod tests {
     /// which is a state production could never produce — this one goes through
     /// the real send → project → scan path, so it is the link they skip.
     #[tokio::test]
-    async fn sla_scan_silences_a_really_projected_fully_read_post() {
+    async fn sla_scan_silences_a_really_projected_fully_acked_post() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-e2e").await;
         mailbox.ensure_project("demo").await.expect("ensure");
         mailbox.spawn_unwrap_loop();
@@ -4234,15 +4264,15 @@ mod tests {
             .expect("backdate");
         for npub in [bnpub.to_hex(), cnpub.to_hex()] {
             sqlx::query(
-                "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
-                 VALUES ('demo', ?1, ?2, ?3)",
+                "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us, acked) \
+                 VALUES ('demo', ?1, ?2, ?3, 1)",
             )
             .bind(&post_id)
             .bind(npub)
             .bind(old_us + 1)
             .execute(&pool)
             .await
-            .expect("read");
+            .expect("ack");
         }
 
         let emitted = mailbox
@@ -4251,7 +4281,7 @@ mod tests {
             .expect("check");
         assert!(
             !emitted.contains(&post_id),
-            "a fully-read post with a REAL audience must not be re-emitted; \
+            "a fully-acked post with a REAL audience must not be re-emitted; \
              empty to_list re-emits it on every scan forever"
         );
         let _ = std::fs::remove_file(&db_path);

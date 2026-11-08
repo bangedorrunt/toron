@@ -60,7 +60,7 @@ informed: flywheel x toron x beads maintainers
 
 - `ToronJournal: kernel::JournalStore` moves to Phase 2: the Phase 1 sender journals intents through a `ToronLog` stream (`journal`), which is what the Loop's `DurableLog` needs; the effect-record journal arrives with flywheel's `mail.append` effect.
 - The reader-side `InboxProgram` (cursor + wake + binding state) is Phase 3 work, where it replaces `DoorbellModel` + `WakeModel`. Phase 1's cursor lives in the store and is advanced by `next`.
-- Lean vectors are exhaustive over a small domain (2160 delivery steps, 125 log traces) instead of `--seed N --count 10000` random draws: every (phase, class, event) case is covered, and `--check` fails if the committed copy drifts. Envelope validation is tested in Rust only (`Proto/Envelope.lean` deferred).
+- Lean vectors are exhaustive over a small domain (2320 delivery steps, 125 log traces) instead of `--seed N --count 10000` random draws: every (phase, class, event) case is covered, and `--check` fails if the committed copy drifts. Envelope validation is tested in Rust only (`Proto/Envelope.lean` deferred).
 
 ## 5. Verification
 

@@ -41,10 +41,13 @@ async fn store(tag: &str) -> InboxStore {
     InboxStore::new(pool).with_operator(OP)
 }
 
+/// Fixture envelopes use one fresh producer epoch per message and seq 0.
+/// The caller's `epoch` only has to be unique per producer; this keeps
+/// different recipient scopes from colliding on `(producer, epoch, seq)`.
 #[allow(clippy::too_many_arguments)]
 fn env(
     from: &str,
-    seq: u64,
+    epoch: u64,
     to: &str,
     class: Class,
     name: &str,
@@ -55,8 +58,8 @@ fn env(
         v: 1,
         msg: MsgId {
             producer: from.into(),
-            epoch: 0,
-            seq,
+            epoch,
+            seq: 0,
         },
         from: from.into(),
         to: Recipient::Npub(to.into()),
@@ -84,10 +87,10 @@ fn lead() -> Envelope {
     )
 }
 
-fn steer(seq: u64, to: &str, priority: &str) -> Envelope {
+fn steer(epoch: u64, to: &str, priority: &str) -> Envelope {
     env(
         SYS,
-        seq,
+        epoch,
         to,
         Class::Control,
         "steer",
@@ -96,10 +99,10 @@ fn steer(seq: u64, to: &str, priority: &str) -> Envelope {
     )
 }
 
-fn notify(from: &str, seq: u64, to: &str, text: &str) -> Envelope {
+fn notify(from: &str, epoch: u64, to: &str, text: &str) -> Envelope {
     env(
         from,
-        seq,
+        epoch,
         to,
         Class::Notify,
         "notify",
@@ -258,7 +261,17 @@ async fn the_head_is_the_first_item_next_serves_as_the_log_and_cursor_move() {
         assert_eq!(pending, urgent, "round {round}: the first urgent item");
         assert_eq!(pending.is_some(), any, "round {round}: --peek --urgent");
         if round % 3 == 2 {
-            s.next(CREW, None, false).await.unwrap();
+            let read = s.next(CREW, None, false).await.unwrap();
+            // `next` also serves live stragglers behind the cursor. Finish
+            // control rows so the unread head and `next`'s head stay
+            // comparable after the cursor moves.
+            for item in read
+                .items
+                .iter()
+                .filter(|item| item.envelope.class == Class::Control)
+            {
+                s.ack(CREW, &item.msg_key, true, None).await.unwrap();
+            }
         }
     }
     let (cursor, served) = next_head(&s, CREW).await;
@@ -574,9 +587,9 @@ async fn pending_urgent_is_one_partial_index_seek_at_100k_rows_front_and_back() 
     }
 }
 
-/// The highest versioned migration on main, before the urgent index.
-/// A pre-index binary resolves exactly this.
-const PRE_INDEX_MAX_MIGRATION: i64 = 31;
+/// The highest versioned migration on main; the urgent index is additive and
+/// raises no version. A pre-index binary resolves exactly this.
+const PRE_INDEX_MAX_MIGRATION: i64 = 33;
 
 #[tokio::test]
 async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
@@ -593,8 +606,10 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
             additive: vec![
                 "inbox_log_urgent",
                 "inbox_stream_close",
+                "mail_ingest",
                 "durable_engine_runs",
-                "durable_workflow_runs"
+                "durable_workflow_runs",
+                "agent_bindings"
             ],
         },
         "the index raises no version a binary checks"
@@ -648,8 +663,10 @@ async fn pending_urgent_is_correct_without_the_index() {
         schema::store_version(s.pool()).await.unwrap().additive,
         vec![
             "inbox_stream_close",
+            "mail_ingest",
             "durable_engine_runs",
-            "durable_workflow_runs"
+            "durable_workflow_runs",
+            "agent_bindings"
         ],
         "the dropped index is gone; the additive table is still there"
     );
@@ -698,8 +715,10 @@ async fn pending_urgent_is_correct_without_the_index() {
         vec![
             "inbox_log_urgent",
             "inbox_stream_close",
+            "mail_ingest",
             "durable_engine_runs",
-            "durable_workflow_runs"
+            "durable_workflow_runs",
+            "agent_bindings"
         ]
     );
 }

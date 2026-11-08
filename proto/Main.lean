@@ -37,6 +37,7 @@ def eventJson : Event → String
   | .done b g => "{\"event\":\"done\",\"by\":" ++ jstr b ++ ",\"gen\":" ++ toString g ++ "}"
   | .verdict b p r => "{\"event\":\"verdict\",\"by\":" ++ jstr b ++ ",\"pass\":" ++ toString p ++ ",\"rework\":" ++ toString r ++ "}"
   | .supersede g => "{\"event\":\"supersede\",\"new_gen\":" ++ toString g ++ "}"
+  | .rebase g => "{\"event\":\"rebase\",\"new_gen\":" ++ toString g ++ "}"
   | .cancel => "{\"event\":\"cancel\"}"
 
 def phases : List Phase := [.intent, .unknown, .sent, .delivered, .acknowledged, .acted, .proved,
@@ -65,7 +66,7 @@ def events : List Event := [
   .progress "r" 1, .progress "r" 0, .progress "x" 1,
   .done "r" 1, .done "r" 0, .done "x" 1,
   .verdict "v" true false, .verdict "v" false true, .verdict "v" false false, .verdict "r" true false,
-  .supersede 2, .supersede 1, .cancel ]
+  .supersede 2, .supersede 1, .cancel, .rebase 2, .rebase 1 ]
 
 def vectorLine (s : State) (e : Event) : String :=
   let expect := match step s e with

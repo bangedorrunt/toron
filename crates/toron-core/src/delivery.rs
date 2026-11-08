@@ -190,6 +190,8 @@ pub enum DeliveryEvent {
     },
     /// Control raised the generation.
     Supersede { new_gen: u32 },
+    /// A steer redirect rebased the generation in place (phase unchanged).
+    Rebase { new_gen: u32 },
     /// Control cancelled the work.
     Cancel,
 }
@@ -210,6 +212,7 @@ impl DeliveryEvent {
             Self::Done { .. } => "done",
             Self::Verdict { .. } => "verdict",
             Self::Supersede { .. } => "supersede",
+            Self::Rebase { .. } => "rebase",
             Self::Cancel => "cancel",
         }
     }
@@ -498,6 +501,18 @@ impl DeliveryFsm {
                 Ok(DeliveryState {
                     generation: *new_gen,
                     ..to(P::Superseded)
+                })
+            }
+            (P::Acknowledged | P::Acted, E::Rebase { new_gen }) => {
+                if *new_gen <= s.generation {
+                    return Err(Reject::StaleGen {
+                        sent: *new_gen,
+                        current: s.generation,
+                    });
+                }
+                Ok(DeliveryState {
+                    generation: *new_gen,
+                    ..s.clone()
                 })
             }
             (P::Acknowledged, E::Cancel) => Ok(to(P::Cancelled)),

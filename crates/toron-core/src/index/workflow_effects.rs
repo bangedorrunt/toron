@@ -264,6 +264,17 @@ impl std::fmt::Display for EffectState {
     }
 }
 
+/// A claim starts a new fenced attempt; it is NOT an outcome transition.
+/// `Parked` resumes under the same key via `plan_attempt`'s `ResumeParked`,
+/// and the uncertain states re-enter only after `plan_attempt` approved the
+/// retry. `ReconcilePending` is owned by reconciliation and never claimable.
+const fn claimable_from(state: EffectState) -> bool {
+    matches!(
+        state,
+        EffectState::Parked | EffectState::InFlight | EffectState::Unknown | EffectState::Accepted
+    ) || can_transition(state, EffectState::InFlight)
+}
+
 /// Whether one effect-state transition is legal (ADR-0032 §5.2). In
 /// particular: `unknown` enters only from in-flight/accepted uncertainty
 /// and leaves only via reconciliation; terminal states never move; a
@@ -520,6 +531,12 @@ pub struct WorkflowRun {
     pub current_node: Option<String>,
     pub failed_node: Option<String>,
     pub terminal_digest: Option<String>,
+    /// Artifact paths recorded with the run (projection column).
+    pub artifact_paths: Option<String>,
+    /// Structured failure projection recorded with the run.
+    pub failure_projection: Option<String>,
+    /// Terminal-publication state recorded with the run.
+    pub terminal_publication_state: Option<String>,
 }
 
 /// A park to persist: one `Parked` effect row plus its pending resume row.
@@ -575,6 +592,8 @@ pub struct Pending {
     pub kind: PendingKind,
     pub pending_payload: String,
     pub publication_state: Option<String>,
+    /// Absolute deadline for the pending wait, when the host knows it.
+    pub deadline: Option<i64>,
 }
 
 /// A terminal publication to note.
@@ -814,7 +833,8 @@ impl WorkflowEffectStore {
     ) -> anyhow::Result<()> {
         let row = sqlx::query(
             "SELECT run_id, project, workflow, workflow_digest, status, started_at, \
-                    suspended_at, finished_at, current_node, failed_node, terminal_digest \
+                    suspended_at, finished_at, current_node, failed_node, terminal_digest, \
+                    artifact_paths, failure_projection, terminal_publication_state \
              FROM workflow_runs WHERE run_id = ?1",
         )
         .bind(run_id)
@@ -836,7 +856,7 @@ impl WorkflowEffectStore {
     ) -> anyhow::Result<()> {
         let row = sqlx::query(
             "SELECT run_id, promise_id, park_generation, project, workflow, node_path, \
-                    effect_key, kind, pending_payload, publication_state \
+                    effect_key, kind, pending_payload, publication_state, deadline \
              FROM workflow_pending WHERE run_id = ?1 AND promise_id = ?2 AND park_generation = ?3",
         )
         .bind(run_id)
@@ -992,11 +1012,10 @@ impl WorkflowEffectStore {
 
     /// Persist a park: the `Parked` effect row and its `workflow_pending
     /// resume row, atomically. The effect row is INSERTED, never
-    /// transitioned: `can_transition` has no edge into `Parked` on either
-    /// side of the kernel port (framework law), so `transition_effect`
-    /// can never write this row. A second park under the same effect key
-    /// attaches to the existing row (`created: false`), which is what
-    /// makes re-parking idempotent rather than a duplicate wait.
+    /// transitioned: `can_transition` has no edge into `Parked`, so the
+    /// re-drive key is idempotent and a second park under the same effect
+    /// key attaches to the existing row (`created: false`). Resume is the
+    /// separate `plan_attempt` -> `ResumeParked` path.
     pub async fn park_effect(&self, park: NewPark) -> anyhow::Result<PrepareOutcome> {
         let now = now_us();
         let reason = park
@@ -1363,6 +1382,9 @@ impl WorkflowEffectStore {
             current_node: r.get("current_node"),
             failed_node: r.get("failed_node"),
             terminal_digest: r.get("terminal_digest"),
+            artifact_paths: r.get("artifact_paths"),
+            failure_projection: r.get("failure_projection"),
+            terminal_publication_state: r.get("terminal_publication_state"),
         })
     }
 
@@ -1379,6 +1401,7 @@ impl WorkflowEffectStore {
             kind: PendingKind::parse(&kind).map_err(|e| anyhow::anyhow!("{e}"))?,
             pending_payload: r.get("pending_payload"),
             publication_state: r.get("publication_state"),
+            deadline: r.get("deadline"),
         })
     }
 
@@ -1436,7 +1459,7 @@ impl WorkflowEffectStore {
         let Some(current) = self.get_effect(effect_key).await? else {
             anyhow::bail!("unknown effect {effect_key:?}");
         };
-        if current.state.is_terminal() {
+        if current.state.is_terminal() || !claimable_from(current.state) {
             return Ok(false);
         }
         let now = now_us();
@@ -1453,7 +1476,7 @@ impl WorkflowEffectStore {
             let updated = sqlx::query(
                 "UPDATE workflow_effects SET attempt = ?1, attempt_id = ?2, claim_token = ?3, \
                         lease_expires_at = ?4, state = 'in_flight', updated_at = ?5 \
-                 WHERE effect_key = ?6 AND claim_token = ?7",
+                 WHERE effect_key = ?6 AND claim_token = ?7 AND state = ?8",
             )
             .bind(claim.attempt)
             .bind(&claim.attempt_id)
@@ -1462,6 +1485,7 @@ impl WorkflowEffectStore {
             .bind(now)
             .bind(effect_key)
             .bind(owned)
+            .bind(current.state.as_str())
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -1475,7 +1499,7 @@ impl WorkflowEffectStore {
             let updated = sqlx::query(
                 "UPDATE workflow_effects SET attempt = ?1, attempt_id = ?2, claim_token = ?3, \
                         lease_expires_at = ?4, state = 'in_flight', updated_at = ?5 \
-                 WHERE effect_key = ?6 AND claim_token IS NULL",
+                 WHERE effect_key = ?6 AND claim_token IS NULL AND state = ?7",
             )
             .bind(claim.attempt)
             .bind(&claim.attempt_id)
@@ -1483,6 +1507,7 @@ impl WorkflowEffectStore {
             .bind(claim.lease_expires_at)
             .bind(now)
             .bind(effect_key)
+            .bind(current.state.as_str())
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -1731,7 +1756,7 @@ impl WorkflowEffectStore {
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_runs SET status = ?1, \
-                    suspended_at = CASE WHEN ?1 = 'suspended' THEN ?2 ELSE suspended_at END, \
+                    suspended_at = CASE WHEN ?1 = 'suspended' THEN ?2 ELSE NULL END, \
                     finished_at = CASE WHEN ?1 IN \
                         ('succeeded','failed','blocked','cancelled','unknown') \
                         THEN ?2 ELSE finished_at END, \
@@ -2522,11 +2547,11 @@ mod workflow_effect_schema_tests {
 
     /// bd-lm27: a park persists as a `Parked` effect row plus its pending
     /// resume row, keyed `(run_id, promise_id, park_generation)`. The row
-    /// is INSERTED, never transitioned: `can_transition` has no edge into
-    /// `Parked` in either direction, and a re-park under the same key
-    /// attaches to the existing row. A `Parked` row is resumable, never a
-    /// failure — the re-drive plan (`ResumeParked`) is proven at the plan
-    /// table, this test proves the row it reads.
+    /// is INSERTED so a re-park under the same key attaches to it; the
+    /// transition table deliberately has no edge into or out of `Parked`,
+    /// and resume is the separate `plan_attempt` -> `ResumeParked` path. A
+    /// `Parked` row is resumable, never a failure — this test proves both
+    /// the row and the claim path the re-drive reads.
     #[tokio::test]
     async fn workflow_effect_schema_park_persists_and_redrives() {
         let (p, _dir) = pool("park").await;
@@ -2576,6 +2601,9 @@ mod workflow_effect_schema_tests {
         assert_eq!(hosted.effect.action_digest, "unknown");
         let rows = store.list_pending("run-9").await.unwrap();
         assert_eq!(rows.len(), 2);
+        // Park is not a transition edge: it is an inserted pending row and
+        // resumes through plan_attempt. No state may enter or leave it via
+        // can_transition, including Parked itself.
         for state in [
             EffectState::Prepared,
             EffectState::InFlight,
@@ -2593,9 +2621,34 @@ mod workflow_effect_schema_tests {
             );
             assert!(
                 !can_transition(EffectState::Parked, state),
-                "Parked must not transition into {state:?} (not even itself)"
+                "Parked must not transition into {state:?}"
             );
         }
+        assert!(claimable_from(EffectState::Parked));
+        assert!(!claimable_from(EffectState::ReconcilePending));
+        let claimed = store
+            .claim_attempt(
+                "park:run-9:n1:2000",
+                ClaimAttempt {
+                    attempt: 1,
+                    attempt_id: "resume-1".into(),
+                    claim_token: "resume-token".into(),
+                    lease_expires_at: i64::MAX,
+                    expected_claim_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(claimed, "a parked row must resume under the same key");
+        assert_eq!(
+            store
+                .get_effect("park:run-9:n1:2000")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            EffectState::InFlight
+        );
     }
 
     /// bd-v139.1: `unknown` and `reconcile_pending` are first-class states —

@@ -35,10 +35,10 @@ use toron_core::kernel::{
 
 use super::control_flow::validate_workflow_lineage;
 use super::durable::{
-    GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
-    RunPhase as ModelPhase, advance_graph, advance_with, durable_graph, graph_unsupported_reason,
-    needs_graph_model, next_effects, resolve_loop_max, resume_effects, resume_graph_effects,
-    unsupported_reason,
+    GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, PersistedWorkflowModel, RunEffect,
+    RunModel, RunMsg, RunPhase as ModelPhase, advance_graph, advance_with, durable_graph,
+    graph_unsupported_reason, needs_graph_model, next_effects, resolve_loop_max, resume_effects,
+    resume_graph_effects, unsupported_reason,
 };
 use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
@@ -183,8 +183,15 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     ) -> Result<(Self, Vec<RunEffect>), HostError> {
         let run_id = run_id.into();
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
-            let mut model: RunModel = serde_json::from_str(&json)
-                .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?;
+            let PersistedWorkflowModel::Linear(model) = PersistedWorkflowModel::decode(&json)
+                .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?
+            else {
+                return Err(HostError::Corrupt(format!(
+                    "{}: persisted graph model opened by the linear driver",
+                    run_id
+                )));
+            };
+            let mut model = *model;
             model.recompile_plan();
             let mut run = Self {
                 model,
@@ -192,6 +199,10 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                 state,
                 spawns: Vec::new(),
             };
+            // Resume must rebuild the spawn specs from the injected seams;
+            // an empty vector made every post-park Action::Spawn fail with
+            // the unknown-profile value (bd-engine-spawn-resume).
+            run.prepare_spawns(spawn_seams);
             return run.resume(now_ms).map(|effects| (run, effects));
         }
 
@@ -234,7 +245,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
         };
         run.prepare_spawns(spawn_seams);
         let model = run.model.clone();
-        run.persist(&model)?;
+        persist_linear(&run.state, &model.run_id, &model)?;
         let effects = run.apply(RunMsg::Start { now_ms }, now_ms)?;
         Ok((run, effects))
     }
@@ -542,7 +553,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     }
 
     fn persist(&self, model: &RunModel) -> Result<(), HostError> {
-        persist_run_state(&self.state, &model.run_id, model)
+        persist_linear(&self.state, &model.run_id, model)
     }
 
     fn require_running(&self, verb: &str) -> Result<(), HostError> {
@@ -724,10 +735,16 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
     ) -> Result<(Self, Vec<GraphEffect>), HostError> {
         let run_id = run_id.into();
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
-            let model: GraphModel = serde_json::from_str(&json)
-                .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?;
+            let PersistedWorkflowModel::Graph(model) = PersistedWorkflowModel::decode(&json)
+                .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?
+            else {
+                return Err(HostError::Corrupt(format!(
+                    "{}: persisted linear model opened by the graph driver",
+                    run_id
+                )));
+            };
             let mut run = Self {
-                model,
+                model: *model,
                 engine,
                 state,
             };
@@ -768,7 +785,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
             state,
         };
         let model = run.model.clone();
-        persist_run_state(&run.state, &model.run_id, &model)?;
+        persist_graph(&run.state, &model.run_id, &model)?;
         let effects = run.apply(GraphMsg::Start { now_ms }, now_ms)?;
         Ok((run, effects))
     }
@@ -938,7 +955,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
     /// One pure transition: persist, then drive the engine.
     fn apply(&mut self, msg: GraphMsg, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
         let (next, effects) = advance_graph(&self.model, &msg);
-        persist_run_state(&self.state, &next.run_id, &next)?;
+        persist_graph(&self.state, &next.run_id, &next)?;
         self.model = next;
         self.engine_verb(&effects, now_ms)?;
         self.settle_past_park(now_ms, effects)
@@ -1023,14 +1040,34 @@ const fn graph_phase_name(phase: &GraphPhase) -> &'static str {
 }
 
 /// The one persist step both drivers use: model first, engine second.
-fn persist_run_state<R: RunState, M: serde::Serialize>(
+fn persist_model<R: RunState>(
     state: &R,
     run_id: &str,
-    model: &M,
+    model: &PersistedWorkflowModel,
 ) -> Result<(), HostError> {
     let json = serde_json::to_string(model)
         .map_err(|e| HostError::Corrupt(format!("encode {run_id}: {e}")))?;
     state.save(run_id, &json).map_err(state_error)
+}
+
+fn persist_linear<R: RunState>(state: &R, run_id: &str, model: &RunModel) -> Result<(), HostError> {
+    persist_model(
+        state,
+        run_id,
+        &PersistedWorkflowModel::Linear(Box::new(model.clone())),
+    )
+}
+
+fn persist_graph<R: RunState>(
+    state: &R,
+    run_id: &str,
+    model: &GraphModel,
+) -> Result<(), HostError> {
+    persist_model(
+        state,
+        run_id,
+        &PersistedWorkflowModel::Graph(Box::new(model.clone())),
+    )
 }
 
 /// The single wake this model owes the engine: the EARLIEST deadline across

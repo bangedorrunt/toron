@@ -276,10 +276,19 @@ async fn next_commits_cursor_and_delivered_together_and_peek_commits_neither() {
         s.delivery(&e.msg.key(), B).await.unwrap().phase,
         Phase::Delivered
     );
+    let again = s.next(B, None, false).await.unwrap();
     assert!(
-        s.next(B, None, false).await.unwrap().items.is_empty(),
-        "nothing past the cursor"
+        again
+            .items
+            .iter()
+            .all(|item| item.offset <= again.cursor_before),
+        "nothing fresh past the cursor; the live task is a straggler"
     );
+    assert_eq!(
+        again.cursor_after, again.cursor_before,
+        "a straggler-only batch does not move the cursor"
+    );
+    assert_eq!(s.cursor(B, B).await.unwrap(), read.cursor_after);
 }
 
 #[tokio::test]

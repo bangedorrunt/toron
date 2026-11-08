@@ -99,7 +99,7 @@ pub async fn try_acquire(
              AND agent_pubkey <> ?4 \
              AND (?5 OR exclusive) \
          ) \
-         ON CONFLICT (project_slug, slot) DO UPDATE SET \
+         ON CONFLICT (project_slug, slot, agent_pubkey) DO UPDATE SET \
            agent_name = excluded.agent_name, \
            agent_pubkey = excluded.agent_pubkey, \
            exclusive = excluded.exclusive, \
@@ -139,14 +139,14 @@ pub async fn try_acquire(
     })
 }
 
-/// Insert a slot lease (idempotent on (project_slug, slot)).
+/// Insert a slot lease (idempotent on (project_slug, slot, agent_pubkey)).
 pub async fn insert_slot(pool: &SqlitePool, lease: &SlotLease) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO build_slots \
          (project_slug, slot, agent_name, agent_pubkey, exclusive, status, \
           event_id, expires_ts_us, created_ts_us) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8) \
-         ON CONFLICT (project_slug, slot) DO UPDATE SET \
+         ON CONFLICT (project_slug, slot, agent_pubkey) DO UPDATE SET \
            agent_name = excluded.agent_name, \
            agent_pubkey = excluded.agent_pubkey, \
            exclusive = excluded.exclusive, \

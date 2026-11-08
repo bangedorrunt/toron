@@ -41,7 +41,7 @@ fn delivery_vectors_from_lean_pass_in_rust() {
         n += 1;
     }
     assert_eq!(
-        n, 2160,
+        n, 2320,
         "the committed vector count changed; regenerate deliberately"
     );
 }

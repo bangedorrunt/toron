@@ -17,10 +17,10 @@
 //!    push (<50ms, no polling).
 //! 3. **Direct dispatch**: the flywheel loop's "dispatch" is a direct
 //!    toron_core call (no HTTP) — exercised via the mailbox methods.
-//! 4. **Single hc client**: `fn agent_prompt` has exactly ONE definition
-//!    in toron-core (the canonical hc client) — asserted statically. The
-//!    flywheel-side assertion (their old herdr.rs/mail.rs removed by bd-o8j.2)
-//!    is an `#[ignore]`d sub-case that also boots the real flywheel binary.
+//! 4. **Single hc client**: toron exposes the canonical `fn prompt` in the
+//!    toron-plane hc client and no legacy `fn agent_prompt` adapter; the
+//!    legacy adapter lives only in flywheel and is checked by the ignored
+//!    cross-repo sub-case that also boots the real flywheel binary.
 #![cfg(feature = "p1")]
 
 use std::sync::Arc;
@@ -154,30 +154,40 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// SC-FW static invariant: exactly ONE `fn agent_prompt` definition in
-/// toron-core (the canonical hc client). The flywheel-side duplicate
-/// definitions are removed by bd-o8j.2; this asserts the toron-core side.
+/// SC-FW static invariant: toron has no legacy `fn agent_prompt` adapter and
+/// exactly one canonical `fn prompt` in the toron-plane hc client. The
+/// flywheel-only adapter is checked by the ignored cross-repo case.
 #[test]
 fn sc_fw_single_agent_prompt_definition_in_core() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let core_src = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .join("toron-core/src");
-    let mut count = 0usize;
-    for entry in walk_rs(&core_src) {
-        let text = std::fs::read_to_string(&entry).unwrap_or_default();
-        for line in text.lines() {
-            let t = line.trim();
-            if t.starts_with("fn agent_prompt(") || t.starts_with("pub fn agent_prompt(") {
-                count += 1;
+    let crates = std::path::Path::new(manifest_dir).parent().unwrap();
+    let mut adapters = 0usize;
+    for src in [
+        crates.join("toron-core/src"),
+        crates.join("toron-plane/src"),
+    ] {
+        for entry in walk_rs(&src) {
+            let text = std::fs::read_to_string(&entry).unwrap_or_default();
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("fn agent_prompt(") || t.starts_with("pub fn agent_prompt(") {
+                    adapters += 1;
+                }
             }
         }
     }
     assert_eq!(
-        count, 1,
-        "exactly one agent_prompt definition in toron-core"
+        adapters, 0,
+        "the legacy agent_prompt adapter lives only in flywheel"
     );
+
+    let hc = crates.join("toron-plane/src/backend/hc.rs");
+    let text = std::fs::read_to_string(&hc).expect("hc client source");
+    let prompts = text
+        .lines()
+        .filter(|line| line.trim().starts_with("fn prompt("))
+        .count();
+    assert_eq!(prompts, 1, "exactly one canonical hc prompt entry point");
 }
 
 /// SC-FW live flywheel sub-case (RESOLVED 2026-08-09, bd-p5-sc-fw-integrated-
@@ -198,6 +208,7 @@ async fn sc_fw_flywheel_binary_live() {
         .arg("fn agent_prompt")
         .arg("~/workspace/flywheel/src")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../toron-core/src"))
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../toron-plane/src"))
         .output()
         .expect("rg");
     let hits = String::from_utf8_lossy(&out.stdout);

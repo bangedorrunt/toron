@@ -60,6 +60,7 @@ inductive Event where
   | done (by_ : String) (gen : Nat)
   | verdict (by_ : String) (pass : Bool) (rework : Bool)
   | supersede (newGen : Nat)
+  | rebase (newGen : Nat)
   | cancel
   deriving DecidableEq, Repr
 
@@ -76,6 +77,7 @@ def Event.name : Event → String
   | .done _ _ => "done"
   | .verdict _ _ _ => "verdict"
   | .supersede _ => "supersede"
+  | .rebase _ => "rebase"
   | .cancel => "cancel"
 
 /-- Reject kinds, spelled as the Rust `Reject` serde tags. -/
@@ -136,6 +138,10 @@ def step (s : State) (e : Event) : Except Reject State :=
       if ng ≤ s.gen then .error .staleGen else .ok { s with phase := .superseded, gen := ng }
   | .acted, .supersede ng =>
       if ng ≤ s.gen then .error .staleGen else .ok { s with phase := .superseded, gen := ng }
+  | .acknowledged, .rebase ng =>
+      if ng ≤ s.gen then .error .staleGen else .ok { s with gen := ng }
+  | .acted, .rebase ng =>
+      if ng ≤ s.gen then .error .staleGen else .ok { s with gen := ng }
   | .acknowledged, .cancel => .ok { s with phase := .cancelled }
   | _, _ => .error .illegalTransition
 

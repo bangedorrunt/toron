@@ -1348,8 +1348,10 @@ impl InboxStore {
                 .await?
                 .map(|r| r.role);
             let mut allowed_now = allowed_now_for(&state, &msg_key, &envelope, topology, role);
-            if items.is_empty()
-                && let Some(task) = &envelope.task
+            // A pending steer blocks every crew verb on the task, not only
+            // the batch head: stragglers may precede it. Project the two ack
+            // lines on each item that names the task (including the steer).
+            if let Some(task) = &envelope.task
                 && let Some((steer_key, _)) =
                     pending_steer(&mut tx, &envelope.context.0, &task.0).await?
             {
@@ -1409,12 +1411,23 @@ impl InboxStore {
         let next = DeliveryFsm::step(&s, event)?;
         if let Some(env) = &env
             && env.contract.name == "steer"
-            && matches!(event, DeliveryEvent::Accept { .. })
+            && matches!(
+                event,
+                DeliveryEvent::Accept { .. } | DeliveryEvent::Refuse { .. }
+            )
         {
+            // Both answers settle the steer: a refusal used to leave the row
+            // `pending` forever and blocked every later verb on the task.
+            let state = if matches!(event, DeliveryEvent::Accept { .. }) {
+                "acked"
+            } else {
+                "refused"
+            };
             sqlx::query(
-                "UPDATE inbox_steer SET state = 'acked' WHERE msg_key = ?1 AND state = 'pending'",
+                "UPDATE inbox_steer SET state = ?2 WHERE msg_key = ?1 AND state = 'pending'",
             )
             .bind(msg_key)
+            .bind(state)
             .execute(&mut *tx)
             .await?;
         }
@@ -1984,7 +1997,7 @@ async fn apply_steer(
     env: &Envelope,
     steer: &SteerV1,
     now: i64,
-) -> Result<(), sqlx::Error> {
+) -> anyhow::Result<()> {
     let Some(task) = &env.task else {
         return Ok(());
     };
@@ -1994,17 +2007,23 @@ async fn apply_steer(
         .await?;
     for row in rows {
         let key: String = row.get(0);
-        let mut state: DeliveryState = serde_json::from_str(&row.get::<String, _>(1))
-            .map_err(|e| sqlx::Error::Decode(e.to_string().into()))?;
+        let state: DeliveryState = serde_json::from_str(&row.get::<String, _>(1))
+            .map_err(|e| anyhow::anyhow!("task {} delivery state: {e}", task.0))?;
         if state.class != Class::Task || state.is_terminal() {
             continue;
         }
-        match steer.op.as_str() {
-            "redirect" => state.generation = state.generation.saturating_add(1),
-            "cancel" => state.phase = Phase::Cancelled,
+        let next = match steer.op.as_str() {
+            "redirect" => DeliveryFsm::step(
+                &state,
+                &DeliveryEvent::Rebase {
+                    new_gen: state.generation.saturating_add(1),
+                },
+            ),
+            "cancel" => DeliveryFsm::step(&state, &DeliveryEvent::Cancel),
             _ => continue,
         }
-        write_delivery(conn, &key, &state, Some(&task.0), None, now).await?;
+        .map_err(|e| anyhow::anyhow!("steer {} on task {}: {e}", steer.op, task.0))?;
+        write_delivery(conn, &key, &next, Some(&task.0), None, now).await?;
     }
     Ok(())
 }

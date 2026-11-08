@@ -1,44 +1,20 @@
 // governed-by: ADR-0003
-//! Lease-liveness oracle for the toron daemon (bd-lease-liveness-oracle-ro8i).
+//! Lease-liveness source for every toron consumer.
 //!
-//! The seam already exists: [`crate::mailbox::reservations`] resurrects an
-//! expired SQL-mirror lease while a sync oracle vouches the holder is live,
-//! and stays pure NIP-40 with no oracle installed. Tests installed ad-hoc
-//! closures; the daemon installed nothing, so a manual holder idle past the
-//! 180 s TTL lost its paths even mid-edit. This module is the daemon's
-//! installer: a background task refreshes a pubkey → last-activity map every
-//! [`REFRESH_SECS`], and the installed predicate is a pure membership read
-//! under a lock — no async query and no ambient clock read inside it (the
-//! refresher passes `now` in; effect-oriented substitution in tests).
+//! The authority is the shared SQLite inbox-cursor/agent-activity snapshot:
+//! `toron serve`, an in-process `Mailbox`, and the CLI all read the same rows,
+//! so an expired lease cannot look dead in one process and live in another.
+//! There is no process-local predicate and no refresh loop to drift.
 //!
-//! Activity source: `inbox_cursors.last_seen_us` joined to the roster npub,
-//! NOT the latest event authored by the pubkey. The bus stores `created_at`
-//! in whole seconds AND gift wraps randomize it up to two days into the
-//! past, so a MAX(created_at) oracle would call live agents stale and stale
-//! agents live. The cursor is host-clock micros advanced on every inbox
-//! fetch — the ambient poll every live agent already runs — and the table
-//! is one row per (project, agent, plane), so the refresh is a single
-//! indexed aggregate bounded to agents active inside the TTL window.
+//! Activity source: `MAX(inbox_cursors.last_seen_us,
+//! inbox_cursors.last_poll_us)` joined to the roster npub, NOT the latest
+//! event authored by the pubkey. The bus stores `created_at` in whole seconds
+//! AND gift wraps randomize it up to two days into the past, so a
+//! MAX(created_at) read would call live agents stale and stale agents live.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-
-use super::reservations::{
-    DEFAULT_RESERVATION_TTL_SECS, clear_lease_liveness_checker, install_lease_liveness_checker,
-};
-
-/// How often the daemon refreshes the live set: 5 s against the 180 s TTL.
-/// The bound is load-bearing, not aesthetic: the acceptance is a +7 s
-/// check past a 4 s TTL, so the worst-case lag (one interval) must sit
-/// under the check horizon — 15 s made the +7 s naming phase-luck (shown
-/// live: clear at +7 s, hard block at +25 s on the same lease). The query
-/// is one indexed aggregate over a per-agent table, so the shorter
-/// cadence costs nothing measurable; a holder that goes quiet still frees
-/// its paths within one interval past the TTL window.
-pub const REFRESH_SECS: u64 = 5;
 
 /// Pubkey hex → last-seen micros. Only currently-live pubkeys are present;
 /// the refresher applies the TTL cutoff, so the predicate is membership.
@@ -119,74 +95,6 @@ static SNAPSHOT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Tested without a database.
 pub fn apply_snapshot(prev: ActivityMap, next: Option<ActivityMap>) -> ActivityMap {
     next.unwrap_or(prev)
-}
-
-/// Daemon guard: installs the membership oracle and refreshes it until
-/// dropped. Drop aborts the task and clears the oracle (shutdown hygiene —
-/// a stale live set must never outlive the refresher that owns it).
-pub struct LeaseLivenessGuard {
-    handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for LeaseLivenessGuard {
-    fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            h.abort();
-        }
-        clear_lease_liveness_checker();
-    }
-}
-
-impl LeaseLivenessGuard {
-    async fn install(pool: sqlx::SqlitePool, ttl_secs: u64) -> Self {
-        let live: Arc<RwLock<ActivityMap>> = Arc::new(RwLock::new(ActivityMap::new()));
-        let now_us = host_now_us();
-        let first = read_activity_snapshot(&pool, ttl_secs, now_us).await;
-        *live.write().unwrap_or_else(|e| e.into_inner()) =
-            apply_snapshot(ActivityMap::new(), first);
-        let refreshed = Arc::clone(&live);
-        install_lease_liveness_checker(Arc::new(move |pubkey_hex: &str| {
-            refreshed
-                .read()
-                .map(|m| m.contains_key(pubkey_hex))
-                .unwrap_or(false)
-        }));
-        let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let now_us = host_now_us();
-                let snap = read_activity_snapshot(&pool, ttl_secs, now_us).await;
-                if let Ok(mut m) = live.write() {
-                    *m = apply_snapshot(std::mem::take(&mut *m), snap);
-                }
-            }
-        });
-        Self {
-            handle: Some(handle),
-        }
-    }
-}
-
-/// Install the oracle for a serving mailbox and hold the guard for the
-/// serve lifetime. No index pool (one-shot consumers) → no oracle, pure
-/// NIP-40, exactly as before.
-pub async fn install_for_daemon(
-    pool: Option<&sqlx::SqlitePool>,
-    ttl_secs: u64,
-) -> Option<LeaseLivenessGuard> {
-    match pool {
-        Some(p) => Some(LeaseLivenessGuard::install(p.clone(), ttl_secs).await),
-        None => None,
-    }
-}
-
-/// Convenience: the daemon's TTL is the reservation heartbeat, unchanged.
-pub async fn install_for_daemon_default_ttl(
-    pool: Option<&sqlx::SqlitePool>,
-) -> Option<LeaseLivenessGuard> {
-    install_for_daemon(pool, DEFAULT_RESERVATION_TTL_SECS).await
 }
 
 /// Host clock micros. Called ONLY at an effect edge by the command that

@@ -227,6 +227,11 @@ struct Buffer {
     /// `last_arrival_ms` of the most-recent mention (drives the sub-window
     /// immediate-flush fast path).
     last_arrival_ms: u64,
+    /// Earliest wall-clock ms at which a requeue backoff permits a flush.
+    /// Arrival timestamps stay truthful; backoff lives here.
+    ready_at_ms: u64,
+    /// A zero-delay requeue that must flush on the next tick.
+    immediate: bool,
 }
 
 impl Buffer {
@@ -235,6 +240,8 @@ impl Buffer {
             mentions: VecDeque::new(),
             first_arrival_ms: now_ms,
             last_arrival_ms: now_ms,
+            ready_at_ms: 0,
+            immediate: false,
         }
     }
 
@@ -406,11 +413,12 @@ impl MentionCoalescer {
         if buf.mentions.is_empty() {
             return FlushOutcome::NotReady;
         }
-        let window_elapsed =
-            now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
-        let subwindow_elapsed =
-            now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
-        if window_elapsed || subwindow_elapsed {
+        let backoff_ready = now_ms >= buf.ready_at_ms;
+        let window_elapsed = backoff_ready
+            && now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
+        let subwindow_elapsed = backoff_ready
+            && now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
+        if buf.immediate || window_elapsed || subwindow_elapsed {
             let coalesced = self
                 .take_buffer(assignee)
                 .expect("non-empty buffer checked above");
@@ -430,11 +438,14 @@ impl MentionCoalescer {
                 if buf.mentions.is_empty() {
                     continue;
                 }
-                let window_elapsed =
-                    now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
-                let subwindow_elapsed =
-                    now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
-                if window_elapsed || subwindow_elapsed {
+                let backoff_ready = now_ms >= buf.ready_at_ms;
+                let window_elapsed = backoff_ready
+                    && now_ms.saturating_sub(buf.first_arrival_ms)
+                        >= self.window.as_millis() as u64;
+                let subwindow_elapsed = backoff_ready
+                    && now_ms.saturating_sub(buf.last_arrival_ms)
+                        >= self.subwindow.as_millis() as u64;
+                if buf.immediate || window_elapsed || subwindow_elapsed {
                     ready.push(a.clone());
                 }
             }
@@ -537,15 +548,14 @@ impl MentionCoalescer {
             .buffers
             .entry(assignee)
             .or_insert_with(|| Buffer::new(now_ms));
-        let win = self.window.as_millis() as u64;
-        let sub = self.subwindow.as_millis() as u64;
         match delay_ms {
             Some(delay) => {
-                let ready_at = now_ms.saturating_add(delay);
-                buf.first_arrival_ms = ready_at.saturating_sub(win);
-                buf.last_arrival_ms = ready_at.saturating_sub(sub);
+                buf.ready_at_ms = now_ms.saturating_add(delay);
+                buf.immediate = delay == 0;
             }
             None => {
+                buf.ready_at_ms = now_ms;
+                buf.immediate = false;
                 if buf.mentions.is_empty() {
                     buf.first_arrival_ms = now_ms;
                     buf.last_arrival_ms = now_ms;
@@ -587,6 +597,8 @@ impl MentionCoalescer {
         let first_arrival_ms = buf.first_arrival_ms;
         buf.first_arrival_ms = 0;
         buf.last_arrival_ms = 0;
+        buf.ready_at_ms = 0;
+        buf.immediate = false;
         Some(Coalesced {
             assignee: assignee.to_string(),
             mentions,

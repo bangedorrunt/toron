@@ -25,6 +25,8 @@
 {"state":{"phase":"intent","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"ok":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
@@ -52,6 +54,8 @@
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"notify","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -79,6 +83,8 @@
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -106,6 +112,8 @@
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"delivered","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -133,6 +141,8 @@
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":null}}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"ok":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null}}}
+{"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":null}}}
+{"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -160,6 +170,8 @@
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":null}}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"ok":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null}}}
+{"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":null}}}
+{"state":{"phase":"acknowledged","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -187,6 +199,8 @@
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -214,6 +228,8 @@
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -241,6 +257,8 @@
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -268,6 +286,8 @@
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
+{"state":{"phase":"acted","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -295,6 +315,8 @@
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -322,6 +344,8 @@
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -349,6 +373,8 @@
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -376,6 +402,8 @@
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"notify","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -403,6 +431,8 @@
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -430,6 +460,8 @@
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -457,6 +489,8 @@
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -484,6 +518,8 @@
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -511,6 +547,8 @@
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -538,6 +576,8 @@
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"notify","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"ok":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"ok":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -565,6 +605,8 @@
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"ok":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
@@ -592,6 +634,8 @@
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"request","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -619,6 +663,8 @@
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -646,6 +692,8 @@
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -673,6 +721,8 @@
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -700,6 +750,8 @@
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -727,6 +779,8 @@
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -754,6 +808,8 @@
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -781,6 +837,8 @@
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -808,6 +866,8 @@
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
+{"state":{"phase":"acted","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -835,6 +895,8 @@
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -862,6 +924,8 @@
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -889,6 +953,8 @@
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -916,6 +982,8 @@
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"request","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -943,6 +1011,8 @@
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -970,6 +1040,8 @@
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -997,6 +1069,8 @@
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1024,6 +1098,8 @@
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1051,6 +1127,8 @@
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1078,6 +1156,8 @@
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"request","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"ok":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"ok":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1105,6 +1185,8 @@
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"ok":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
@@ -1132,6 +1214,8 @@
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"task","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1159,6 +1243,8 @@
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1186,6 +1272,8 @@
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1213,6 +1301,8 @@
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":null}}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"ok":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null}}}
+{"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":null}}}
+{"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1240,6 +1330,8 @@
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":null}}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"ok":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null}}}
+{"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":null}}}
+{"state":{"phase":"acknowledged","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1267,6 +1359,8 @@
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1294,6 +1388,8 @@
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1321,6 +1417,8 @@
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1348,6 +1446,8 @@
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
+{"state":{"phase":"acted","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1375,6 +1475,8 @@
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1402,6 +1504,8 @@
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"proved","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1429,6 +1533,8 @@
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1456,6 +1562,8 @@
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"task","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1483,6 +1591,8 @@
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1510,6 +1620,8 @@
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1537,6 +1649,8 @@
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1564,6 +1678,8 @@
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1591,6 +1707,8 @@
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1618,6 +1736,8 @@
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"task","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"ok":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"ok":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null}}}
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1645,6 +1765,8 @@
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"intent","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"ok":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null}}}
@@ -1672,6 +1794,8 @@
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"unknown","class":"control","recipient":"r","offset":null,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1699,6 +1823,8 @@
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"sent","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1726,6 +1852,8 @@
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"delivered","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1753,6 +1881,8 @@
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1780,6 +1910,8 @@
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"acknowledged","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1807,6 +1939,8 @@
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"r"}}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1834,6 +1968,8 @@
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":2,"holder":"r","doer":"x"}}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1861,6 +1997,8 @@
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"r"}}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"r"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1888,6 +2026,8 @@
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":2},"expect":{"ok":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":2},"expect":{"ok":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":2,"holder":"x","doer":"x"}}}
+{"state":{"phase":"acted","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":"x"},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"stale_gen"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1915,6 +2055,8 @@
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"illegal_transition"}}
@@ -1942,6 +2084,8 @@
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"illegal_transition"}}
+{"state":{"phase":"proved","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"illegal_transition"}}
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1969,6 +2113,8 @@
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"rejected","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -1996,6 +2142,8 @@
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"expired","class":"control","recipient":"r","offset":5,"gen":1,"holder":null,"doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2023,6 +2171,8 @@
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2050,6 +2200,8 @@
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"superseded","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2077,6 +2229,8 @@
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2104,6 +2258,8 @@
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"cancelled","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2131,6 +2287,8 @@
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"r","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"appended","offset":5},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"append_uncertain"},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"reconcile_found","offset":5},"expect":{"reject":"terminal"}}
@@ -2158,3 +2316,5 @@
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":2},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"supersede","new_gen":1},"expect":{"reject":"terminal"}}
 {"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"cancel"},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":2},"expect":{"reject":"terminal"}}
+{"state":{"phase":"failed","class":"control","recipient":"r","offset":5,"gen":1,"holder":"x","doer":null},"event":{"event":"rebase","new_gen":1},"expect":{"reject":"terminal"}}

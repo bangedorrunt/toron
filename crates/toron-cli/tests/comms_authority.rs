@@ -101,21 +101,25 @@ fn write_env(dir: &Path, name: &str, env: &Envelope) -> PathBuf {
     p
 }
 
-fn msg(producer: &str, seq: u64) -> MsgId {
+fn msg_at(producer: &str, epoch: u64, seq: u64) -> MsgId {
     MsgId {
         producer: producer.into(),
-        epoch: 0,
+        epoch,
         seq,
     }
 }
 
 fn role_fact(from: &str, seq: u64, subject: &str, role: Role) -> Envelope {
+    role_fact_at(from, 0, seq, subject, role)
+}
+
+fn role_fact_at(from: &str, epoch: u64, seq: u64, subject: &str, role: Role) -> Envelope {
     RoleV1 {
         npub: subject.into(),
         role,
         generation: 0,
     }
-    .into_envelope(msg(from, seq), ContextId(CTX.into()))
+    .into_envelope(msg_at(from, epoch, seq), ContextId(CTX.into()))
 }
 
 fn shaped(
@@ -127,9 +131,23 @@ fn shaped(
     task: Option<&str>,
     body: serde_json::Value,
 ) -> Envelope {
+    shaped_at(from, 0, seq, to, class, contract, task, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shaped_at(
+    from: &str,
+    epoch: u64,
+    seq: u64,
+    to: &str,
+    class: Class,
+    contract: &str,
+    task: Option<&str>,
+    body: serde_json::Value,
+) -> Envelope {
     Envelope {
         v: 1,
-        msg: msg(from, seq),
+        msg: msg_at(from, epoch, seq),
         from: from.into(),
         to: Recipient::Npub(to.into()),
         class,
@@ -160,7 +178,10 @@ fn governed(tag: &str) -> (PathBuf, PathBuf) {
     for (name, env) in [
         ("r0.json", role_fact(&op, 0, CAP, Role::Captain)),
         ("r1.json", role_fact(CAP, 0, CREW, Role::Crew)),
-        ("r2.json", role_fact(CAP, 1, PEER, Role::Peer)),
+        // Sequencing is per (producer, recipient) scope: CAP->PEER is a fresh
+        // scope even though CAP already appended to CREW's scope. The log's
+        // (producer, epoch, seq) key also needs a distinct epoch per scope.
+        ("r2.json", role_fact_at(CAP, 1, 0, PEER, Role::Peer)),
     ] {
         let o = append(&dir, &key, Some("1"), name, &env);
         assert!(
@@ -375,9 +396,10 @@ fn refused_as(o: &Output, tag: &str) -> serde_json::Value {
     v
 }
 
-fn steer_at(from: &str, seq: u64, sup_epoch: u64) -> Envelope {
-    shaped(
+fn steer_at_epoch(from: &str, epoch: u64, seq: u64, sup_epoch: u64) -> Envelope {
+    shaped_at(
         from,
+        epoch,
         seq,
         CREW,
         Class::Control,
@@ -407,7 +429,13 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     }
 
     let v = refused_as(
-        &append(&dir, &key, Some("1"), "s0.json", &steer_at(CAP, 1, 1)),
+        &append(
+            &dir,
+            &key,
+            Some("1"),
+            "s0.json",
+            &steer_at_epoch(CAP, 2, 0, 1),
+        ),
         "no_lead",
     );
     assert_eq!(v["refused"]["context"], CTX);
@@ -416,7 +444,13 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
         "{v}"
     );
 
-    let o = append(&dir, &key, Some("1"), "s0op.json", &steer_at(&op, 1, 0));
+    let o = append(
+        &dir,
+        &key,
+        Some("1"),
+        "s0op.json",
+        &steer_at_epoch(&op, 1, 0, 0),
+    );
     assert!(
         o.status.success(),
         "operator steer with no lead: {}",
@@ -424,9 +458,10 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     );
     assert_eq!(json(&o)["replay"], false);
 
-    let lead = shaped(
+    let lead = shaped_at(
         &op,
         2,
+        0,
         CAP,
         Class::Control,
         "lead",
@@ -436,12 +471,20 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     let o = append(&dir, &key, Some("1"), "lead.json", &lead);
     assert!(
         o.status.success(),
-        "lead: {}",
+        "lead: exit {:?} stdout {} stderr {}",
+        o.status.code(),
+        String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
 
     let v = refused_as(
-        &append(&dir, &key, Some("1"), "s1.json", &steer_at(&op, 3, 1)),
+        &append(
+            &dir,
+            &key,
+            Some("1"),
+            "s1.json",
+            &steer_at_epoch(&op, 3, 0, 1),
+        ),
         "not_lead_holder",
     );
     assert_eq!(v["refused"]["actor"], op.as_str());
@@ -449,12 +492,24 @@ fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
     assert_eq!(v["refused"]["sup_epoch"], 1);
 
     let v = refused_as(
-        &append(&dir, &key, Some("1"), "s2.json", &steer_at(CAP, 1, 0)),
+        &append(
+            &dir,
+            &key,
+            Some("1"),
+            "s2.json",
+            &steer_at_epoch(CAP, 2, 0, 0),
+        ),
         "stale_sup_epoch",
     );
     assert_eq!(v["refused"]["current"], 1);
 
-    let o = append(&dir, &key, Some("1"), "s3.json", &steer_at(CAP, 1, 1));
+    let o = append(
+        &dir,
+        &key,
+        Some("1"),
+        "s3.json",
+        &steer_at_epoch(CAP, 2, 0, 1),
+    );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
     assert_eq!(json(&o)["replay"], false);
 }

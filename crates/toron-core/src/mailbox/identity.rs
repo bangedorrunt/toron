@@ -1085,12 +1085,9 @@ impl Mailbox {
         .ok()
         .flatten()?;
         if alias == "captain" && !self.captain_target_live(pool, project_slug, &folded).await {
-            let _ = sqlx::query(
-                "DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
-            )
-            .bind(project_slug)
-            .execute(pool)
-            .await;
+            // A read reports the dead fold, but never mutates the alias table:
+            // destructive cleanup belongs to the explicit registration/clear
+            // path, not to whois or the send-path resolver (ADR-0018 D4).
             return None;
         }
         Some(folded)
@@ -1497,7 +1494,8 @@ impl Mailbox {
     /// any-name resolution (AM-Rust parity).
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
         let canonical = self.canonical_project(project_slug).await;
-        let panes = Self::live_pin_pane_map(self.plane.as_deref(), &canonical);
+        let panes =
+            Self::live_pin_pane_map(self.plane.as_deref(), self.index_pool(), &canonical).await;
         self.whois_inner(&canonical, name, panes).await
     }
 
@@ -1725,7 +1723,8 @@ impl Mailbox {
             agents.retain(|a| a.last_active_ts_us >= cutoff);
         }
         agents.sort_by_key(|b| std::cmp::Reverse(b.last_active_ts_us));
-        let mut panes = Self::live_pin_pane_map(self.plane.as_deref(), &canonical);
+        let mut panes =
+            Self::live_pin_pane_map(self.plane.as_deref(), self.index_pool(), &canonical).await;
         for agent in &mut agents {
             if let Some(pane) = panes.remove(&agent.name) {
                 agent.identity_divergent = pane
@@ -1774,8 +1773,9 @@ impl Mailbox {
     /// bd-zoir: a pin the direct sweep misses falls back to the flywheel
     /// spawn registry binding for `project`, so a pane re-bound under another
     /// display pin still answers for its mail identity.
-    fn live_pin_pane_map(
+    async fn live_pin_pane_map(
         plane: Option<&dyn crate::plane_port::PanePlane>,
+        pool: Option<&sqlx::SqlitePool>,
         project: &str,
     ) -> std::collections::HashMap<String, PaneRef> {
         let Some(plane) = plane else {
@@ -1794,11 +1794,20 @@ impl Mailbox {
             plane.agent_list().unwrap_or_default()
         };
         let mut map = pin_pane_map(&panes, &agents);
-        augment_pane_map_with_registry(
-            &mut map,
-            &panes,
-            &spawn_registry_bindings_for_slug(project),
-        );
+        let bindings = match pool {
+            Some(pool) => crate::mailbox::agent_bindings::list(pool, project)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| !b.pane_id.is_empty())
+                .map(|b| SpawnRegistryBinding {
+                    pin: b.pin,
+                    pane_id: b.pane_id,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        augment_pane_map_with_registry(&mut map, &panes, &bindings);
         map
     }
 
@@ -2065,27 +2074,6 @@ pub fn spawn_registry_bindings_in(dir: &std::path::Path, slug: &str) -> Vec<Spaw
         }
     }
     out
-}
-
-/// bd-zoir: flywheel's state dir — `$XDG_STATE_HOME/flywheel` >
-/// `~/.local/state/flywheel`, the same resolution flywheel's
-/// `config::state_dir()` uses (never the macOS App Support dir: live state
-/// lives under `~/.local/state`).
-fn flywheel_state_dir() -> Option<PathBuf> {
-    if let Some(xdg) = crate::config::home_env("XDG_STATE_HOME") {
-        return Some(xdg.join("flywheel"));
-    }
-    let home = crate::config::home_env("HOME")?;
-    Some(home.join(".local").join("state").join("flywheel"))
-}
-
-/// bd-zoir: the ambient spawn-registry read — best-effort, empty when no
-/// state home resolves.
-fn spawn_registry_bindings_for_slug(slug: &str) -> Vec<SpawnRegistryBinding> {
-    match flywheel_state_dir() {
-        Some(state) => spawn_registry_bindings_in(&state.join("agents"), slug),
-        None => Vec::new(),
-    }
 }
 
 /// bd-0sbf: pure resolve core — token-first, `agent.list` name fallback
@@ -4790,21 +4778,44 @@ mod tests {
     /// constructing a backend. A stamped mock pane enriches the map; an
     /// unreachable plane (or none) maps nothing — the same degrade-as-absent
     /// posture as the old per-call `connect_default` failure.
-    #[test]
-    fn live_pin_pane_map_reads_injected_plane() {
+    #[tokio::test]
+    async fn live_pin_pane_map_reads_injected_plane() {
         use crate::plane_port::MockPanePlane;
         let npub = "cc".repeat(32);
         let mock = MockPanePlane::new(
             vec![test_pane_stamped("b:9", "WaveSixA", "proj", &npub)],
             vec![],
         );
-        let map = Mailbox::live_pin_pane_map(Some(&mock), "proj");
+        let map = Mailbox::live_pin_pane_map(Some(&mock), None, "proj").await;
         let hit = map.get("WaveSixA").expect("stamped pin maps");
         assert_eq!(hit.pane_id, "b:9");
-        let empty = Mailbox::live_pin_pane_map(Some(&MockPanePlane::unreachable()), "proj");
+        let empty =
+            Mailbox::live_pin_pane_map(Some(&MockPanePlane::unreachable()), None, "proj").await;
         assert!(empty.is_empty(), "unreachable plane maps nothing");
-        let gone = Mailbox::live_pin_pane_map(None, "proj");
+        let gone = Mailbox::live_pin_pane_map(None, None, "proj").await;
         assert!(gone.is_empty(), "absent plane maps nothing");
+    }
+
+    /// The shared `agent_bindings` table is the binding authority; no state
+    /// home or registry file participates.
+    #[tokio::test]
+    async fn live_pin_pane_map_reads_shared_agent_bindings() {
+        use crate::mailbox::agent_bindings::{AgentBinding, upsert};
+        use crate::plane_port::MockPanePlane;
+        let (_mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("shared-bindings").await;
+        let npub = "dd".repeat(32);
+        let mock = MockPanePlane::new(
+            vec![test_pane_stamped("b:20", "PaneName", "proj", &npub)],
+            vec![],
+        );
+        let mut binding = AgentBinding::pane("proj", "BoundPin", "b:20");
+        binding.name = "PaneName".into();
+        upsert(&pool, "proj", &binding, 1).await.expect("upsert");
+        let map = Mailbox::live_pin_pane_map(Some(&mock), Some(&pool), "proj").await;
+        let hit = map.get("BoundPin").expect("DB binding maps");
+        assert_eq!(hit.pane_id, "b:20");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     /// wave6-b: `resolve_pane_identity` answers from the injected plane

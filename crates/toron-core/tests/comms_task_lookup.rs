@@ -28,12 +28,12 @@ async fn store(tag: &str) -> InboxStore {
     InboxStore::new(pool)
 }
 
-fn env(from: &str, to: &str, class: Class, seq: u64, task: Option<&str>) -> Envelope {
+fn env(from: &str, to: &str, class: Class, epoch: u64, seq: u64, task: Option<&str>) -> Envelope {
     Envelope {
         v: 1,
         msg: MsgId {
             producer: from.into(),
-            epoch: 0,
+            epoch,
             seq,
         },
         from: from.into(),
@@ -61,17 +61,18 @@ fn env(from: &str, to: &str, class: Class, seq: u64, task: Option<&str>) -> Enve
     }
 }
 
-/// A: assigns t-1 to B (seq 0), then sends a follow-up on t-1 to C (seq 1),
-/// and an unrelated task t-2 to B (seq 2).
+/// A: assigns t-1 to B (epoch 0, seq 0), then sends a follow-up on t-1 to C
+/// (its own scope, epoch 1, seq 0), and an unrelated task t-2 to B (epoch 0,
+/// seq 1).
 async fn seeded(tag: &str) -> InboxStore {
     let s = store(tag).await;
-    s.append_envelope(&env(A, B, Class::Task, 0, Some("t-1")))
+    s.append_envelope(&env(A, B, Class::Task, 0, 0, Some("t-1")))
         .await
         .unwrap();
-    s.append_envelope(&env(A, C, Class::Task, 1, Some("t-1")))
+    s.append_envelope(&env(A, C, Class::Task, 1, 0, Some("t-1")))
         .await
         .unwrap();
-    s.append_envelope(&env(A, B, Class::Task, 2, Some("t-2")))
+    s.append_envelope(&env(A, B, Class::Task, 0, 1, Some("t-2")))
         .await
         .unwrap();
     s
@@ -84,7 +85,7 @@ async fn the_sender_sees_every_message_of_its_task_in_order() {
     let s = seeded("sender").await;
     let got = s.by_task("t-1", A).await.unwrap();
     let keys: Vec<_> = got.iter().map(|m| m.msg_key.as_str()).collect();
-    assert_eq!(keys, [format!("{A}:0:0"), format!("{A}:0:1")]);
+    assert_eq!(keys, [format!("{A}:0:0"), format!("{A}:1:0")]);
     assert_eq!(got[0].recipient, B);
     assert_eq!(got[1].recipient, C);
     assert!(got[0].offset < got[1].offset);
@@ -129,12 +130,12 @@ async fn control_a_stranger_sees_nothing() {
 #[tokio::test]
 async fn control_messages_without_a_task_are_not_matched() {
     let s = seeded("notask").await;
-    s.append_envelope(&env(A, B, Class::Notify, 3, None))
+    s.append_envelope(&env(A, B, Class::Notify, 0, 2, None))
         .await
         .unwrap();
     for t in ["t-1", "t-2", ""] {
         let got = s.by_task(t, A).await.unwrap();
-        assert!(got.iter().all(|m| m.msg_key != format!("{A}:0:3")), "{t}");
+        assert!(got.iter().all(|m| m.msg_key != format!("{A}:0:2")), "{t}");
     }
 }
 

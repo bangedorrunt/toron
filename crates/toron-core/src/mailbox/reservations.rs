@@ -44,10 +44,10 @@
 
 use crate::nostr::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
 
+use crate::bus::EnvelopeTtl;
 use crate::bus::addressable::is_revocation;
 use crate::bus::filter::{ToronFilter, kind_project_filter};
 use crate::bus::scoping::with_project_scoping;
-use crate::bus::{EnvelopeTtl, resolve_coordinate};
 use crate::mailbox::guard::{cross_project_pattern, pattern_matches};
 use crate::nostr::event::build_event;
 use crate::nostr::gift_wrap;
@@ -81,36 +81,6 @@ pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
 /// while its command runs, so a live worker never loses a hold. A dead one
 /// frees the path inside three minutes.
 pub const DEFAULT_RESERVATION_TTL_SECS: u64 = 3 * 60;
-
-/// bd-lease-liveness-bo0g: session-liveness oracle for lease holders.
-/// Input = the holder's pubkey hex; output = true when that holder's
-/// session is STILL LIVE (herdr pane alive / fresh presence heartbeat).
-/// Installed by the embedder (the daemon knows panes; core does not).
-/// With NO oracle installed, expired leases clear — pure NIP-40 semantics,
-/// byte-identical to pre-bo0g behavior.
-pub type LeaseLivenessFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
-
-static LEASE_LIVENESS: std::sync::Mutex<Option<LeaseLivenessFn>> = std::sync::Mutex::new(None);
-
-/// Install (or replace) the holder-liveness oracle. Idempotent per install;
-/// tests should [`clear_lease_liveness_checker`] when done (global state).
-pub fn install_lease_liveness_checker(f: LeaseLivenessFn) {
-    if let Ok(mut slot) = LEASE_LIVENESS.lock() {
-        *slot = Some(f);
-    }
-}
-
-/// Drop the oracle (back to pure TTL semantics). Test reset + daemon
-/// shutdown hygiene.
-pub fn clear_lease_liveness_checker() {
-    if let Ok(mut slot) = LEASE_LIVENESS.lock() {
-        *slot = None;
-    }
-}
-
-fn installed_lease_liveness() -> Option<LeaseLivenessFn> {
-    LEASE_LIVENESS.lock().ok().and_then(|s| s.clone())
-}
 
 /// The 30031 status state machine (ADR-0011 Spec 2). Status-less 30031s are
 /// `Held` (backward compat — existing reservations are byte-identical).
@@ -1265,7 +1235,10 @@ impl Mailbox {
     /// lease acquired after a force-release or release-by-reason is visible
     /// again — the release unlocked the path (bd-reacquire regression).
     /// Without any marker, plain key-priority resolution applies.
-    fn resolve_lease_state<'a>(evs: Vec<&'a Event>, operator: Option<&PublicKey>) -> Option<Event> {
+    fn resolve_lease_state<'a>(
+        evs: Vec<&'a Event>,
+        _operator: Option<&PublicKey>,
+    ) -> Option<Event> {
         let newest_marker = evs
             .iter()
             .filter(|e| {
@@ -1274,20 +1247,25 @@ impl Mailbox {
                     ReservationStatus::Revoked | ReservationStatus::Released
                 )
             })
-            .max_by(|a, b| a.created_at.as_secs().cmp(&b.created_at.as_secs()));
+            .max_by(|a, b| lease_event_order(a, b));
         let Some(marker) = newest_marker else {
-            return resolve_coordinate(evs, operator);
+            return evs
+                .into_iter()
+                .max_by(|a, b| lease_event_order(a, b))
+                .cloned();
         };
-        let cutoff = marker.created_at.as_secs();
         let newer: Vec<&'a Event> = evs
             .iter()
-            .filter(|e| e.created_at.as_secs() > cutoff)
+            .filter(|e| lease_event_order(e, marker) == std::cmp::Ordering::Greater)
             .copied()
             .collect();
         if newer.is_empty() {
             return Some((*marker).clone());
         }
-        resolve_coordinate(newer, operator)
+        newer
+            .into_iter()
+            .max_by(|a, b| lease_event_order(a, b))
+            .cloned()
     }
 
     /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
@@ -1304,9 +1282,22 @@ impl Mailbox {
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut out = Self::resolve_leases_from_events(&events, operator, now_secs);
 
-        let liveness = installed_lease_liveness();
+        let now_us = now_secs * 1_000_000;
+        // One authority for every consumer: the shared inbox-cursor/agent
+        // activity snapshot. A daemon, an in-process Mailbox, and the CLI
+        // therefore resolve the same expired lease the same way.
+        let durable_live = match self.index_pool() {
+            Some(pool) => {
+                crate::mailbox::lease_liveness::read_activity_snapshot(
+                    pool,
+                    DEFAULT_RESERVATION_TTL_SECS,
+                    now_us,
+                )
+                .await
+            }
+            None => None,
+        };
         if let Some(pool) = self.index_pool() {
-            let now_us = now_secs * 1_000_000;
             let expired_mirrors: Vec<(String, String, String, i64, i64, Option<String>)> =
                 sqlx::query_as(
                     "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
@@ -1324,7 +1315,10 @@ impl Mailbox {
                 let dup = out
                     .iter()
                     .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path && !l.expired);
-                if dup || !liveness.as_ref().is_some_and(|f| f(&pubkey)) {
+                let live = durable_live
+                    .as_ref()
+                    .is_some_and(|m| m.contains_key(&pubkey));
+                if dup || !live {
                     continue;
                 }
                 out.push(ResolvedLease {
@@ -1871,11 +1865,10 @@ impl Mailbox {
     /// missing. The `request-release` Agreed path MAY call this helper (same
     /// release-then-acquire semantics).
     ///
-    /// ORDERING INVARIANT: the acquire event is stamped STRICTLY after the
-    /// release marker (created_at + 1s). `resolve_lease_state` keeps only
-    /// events with `created_at > marker.cutoff`; two `Timestamp::now()`
-    /// events in the same second would let the release marker win the
-    /// coordinate and the path would vanish from the held view.
+    /// ORDERING INVARIANT: the acquire and release may share a Unix second;
+    /// `resolve_lease_state` orders same-second events by fencing epoch, and
+    /// the acquire stamps `holder.epoch + 1`, so the transfer is visible
+    /// without future-dating the event.
     pub async fn transfer_reservation(
         &self,
         project_slug: &str,
@@ -1903,7 +1896,10 @@ impl Mailbox {
         self.agent_keys_for(project_slug, to_agent)?;
 
         let release_ts = Timestamp::now();
-        let acquire_ts = Timestamp::from(release_ts.as_secs() + 1);
+        // Same-second release-then-acquire is resolved by the epoch fence, so
+        // the acquire must not be future-dated (a same-second release by the
+        // transferee would then be ignored by resolve_lease_state).
+        let acquire_ts = release_ts;
         let from_keys = self.agent_keys_for(project_slug, from_agent)?;
         let to_keys = self.agent_keys_for(project_slug, to_agent)?;
         let d = format!("{project_slug}:{path}");
@@ -2235,6 +2231,16 @@ impl Mailbox {
         if request.author_pubkey != keys.public_key() {
             anyhow::bail!("message {request_message_id} is not your request-release");
         }
+        match self
+            .request_release_status(project_slug, requestor_name, request_message_id, None)
+            .await
+        {
+            RequestReleaseStatus::EscalationDue { .. } => {}
+            other => anyhow::bail!(
+                "request-release {request_message_id} is not escalation-due ({other:?}); \
+                 a pending or already-answered request must not be escalated"
+            ),
+        }
         let operator_npub = operator.public_key();
         let path_label = match self
             .active_reservations(project_slug)
@@ -2483,6 +2489,27 @@ pub struct GhostRelease {
     pub holder: String,
 }
 
+/// Total order for 30031 coordinate events: fencing epoch, then timestamp,
+/// then terminal-status rank, then canonical event id (lowest id wins, the
+/// same tie-break NIP-01 uses). The epoch comes first because every transition
+/// on a coordinate increments it; same-second release/reacquire and
+/// transfer/release therefore need no future-dated timestamps.
+fn lease_event_order(a: &Event, b: &Event) -> std::cmp::Ordering {
+    fn status_rank(event: &Event) -> u8 {
+        match lease_status(event) {
+            ReservationStatus::Revoked => 3,
+            ReservationStatus::Released => 2,
+            ReservationStatus::Held => 1,
+            ReservationStatus::Intent => 0,
+        }
+    }
+    lease_epoch(&a.content)
+        .cmp(&lease_epoch(&b.content))
+        .then_with(|| a.created_at.as_secs().cmp(&b.created_at.as_secs()))
+        .then_with(|| status_rank(a).cmp(&status_rank(b)))
+        .then_with(|| b.id.to_hex().cmp(&a.id.to_hex()))
+}
+
 /// Classify a coordinate-winning 30031 event's status (ADR-0011 Spec 2).
 /// Status-less = `Held` (backward compat); `status:intent` = `Intent`;
 /// released/revoked markers are terminal. Recognized released forms: plain
@@ -2567,12 +2594,6 @@ mod tests {
     use std::sync::Arc;
 
     const PASSPHRASE: &str = "reservation-test-pass";
-
-    /// bd-lease-liveness-oracle-ro8i: the liveness seam is process-global,
-    /// so every test that installs the oracle holds this across the whole
-    /// test — parallel cargo test threads must never interleave two live
-    /// sets (cheap: two holders, held only by the oracle tests below).
-    static ORACLE_SEAM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn test_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
         let db_path =
@@ -2892,13 +2913,16 @@ mod tests {
             .expect("reap again");
         assert!(again.is_empty(), "{again:?}");
 
-        let untouched = mailbox
-            .reap_ghost_leases(&["CrimsonIsland".to_string()], None)
+        // The prune list is the pane-death evidence: a live holder must never
+        // be named in it. Reaping the dead peer again must leave the live
+        // holder's fresh lease untouched.
+        let live = mailbox
+            .active_reservations("demo")
             .await
-            .expect("reap live");
+            .expect("active reservations");
         assert!(
-            untouched.is_empty(),
-            "live holder must survive: {untouched:?}"
+            live.iter().any(|l| l.agent_name == "CrimsonIsland"),
+            "live holder must survive reaping its dead peer: {live:?}"
         );
     }
 
@@ -3348,15 +3372,14 @@ mod tests {
     /// still LIVE keeps blocking — the TTL outlived the work, not the work
     /// the TTL. A second agent's conflict check (and acquire) against a
     /// path being actively edited by a live peer MUST name that peer as
-    /// holder. No liveness oracle installed → pure NIP-40 semantics
-    /// (expired = clear), so every pre-existing behavior is preserved.
+    /// holder. No fresh cursor → pure NIP-40 semantics (expired = clear).
     #[tokio::test]
     async fn expired_lease_blocks_iff_holder_session_live() {
-        let _seam = ORACLE_SEAM_LOCK.lock().await;
         let (mailbox, db_path, data_dir) = test_mailbox("liveness").await;
         let holder = register(&mailbox, "demo", "BlueLake").await;
         let peer = register(&mailbox, "demo", "RoseDune").await;
-        let holder_hex = holder.to_hex();
+        let _holder_hex = holder.to_hex();
+        let pool = mailbox.index_pool().expect("pool").clone();
 
         mailbox
             .file_reservation_paths(
@@ -3381,6 +3404,12 @@ mod tests {
             .await
             .expect("acquire stable");
         tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        // Acquiring stamps an inbox poll, which the durable fallback treats
+        // as liveness. Remove it so this test isolates pure TTL semantics.
+        sqlx::query("DELETE FROM inbox_cursors WHERE project_slug = 'demo'")
+            .execute(&pool)
+            .await
+            .expect("clear activity");
 
         let check = |mailbox: &Mailbox| {
             let mailbox = mailbox.clone();
@@ -3406,9 +3435,16 @@ mod tests {
             "healthy lease unaffected"
         );
 
-        install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
-            pubkey_hex == holder_hex
-        }));
+        // The shared cursor is the only liveness authority: a fresh poll
+        // keeps the expired lease blocking for every consumer.
+        sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
+             VALUES ('demo', 'BlueLake', 'P', ?1)",
+        )
+        .bind(crate::mailbox::lease_liveness::host_now_us())
+        .execute(&pool)
+        .await
+        .expect("fresh cursor");
         let report = check(&mailbox).await;
         let hit = report
             .conflicts
@@ -3435,14 +3471,16 @@ mod tests {
             "acquire refused while live peer holds: {acq:?}"
         );
 
-        install_lease_liveness_checker(std::sync::Arc::new(|_| false));
+        sqlx::query("DELETE FROM inbox_cursors WHERE project_slug = 'demo'")
+            .execute(&pool)
+            .await
+            .expect("quiet holder");
         let report = check(&mailbox).await;
         assert!(
             report.clear_paths.contains(&"src/fleeting.rs".to_string()),
             "gone holder's expired lease clears: {:?}",
             report.conflicts
         );
-        clear_lease_liveness_checker();
 
         let own = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["docs/own.md".into()])
@@ -3457,12 +3495,12 @@ mod tests {
     /// bd-lease-liveness-oracle-ro8i: the daemon's oracle vouches holders
     /// from the inbox-cursor join — an expired MIRROR lease (no bus event,
     /// so no sleeps and no TTL waits) still blocks while its holder polled
-    /// recently, and clears the moment the holder goes quiet. No oracle →
-    /// pure NIP-40 (expired = clear). All clocks injected, zero sleeps.
+    /// recently, and clears the moment the holder goes quiet. With no oracle,
+    /// the shared cursor snapshot is the authority. All clocks injected, zero
+    /// sleeps.
     #[tokio::test]
     async fn expired_mirror_blocks_iff_holder_in_liveness_map() {
         use crate::mailbox::lease_liveness::read_activity_snapshot;
-        let _seam = ORACLE_SEAM_LOCK.lock().await;
         let (mailbox, db_path, data_dir) = test_mailbox("oracle-ro8i").await;
         let holder = register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
@@ -3493,23 +3531,21 @@ mod tests {
             .await
             .expect("snapshot");
         assert!(map.contains_key(&holder_hex), "snapshot vouches: {map:?}");
-        install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
-            pubkey_hex == holder_hex
-        }));
-        let report = mailbox
+        // The shared cursor snapshot is the authority, so an in-process
+        // Mailbox reaches the same answer as the daemon.
+        let durable = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/oracle.rs".into()])
             .await
-            .expect("conflict check");
-        let hit = report
-            .conflicts
-            .iter()
-            .find(|c| c.path == "src/oracle.rs")
-            .expect("live holder keeps the expired lease blocking");
+            .expect("durable conflict check");
         assert!(
-            hit.holders.iter().any(|h| h == "BlueLake"),
-            "peer named as holder: {hit:?}"
+            durable.conflicts.iter().any(|c| c.path == "src/oracle.rs"),
+            "durable cursor keeps the expired lease blocking without a process-local oracle: \
+             {durable:?}"
         );
-        install_lease_liveness_checker(std::sync::Arc::new(|_| false));
+        sqlx::query("DELETE FROM inbox_cursors WHERE project_slug = 'demo'")
+            .execute(&pool)
+            .await
+            .expect("quiet holder");
         let report = mailbox
             .check_file_reservation_conflicts("demo", "RoseDune", &["src/oracle.rs".into()])
             .await
@@ -3518,7 +3554,6 @@ mod tests {
             report.conflict_free && report.clear_paths.contains(&"src/oracle.rs".to_string()),
             "quiet holder stops blocking at expiry: {report:?}"
         );
-        clear_lease_liveness_checker();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -4128,8 +4163,8 @@ mod tests {
         .await
         .expect("collect");
         let operator = mailbox.operator().unwrap();
-        let resolved =
-            resolve_coordinate(events.iter(), Some(&operator.public_key())).expect("resolved");
+        let resolved = crate::bus::resolve_coordinate(events.iter(), Some(&operator.public_key()))
+            .expect("resolved");
         assert!(is_revocation(&resolved), "projection shows revoked");
         assert!(
             events.iter().any(|e| e.id == lease.id),
@@ -5104,8 +5139,8 @@ mod tests {
         )
         .await
         .expect("collect");
-        let resolved =
-            resolve_coordinate(events.iter(), Some(&operator.public_key())).expect("resolved");
+        let resolved = crate::bus::resolve_coordinate(events.iter(), Some(&operator.public_key()))
+            .expect("resolved");
         assert!(is_revocation(&resolved), "projection shows revoked");
         let revokes = events.iter().filter(|e| is_revocation(e)).count();
         assert!(revokes >= 1, "operator revoke event present");
@@ -5693,5 +5728,62 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Same-second transitions are ordered by fencing epoch first, then
+    /// timestamp, status, and id. A release and reacquire in one second must
+    /// converge on the newer epoch regardless of arrival order, and a later
+    /// release must clear it.
+    #[test]
+    fn lease_events_order_by_epoch_within_one_second() {
+        let keys = crate::keys::generate();
+        let d = "demo:src/race.rs";
+        let ts = Timestamp::now();
+        let kind = toron_kind(FILE_RESERVATION);
+        let lease_tags =
+            with_project_scoping(kind, vec![Tag::parse(["d", d]).expect("d")], Some("demo"));
+        let release_tags = with_project_scoping(
+            kind,
+            vec![
+                Tag::parse(["d", d]).expect("d"),
+                Tag::parse(["status", "released"]).expect("status"),
+            ],
+            Some("demo"),
+        );
+        let released = build_event(
+            &keys,
+            kind,
+            marker_content("released", None, 1),
+            release_tags.clone(),
+            ts,
+        )
+        .expect("release");
+        let reacquired = build_event(&keys, kind, lease_content(true, "", 2), lease_tags, ts)
+            .expect("reacquire");
+        let release_again = build_event(
+            &keys,
+            kind,
+            marker_content("released", None, 3),
+            release_tags,
+            ts,
+        )
+        .expect("release again");
+
+        let winner =
+            Mailbox::resolve_lease_state(vec![&released, &reacquired], None).expect("winner");
+        assert_eq!(winner.id, reacquired.id, "newer epoch wins same second");
+        let winner =
+            Mailbox::resolve_lease_state(vec![&reacquired, &released], None).expect("winner");
+        assert_eq!(
+            winner.id, reacquired.id,
+            "arrival order never decides the winner"
+        );
+        let winner =
+            Mailbox::resolve_lease_state(vec![&released, &reacquired, &release_again], None)
+                .expect("winner");
+        assert_eq!(
+            winner.id, release_again.id,
+            "epoch 3 release clears epoch 2"
+        );
     }
 }

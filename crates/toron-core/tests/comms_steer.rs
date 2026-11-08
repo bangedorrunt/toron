@@ -33,6 +33,9 @@ async fn store(tag: &str) -> InboxStore {
     InboxStore::new(pool).with_operator(OP)
 }
 
+/// The inbox sequences per `(producer, recipient)` scope and fences epochs
+/// per producer. Give every fixture message a fresh epoch and seq 0: each
+/// scope starts legitimately, and a refused probe consumes no accepted seq.
 struct Seqs(BTreeMap<String, u64>);
 
 impl Seqs {
@@ -40,24 +43,21 @@ impl Seqs {
         Self(BTreeMap::new())
     }
     fn msg(&mut self, from: &str) -> MsgId {
-        let n = self.0.entry(from.to_string()).or_insert(0);
-        MsgId {
+        let epoch = self.0.entry(from.to_string()).or_insert(0);
+        let msg = MsgId {
             producer: from.into(),
-            epoch: 0,
-            seq: *n,
-        }
-    }
-    fn used(&mut self, from: &str) {
-        *self.0.get_mut(from).unwrap() += 1;
+            epoch: *epoch,
+            seq: 0,
+        };
+        *epoch += 1;
+        msg
     }
 }
 
-async fn put(s: &InboxStore, q: &mut Seqs, env: Envelope) {
-    let from = env.from.clone();
+async fn put(s: &InboxStore, _q: &mut Seqs, env: Envelope) {
     s.append_envelope(&env)
         .await
         .unwrap_or_else(|e| panic!("append {} {} failed: {e}", env.class.as_str(), env.contract));
-    q.used(&from);
 }
 
 fn role_fact(m: MsgId, subject: &str, role: Role) -> Envelope {
@@ -347,16 +347,25 @@ async fn progress_and_done_wait_until_the_steer_is_acked() {
     )
     .await;
     let batch = s.next(CREW, None, false).await.unwrap();
+    let steer_item = batch
+        .items
+        .iter()
+        .find(|i| i.msg_key == steer_key)
+        .expect("the unread steer is in this batch");
     assert_eq!(
-        batch.items.len(),
-        1,
-        "only the unread steer is in this batch"
-    );
-    assert_eq!(batch.items[0].msg_key, steer_key);
-    assert_eq!(
-        batch.items[0].allowed_now,
+        steer_item.allowed_now,
         steer_pending_verbs(&steer_key),
-        "pending steer on the head item, not the phase table and not the projection"
+        "pending steer on the steer item, not the phase table and not the projection"
+    );
+    let task_item = batch
+        .items
+        .iter()
+        .find(|i| i.msg_key == key)
+        .expect("the acked task remains a live straggler");
+    assert_eq!(
+        task_item.allowed_now,
+        steer_pending_verbs(&steer_key),
+        "pending steer blocks the task even when it is not the batch head"
     );
 
     s.ack(CREW, &steer_key, true, None).await.unwrap();

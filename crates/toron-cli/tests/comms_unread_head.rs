@@ -18,7 +18,7 @@ use toron_core::inbox::{HeadRow, InboxStore};
 use toron_core::wake::Urgency;
 
 const SYS: &str = "5959595959595959595959595959595959595959595959595959595959595901";
-const CREW: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+const CREW_PIN: &str = "AmberFox";
 const CTX: &str = "proj-head-cli";
 
 fn scratch(tag: &str) -> PathBuf {
@@ -66,16 +66,24 @@ fn ok_json(o: &Output) -> serde_json::Value {
     serde_json::from_slice(&o.stdout).expect("JSON on stdout")
 }
 
-fn env(from: &str, seq: u64, class: Class, name: &str, body: serde_json::Value) -> Envelope {
+fn env(
+    from: &str,
+    epoch: u64,
+    seq: u64,
+    class: Class,
+    name: &str,
+    to: &str,
+    body: serde_json::Value,
+) -> Envelope {
     Envelope {
         v: 1,
         msg: MsgId {
             producer: from.into(),
-            epoch: 0,
+            epoch,
             seq,
         },
         from: from.into(),
-        to: Recipient::Npub(if name == "lead" { SYS } else { CREW }.into()),
+        to: Recipient::Npub(if name == "lead" { SYS } else { to }.into()),
         class,
         contract: ContractId::new(name, 1),
         context: ContextId(CTX.into()),
@@ -114,24 +122,24 @@ fn served(batch: &serde_json::Value) -> (u64, Option<HeadRow>) {
     (before, head)
 }
 
-async fn head_in_process(dir: &Path, after: u64) -> Option<HeadRow> {
+async fn head_in_process(dir: &Path, reader: &str, after: u64) -> Option<HeadRow> {
     let db = dir.join("data").join(toron_core::config::INDEX_SQLITE);
     let pool = toron_core::index::schema::connect(db.to_str().unwrap())
         .await
         .expect("open the fixture root");
     InboxStore::new(pool)
-        .unread_head(CREW, after)
+        .unread_head(reader, after)
         .await
         .unwrap()
 }
 
-async fn urgent_in_process(dir: &Path, after: u64) -> Option<HeadRow> {
+async fn urgent_in_process(dir: &Path, reader: &str, after: u64) -> Option<HeadRow> {
     let db = dir.join("data").join(toron_core::config::INDEX_SQLITE);
     let pool = toron_core::index::schema::connect(db.to_str().unwrap())
         .await
         .expect("open the fixture root");
     InboxStore::new(pool)
-        .pending_urgent(CREW, after)
+        .pending_urgent(reader, after)
         .await
         .unwrap()
 }
@@ -156,8 +164,14 @@ async fn the_head_is_what_toron_next_serves() {
         .unwrap()
         .public_key()
         .to_hex();
+    let boot = ok_json(&toron(
+        &dir,
+        Some(&key),
+        &["agent", "bootstrap", "--project", CTX, "--as", CREW_PIN],
+    ));
+    let crew = boot["npub"].as_str().expect("crew npub").to_string();
     let next = |peek: bool| {
-        let mut a = vec!["next", "--project", CTX, "--as", CREW];
+        let mut a = vec!["next", "--project", CTX, "--as", CREW_PIN];
         if peek {
             a.push("--peek");
         }
@@ -168,7 +182,15 @@ async fn the_head_is_what_toron_next_serves() {
         let o = toron(
             &dir,
             Some(&key),
-            &["next", "--project", CTX, "--as", CREW, "--peek", "--urgent"],
+            &[
+                "next",
+                "--project",
+                CTX,
+                "--as",
+                CREW_PIN,
+                "--peek",
+                "--urgent",
+            ],
         );
         match o.status.code() {
             Some(0) => {
@@ -186,46 +208,54 @@ async fn the_head_is_what_toron_next_serves() {
 
     let (c, s) = served(&next(true));
     assert_eq!(s, None);
-    assert_eq!(head_in_process(&dir, c).await, None);
+    assert_eq!(head_in_process(&dir, &crew, c).await, None);
     assert!(!urgent_cli());
-    assert_eq!(urgent_in_process(&dir, c).await, None);
+    assert_eq!(urgent_in_process(&dir, &crew, c).await, None);
 
     let lead = env(
         &op,
         0,
+        0,
         Class::Control,
         "lead",
+        &crew,
         serde_json::json!({"holder": SYS, "sup_epoch": 1}),
     );
     append(&dir, &key, 0, &lead);
     let notice = env(
         &op,
         1,
+        0,
         Class::Notify,
         "notify",
+        &crew,
         serde_json::json!({"text": "urgent, says the text"}),
     );
     append(&dir, &key, 1, &notice);
     assert!(!urgent_cli());
-    assert_eq!(urgent_in_process(&dir, 0).await, None);
+    assert_eq!(urgent_in_process(&dir, &crew, 0).await, None);
     let steer = env(
         SYS,
         0,
+        0,
         Class::Control,
         "steer",
+        &crew,
         serde_json::json!({"op": "pause", "priority": "urgent", "sup_epoch": 1}),
     );
     append(&dir, &key, 2, &steer);
 
     let batch = next(true);
     let (c, s) = served(&batch);
-    let h = head_in_process(&dir, c).await;
+    let h = head_in_process(&dir, &crew, c).await;
     assert_eq!(h, s);
     let h = h.unwrap();
     assert_eq!(h.contract, ContractId::new("notify", 1));
     assert_eq!(h.urgency, Urgency::Normal);
     assert!(urgent_cli());
-    let u = urgent_in_process(&dir, c).await.expect("pending urgent");
+    let u = urgent_in_process(&dir, &crew, c)
+        .await
+        .expect("pending urgent");
     assert_eq!(
         u.offset.get(),
         batch["items"][1]["offset"].as_u64().unwrap(),
@@ -236,25 +266,52 @@ async fn the_head_is_what_toron_next_serves() {
     let read = next(false);
     let after = read["cursor_after"].as_u64().unwrap();
     assert_eq!(read["items"].as_array().unwrap().len(), 2);
+    let steer_msg = read["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|it| it["envelope"]["contract"]["name"] == "steer")
+        .and_then(|it| it["msg_key"].as_str())
+        .expect("steer in the batch")
+        .to_string();
+    ok_json(&toron(
+        &dir,
+        Some(&key),
+        &[
+            "ack",
+            &steer_msg,
+            "accept",
+            "--project",
+            CTX,
+            "--as",
+            CREW_PIN,
+        ],
+    ));
     let (c, s) = served(&next(true));
     assert_eq!(c, after);
     assert_eq!(s, None);
-    assert_eq!(head_in_process(&dir, after).await, None);
+    assert_eq!(head_in_process(&dir, &crew, after).await, None);
     assert!(!urgent_cli(), "read: not pending");
-    assert_eq!(urgent_in_process(&dir, after).await, None);
+    assert_eq!(
+        urgent_in_process(&dir, &crew, after).await,
+        None,
+        "after={after} read={read} batch={batch}"
+    );
 
     let steer2 = env(
         SYS,
+        0,
         1,
         Class::Control,
         "steer",
+        &crew,
         serde_json::json!({"op": "resume", "priority": "urgent", "sup_epoch": 1}),
     );
     append(&dir, &key, 3, &steer2);
     let (c, s) = served(&next(true));
-    let h = head_in_process(&dir, c).await;
+    let h = head_in_process(&dir, &crew, c).await;
     assert_eq!(h, s);
     assert_eq!(h.clone().unwrap().urgency, Urgency::Urgent);
     assert!(urgent_cli());
-    assert_eq!(urgent_in_process(&dir, c).await, h);
+    assert_eq!(urgent_in_process(&dir, &crew, c).await, h);
 }

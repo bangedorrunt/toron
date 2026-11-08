@@ -128,7 +128,11 @@ impl Mailbox {
         // (parity bug bd-XXX: reported under-extension to ~10s).
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let existing = active_slot(pool, project_slug, slot).await;
-        let base_abs_us = existing.and_then(|s| s.expires_ts_us).unwrap_or(now_us);
+        let base_abs_us = existing
+            .as_ref()
+            .and_then(|s| s.expires_ts_us)
+            .unwrap_or(now_us);
+        let exclusive = existing.as_ref().is_none_or(|s| s.exclusive);
         let new_expiry = base_abs_us.saturating_add(extend_secs as i64 * 1_000_000);
         let renewed = slots::renew_slot(pool, project_slug, slot, &npub, new_expiry).await?;
         if !renewed {
@@ -146,7 +150,7 @@ impl Mailbox {
         let event = build_event(
             &agent_keys,
             toron_kind(BUILD_SLOT),
-            r#"{"exclusive":true}"#,
+            serde_json::json!({ "exclusive": exclusive }).to_string(),
             tags,
             created,
         )?;

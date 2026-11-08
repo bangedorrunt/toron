@@ -1369,6 +1369,72 @@ pub struct GraphModel {
     pub phase: GraphPhase,
 }
 
+/// One persisted durable run, tagged by model shape.
+///
+/// Before this wrapper the store was shape-blind: every row was parsed as
+/// `RunModel` first, so a parked DAG row looked corrupt and was left behind on
+/// restart. The tag makes the shape explicit; [`Self::decode`] still accepts
+/// bare legacy models so an upgrade resumes rows written by the old host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "model", content = "state", rename_all = "snake_case")]
+pub enum PersistedWorkflowModel {
+    /// A `steps:` workflow.
+    Linear(Box<RunModel>),
+    /// A `graph:` workflow.
+    Graph(Box<GraphModel>),
+}
+
+impl PersistedWorkflowModel {
+    /// Decode a new tagged row, falling back to a bare pre-tag model.
+    ///
+    /// The fallback is deliberately one-way: new writes are always tagged, so
+    /// a future shape cannot be mistaken for an old linear row.
+    pub fn decode(json: &str) -> Result<Self, String> {
+        if let Ok(model) = serde_json::from_str::<Self>(json) {
+            return Ok(model);
+        }
+        if let Ok(model) = serde_json::from_str::<RunModel>(json) {
+            return Ok(Self::Linear(Box::new(model)));
+        }
+        if let Ok(model) = serde_json::from_str::<GraphModel>(json) {
+            return Ok(Self::Graph(Box::new(model)));
+        }
+        Err("neither a tagged durable model nor a legacy linear/graph model".to_string())
+    }
+
+    /// True for terminal phases in either shape.
+    pub const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Linear(model) => model.is_terminal(),
+            Self::Graph(model) => model.is_terminal(),
+        }
+    }
+
+    /// The stored workflow definition.
+    pub fn workflow(&self) -> &Workflow {
+        match self {
+            Self::Linear(model) => &model.workflow,
+            Self::Graph(model) => &model.workflow,
+        }
+    }
+
+    /// The stored trigger payload.
+    pub fn trigger(&self) -> &serde_json::Value {
+        match self {
+            Self::Linear(model) => &model.trigger,
+            Self::Graph(model) => &model.trigger,
+        }
+    }
+
+    /// The run key.
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Linear(model) => &model.run_id,
+            Self::Graph(model) => &model.run_id,
+        }
+    }
+}
+
 /// One input to the pure graph transition.
 #[derive(Clone, Debug)]
 pub enum GraphMsg {
@@ -2955,5 +3021,63 @@ fn is_graph_sequencable(action: &Action) -> bool {
         Action::CallWorkflow { .. } => true,
         Action::Delay { .. } | Action::RequestApproval { .. } | Action::Reduce { .. } => true,
         _ => matches!(partition(action), ActionPartition::HostSink { .. }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::Workflow;
+
+    fn empty_workflow(name: &str) -> Workflow {
+        Workflow {
+            name: name.into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        }
+    }
+
+    /// New rows carry a shape tag; bare rows written before the tag still
+    /// decode. This is the upgrade contract for a restart mid-run.
+    #[test]
+    fn persisted_model_tag_roundtrips_and_accepts_legacy_rows() {
+        let linear = RunModel::new(
+            "run-linear",
+            empty_workflow("linear"),
+            serde_json::json!({}),
+        );
+        let legacy = serde_json::to_string(&linear).expect("legacy encode");
+        assert!(!legacy.contains("\"model\""));
+        match PersistedWorkflowModel::decode(&legacy).expect("legacy decode") {
+            PersistedWorkflowModel::Linear(model) => assert_eq!(model.run_id, "run-linear"),
+            PersistedWorkflowModel::Graph(_) => panic!("bare linear row decoded as a graph"),
+        }
+        let tagged = serde_json::to_string(&PersistedWorkflowModel::Linear(Box::new(linear)))
+            .expect("tagged encode");
+        assert!(tagged.contains("\"model\":\"linear\""), "{tagged}");
+        match PersistedWorkflowModel::decode(&tagged).expect("tagged decode") {
+            PersistedWorkflowModel::Linear(model) => assert_eq!(model.run_id, "run-linear"),
+            PersistedWorkflowModel::Graph(_) => panic!("tagged linear row decoded as a graph"),
+        }
+
+        let graph = GraphModel::new("run-graph", empty_workflow("graph"), serde_json::json!({}));
+        let legacy_graph = serde_json::to_string(&graph).expect("legacy graph encode");
+        match PersistedWorkflowModel::decode(&legacy_graph).expect("legacy graph decode") {
+            PersistedWorkflowModel::Graph(model) => assert_eq!(model.run_id, "run-graph"),
+            PersistedWorkflowModel::Linear(_) => panic!("bare graph row decoded as linear"),
+        }
+        let tagged_graph = serde_json::to_string(&PersistedWorkflowModel::Graph(Box::new(graph)))
+            .expect("tagged graph encode");
+        match PersistedWorkflowModel::decode(&tagged_graph).expect("tagged graph decode") {
+            PersistedWorkflowModel::Graph(model) => assert_eq!(model.run_id, "run-graph"),
+            PersistedWorkflowModel::Linear(_) => panic!("tagged graph row decoded as linear"),
+        }
     }
 }

@@ -419,10 +419,12 @@ impl MultiplexerBackend for SuperlogicalBackend {
         let rex = Self::rex()?;
         let sessions = parse_sessions(&rex.json(&ls_args()).map_err(RexFail::into_backend)?)
             .map_err(RexFail::into_backend)?;
-        let started = Instant::now();
-        let mut scanned = 0usize;
         let mut agents = Vec::new();
         for session in sessions {
+            // Budget each session independently. One slow session must not
+            // starve every later session's statuses into Unknown.
+            let started = Instant::now();
+            let mut scanned = 0usize;
             let blocks = Self::blocks(&rex, &session.session_id).map_err(RexFail::into_backend)?;
             for block in blocks {
                 // Status is one subprocess per block (program_status, plus a

@@ -12,9 +12,7 @@ use super::armor::{
     passthrough,
 };
 use super::dispatch::{DispatchRequest, DispatchResult, EffectDispatcher, durable_route};
-use super::durable::{
-    GraphEffect, GraphModel, RunEffect, RunModel, RunPhase as ModelPhase, needs_graph_model,
-};
+use super::durable::{GraphEffect, RunEffect, RunPhase as ModelPhase, needs_graph_model};
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
 use super::leaf::LeafSeams;
 use super::linear_step::{GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step};
@@ -985,12 +983,8 @@ type SpawnSettleStep =
 /// A persisted durable row is one model or the other; the workflow tells them
 /// apart on open, and the shape is stored with the model.
 fn model_head(json: &str) -> Option<(Workflow, serde_json::Value)> {
-    if let Ok(model) = serde_json::from_str::<RunModel>(json) {
-        return Some((model.workflow, model.trigger));
-    }
-    serde_json::from_str::<GraphModel>(json)
-        .ok()
-        .map(|model| (model.workflow, model.trigger))
+    let model = crate::engine::durable::PersistedWorkflowModel::decode(json).ok()?;
+    Some((model.workflow().clone(), model.trigger().clone()))
 }
 
 /// Build the three host handles for one pool (bd-host-cut-pqkg). Call from
@@ -1857,14 +1851,21 @@ impl WorkflowHost {
             }
         };
         for (run_id, json) in rows {
-            let model: RunModel = match serde_json::from_str(&json) {
-                Ok(model) => model,
-                Err(e) => {
-                    warn!(run_id = %run_id, "durable sweep: unparsable model, leaving the row: {e}");
+            // A persisted model may be a linear RunModel or a GraphModel.
+            // Parsing every row as RunModel skipped all parked DAG runs as
+            // "unparsable" (bd-durable-graph-resume). Classify both shapes
+            // before deciding whether to delete or drive.
+            let terminal = match crate::engine::durable::PersistedWorkflowModel::decode(&json) {
+                Ok(model) => model.is_terminal(),
+                Err(error) => {
+                    warn!(
+                        run_id = %run_id,
+                        "durable sweep: unparsable model, leaving the row: {error}"
+                    );
                     continue;
                 }
             };
-            if model.is_terminal() {
+            if terminal {
                 let state_for_delete = state.clone();
                 let rid = run_id.clone();
                 if let Err(e) =
@@ -4306,7 +4307,7 @@ mod tests {
                 .expect("model row");
         let model: serde_json::Value = serde_json::from_str(&raw).expect("model json");
         assert_eq!(
-            model["outputs"]["spawn_it"],
+            model["state"]["outputs"]["spawn_it"],
             json!({
                 "ok": true,
                 "spawn_key": "run-spawn-1:spawn_it:1",
@@ -4412,7 +4413,7 @@ mod tests {
                 .expect("model row");
         let model: serde_json::Value = serde_json::from_str(&raw).expect("model json");
         assert_eq!(
-            model["outputs"]["spawn_it"],
+            model["state"]["outputs"]["spawn_it"],
             json!({
                 "ok": false,
                 "error": "spawn-await run-spawn-t:spawn_it:1: timed out after 1s",
@@ -4544,6 +4545,136 @@ mod tests {
             state,
             RunState::Succeeded,
             "resolution settles the swept run"
+        );
+    }
+
+    /// The DAG cut witness: a graph approval parked before the restart must
+    /// decode as a `GraphModel` on the sweep, rebuild its `durable_parks`
+    /// entry, and settle on resolution. Before the tagged model, every DAG
+    /// row was parsed as linear and left behind as "unparsable".
+    #[tokio::test]
+    async fn durable_graph_sweep_rebuilds_park_after_restart() {
+        use crate::schema::{Action, Graph, GraphNode, StepOnError, Workflow};
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        let db = std::env::temp_dir().join(format!("wf-graph-cut-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let workflow = Workflow {
+            name: "graph-cut-approval".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![],
+            graph: Some(Graph {
+                nodes: [(
+                    "approve".to_string(),
+                    GraphNode {
+                        action: Action::RequestApproval {
+                            message: "ship the DAG?".into(),
+                        },
+                        needs: vec![],
+                        guard: None,
+                        on_error: StepOnError::Continue,
+                        build_slot: false,
+                    },
+                )]
+                .into(),
+            }),
+            inputs: vec![],
+            crew: None,
+        };
+        let bus1: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host1 = WorkflowHost::over_bus(bus1, vec![workflow.clone()], None).expect("host1");
+        host1
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
+            .await;
+        let input = RunInput {
+            workflow: workflow.clone(),
+            trigger: serde_json::json!({}),
+            run_id: Some("run-graph-cut-9".to_string()),
+        };
+        host1
+            .run_durable_graph_loop("run-graph-cut-9".to_string(), workflow, input)
+            .await;
+        assert_eq!(
+            host1
+                .pending
+                .lock()
+                .await
+                .run_state_durable("run-graph-cut-9")
+                .await,
+            RunState::Suspended,
+            "host1 parks the graph approval"
+        );
+        assert!(
+            host1
+                .durable_parks
+                .lock()
+                .unwrap()
+                .contains_key(&("run-graph-cut-9".to_string(), "approve".to_string())),
+            "the graph park is keyed by node"
+        );
+        drop(host1);
+
+        let bus2: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host2 = WorkflowHost::over_bus(bus2, vec![], None).expect("host2");
+        host2
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
+            .await;
+        let _sweep = host2.spawn_durable_sweep(std::time::Duration::from_secs(3600));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if host2
+                .durable_parks
+                .lock()
+                .unwrap()
+                .contains_key(&("run-graph-cut-9".to_string(), "approve".to_string()))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "graph sweep must re-park the restarted run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let res = Resolution {
+            run_id: "run-graph-cut-9".into(),
+            node: Some("approve".into()),
+            project: None,
+            promise_id: "run-graph-cut-9".into(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: "yes".into(),
+        };
+        host2.resolve_parked(res).await.expect("graph resolve");
+        assert_eq!(
+            host2
+                .pending
+                .lock()
+                .await
+                .run_state_durable("run-graph-cut-9")
+                .await,
+            RunState::Succeeded,
+            "resolution settles the swept graph run"
         );
     }
 

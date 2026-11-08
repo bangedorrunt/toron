@@ -171,7 +171,7 @@ impl Mailbox {
         let now = now_us();
         let result = sqlx::query(
             "UPDATE contacts SET status = ?1, created_ts_us = ?2 \
-             WHERE from_pubkey = ?3 AND to_pubkey = ?4",
+             WHERE from_pubkey = ?3 AND to_pubkey = ?4 AND status = 'pending'",
         )
         .bind(status.as_str())
         .bind(now)
@@ -354,7 +354,11 @@ impl Mailbox {
               status, created_ts_us) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (from_pubkey, to_pubkey) \
-             DO UPDATE SET status = excluded.status, created_ts_us = excluded.created_ts_us",
+             DO UPDATE SET \
+               status = CASE WHEN contacts.status = 'pending' \
+                             THEN excluded.status ELSE contacts.status END, \
+               created_ts_us = CASE WHEN contacts.status = 'pending' \
+                                    THEN excluded.created_ts_us ELSE contacts.created_ts_us END",
         )
         .bind(&link.project_slug)
         .bind(&link.from_name)
