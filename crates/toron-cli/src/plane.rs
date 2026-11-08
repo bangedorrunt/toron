@@ -1244,75 +1244,23 @@ fn presence_file(mailbox: &Mailbox) -> PathBuf {
 }
 
 /// One presence projection row: the last heartbeat per npub inside the TTL.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct PresenceRow {
-    /// Agent name as the heartbeating process reported it.
-    pub name: String,
-    /// Agent npub (hex).
-    pub npub: String,
-    /// Canonical state word (`idle`/`working`/`blocked`/`done`/`unknown`).
-    pub state: String,
-    /// Optional status line.
-    pub status: Option<String>,
-    /// Heartbeat unix seconds.
-    pub ts: u64,
-    /// Project the heartbeat was published for.
-    pub project: String,
-}
+pub(crate) type PresenceRow = toron_core::bus::presence::PresenceSpoolRow;
 
-/// Load the presence projection: last heartbeat per npub, newest ts wins.
-/// `pub(crate)`: the TUI's Agents tab joins this with the roster — one
-/// projection reader, so the two surfaces cannot disagree about who is live.
+/// Load the cross-process presence projection through the shared core reader:
+/// last heartbeat per npub, newest ts wins. `pub(crate)`: the TUI's Agents tab
+/// joins this with the roster — one projection reader, so the two surfaces
+/// cannot disagree about who is live.
 pub(crate) fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<PresenceRow> {
     let ttl = std::env::var("TORON_PRESENCE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(PRESENCE_TTL_SECS);
-    let Ok(body) = std::fs::read_to_string(presence_file(mailbox)) else {
-        return Vec::new();
-    };
-    let mut by_npub: std::collections::HashMap<String, PresenceRow> =
-        std::collections::HashMap::new();
-    for line in body.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("project").and_then(|p| p.as_str()) != Some(project) {
-            continue;
-        }
-        let npub = v
-            .get("npub")
-            .and_then(|n| n.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        if now_secs.saturating_sub(ts) > ttl {
-            continue;
-        }
-        let is_newer = by_npub.get(&npub).map(|old| old.ts <= ts).unwrap_or(true);
-        if is_newer {
-            let row = PresenceRow {
-                name: v
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                npub: npub.clone(),
-                state: v
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                status: v.get("status").and_then(|s| s.as_str()).map(str::to_string),
-                ts,
-                project: project.to_string(),
-            };
-            by_npub.insert(npub, row);
-        }
-    }
-    let mut out: Vec<PresenceRow> = by_npub.into_values().collect();
-    out.sort_by_key(|r| std::cmp::Reverse(r.ts));
-    out
+    toron_core::bus::presence::read_spool(
+        &presence_file(mailbox),
+        Some(project),
+        now_secs,
+        std::time::Duration::from_secs(ttl),
+    )
 }
 
 /// bd-1wwc: presence flag/env resolution (functional core). Flags win;
@@ -1364,15 +1312,15 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
         .whois(&project, &as_name)
         .await
         .context("whois for presence projection")?;
-    let line = serde_json::json!({
-        "name": whois.name,
-        "npub": keys.public_key().to_hex(),
-        "state": state_str(&payload.state),
-        "status": payload.status,
-        "ts": payload.ts,
-        "project": project,
-    });
-    toron_core::jsonl::append_row(&presence_file(mailbox), &line)
+    let row = PresenceRow {
+        name: whois.name.clone(),
+        npub: keys.public_key().to_hex(),
+        state: state_str(&payload.state).to_string(),
+        status: payload.status.clone(),
+        ts: payload.ts,
+        project: project.clone(),
+    };
+    toron_core::bus::presence::append_spool(&presence_file(mailbox), &row)
         .context("write presence projection")?;
     print_json(&serde_json::json!({
         "npub": keys.public_key().to_hex(),

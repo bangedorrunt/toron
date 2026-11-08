@@ -72,6 +72,10 @@ pub static ADDITIVE_TABLES: &[AdditiveTable] = &[
         name: "agent_bindings",
         ddl: include_str!("../../schema/additive/agent_bindings.sql"),
     },
+    AdditiveTable {
+        name: "reservation_kernel_models",
+        ddl: include_str!("../../schema/additive/reservation_kernel_model.sql"),
+    },
 ];
 
 /// A store's version, in its two parts: what an opening binary must ship,

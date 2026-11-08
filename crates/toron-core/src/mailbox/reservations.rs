@@ -56,7 +56,9 @@ use crate::nostr::kinds::{FILE_RESERVATION, toron_kind};
 use super::Mailbox;
 use super::collect_replay;
 use super::messaging::{SendMessage, SendResult};
-use super::reservations_core::{self, EntryState, KernelModel, LeaseEntry};
+use super::reservations_core::{
+    self, EntryState, KernelEffect, KernelModel, KernelMsg, LeaseEntry,
+};
 
 /// Default staleness threshold for force-release (holder inactive this long
 /// counts as stale). Matches the AM-Rust inactivity heuristic spirit (30 min).
@@ -500,7 +502,8 @@ impl Mailbox {
         for path in paths {
             let now_us = Self::kernel_now_us();
             let (model, meta) = self.kernel_model_for(project_slug).await;
-            let ttl_us = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
+            let ttl_secs = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
+            let ttl_us = ttl_secs;
             let blockers = Self::kernel_blockers_for(
                 &model,
                 &meta,
@@ -539,7 +542,7 @@ impl Mailbox {
             let mut tags =
                 with_project_scoping(toron_kind(FILE_RESERVATION), base, Some(project_slug));
             let ttl = EnvelopeTtl {
-                secs: Some(ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS)),
+                secs: Some(ttl_secs),
             };
             let created = Timestamp::now();
             if let Some(exp) = ttl.expiration_tag(created) {
@@ -555,6 +558,47 @@ impl Mailbox {
                 tags,
                 created,
             )?;
+            // The pure kernel decides the grant; the host only persists its
+            // returned model and executes the Granted effect on the bus.
+            let (next, effects) = reservations_core::tick(
+                &model,
+                &KernelMsg::Acquire {
+                    id: event.id.to_hex(),
+                    holder: agent_keys.public_key().to_hex(),
+                    path_pattern: path.clone(),
+                    exclusive,
+                    expires_us: Some(now_us + ttl_secs as i64 * 1_000_000),
+                    created_at_secs: created.as_secs() as i64,
+                    epoch,
+                    state: EntryState::Held,
+                    now_us,
+                },
+            );
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, KernelEffect::Granted { .. }))
+            {
+                let mut holders = Vec::new();
+                let mut ids = Vec::new();
+                for effect in &effects {
+                    if let KernelEffect::Denied {
+                        reason: super::reservations_core::DenyReason::HardConflict { blocking_id },
+                        ..
+                    } = effect
+                        && let Some((name, _)) = meta.get(blocking_id)
+                    {
+                        holders.push(name.clone());
+                        ids.push(blocking_id.clone());
+                    }
+                }
+                result.conflicts.push(PathConflict {
+                    path: path.clone(),
+                    holders,
+                    reservation_ids: ids,
+                });
+                continue;
+            }
+            self.persist_kernel_model(project_slug, &next).await;
             let ok = self.bus.publish(event.clone()).await?;
             if !ok.stored {
                 anyhow::bail!("reservation event rejected by bus");
@@ -815,6 +859,22 @@ impl Mailbox {
             let ttl = EnvelopeTtl {
                 secs: Some(new_expiry_secs.saturating_sub(created.as_secs())),
             };
+            let (_, effects) = self
+                .kernel_tick(
+                    project_slug,
+                    &KernelMsg::Renew {
+                        id: res.id.clone(),
+                        holder: agent_keys.public_key().to_hex(),
+                        expires_us: Some(new_expiry_secs as i64 * 1_000_000),
+                    },
+                )
+                .await;
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, KernelEffect::Renewed { .. }))
+            {
+                continue;
+            }
             if let Some(exp) = ttl.expiration_tag(created) {
                 tags.push(exp);
             }
@@ -880,6 +940,15 @@ impl Mailbox {
         let mut released = 0usize;
         let mut leases = Vec::new();
         for res in mine {
+            let (_, effects) = self
+                .kernel_tick(project_slug, &KernelMsg::Release { id: res.id.clone() })
+                .await;
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, KernelEffect::Released { .. }))
+            {
+                continue;
+            }
             let d = format!("{project_slug}:{}", res.path_pattern);
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
@@ -985,6 +1054,9 @@ impl Mailbox {
             Timestamp::now(),
         )?;
         assert!(is_revocation(&revoke), "revocation must be detectable");
+        if !self.kernel_release_lease(project_slug, &lease).await {
+            anyhow::bail!("kernel refused force-release of {}", lease.id);
+        }
         self.bus.publish(revoke.clone()).await?;
         self.project_lease_status(
             project_slug,
@@ -1072,6 +1144,14 @@ impl Mailbox {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            let _ = self
+                .kernel_tick(
+                    &project_slug,
+                    &KernelMsg::ExpireTick {
+                        now_us: Self::kernel_now_us(),
+                    },
+                )
+                .await;
             for lease in held {
                 if !lease.exclusive || !dead_holders.iter().any(|h| h == &lease.agent_name) {
                     continue;
@@ -1095,6 +1175,9 @@ impl Mailbox {
                     Some(&project_slug),
                 );
                 tags.push(Tag::custom("note", [note.unwrap_or("ghost-pane-cleanup")]));
+                if !self.kernel_release_lease(&project_slug, &lease).await {
+                    continue;
+                }
                 let revoke = build_event(
                     operator,
                     toron_kind(FILE_RESERVATION),
@@ -1174,6 +1257,9 @@ impl Mailbox {
                 Timestamp::now(),
             )?;
             assert!(is_revocation(&revoke), "revocation must be detectable");
+            if !self.kernel_release_lease(project_slug, &lease).await {
+                continue;
+            }
             self.bus.publish(revoke.clone()).await?;
             self.project_lease_status(
                 project_slug,
@@ -1908,6 +1994,9 @@ impl Mailbox {
             .or_else(|| (!holder.reason.is_empty()).then(|| holder.reason.clone()))
             .unwrap_or_default();
 
+        if !self.kernel_release_lease(project_slug, &holder).await {
+            anyhow::bail!("kernel refused transfer release of {}", holder.id);
+        }
         let release_event = build_event(
             &from_keys,
             toron_kind(FILE_RESERVATION),
@@ -1942,6 +2031,29 @@ impl Mailbox {
             ),
             acquire_ts,
         )?;
+        let acquire_id = acquire_event.id.to_hex();
+        let (_, effects) = self
+            .kernel_tick(
+                project_slug,
+                &KernelMsg::Acquire {
+                    id: acquire_id.clone(),
+                    holder: to_keys.public_key().to_hex(),
+                    path_pattern: path.to_string(),
+                    exclusive: holder.exclusive,
+                    expires_us: None,
+                    created_at_secs: acquire_ts.as_secs() as i64,
+                    epoch: acquire_epoch,
+                    state: EntryState::Held,
+                    now_us: Self::kernel_now_us(),
+                },
+            )
+            .await;
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, KernelEffect::Granted { id } if id == &acquire_id))
+        {
+            anyhow::bail!("kernel denied transfer acquire for {to_agent} on {path}");
+        }
         self.bus.publish(acquire_event.clone()).await?;
         self.project_lease_upsert(LeaseUpsert {
             project_slug,
@@ -2377,6 +2489,59 @@ impl Mailbox {
     /// external readers query directly). Best-effort by design: no attached
     /// index pool → no-op; a failed projection logs but never fails the
     /// signed lease event (the bus replay stays the source of truth).
+    /// Run one kernel transition and persist the returned model. All
+    /// reservation writes (acquire, renew, release, expiry sweep) go through
+    /// this door, so `reservations_core::tick` is the single write authority
+    /// while SQLite keeps the last model for replay/observer reads.
+    async fn kernel_tick(
+        &self,
+        project_slug: &str,
+        msg: &KernelMsg,
+    ) -> (KernelModel, Vec<KernelEffect>) {
+        let (model, _) = self.kernel_model_for(project_slug).await;
+        let (next, effects) = reservations_core::tick(&model, msg);
+        self.persist_kernel_model(project_slug, &next).await;
+        (next, effects)
+    }
+
+    async fn kernel_release_lease(&self, project_slug: &str, lease: &Reservation) -> bool {
+        let (_, effects) = self
+            .kernel_tick(
+                project_slug,
+                &KernelMsg::Release {
+                    id: lease.id.clone(),
+                },
+            )
+            .await;
+        effects
+            .iter()
+            .any(|effect| matches!(effect, KernelEffect::Released { id } if id == &lease.id))
+    }
+
+    async fn persist_kernel_model(&self, project_slug: &str, model: &KernelModel) {
+        let Some(pool) = self.index_pool() else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(model) else {
+            return;
+        };
+        let result = sqlx::query(
+            "INSERT INTO reservation_kernel_models (project_slug, model_json, updated_ts_us) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(project_slug) DO UPDATE SET \
+               model_json = excluded.model_json, \
+               updated_ts_us = excluded.updated_ts_us",
+        )
+        .bind(project_slug)
+        .bind(json)
+        .bind(Self::kernel_now_us())
+        .execute(pool)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("reservation kernel model persist failed ({project_slug}): {e}");
+        }
+    }
+
     async fn project_lease_upsert(&self, u: LeaseUpsert<'_>) {
         let Some(pool) = self.index_pool() else {
             return;
@@ -5265,6 +5430,58 @@ mod tests {
         let golden = "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b";
         let ok = revocation_target(golden).expect("real hex passes through");
         assert_eq!(ok.to_hex(), golden);
+    }
+
+    /// The kernel is the write authority, and its returned model survives
+    /// the call in SQLite: acquire writes the lease, release removes it.
+    #[tokio::test]
+    async fn kernel_model_is_persisted_across_acquire_and_release() {
+        let (mailbox, db_path, data_dir) = test_mailbox("kernel-persist").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        let acquired = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/kernel.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-kernel"),
+            )
+            .await
+            .expect("acquire");
+        assert_eq!(acquired.granted.len(), 1);
+        let lease_id = acquired.granted[0].id.clone();
+        let pool = mailbox.index_pool().expect("pool").clone();
+        let model: String = sqlx::query_scalar(
+            "SELECT model_json FROM reservation_kernel_models WHERE project_slug = 'demo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("kernel model persisted");
+        assert!(
+            model.contains(&lease_id),
+            "acquire writes the granted lease into the persisted kernel model: {model}"
+        );
+
+        let released = mailbox
+            .release_file_reservations("demo", "BlueLake", &["src/kernel.rs".into()])
+            .await
+            .expect("release");
+        assert_eq!(released.released, 1);
+        let model: String = sqlx::query_scalar(
+            "SELECT model_json FROM reservation_kernel_models WHERE project_slug = 'demo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("kernel model persisted");
+        assert!(
+            !model.contains(&lease_id),
+            "release removes the lease from the persisted kernel model: {model}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// bd-h3oj: release_by_reason revokes ONLY the leases whose reason

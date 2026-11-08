@@ -13,6 +13,7 @@
 //! that is the other half of the "not stored" guarantee.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,76 @@ impl Presence {
     }
 }
 
+/// One cross-process presence row. The CLI appends these to
+/// `<mailbox-root>/presence.jsonl`; the bus broker reads the same file so a
+/// heartbeat published by another process is visible without giving up the
+/// ephemeral no-store rule (the JSONL is a TTL projection, never the bus).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PresenceSpoolRow {
+    pub name: String,
+    pub npub: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub ts: u64,
+    pub project: String,
+}
+
+/// Canonical cross-process presence file under a mailbox root.
+pub fn spool_path(root: &Path) -> PathBuf {
+    root.join("presence.jsonl")
+}
+
+/// Append one heartbeat to the shared TTL projection.
+pub fn append_spool(path: &Path, row: &PresenceSpoolRow) -> anyhow::Result<()> {
+    let value = serde_json::to_value(row)?;
+    crate::jsonl::append_row(path, &value)
+}
+
+/// Last heartbeat per npub inside `ttl`, optionally restricted to one project.
+/// Malformed rows are skipped, exactly as a dropping presence channel would.
+pub fn read_spool(
+    path: &Path,
+    project: Option<&str>,
+    now_secs: u64,
+    ttl: Duration,
+) -> Vec<PresenceSpoolRow> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut by_npub: HashMap<String, PresenceSpoolRow> = HashMap::new();
+    for line in body.lines() {
+        let Ok(row) = serde_json::from_str::<PresenceSpoolRow>(line) else {
+            continue;
+        };
+        if project.is_some_and(|wanted| row.project != wanted) {
+            continue;
+        }
+        if now_secs.saturating_sub(row.ts) > ttl.as_secs() {
+            continue;
+        }
+        if by_npub.get(&row.npub).is_none_or(|old| old.ts <= row.ts) {
+            by_npub.insert(row.npub.clone(), row);
+        }
+    }
+    let mut rows: Vec<PresenceSpoolRow> = by_npub.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.ts));
+    rows
+}
+
+fn presence_from_spool(row: &PresenceSpoolRow) -> Option<Presence> {
+    let pubkey = PublicKey::from_hex(&row.npub).ok()?;
+    let state =
+        serde_json::from_value::<PresenceState>(serde_json::Value::String(row.state.clone()))
+            .ok()?;
+    Some(Presence {
+        pubkey,
+        state,
+        status: row.status.clone(),
+        ts: row.ts,
+    })
+}
+
 /// Presence broker: subscribes to kind-20001 on the bus, keeps last-heartbeat-
 /// wins state (keyed by pubkey) with expiry, and re-broadcasts live presence
 /// on a lossy channel.
@@ -65,12 +136,32 @@ impl PresenceBroker {
     /// Start the broker on a bus. Spawns a background task that subscribes to
     /// kind-20001 and updates state.
     pub fn start(bus: Arc<dyn Bus>, ttl: Duration) -> Self {
+        Self::start_with_spool(bus, ttl, None)
+    }
+
+    /// Start the broker with an optional cross-process spool path. Rows in
+    /// the spool are folded in at start and on every expiry tick, so a CLI
+    /// heartbeat in another process is visible to an embedding host.
+    pub fn start_with_spool(bus: Arc<dyn Bus>, ttl: Duration, spool: Option<PathBuf>) -> Self {
         let state: Arc<RwLock<HashMap<String, Presence>>> = Arc::new(RwLock::new(HashMap::new()));
         let (live_tx, _) = broadcast::channel(256);
+
+        if let Some(path) = spool.as_ref() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for row in read_spool(path, None, now, ttl) {
+                if let Some(p) = presence_from_spool(&row) {
+                    state.write().insert(row.npub.clone(), p);
+                }
+            }
+        }
 
         let state_for_task = state.clone();
         let live_for_task = live_tx.clone();
         let bus_for_task = bus.clone();
+        let spool_for_task = spool.clone();
         let handle = tokio::spawn(async move {
             let filter =
                 crate::bus::Filter::new().kinds([crate::nostr::kinds::toron_kind(PRESENCE)]);
@@ -110,6 +201,21 @@ impl PresenceBroker {
                         state_for_task
                             .write()
                             .retain(|_, p| !p.is_stale(now, ttl));
+                        if let Some(path) = spool_for_task.as_ref() {
+                            for row in read_spool(path, None, now, ttl) {
+                                let Some(p) = presence_from_spool(&row) else {
+                                    continue;
+                                };
+                                let newer = state_for_task
+                                    .read()
+                                    .get(&row.npub)
+                                    .is_none_or(|old| old.ts < p.ts);
+                                if newer {
+                                    state_for_task.write().insert(row.npub.clone(), p.clone());
+                                    let _ = live_for_task.send(p);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -215,6 +321,53 @@ mod tests {
         };
         assert!(p.is_stale(1_700_000_100, Duration::from_secs(60)));
         assert!(!p.is_stale(1_700_000_050, Duration::from_secs(60)));
+    }
+
+    /// A heartbeat appended by another process to the shared TTL projection
+    /// is visible when the broker starts, without a 20001 store row.
+    #[tokio::test]
+    async fn broker_reads_a_cross_process_spool_heartbeat() {
+        let (bus, db_path) = temp_bus().await;
+        let keys = Keys::generate();
+        let dir =
+            std::env::temp_dir().join(format!("toron-presence-spool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        append_spool(
+            &spool_path(&dir),
+            &PresenceSpoolRow {
+                name: "OtherProcess".into(),
+                npub: keys.public_key().to_hex(),
+                state: "working".into(),
+                status: Some("from the CLI".into()),
+                ts: now,
+                project: "demo".into(),
+            },
+        )
+        .expect("append spool");
+
+        let broker = PresenceBroker::start_with_spool(
+            Arc::new(bus),
+            Duration::from_secs(60),
+            Some(spool_path(&dir)),
+        );
+        let current = broker
+            .current(&keys.public_key(), now)
+            .expect("spool heartbeat visible");
+        assert_eq!(current.state, PresenceState::Working);
+        assert_eq!(current.status.as_deref(), Some("from the CLI"));
+        assert!(
+            broker
+                .live_agents(now)
+                .iter()
+                .any(|p| p.pubkey == keys.public_key())
+        );
+        broker.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
