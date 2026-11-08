@@ -113,19 +113,19 @@ steps:
         .expect("model row exists");
     let model: serde_json::Value = serde_json::from_str(&json).expect("model parses");
     assert_eq!(
-        model["phase"]["phase"], "succeeded",
+        model["state"]["phase"]["phase"], "succeeded",
         "spawn-await resumes to SUCCESS with the job result: {model}"
     );
     assert_eq!(
-        model["outputs"]["build"]["ok"], true,
+        model["state"]["outputs"]["build"]["ok"], true,
         "spawn-await resumes to SUCCESS with the job result: {model}"
     );
     assert_eq!(
-        model["outputs"]["build"]["result"]["exit"], 0,
+        model["state"]["outputs"]["build"]["result"]["exit"], 0,
         "job result payload flows into steps.build.result: {model}"
     );
     assert_eq!(
-        model["outputs"]["build"]["result"]["checks"], "all-healthy",
+        model["state"]["outputs"]["build"]["result"]["checks"], "all-healthy",
         "job result payload flows into steps.build.result: {model}"
     );
 

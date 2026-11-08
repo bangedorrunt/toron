@@ -87,7 +87,10 @@ pub async fn upsert(
     if binding.pin.trim().is_empty() {
         anyhow::bail!("agent binding pin is empty");
     }
-    let mut tx = pool.begin().await?;
+    // Acquire the write lock before reading the conflicting pane. A deferred
+    // transaction would let two spawns both observe the old owner and then
+    // race the DELETE/INSERT; IMMEDIATE queues them behind the busy timeout.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if !binding.pane_id.is_empty() {
         sqlx::query(
             "DELETE FROM agent_bindings \
@@ -201,6 +204,46 @@ mod tests {
         let rows = list(&pool, "proj").await.expect("list");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].pane_id, "b:2");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The concurrent spawn/inject witness: eight writers claim the SAME
+    /// pane with different pins at once. Whichever transaction lands last
+    /// wins, but the table may never end with two pins on that pane.
+    #[tokio::test]
+    async fn concurrent_upserts_leave_one_pin_per_pane() {
+        let (pool, path) = pool("concurrent").await;
+        let pins = [
+            "BlueLake",
+            "RoseDune",
+            "GreenMoss",
+            "AmberFjord",
+            "SilverReed",
+            "CopperVale",
+            "VioletPeak",
+            "CrimsonBay",
+        ];
+        let mut tasks = Vec::new();
+        for (i, pin) in pins.iter().enumerate() {
+            let pool = pool.clone();
+            let binding = AgentBinding::pane("proj", *pin, "b:shared");
+            tasks.push(tokio::spawn(async move {
+                upsert(&pool, "proj", &binding, i as i64).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("writer task must not panic")
+                .expect("concurrent upsert must serialize");
+        }
+
+        let rows = list(&pool, "proj").await.expect("list");
+        assert_eq!(rows.len(), 1, "one pane has exactly one pin: {rows:?}");
+        assert_eq!(rows[0].pane_id, "b:shared");
+        assert!(
+            pins.contains(&rows[0].pin.as_str()),
+            "winner is one of the racing pins: {rows:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

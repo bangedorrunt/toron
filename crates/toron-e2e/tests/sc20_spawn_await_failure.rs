@@ -111,10 +111,10 @@ steps:
         .expect("model row exists");
     let model: serde_json::Value = serde_json::from_str(&json).expect("model parses");
     assert_eq!(
-        model["outputs"]["build"]["ok"], false,
+        model["state"]["outputs"]["build"]["ok"], false,
         "spawn-await failure fails the step, NOT a decision: {model}"
     );
-    let err = model["outputs"]["build"]["error"]
+    let err = model["state"]["outputs"]["build"]["error"]
         .as_str()
         .unwrap_or_default();
     assert!(
