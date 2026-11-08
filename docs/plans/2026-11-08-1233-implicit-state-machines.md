@@ -13,6 +13,39 @@ While several cores are now explicit ([`DeliveryFsm::step`](file:///Users/banged
 
 ---
 
+## Implementation Status — 2026-11-09
+
+This document remains the diagnosis and proposal set for the implicit state machines. The
+operator- and agent-experience surfaces around that work are now complete; the state-machine
+proposals below are **not** claimed complete.
+
+- [x] **`doorbell why` is globally ordered and filterable.** Newest rows survive the limit, with
+  `matched` / `shown` / `withheld`, `--workspace`, `--since`, and `--json`; omitting the pin now
+  explains every pin in scope.
+- [x] **`/health` publishes typed host liveness.** The `hosts` array includes live, exited, and
+  unknown dispatcher state, PIDs, projects, workspaces, and build generations; the macOS hostname
+  fallback and `doorbell --version` are live, and the shared lease liveness check rejects zombies.
+- [x] **Briefings route the full operating bundle.** `required_skills` returns the mode skill,
+  `toron`, and `br`; the global bootstrap and mode skills follow every entry.
+- [x] **One stack door.** `flywheel stack status [--json] [--check]` is native and fails on missing
+  binaries, health/version skew, stale live hosts, and a replaced toron build. `flywheel stack
+  install` delegates to the audited `scripts/stack.sh` installer.
+- [x] **Stale-host recovery is identity-safe and replacement-verified.** Recovery verifies
+  `flywheel __doorbell` before killing a PID, restarts only the stale host's
+  `dev.flywheel.doorbell.<project>` supervisor, and requires the same workspace to return live on
+  the new hash within 90s; install fails instead of ignoring a failed recovery.
+- [x] **One ship gate with committed tracker evidence.** `flywheel ship check <bead> [--json]`
+  checks HEAD naming, clean `.beads`, the closed row in `HEAD:.beads/issues.jsonl`, and the legal
+  ledger verdict; `scripts/ship-check.sh` is a wrapper.
+- [x] **Clean-export proof is repeatable.** `scripts/clean-proof.sh [--head] [--tests] [--keep]`
+  snapshots intended files through a throwaway index, archives the temporary commit, links sibling
+  sources, and runs `check --workspace` plus optional doorbell tests.
+- [x] **Docs and skills synced.** flywheel `0.10.4`, changelog, `AGENTS.md`, and the global
+  flywheel/open/captain skills carry the same commands and required-skill list.
+
+Open: Parts I–VI and the sequenced state-machine waves below. This completion ledger does not mark
+any of those proposals done.
+
 ## Part I — Cross-Stack Distributed State Machines (`flywheel` × `toron` × `beads`)
 
 No single database or process owns the composite lifecycle of a unit of work, an agent identity, a workflow run, or the transport plane. Instead, each tick reconstructs composite state by joining across SQLite, Nostr events, JSONL files, git history, and multiplexer panes.
