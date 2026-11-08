@@ -6,7 +6,7 @@
 //! pool + mmap + 10Hz watch-style replay and grow to tens of GB RSS.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,8 +38,37 @@ impl Drop for ServeLock {
 pub fn acquire(data_dir: &Path) -> anyhow::Result<ServeLock> {
     fs::create_dir_all(data_dir)?;
     let path = data_dir.join("serve.pid");
-    if let Ok(s) = fs::read_to_string(&path)
-        && let Ok(pid) = s.trim().parse::<u32>()
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    // The OS lock, not the pid text, is the authority: two starts racing on
+    // an absent or stale file both parse nothing and both used to truncate
+    // and write, so both "won". Hold the lock for the ServeLock lifetime.
+    if let Err(error) = file.try_lock() {
+        if !matches!(error, std::fs::TryLockError::WouldBlock) {
+            anyhow::bail!(
+                "could not take the serve lock on {}: {error:?}",
+                path.display()
+            );
+        }
+        let mut holder = String::new();
+        let _ = file.read_to_string(&mut holder);
+        let holder = holder.trim();
+        anyhow::bail!(
+            "another toron serve already holds {} (pid {}) — \
+             one writer per data dir (bd-741i)",
+            data_dir.display(),
+            if holder.is_empty() { "unknown" } else { holder }
+        );
+    }
+    let mut existing = String::new();
+    if file.read_to_string(&mut existing).is_err() {
+        existing.clear();
+    }
+    if let Ok(pid) = existing.trim().parse::<u32>()
         && pid_alive(pid)
     {
         if pid_is_toron_serve(pid) {
@@ -65,11 +94,8 @@ pub fn acquire(data_dir: &Path) -> anyhow::Result<ServeLock> {
         }
     }
     let pid = std::process::id();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     write!(file, "{pid}")?;
     file.flush()?;
 
@@ -142,6 +168,35 @@ mod tests {
         );
         drop(first);
         acquire(&dir).expect("lock reusable after drop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two `toron serve` starts racing on one data dir must not both win.
+    /// The liveness check cannot decide this (both read no file or a stale
+    /// one), so an OS lock on the pid file is the authority: even a pid file
+    /// with no readable holder must refuse the second acquire.
+    #[test]
+    fn second_acquire_fails_even_when_the_pid_file_looks_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-serve-lock-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = acquire(&dir).expect("first lock");
+        // Blank the pid so the liveness check cannot be what rejects the
+        // second acquire; only the held lock proves the dir is taken.
+        fs::write(dir.join("serve.pid"), "").unwrap();
+        let err = acquire(&dir).expect_err("a held lock must refuse a second serve");
+        assert!(format!("{err:#}").contains("already holds"), "got: {err:#}");
+        // Reuse-after-drop is covered by the live-pid test. Asserting it here
+        // would race sibling tests that spawn children: a child can hold a
+        // duplicate of the lock until it exits.
+        drop(first);
         let _ = fs::remove_dir_all(&dir);
     }
 
