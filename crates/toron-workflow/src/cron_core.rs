@@ -95,6 +95,20 @@ pub struct CronModel {
     /// durable loop guarantees `None` at every decision; the path exists
     /// for concurrent interpreters and is covered by paths tests.
     pub in_flight: Option<i64>,
+    /// A fire held back by the failure backoff (bd-cron-double-emit). A
+    /// gated decision emits ONLY `SleepUntil`; the deferred tick fires on
+    /// the first `Tick` at or after `at_secs`, never alongside the sleep.
+    #[serde(default)]
+    pub deferred: Option<DeferredTick>,
+}
+
+/// One fire held back by the failure backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredTick {
+    /// The due tick waiting for the gate.
+    pub tick: i64,
+    /// Wall time the gate lifts.
+    pub at_secs: i64,
 }
 
 impl CronModel {
@@ -106,6 +120,7 @@ impl CronModel {
             last_fired: None,
             consecutive: 0,
             in_flight: None,
+            deferred: None,
         }
     }
 
@@ -117,6 +132,7 @@ impl CronModel {
             last_fired: None,
             consecutive: 0,
             in_flight: None,
+            deferred: None,
         }
     }
 }
@@ -295,22 +311,33 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
                 }
                 return (next, effects);
             }
+            if let Some(deferred) = next.deferred {
+                if *now_secs < deferred.at_secs {
+                    return (
+                        next,
+                        vec![CronEffect::SleepUntil {
+                            at_secs: deferred.at_secs,
+                        }],
+                    );
+                }
+                next.deferred = None;
+                if model.last_fired.is_none_or(|last| deferred.tick > last) {
+                    next.in_flight = Some(deferred.tick);
+                    return (
+                        next,
+                        vec![CronEffect::FireTick {
+                            tick: deferred.tick,
+                        }],
+                    );
+                }
+            }
             match select_fireable(model.catchup, model.last_fired, *now_secs, candidates) {
+                Some(tick) if next.consecutive > 0 => {
+                    let at_secs = now_secs.saturating_add(backoff_for_streak(next.consecutive));
+                    next.deferred = Some(DeferredTick { tick, at_secs });
+                    (next, vec![CronEffect::SleepUntil { at_secs }])
+                }
                 Some(tick) => {
-                    if next.consecutive > 0 {
-                        let gate_until =
-                            now_secs.saturating_add(backoff_for_streak(next.consecutive));
-                        next.in_flight = Some(tick);
-                        return (
-                            next,
-                            vec![
-                                CronEffect::SleepUntil {
-                                    at_secs: gate_until,
-                                },
-                                CronEffect::FireTick { tick },
-                            ],
-                        );
-                    }
                     next.in_flight = Some(tick);
                     (next, vec![CronEffect::FireTick { tick }])
                 }
@@ -322,10 +349,12 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
             }
         }
         CronMsg::TickStarted { tick } => {
+            next.deferred = None;
             next.in_flight = Some(*tick);
             (next, vec![])
         }
         CronMsg::TickSucceeded { tick } => {
+            next.deferred = None;
             if next.in_flight == Some(*tick) {
                 next.in_flight = None;
             }
@@ -344,6 +373,7 @@ pub fn tick(model: &CronModel, msg: &CronMsg) -> (CronModel, Vec<CronEffect>) {
             )
         }
         CronMsg::TickFailed { tick, .. } => {
+            next.deferred = None;
             if next.in_flight == Some(*tick) {
                 next.in_flight = None;
             }
@@ -551,6 +581,18 @@ mod kernel_paths_tests {
                         CronEffect::PolicyAction { .. } => {}
                     }
                 }
+                let fires = fx
+                    .iter()
+                    .filter(|e| matches!(e, CronEffect::FireTick { .. }))
+                    .count();
+                let sleeps = fx
+                    .iter()
+                    .filter(|e| matches!(e, CronEffect::SleepUntil { .. }))
+                    .count();
+                assert!(
+                    fires == 0 || sleeps == 0,
+                    "a fire and a sleep never travel together: {fx:?}"
+                );
                 if let CronMsg::TickSucceeded { tick } | CronMsg::TickFailed { tick } = msg
                     && model.in_flight == Some(*tick)
                 {
@@ -617,23 +659,51 @@ mod kernel_paths_tests {
                 schedule_ok: true,
             },
         );
-        let sleeps: Vec<i64> = fx3
-            .iter()
-            .filter_map(|e| match e {
-                CronEffect::SleepUntil { at_secs } => Some(*at_secs),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            sleeps.iter().any(|s| *s > 1420),
-            "backoff spaces the refire: {fx3:?}"
+        let gate = 1420 + backoff_for_streak(m1.consecutive);
+        assert_eq!(
+            fx3,
+            vec![CronEffect::SleepUntil { at_secs: gate }],
+            "a gated tick sleeps without firing alongside: {fx3:?}"
         );
-        assert!(
-            fx3.iter()
-                .any(|e| matches!(e, CronEffect::FireTick { tick: 1420 })),
-            "the next due tick fires (schedule advances, no refire): {fx3:?}"
+        assert_eq!(
+            m3.deferred,
+            Some(DeferredTick {
+                tick: 1420,
+                at_secs: gate
+            }),
+            "the due tick is carried across the gate, never dropped"
         );
-        let _ = m3;
+
+        let (m4, fx4) = tick(
+            &m3,
+            &CronMsg::Tick {
+                now_secs: 1500,
+                candidates: vec![1360, 1420],
+                schedule_ok: true,
+            },
+        );
+        assert_eq!(
+            fx4,
+            vec![CronEffect::SleepUntil { at_secs: gate }],
+            "the gate holds until its deadline"
+        );
+        assert_eq!(m4.deferred, m3.deferred);
+
+        let (m5, fx5) = tick(
+            &m4,
+            &CronMsg::Tick {
+                now_secs: gate,
+                candidates: vec![1360, 1420, 1720],
+                schedule_ok: true,
+            },
+        );
+        assert_eq!(
+            fx5,
+            vec![CronEffect::FireTick { tick: 1420 }],
+            "the carried tick fires exactly once at the gate"
+        );
+        assert_eq!(m5.in_flight, Some(1420));
+        assert!(m5.deferred.is_none(), "the gate resolves on fire");
     }
 
     /// Policy table pinned in the kernel (moved semantics from

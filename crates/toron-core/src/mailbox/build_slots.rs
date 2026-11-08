@@ -127,7 +127,7 @@ impl Mailbox {
 
         // (parity bug bd-XXX: reported under-extension to ~10s).
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        let existing = active_slot(pool, project_slug, slot).await;
+        let existing = active_slot(pool, project_slug, slot, &npub).await;
         let base_abs_us = existing
             .as_ref()
             .and_then(|s| s.expires_ts_us)
@@ -156,7 +156,7 @@ impl Mailbox {
         )?;
         self.bus.publish(event.clone()).await?;
 
-        Ok(active_slot(pool, project_slug, slot).await)
+        Ok(active_slot(pool, project_slug, slot, &npub).await)
     }
 
     /// `release_build_slot`: mark an active lease released (non-destructive).
@@ -191,17 +191,19 @@ impl Mailbox {
     }
 }
 
-/// Fetch a single active slot from the projection.
+/// Fetch the caller's own active slot from the projection. Shared slots have
+/// one row per holder, so renewing must never pick a peer's expiry.
 async fn active_slot(
     pool: &sqlx::SqlitePool,
     project_slug: &str,
     slot: &str,
+    agent_pubkey: &str,
 ) -> Option<slots::BuildSlot> {
     slots::active_slots(pool, project_slug)
         .await
         .ok()?
         .into_iter()
-        .find(|s| s.slot == slot)
+        .find(|s| s.slot == slot && s.agent_pubkey == agent_pubkey)
 }
 
 #[cfg(test)]
@@ -380,6 +382,93 @@ mod tests {
             Some(expected_us),
             "renewed expiry must be OLD absolute expiry + extend, not now+extend (bd-XXX regression); old={old_expiry_us} got={:?}",
             renewed.expires_ts_us,
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-build-slots-shared: shared holders coexist as separate rows, and a
+    /// renewal stays shared — it extends the caller's own expiry and never
+    /// publishes the old hardcoded `exclusive:true`.
+    #[tokio::test]
+    async fn shared_holders_coexist_and_renewal_stays_shared() {
+        let (mailbox, db_path, data_dir) = test_mailbox("shared-renew").await;
+        register(&mailbox, "BlueLake").await;
+        register(&mailbox, "RoseDune").await;
+
+        let a = mailbox
+            .acquire_build_slot("demo", "BlueLake", "sh", Some(3600), false)
+            .await
+            .expect("acquire a");
+        assert_eq!(a.granted.len(), 1);
+        let b = mailbox
+            .acquire_build_slot("demo", "RoseDune", "sh", Some(3600), false)
+            .await
+            .expect("acquire b");
+        assert_eq!(b.granted.len(), 1, "shared coexists");
+        assert!(b.conflicts.is_empty(), "shared never conflicts: {b:?}");
+
+        let pool = mailbox.index_pool().expect("pool").clone();
+        let holders: Vec<String> = sqlx::query_scalar(
+            "SELECT agent_name FROM build_slots \
+             WHERE project_slug = 'demo' AND slot = 'sh' AND status = 'active' \
+             ORDER BY agent_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("holders");
+        assert_eq!(
+            holders,
+            vec!["BlueLake".to_string(), "RoseDune".to_string()],
+            "both shared holders keep a row"
+        );
+
+        // Give the peer a deliberately different expiry: renewing RoseDune
+        // must extend HER row, not the first active row for the slot.
+        sqlx::query(
+            "UPDATE build_slots SET expires_ts_us = 1 \
+             WHERE project_slug = 'demo' AND slot = 'sh' AND agent_name = 'BlueLake'",
+        )
+        .execute(&pool)
+        .await
+        .expect("peer expiry");
+        let rose_before: i64 = sqlx::query_scalar(
+            "SELECT expires_ts_us FROM build_slots \
+             WHERE project_slug = 'demo' AND slot = 'sh' AND agent_name = 'RoseDune'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("rose expiry");
+
+        let renewed = mailbox
+            .renew_build_slot("demo", "RoseDune", "sh", 60)
+            .await
+            .expect("renew")
+            .expect("active shared lease renews");
+        assert!(!renewed.exclusive, "renewal stays shared");
+        assert_eq!(
+            renewed.expires_ts_us,
+            Some(rose_before + 60_000_000),
+            "renewal extends the caller's own row"
+        );
+
+        let exclusive_true: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bus_events \
+             WHERE kind = 30032 AND raw_json LIKE '%\"exclusive\":true%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("event scan");
+        assert_eq!(exclusive_true, 0, "a shared slot never publishes exclusive");
+        let published: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bus_events WHERE kind = 30032")
+                .fetch_one(&pool)
+                .await
+                .expect("event count");
+        assert!(
+            published >= 2,
+            "each holder's latest addressable slot event is stored: {published}"
         );
 
         let _ = std::fs::remove_file(&db_path);

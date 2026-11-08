@@ -361,6 +361,16 @@ mod tests {
             .unwrap();
         assert_eq!(s2.granted.len(), 1, "shared coexists");
         assert!(s2.conflicts.is_empty());
+        let shared = active_slots(&p, "demo").await.unwrap();
+        let holders: Vec<&str> = shared
+            .iter()
+            .filter(|s| s.slot == "sh")
+            .map(|s| s.agent_pubkey.as_str())
+            .collect();
+        assert!(
+            holders.contains(&"aaa") && holders.contains(&"bbb"),
+            "a second shared acquire never overwrites the first: {shared:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
