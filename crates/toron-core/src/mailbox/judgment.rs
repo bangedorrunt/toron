@@ -907,6 +907,10 @@ pub async fn journal_get_for(
 /// Placeholder model id marking an unsettled claim (never a final answer).
 pub const CLAIM_MODEL_ID: &str = "__claim__";
 
+/// A claim older than this is presumed crashed, not in flight: it is well
+/// past the longest legal invocation, so reaping it cannot race a live ask.
+pub const JUDGMENT_CLAIM_STALE_SECS: u64 = 600;
+
 /// True when the row is an unsettled claim, not a judged answer.
 pub fn is_claim_record(record: &JudgmentEffectRecord) -> bool {
     record.model_id == CLAIM_MODEL_ID
@@ -922,6 +926,13 @@ pub async fn claim_judgment(
     pack_id: &str,
     pack_version: Option<u32>,
 ) -> anyhow::Result<bool> {
+    // A caller that crashed mid-ask leaves `__claim__` behind forever; reap
+    // only claims past the longest legal invocation, then let INSERT OR
+    // IGNORE decide the fresh race (a live ask keeps its own claim).
+    let stale_micros = i64::try_from(JUDGMENT_CLAIM_STALE_SECS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    reconcile_judgment_claims(pool, stale_micros).await?;
     let claim = JudgmentEffectRecord {
         effect_key: effect_key.to_string(),
         pack_id: pack_id.to_string(),
@@ -1616,6 +1627,44 @@ mod tests {
             .await
             .expect("reclaim"),
             "key reclaimable after reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_claim_is_reaped_by_the_next_claim() {
+        let pool = uhkr_pool().await;
+        let pack = find_pack("wake-priority").unwrap();
+        assert!(
+            claim_judgment(
+                &pool,
+                "toron",
+                "k-stale",
+                "wake-priority",
+                Some(pack.version)
+            )
+            .await
+            .expect("claim")
+        );
+        // Simulate a caller that died mid-ask: the placeholder stays behind,
+        // aged past every legal invocation.
+        sqlx::query(
+            "UPDATE judgment_effects SET created_at = 0 \
+             WHERE effect_key = 'k-stale' AND model_id = '__claim__'",
+        )
+        .execute(&pool)
+        .await
+        .expect("age the claim");
+        assert!(
+            claim_judgment(
+                &pool,
+                "toron",
+                "k-stale",
+                "wake-priority",
+                Some(pack.version)
+            )
+            .await
+            .expect("reclaim"),
+            "a claim past the longest invocation must not block a retry forever"
         );
     }
 

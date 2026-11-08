@@ -133,6 +133,18 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
                 blocks: blockers.clone().into_iter().collect(),
             });
         }
+        // Never sleep while holding a partial grant: another agent may need
+        // the paths we hold while we wait for the rest (hold-and-wait). Drop
+        // them and retry the full set on the next poll.
+        if !held.is_empty() {
+            if let Err(e) = store.release(args).await {
+                eprintln!(
+                    "toron reserve with-lease: release of partial grants failed (they expire \
+                     on their own): {e:#}"
+                );
+            }
+            held.clear();
+        }
         tokio::time::sleep(POLL).await;
     };
     if let Some(Refusal {

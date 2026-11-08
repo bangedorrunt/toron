@@ -82,8 +82,18 @@ struct Subscriber {
     /// subscribe setup). Cleared once `replay_done` (single-path delivery
     /// needs no dedup; bounded memory).
     delivered: Arc<Mutex<HashSet<String>>>,
-    /// Set to true once the replay task has pushed history + EOSE.
+    /// Set to true once the replay task has pushed history + EOSE AND every
+    /// live event buffered during replay has been delivered. Until then live
+    /// events wait in `pending` instead of racing ahead of the EOSE marker.
     replay_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Live events published while replay is running, in publish order. The
+    /// replay task drains these after EOSE. Bounded by the channel capacity:
+    /// a subscriber that cannot keep up during replay is a full-drop, exactly
+    /// as it would be after replay.
+    pending: Arc<Mutex<Vec<Event>>>,
+    /// Serializes the replay seal (EOSE + `replay_done` flip + pending drain)
+    /// against live publishers. Held only for synchronous channel operations.
+    gate: Arc<Mutex<()>>,
     /// Last channel-full drop report (rate-limits the WARN so a permanently
     /// slow consumer doesn't flood the log; drops stay exactly counted).
     last_full_warn: Arc<Mutex<std::time::Instant>>,
@@ -223,6 +233,7 @@ impl InProcessBus {
 
     fn fanout_to(&self, sub: &Subscriber, event: &Event) {
         let id = event.id.to_hex();
+        let gate = sub.gate.lock();
         if !sub.replay_done.load(std::sync::atomic::Ordering::Acquire) {
             if sub.snapshot.contains(&id) {
                 return;
@@ -230,24 +241,25 @@ impl InProcessBus {
             if !sub.delivered.lock().insert(id.clone()) {
                 return;
             }
-            match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    sub.delivered.lock().remove(&id);
-                    self.note_full_drop(sub, event);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.subs.write().remove(&sub.id);
-                }
+            let mut pending = sub.pending.lock();
+            if pending.len() >= self.config.channel_capacity {
+                drop(pending);
+                sub.delivered.lock().remove(&id);
+                drop(gate);
+                self.note_full_drop(sub, event);
+                return;
             }
+            pending.push(event.clone());
             return;
         }
         match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                drop(gate);
                 self.note_full_drop(sub, event);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                drop(gate);
                 self.subs.write().remove(&sub.id);
             }
         }
@@ -319,6 +331,10 @@ impl InProcessBus {
             Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
         let delivered: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let gate: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let pending_clone = pending.clone();
+        let gate_clone = gate.clone();
         let replay_tx = tx.clone();
         let snapshot_clone = snapshot;
         let replay_done_clone = replay_done.clone();
@@ -358,9 +374,41 @@ impl InProcessBus {
                     tracing::warn!("subscribe delta re-read failed: {e}");
                 }
             }
-            let _ = replay_tx.send(SubscriptionEvent::Eose).await;
-            replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
-            delivered_clone.lock().clear();
+            // EOSE is the boundary: live events buffered during replay are
+            // delivered only after it, and the gate keeps a new publisher from
+            // slipping one in front of the marker while we seal.
+            if replay_tx.send(SubscriptionEvent::Eose).await.is_err() {
+                return;
+            }
+            loop {
+                let gate = gate_clone.lock();
+                let batch: Vec<Event> = std::mem::take(&mut *pending_clone.lock());
+                if batch.is_empty() {
+                    replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
+                    drop(gate);
+                    delivered_clone.lock().clear();
+                    return;
+                }
+                let mut overflow = Vec::new();
+                for ev in batch {
+                    match replay_tx.try_send(SubscriptionEvent::Event(ev)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(SubscriptionEvent::Event(ev))) => {
+                            overflow.push(ev);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
+                drop(gate);
+                // Still pre-seal, so new publishers keep buffering while an
+                // overflowed event waits for channel space.
+                for ev in overflow {
+                    if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
+                        return;
+                    }
+                }
+            }
         });
 
         let sub = Arc::new(Subscriber {
@@ -371,6 +419,8 @@ impl InProcessBus {
             snapshot: snapshot_ids,
             delivered,
             replay_done,
+            pending,
+            gate,
             last_full_warn: Arc::new(Mutex::new(
                 std::time::Instant::now()
                     .checked_sub(Subscriber::FULL_WARN_INTERVAL)
@@ -696,6 +746,53 @@ mod tests {
         let got_eose = items.iter().any(|it| matches!(it, SubscriptionEvent::Eose));
         assert!(saw_event, "live event must be delivered, got {items:?}");
         assert!(got_eose, "EOSE marker must be emitted, got {items:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A live publish during replay must not be dropped for channel-full
+    /// once the channel is saturated by history, and it must never arrive
+    /// ahead of EOSE. Before the buffer, `try_send` on the full channel
+    /// discarded it; now it waits for the seal and follows the marker.
+    #[tokio::test]
+    async fn live_events_wait_for_eose_and_survive_a_full_replay_channel() {
+        let (bus, path) = temp_bus_with(InProcessBusConfig {
+            channel_capacity: 2,
+            ..Default::default()
+        })
+        .await;
+        let keys = Keys::generate();
+        for i in 0..6 {
+            bus.publish(signed(&keys, PROJECT_MANIFEST, &format!("h{i}"), "demo"))
+                .await
+                .expect("seed");
+        }
+        let mut sub = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("sub");
+        // Replay is now blocked on the 2-slot channel, so this publish lands
+        // in the pending buffer rather than the channel.
+        let live = signed(&keys, PROJECT_MANIFEST, "live", "demo");
+        bus.publish(live.clone()).await.expect("live publish");
+
+        let items = drain(&mut sub, 32, Duration::from_millis(300)).await;
+        let eose = items
+            .iter()
+            .position(|it| matches!(it, SubscriptionEvent::Eose))
+            .expect("EOSE");
+        let live_at = items
+            .iter()
+            .position(|it| matches!(it, SubscriptionEvent::Event(e) if e.id == live.id))
+            .expect("buffered live event must be delivered");
+        assert!(
+            eose < live_at,
+            "history + EOSE must precede a buffered live event: {items:?}"
+        );
+        let history = items[..eose]
+            .iter()
+            .filter(|it| matches!(it, SubscriptionEvent::Event(_)))
+            .count();
+        assert_eq!(history, 6, "all replayed history arrives: {items:?}");
         let _ = std::fs::remove_file(&path);
     }
 
