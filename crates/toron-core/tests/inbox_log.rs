@@ -9,9 +9,7 @@ use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipi
 use toron_core::inbox::{INBOX_STREAM, InboxError, InboxStore, JOURNAL_STREAM, ToronLog};
 use toron_core::index::schema;
 use toron_core::kernel::{self, AppendError, Boot, DurableLog, Failure, Loop, Producer, Program};
-use toron_core::outbox::{
-    self, MAX_RECONCILE, Outbox, OutboxModel, OutboxMsg, OutboxRun, SendState,
-};
+use toron_core::outbox::{self, Outbox, OutboxCmd, OutboxModel, OutboxMsg, OutboxRun, SendState};
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -107,13 +105,46 @@ fn an_unknown_journal_outcome_parks_without_a_command() {
     let msg = Outbox::failure(&Failure::Unknown(AppendError::Unavailable(
         "lost acknowledgement".into(),
     )));
-    assert!(matches!(msg, OutboxMsg::JournalUnknown(_)));
+    assert!(matches!(
+        msg,
+        OutboxMsg::JournalUnknown { msg_key: None, .. }
+    ));
+    let update = Outbox::update(&OutboxModel::default(), &msg);
+    assert!(update.commands.is_empty(), "{:?}", update.commands);
+    // With no command in hand there is no send to park: the fold records
+    // that it saw an unattributed failure rather than inventing a key.
+    assert!(update.model.sends.is_empty());
+    assert_eq!(update.model.unattributed, 1);
+}
+
+/// A rejected durable intent names its send: the fold refuses the real key,
+/// not a synthetic one derived from the error text.
+#[test]
+fn a_rejected_intent_names_the_send_it_refused() {
+    let env = task(A, B, 0, 7);
+    let key = env.msg.key();
+    let msg = Outbox::failure_for(
+        Some(&OutboxCmd::Append(env)),
+        &Failure::NotAppended(AppendError::StaleEpoch {
+            producer: A.into(),
+            sent: 0,
+            current: 1,
+        }),
+    );
+    match &msg {
+        OutboxMsg::NotJournaled { msg_key, why } => {
+            assert_eq!(msg_key.as_deref(), Some(key.as_str()));
+            assert!(!why.is_empty(), "the refusal is rendered");
+        }
+        other => panic!("expected a keyed NotJournaled, got {other:?}"),
+    }
     let update = Outbox::update(&OutboxModel::default(), &msg);
     assert!(update.commands.is_empty(), "{:?}", update.commands);
     assert!(matches!(
-        update.model.sends.values().next(),
-        Some(SendState::Unknown(MAX_RECONCILE))
+        update.model.sends.get(&key),
+        Some(SendState::Refused(_))
     ));
+    assert_eq!(update.model.unattributed, 0);
 }
 
 /// The closure laws each close their log, so they run on fresh logs rather

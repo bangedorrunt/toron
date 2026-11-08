@@ -77,6 +77,12 @@ pub enum SendState {
 pub struct OutboxModel {
     /// Send state per `msg_key`.
     pub sends: BTreeMap<String, SendState>,
+    /// Failures the loop could not attribute to a send (the failure answers
+    /// a fold input, not an intent). Never a send state: every send has a
+    /// key. `serde(default)` keeps a snapshot written before this field
+    /// readable.
+    #[serde(default)]
+    pub unattributed: u64,
 }
 
 /// Inputs.
@@ -95,10 +101,22 @@ pub enum OutboxMsg {
     /// The log or the contract refused.
     Refused { key: String, why: String },
     /// The journal refused the intent (e.g. stale epoch): nothing ran.
-    NotJournaled(String),
+    /// `msg_key` names the send when the loop held its command; `None`
+    /// means the failure answers a fold input, not a send.
+    NotJournaled {
+        /// The send the refusal belongs to, when one is known.
+        msg_key: Option<String>,
+        /// The journal's refusal, rendered.
+        why: String,
+    },
     /// The journal's append outcome is unknown: the intent may have landed.
     /// Parked, never retried blind; a host re-feeds `Recover` to reconcile.
-    JournalUnknown(String),
+    JournalUnknown {
+        /// The send the unknown outcome belongs to, when one is known.
+        msg_key: Option<String>,
+        /// Why the outcome is unknown.
+        why: String,
+    },
 }
 
 /// Commands.
@@ -192,28 +210,50 @@ impl Program for Outbox {
                     .insert(key.clone(), SendState::Refused(why.clone()));
                 Update::quiet(next)
             }
-            OutboxMsg::NotJournaled(why) => {
-                next.sends.insert(
-                    format!("<not journaled> {why}"),
-                    SendState::Refused(why.clone()),
-                );
+            OutboxMsg::NotJournaled { msg_key, why } => {
+                match msg_key {
+                    Some(key) => {
+                        next.sends
+                            .insert(key.clone(), SendState::Refused(why.clone()));
+                    }
+                    None => next.unattributed = next.unattributed.saturating_add(1),
+                }
                 Update::quiet(next)
             }
-            OutboxMsg::JournalUnknown(why) => {
-                next.sends.insert(
-                    format!("<journal unknown> {why}"),
-                    SendState::Unknown(MAX_RECONCILE),
-                );
+            OutboxMsg::JournalUnknown { msg_key, .. } => {
+                match msg_key {
+                    Some(key) => {
+                        next.sends
+                            .insert(key.clone(), SendState::Unknown(MAX_RECONCILE));
+                    }
+                    None => next.unattributed = next.unattributed.saturating_add(1),
+                }
                 Update::quiet(next)
             }
         }
     }
 
     fn failure(failure: &Failure<String>) -> OutboxMsg {
+        Self::failure_for(None, failure)
+    }
+
+    fn failure_for(cmd: Option<&OutboxCmd>, failure: &Failure<String>) -> OutboxMsg {
+        let msg_key = cmd.map(|cmd| match cmd {
+            OutboxCmd::Append(env) | OutboxCmd::Reconcile(env) => env.msg.key(),
+        });
         match failure {
-            Failure::NotAppended(e) => OutboxMsg::NotJournaled(e.to_string()),
-            Failure::Unknown(e) => OutboxMsg::JournalUnknown(e.to_string()),
-            other => OutboxMsg::NotJournaled(format!("{other:?}")),
+            Failure::NotAppended(e) => OutboxMsg::NotJournaled {
+                msg_key,
+                why: e.to_string(),
+            },
+            Failure::Unknown(e) => OutboxMsg::JournalUnknown {
+                msg_key,
+                why: e.to_string(),
+            },
+            other => OutboxMsg::NotJournaled {
+                msg_key,
+                why: format!("{other:?}"),
+            },
         }
     }
 }
