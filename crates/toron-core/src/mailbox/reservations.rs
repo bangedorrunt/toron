@@ -1771,7 +1771,21 @@ impl Mailbox {
         KernelModel,
         std::collections::HashMap<String, (String, ReservationStatus)>,
     ) {
-        let leases = self.resolved_leases(project_slug).await.unwrap_or_default();
+        let leases = match self.resolved_leases(project_slug).await {
+            Ok(leases) => leases,
+            Err(error) => {
+                // A failed bus projection must not collapse to an empty lease
+                // board and grant a conflicting acquire. The persisted kernel
+                // snapshot is stale by definition, but it is fail-closed.
+                tracing::warn!("reservation projection read failed ({project_slug}): {error}");
+                return (
+                    self.persisted_kernel_model(project_slug)
+                        .await
+                        .unwrap_or_default(),
+                    std::collections::HashMap::new(),
+                );
+            }
+        };
         let names = self.agent_name_map(project_slug).await;
         let mut model = KernelModel::new();
         let mut meta = std::collections::HashMap::new();
@@ -2516,6 +2530,18 @@ impl Mailbox {
         effects
             .iter()
             .any(|effect| matches!(effect, KernelEffect::Released { id } if id == &lease.id))
+    }
+
+    async fn persisted_kernel_model(&self, project_slug: &str) -> Option<KernelModel> {
+        let pool = self.index_pool()?;
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT model_json FROM reservation_kernel_models WHERE project_slug = ?1",
+        )
+        .bind(project_slug)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+        serde_json::from_str(&json).ok()
     }
 
     async fn persist_kernel_model(&self, project_slug: &str, model: &KernelModel) {
