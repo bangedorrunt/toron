@@ -28,7 +28,7 @@
 //! spelling of the path and no generic-resolution fragility.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -126,6 +126,10 @@ pub fn passthrough() -> BoxSend {
 pub struct CircuitBreaker {
     inner: tower::limit::ConcurrencyLimit<tower::timeout::Timeout<BoxSend>>,
     state: Arc<Mutex<BreakerState>>,
+    /// Bumped on every breaker transition. A call settles only for the
+    /// generation that dispatched it, so a slow Closed-era success can
+    /// never close a HalfOpen probe (bd-breaker-generation).
+    generation: Arc<AtomicU64>,
     threshold: u32,
     reset_after: Duration,
     clock: ClockFn,
@@ -149,6 +153,8 @@ impl std::fmt::Debug for CircuitBreaker {
 /// Completed probes mark `done` before `observe`, so the guard no-ops.
 struct ProbeGuard {
     state: Arc<Mutex<BreakerState>>,
+    generation: Arc<AtomicU64>,
+    call_generation: u64,
     probe: bool,
     done: Arc<AtomicBool>,
 }
@@ -156,6 +162,9 @@ struct ProbeGuard {
 impl Drop for ProbeGuard {
     fn drop(&mut self) {
         if !self.probe || self.done.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.generation.load(Ordering::SeqCst) != self.call_generation {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -201,6 +210,7 @@ impl CircuitBreaker {
             state: Arc::new(Mutex::new(BreakerState::Closed {
                 consecutive_failures: 0,
             })),
+            generation: Arc::new(AtomicU64::new(0)),
             threshold,
             reset_after,
             clock: Arc::new(tokio::time::Instant::now),
@@ -217,11 +227,16 @@ impl CircuitBreaker {
     /// Observe one completed inner call. The clock is injected: `Open`
     /// deadlines and `HalfOpen` re-opens read `(self.clock)()`, never
     /// wall time directly (bd-mbck).
-    fn observe(&self, failed: bool) {
+    fn observe(&self, call_generation: u64, failed: bool) {
         let threshold = self.threshold;
         let reset_after = self.reset_after;
         let now = (self.clock)();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // A settle is authoritative only for the generation that dispatched
+        // it: after any transition, older in-flight calls are stale.
+        if self.generation.load(Ordering::SeqCst) != call_generation {
+            return;
+        }
         match (&mut *state, failed) {
             (
                 BreakerState::Closed {
@@ -231,6 +246,7 @@ impl CircuitBreaker {
             ) => {
                 *consecutive_failures += 1;
                 if *consecutive_failures >= threshold {
+                    self.generation.fetch_add(1, Ordering::SeqCst);
                     *state = BreakerState::Open {
                         retry_at: now + reset_after,
                     };
@@ -245,11 +261,13 @@ impl CircuitBreaker {
                 *consecutive_failures = 0;
             }
             (BreakerState::HalfOpen { .. }, false) => {
+                self.generation.fetch_add(1, Ordering::SeqCst);
                 *state = BreakerState::Closed {
                     consecutive_failures: 0,
                 };
             }
             (BreakerState::HalfOpen { .. }, true) => {
+                self.generation.fetch_add(1, Ordering::SeqCst);
                 *state = BreakerState::Open {
                     retry_at: now + reset_after,
                 };
@@ -271,6 +289,7 @@ impl Service<SendRequest> for CircuitBreaker {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if let BreakerState::Open { retry_at } = *state {
                 if (self.clock)() >= retry_at {
+                    self.generation.fetch_add(1, Ordering::SeqCst);
                     *state = BreakerState::HalfOpen {
                         probe_in_flight: false,
                     };
@@ -293,7 +312,7 @@ impl Service<SendRequest> for CircuitBreaker {
     }
 
     fn call(&mut self, req: SendRequest) -> Self::Future {
-        let probe = {
+        let (probe, call_generation) = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             match *state {
                 BreakerState::Open { .. } => {
@@ -310,9 +329,9 @@ impl Service<SendRequest> for CircuitBreaker {
                     *state = BreakerState::HalfOpen {
                         probe_in_flight: true,
                     };
-                    true
+                    (true, self.generation.load(Ordering::SeqCst))
                 }
-                BreakerState::Closed { .. } => false,
+                BreakerState::Closed { .. } => (false, self.generation.load(Ordering::SeqCst)),
             }
         };
         let mut inner = self.inner.clone();
@@ -320,6 +339,7 @@ impl Service<SendRequest> for CircuitBreaker {
         let observer = Self {
             inner: self.inner.clone(),
             state: observer_state,
+            generation: self.generation.clone(),
             threshold: self.threshold,
             reset_after: self.reset_after,
             clock: self.clock.clone(),
@@ -328,23 +348,25 @@ impl Service<SendRequest> for CircuitBreaker {
             let done = Arc::new(AtomicBool::new(false));
             let _permit = ProbeGuard {
                 state: observer.state.clone(),
+                generation: observer.generation.clone(),
+                call_generation,
                 probe,
                 done: done.clone(),
             };
             if let Err(e) = inner.ready().await {
                 done.store(true, Ordering::SeqCst);
-                observer.observe(true);
+                observer.observe(call_generation, true);
                 return Err(ArmorError::Ambiguous(e.to_string()));
             }
             match inner.call(req).await {
                 Ok(outcome) => {
                     done.store(true, Ordering::SeqCst);
-                    observer.observe(outcome.is_err());
+                    observer.observe(call_generation, outcome.is_err());
                     Ok(outcome)
                 }
                 Err(e) => {
                     done.store(true, Ordering::SeqCst);
-                    observer.observe(true);
+                    observer.observe(call_generation, true);
                     Err(ArmorError::Ambiguous(e.to_string()))
                 }
             }
@@ -672,6 +694,112 @@ mod armor_matrix_tests {
         drop(armor);
         assert_eq!(out, Ok(1));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// bd-breaker-generation: a slow call that started while `Closed` must
+    /// not settle the breaker after it has moved to `HalfOpen`. Only the
+    /// probe's own generation may close or re-open it.
+    #[tokio::test]
+    async fn stale_closed_success_cannot_close_halfopen_probe() {
+        let manual = ManualClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a_entered = Arc::new(AtomicBool::new(false));
+        let c_entered = Arc::new(AtomicBool::new(false));
+        let (a_tx, a_rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+        let a_rx = Arc::new(Mutex::new(Some(a_rx)));
+        let (c_tx, c_rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+        let c_rx = Arc::new(Mutex::new(Some(c_rx)));
+        let inner = {
+            let calls = calls.clone();
+            let a_entered = a_entered.clone();
+            let c_entered = c_entered.clone();
+            box_send(move |_| {
+                let calls = calls.clone();
+                let a_entered = a_entered.clone();
+                let c_entered = c_entered.clone();
+                let a_rx = a_rx.clone();
+                let c_rx = c_rx.clone();
+                Box::pin(async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    match call {
+                        0 => {
+                            a_entered.store(true, Ordering::SeqCst);
+                            let recv = a_rx
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take()
+                                .expect("one closed-era call");
+                            recv.await.expect("closed-era released")
+                        }
+                        1 => Err("storm".to_string()),
+                        2 => {
+                            c_entered.store(true, Ordering::SeqCst);
+                            let recv = c_rx
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take()
+                                .expect("one probe");
+                            recv.await.expect("probe released")
+                        }
+                        _ => Ok(1usize),
+                    }
+                }) as SendFuture
+            })
+        };
+        let armor =
+            SendArmor::with_tuning(inner, Duration::from_secs(5), 4, 1, Duration::from_secs(30))
+                .with_clock(manual.clock());
+
+        // A enters while Closed and stays in flight.
+        let a = armor.clone();
+        let a_task = tokio::spawn(async move { a.send(req()).await });
+        wait_for_flag(&a_entered, "closed-era call never entered").await;
+
+        // B fails and opens the breaker (threshold 1).
+        let out_b = armor.send(req()).await.expect("armor ok");
+        assert_eq!(out_b, Err("storm".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // The reset elapses and C becomes the single HalfOpen probe.
+        manual.advance(Duration::from_secs(31));
+        let c = armor.clone();
+        let c_task = tokio::spawn(async move { c.send(req()).await });
+        wait_for_flag(&c_entered, "probe never entered").await;
+
+        // A (an older generation) succeeds while the probe is in flight. That
+        // settle is stale and must be ignored, so the breaker stays half-open.
+        a_tx.send(Ok(7)).expect("release closed-era call");
+        assert_eq!(
+            a_task.await.expect("closed-era task").expect("armor ok"),
+            Ok(7)
+        );
+        let err = armor.send(req()).await.expect_err("probe still owns it");
+        assert_eq!(err, ArmorError::BreakerOpen);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a stale success never admits another call"
+        );
+
+        // The probe's own failure re-opens the breaker for a fresh window.
+        c_tx.send(Err("probe failed".to_string()))
+            .expect("release probe");
+        assert_eq!(
+            c_task.await.expect("probe task").expect("armor ok"),
+            Err("probe failed".to_string())
+        );
+        let err = armor.send(req()).await.expect_err("probe failure re-opens");
+        assert_eq!(err, ArmorError::BreakerOpen);
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool, message: &str) {
+        for _ in 0..10_000 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{message}");
     }
 
     /// bd-mbck: the injected clock alone drives recovery — open refuses,
