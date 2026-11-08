@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-11-09
+
+### Added
+- **One same-plane identity snapshot (`PanePlane::identity_snapshot`).** Pane cleanup reconciles the pane and agent halves from one plane read; the fallback backend pins the pair, so a rex pane list can never be compared with an hc agent list. A failed pane list now aborts cleanup instead of marking every live identity dead.
+- **Daemon-free behavior matrix in CI.** `scripts/e2e-behavior.sh` covers channel/job/mail/supervisor paths without a live daemon.
+
+### Fixed
+- **`channel post --mention` requires the body marker.** A `--mention Name` whose body lacks `@Name` exits 2 and publishes neither the channel post nor a 43001 job, matching the dispatcher's dual requirement.
+- **Rex roster enrichment no longer shares one sweep deadline.** Each status call has its own bound and up to eight probe concurrently, so later blocks are not silently reported as `Unknown`; the cap still lists every pane.
+
 ## [1.6.1] — 2026-11-03
 
 ### Fixed

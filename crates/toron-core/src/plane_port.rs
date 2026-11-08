@@ -20,6 +20,14 @@ pub use crate::pane_types::{
 pub trait PanePlane: Send + Sync {
     fn pane_list(&self) -> anyhow::Result<Vec<PaneInfo>>;
     fn agent_list(&self) -> anyhow::Result<Vec<AgentInfo>>;
+
+    /// One read of both facts from the **same** plane. Destructive callers
+    /// (pane cleanup) use this so a per-call fallback cannot combine a rex
+    /// pane list with an hc agent list. The default keeps canned/test ports
+    /// working; the live adapter pins the pair in `FallbackBackend`.
+    fn identity_snapshot(&self) -> anyhow::Result<(Vec<PaneInfo>, Vec<AgentInfo>)> {
+        Ok((self.pane_list()?, self.agent_list()?))
+    }
 }
 
 /// Canned panes/agents for kernel tests. No backend, no env, no I/O.

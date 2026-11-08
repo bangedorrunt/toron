@@ -136,6 +136,7 @@ Prefix cargo with `mbx` (bare `cargo` misparses under the mbx shim).
 
 ```bash
 bash scripts/verify-gates.sh
+bash scripts/e2e-behavior.sh        # daemon-free channel/job/mail/supervisor matrix
 toron daemon status --json
 mbx test --workspace
 mbx test catalog_freshness

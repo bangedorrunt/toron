@@ -641,6 +641,13 @@ async fn post_one(
 ) -> anyhow::Result<()> {
     let mut mention_pks: Vec<PublicKey> = Vec::new();
     for name in args.mention.iter().filter(|_| with_mentions) {
+        if !toron_workflow::mention::body_mentions(body, name) {
+            return Err(UsageError(format!(
+                "--mention {name} requires @{name} in the post body: the p tag alone does not \
+                 dispatch a 43001 job. Add '@{name}' to the message body."
+            ))
+            .into());
+        }
         let whois = mailbox
             .whois(&args.project, name)
             .await

@@ -42,6 +42,10 @@ impl PanePlane for LivePanePlane {
     fn agent_list(&self) -> anyhow::Result<Vec<AgentInfo>> {
         self.inner.agent_list().map_err(anyhow::Error::new)
     }
+
+    fn identity_snapshot(&self) -> anyhow::Result<(Vec<PaneInfo>, Vec<AgentInfo>)> {
+        self.inner.identity_snapshot().map_err(anyhow::Error::new)
+    }
 }
 
 #[cfg(test)]

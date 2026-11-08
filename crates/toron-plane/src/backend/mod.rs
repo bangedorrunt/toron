@@ -106,6 +106,13 @@ pub trait Backend: Send + Sync {
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         Err(unsupported(self.name(), "agent_list"))
     }
+
+    /// Both list facts from one plane. The composite backend overrides this
+    /// to pin the pair; callers that reconcile identities must use it rather
+    /// than two independently-fallbackable calls.
+    fn identity_snapshot(&self) -> Result<(Vec<PaneInfo>, Vec<AgentInfo>), BackendError> {
+        Ok((self.pane_list(None)?, self.agent_list()?))
+    }
     fn agent_start(
         &self,
         _name: &str,

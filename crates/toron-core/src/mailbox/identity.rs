@@ -1823,7 +1823,7 @@ impl Mailbox {
         plane: &dyn crate::plane_port::PanePlane,
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let panes: Vec<PaneInfo> = plane.pane_list().unwrap_or_default();
+        let panes: Vec<PaneInfo> = plane.pane_list()?;
         // Cheap path first: a token (hc) or an adapter-mapped label (rex)
         // answers without the agent sweep. The legacy `agent.list` name
         // fallback runs only on a miss.
@@ -1842,12 +1842,18 @@ impl Mailbox {
     /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead
     /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
     /// retires both, so neither is ever a silent live pin.
+    ///
+    /// A failed pane list aborts the sweep. Treating it as an empty list would
+    /// report every live identity as dead (and let the caller reap its leases)
+    /// on a transient plane error.
     pub fn cleanup_pane_identities(
         &self,
         plane: &dyn crate::plane_port::PanePlane,
     ) -> anyhow::Result<Vec<String>> {
-        let agents = plane.agent_list()?;
-        let panes: Vec<PaneInfo> = plane.pane_list().unwrap_or_default();
+        // One snapshot, not two independently-fallbackable reads: the live
+        // `auto` backend can otherwise answer the pane half from rex and the
+        // agent half from hc, making every rex identity look dead.
+        let (panes, agents) = plane.identity_snapshot()?;
         let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();
         let live_panes: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
         Ok(agents
@@ -4853,5 +4859,24 @@ mod tests {
                 .expect("miss"),
             None
         );
+    }
+
+    /// A transient pane-list failure must fail closed: an empty list would
+    /// mark every live identity dead and let the caller reap their leases.
+    #[tokio::test]
+    async fn cleanup_pane_identities_refuses_a_failed_pane_list() {
+        use crate::plane_port::MockPanePlane;
+        let (mailbox, db_path, data_dir) = test_mailbox("cleanup-pane-list-fail").await;
+        let mut plane = MockPanePlane::new(vec![], vec![test_agent("w1:p1", Some("CoralFinch"))]);
+        plane.panes = Err("pane list unavailable".into());
+        let error = mailbox
+            .cleanup_pane_identities(&plane)
+            .expect_err("a failed pane list must not prune every identity");
+        assert!(
+            error.to_string().contains("pane list unavailable"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

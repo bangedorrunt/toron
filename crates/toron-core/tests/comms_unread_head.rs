@@ -609,7 +609,8 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
                 "mail_ingest",
                 "durable_engine_runs",
                 "durable_workflow_runs",
-                "agent_bindings"
+                "agent_bindings",
+                "reservation_kernel_models"
             ],
         },
         "the index raises no version a binary checks"
@@ -666,7 +667,8 @@ async fn pending_urgent_is_correct_without_the_index() {
             "mail_ingest",
             "durable_engine_runs",
             "durable_workflow_runs",
-            "agent_bindings"
+            "agent_bindings",
+            "reservation_kernel_models"
         ],
         "the dropped index is gone; the additive table is still there"
     );
@@ -718,7 +720,8 @@ async fn pending_urgent_is_correct_without_the_index() {
             "mail_ingest",
             "durable_engine_runs",
             "durable_workflow_runs",
-            "agent_bindings"
+            "agent_bindings",
+            "reservation_kernel_models"
         ]
     );
 }

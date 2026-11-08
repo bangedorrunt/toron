@@ -78,7 +78,7 @@ flowchart LR
     C --> K["43005 cancel"]
 ```
 
-An `@Name` in the body plus `--mention Name` (which sets the `p` tag) creates the job. A missing `p` tag is no job. Claim through `toron job claim`; never fake a 43002 with raw events:
+An `@Name` in the body plus `--mention Name` (which sets the `p` tag) creates the job. Both are required: a missing `p` tag is no job, and `--mention Name` without `@Name` in the body now exits 2 before publishing. Claim through `toron job claim`; never fake a 43002 with raw events:
 
 ```text
 $ toron job list --project toron

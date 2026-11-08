@@ -188,6 +188,13 @@ impl Backend for FallbackBackend {
         self.run(Policy::Read, |backend| backend.agent_list())
     }
 
+    /// Both lists are one read. Without this override, `pane_list` and
+    /// `agent_list` could each fall back independently and reconciliation
+    /// would compare different planes' id spaces.
+    fn identity_snapshot(&self) -> Result<(Vec<PaneInfo>, Vec<AgentInfo>), BackendError> {
+        self.run(Policy::Read, |backend| backend.identity_snapshot())
+    }
+
     fn agent_start(
         &self,
         name: &str,
@@ -338,6 +345,14 @@ mod fallback_tests {
             self.next("agent_wait")?;
             Err(BackendError::timeout("scripted wait returned no agent"))
         }
+
+        fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+            self.next("pane_list").map(|()| Vec::new())
+        }
+
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
+            self.next("agent_list").map(|()| Vec::new())
+        }
     }
 
     fn backend(primary: Scripted, fallback: Option<Scripted>) -> FallbackBackend {
@@ -429,6 +444,26 @@ mod fallback_tests {
             .expect_err("timeout must surface");
         assert_eq!(error.code(), &BackendErrorCode::Timeout);
         assert_eq!(fallback.calls(), 0);
+    }
+
+    /// The identity pair is one read: a connection refusal on the pane half
+    /// replays BOTH halves on the fallback, never a rex pane list against an
+    /// hc agent list.
+    #[test]
+    fn an_identity_snapshot_replays_as_one_unit() {
+        let primary = Scripted::new("rex", vec![Some(BackendErrorCode::Connect), None, None]);
+        let fallback = Scripted::ok("hc");
+        let backend = backend(primary.clone(), Some(fallback.clone()));
+        let (panes, agents) = backend
+            .identity_snapshot()
+            .expect("the pair is replayed on hc");
+        assert!(panes.is_empty() && agents.is_empty());
+        assert_eq!(primary.calls(), 1, "the primary pair stops at pane_list");
+        assert_eq!(
+            fallback.calls(),
+            2,
+            "both lists come from the same fallback plane"
+        );
     }
 
     /// Unsupported is a verdict about the call, not a transport fault. A

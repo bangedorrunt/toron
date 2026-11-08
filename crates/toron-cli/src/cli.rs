@@ -1533,7 +1533,9 @@ pub struct ChannelPostArgs {
     #[arg(long = "as", required = true)]
     pub as_name: String,
     /// @mention targets (canonical names; p-tags + mention dispatcher;
-    /// applied to the first chunk only).
+    /// applied to the first chunk only). Each target must also appear as
+    /// `@Name` in the body; a flag/body mismatch is a usage error (exit 2)
+    /// and publishes nothing.
     #[arg(long, value_delimiter = ',')]
     pub mention: Vec<String>,
     /// Verify-after-send (bd-verify-after-send-fxtv): after publishing,

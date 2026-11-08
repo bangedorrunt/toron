@@ -148,6 +148,34 @@ pub fn parse_mentions(event: &Event) -> Vec<Mention> {
     mentions
 }
 
+/// True when `content` carries the exact `@name` token.
+///
+/// The dispatcher requires both the body marker and the `p` tag. The CLI uses
+/// this check before publishing so `--mention Name` with a body that lacks
+/// `@Name` fails as a usage error instead of silently producing no 43001.
+pub fn body_mentions(content: &str, name: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == MENTION_PREFIX as u8 {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'-')
+            {
+                end += 1;
+            }
+            if end > start && &content[start..end] == name {
+                return true;
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Does `content` contain an `@token`? Returns the token (lowercased, without
 /// `@`) if so. Channel-agnostic: no channel binding (beads-review).
 pub fn content_mentions(content: &str, _npub: &PublicKey) -> Option<String> {
@@ -208,6 +236,15 @@ mod tests {
         assert_eq!(mentions[0].name, "OCbeta");
         assert_eq!(mentions[0].message_id, ev.id);
         assert!(is_mention(&ev));
+    }
+
+    #[test]
+    fn body_mentions_requires_the_exact_token() {
+        assert!(body_mentions("handoff @OCbeta now", "OCbeta"));
+        assert!(body_mentions("@OCbeta", "OCbeta"));
+        assert!(!body_mentions("handoff", "OCbeta"));
+        assert!(!body_mentions("@OCbeta", "OC"));
+        assert!(!body_mentions("@ocbeta", "OCbeta"));
     }
 
     #[test]

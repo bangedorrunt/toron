@@ -234,6 +234,47 @@ async fn sc27_crew_steer_cli_no_captain() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // The flag alone is not a mention: no `@B` in the body means no job.
+    // It must be a usage error that publishes neither a post nor a 43001.
+    let out = run(
+        &dir,
+        &[
+            "channel",
+            "post",
+            CHANNEL,
+            "--body",
+            "handoff without the marker",
+            "--mention",
+            B,
+            "--project",
+            PROJECT,
+            "--as",
+            A,
+        ],
+    );
+    collect(&out);
+    assert_eq!(
+        exit_code(&out),
+        2,
+        "--mention without @Name must exit 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires @"),
+        "the error must name the missing body marker: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        store_kind_count(&pool, 9).await,
+        0,
+        "a refused mention must publish no channel post"
+    );
+    assert_eq!(
+        store_kind_count(&pool, 43001).await,
+        0,
+        "a refused mention must publish no job"
+    );
+
     let out = run(
         &dir,
         &[

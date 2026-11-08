@@ -45,10 +45,14 @@ use rex_cli::{
 /// blocks are still reported, but with `Unknown` — never a fabricated status.
 pub const AGENT_SCAN_CAP: usize = 512;
 
-/// Total time one `agent_list` call may spend on status enrichment. Checked
-/// between blocks; one in-flight rex call is bounded separately by `REX_WAIT`
-/// (12 s), so the sweep ends within this budget plus at most one call.
-pub const AGENT_STATUS_BUDGET: Duration = Duration::from_secs(3);
+/// Time one status subprocess may spend. Each block gets this bound
+/// independently; there is no shared 3 s sweep deadline, so a slow early
+/// block cannot starve later blocks into `Unknown`.
+pub const AGENT_STATUS_CALL_BUDGET: Duration = Duration::from_secs(3);
+
+/// Maximum status probes in flight for one roster read. The cap bounds the
+/// rex process fan-out; order is restored from the collected results.
+pub const AGENT_STATUS_WORKERS: usize = 8;
 
 /// bd-rex-reliability-ioyz D: a session-scoped event stream.
 ///
@@ -419,33 +423,74 @@ impl MultiplexerBackend for SuperlogicalBackend {
         let rex = Self::rex()?;
         let sessions = parse_sessions(&rex.json(&ls_args()).map_err(RexFail::into_backend)?)
             .map_err(RexFail::into_backend)?;
-        let mut agents = Vec::new();
+
+        // One roster row per block, in session/list order. No status probe is
+        // started before the whole roster is known, so results never depend
+        // on which earlier block happened to be slow.
+        let mut targets: Vec<(String, RexBlock)> = Vec::new();
         for session in sessions {
-            // Budget each session independently. One slow session must not
-            // starve every later session's statuses into Unknown.
-            let started = Instant::now();
-            let mut scanned = 0usize;
             let blocks = Self::blocks(&rex, &session.session_id).map_err(RexFail::into_backend)?;
             for block in blocks {
-                // Status is one subprocess per block (program_status, plus a
-                // process probe when no record exists). Bound the sweep: past
-                // the cap or the budget the block is still listed, but with
-                // `Unknown`, which can never prove completion.
-                if !scan_allows(started.elapsed(), scanned) {
-                    agents.push(agent_from(
-                        &block,
-                        &session.session_id,
-                        AgentStatus::Unknown,
-                        serde_json::Map::new(),
-                    ));
-                    continue;
-                }
-                scanned += 1;
-                let (status, labels) =
-                    Self::block_state(&rex, &session.session_id, &block.block_id)
-                        .map_err(RexFail::into_backend)?;
-                agents.push(agent_from(&block, &session.session_id, status, labels));
+                targets.push((session.session_id.clone(), block));
             }
+        }
+        let mut agents: Vec<AgentInfo> = targets
+            .iter()
+            .map(|(session, block)| {
+                agent_from(block, session, AgentStatus::Unknown, serde_json::Map::new())
+            })
+            .collect();
+
+        let status_count = status_scan_count(targets.len());
+        if status_count == 0 {
+            return Ok(agents);
+        }
+
+        // Status is one `program_status` subprocess per block (plus a process
+        // probe when no record exists). Probe a bounded number concurrently;
+        // each call gets its own wait instead of a shared wall-clock deadline.
+        let status_rex = rex.with_wait(AGENT_STATUS_CALL_BUDGET);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<std::sync::Mutex<Option<Result<_, RexFail>>>> = (0..status_count)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        std::thread::scope(|scope| {
+            for _ in 0..status_workers(targets.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if index >= status_count {
+                            break;
+                        }
+                        let (session, block) = &targets[index];
+                        let result = Self::block_state(&status_rex, session, &block.block_id);
+                        if let Ok(mut slot) = results[index].lock() {
+                            *slot = Some(result);
+                        }
+                    }
+                });
+            }
+        });
+
+        for (index, result) in results.into_iter().enumerate() {
+            let result = result
+                .into_inner()
+                .map_err(|_| {
+                    crate::backend::BackendError::new(
+                        crate::backend::BackendErrorCode::Other("rex_status_worker".into()),
+                        "rex status worker panicked",
+                    )
+                })?
+                .ok_or_else(|| {
+                    crate::backend::BackendError::new(
+                        crate::backend::BackendErrorCode::Other("rex_status_worker".into()),
+                        "rex status worker returned no result",
+                    )
+                })?
+                .map_err(RexFail::into_backend)?;
+            let (session, block) = &targets[index];
+            let (status, labels) = result;
+            agents[index] = agent_from(block, session, status, labels);
         }
         Ok(agents)
     }
@@ -786,11 +831,15 @@ fn agent_from(
     }
 }
 
-/// Whether the roster sweep may spend another status call. Pure, so the bound
-/// is testable without a rex server: both the cap and the budget must hold
-/// before each block, and the loop can run past neither.
-fn scan_allows(elapsed: Duration, scanned: usize) -> bool {
-    scanned < AGENT_SCAN_CAP && elapsed < AGENT_STATUS_BUDGET
+/// How many blocks receive a status probe. The remainder stay `Unknown` but
+/// are still listed, so the cap never hides a pane from reconciliation.
+fn status_scan_count(blocks: usize) -> usize {
+    blocks.min(AGENT_SCAN_CAP)
+}
+
+/// How many status probes run at once for a roster of `blocks`.
+fn status_workers(blocks: usize) -> usize {
+    AGENT_STATUS_WORKERS.min(status_scan_count(blocks))
 }
 
 fn none_if_empty(text: &str) -> Option<String> {
@@ -1013,17 +1062,17 @@ mod pane_identity_tests {
         );
     }
 
-    /// `agent_list` used to pay one `program_status` per block with no bound.
-    /// Mutation: drop either conjunct and the corresponding assertion below
-    /// fails — an unbounded sweep either times out or reports every block.
+    /// `agent_list` used to spend one shared 3 s deadline across the sweep;
+    /// once it expired, every later block silently became `Unknown`. The
+    /// replacement bounds each status call and caps how many blocks are
+    /// enriched, while still listing the rest.
     #[test]
-    fn the_roster_sweep_is_bounded_by_cap_and_time() {
-        assert!(scan_allows(Duration::ZERO, 0));
-        assert!(scan_allows(
-            AGENT_STATUS_BUDGET - Duration::from_millis(1),
-            AGENT_SCAN_CAP - 1
-        ));
-        assert!(!scan_allows(AGENT_STATUS_BUDGET, 0));
-        assert!(!scan_allows(Duration::ZERO, AGENT_SCAN_CAP));
+    fn the_roster_sweep_caps_status_work_without_a_shared_deadline() {
+        assert_eq!(status_scan_count(0), 0);
+        assert_eq!(status_scan_count(3), 3);
+        assert_eq!(status_scan_count(AGENT_SCAN_CAP + 17), AGENT_SCAN_CAP);
+        assert_eq!(status_workers(0), 0);
+        assert_eq!(status_workers(1), 1);
+        assert_eq!(status_workers(AGENT_SCAN_CAP + 1), AGENT_STATUS_WORKERS);
     }
 }

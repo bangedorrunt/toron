@@ -134,6 +134,16 @@ impl Rex {
         Self { bin, wait }
     }
 
+    /// The same resolved binary with a tighter per-call bound. Used by the
+    /// roster sweep so one status probe cannot spend the whole command's
+    /// wait while other blocks wait behind it.
+    pub fn with_wait(&self, wait: Duration) -> Self {
+        Self {
+            bin: self.bin.clone(),
+            wait,
+        }
+    }
+
     /// `$REX_BIN_DIR/rex` when that variable is set, otherwise `rex` on PATH.
     pub fn resolve() -> Result<Self, RexFail> {
         match std::env::var("REX_BIN_DIR") {

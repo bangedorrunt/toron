@@ -36,6 +36,12 @@ jobs:
         run: cargo check --workspace
       - name: cargo test --workspace
         run: cargo test --workspace
+      - name: Install jq for behavior matrix
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build toron CLI for behavior matrix
+        run: cargo build -p toron-cli --bin toron
+      - name: Daemon-free e2e behavior matrix
+        run: bash scripts/e2e-behavior.sh
       - name: cargo clippy --workspace -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo fmt --check
