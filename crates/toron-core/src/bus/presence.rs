@@ -71,8 +71,68 @@ pub fn spool_path(root: &Path) -> PathBuf {
     root.join("presence.jsonl")
 }
 
+/// Compact the spool once it grows past this size. Presence is last-wins
+/// and TTL-bounded, so old rows carry no information after a newer beat.
+pub const SPOOL_COMPACT_BYTES: u64 = 256 * 1024;
+
+/// Bounded exclusive lock for spool rewrites. A busy writer never blocks the
+/// heartbeat path: compaction is opportunistic, and a failed lock falls back
+/// to a plain append.
+fn lock_spool(path: &Path) -> Option<std::fs::File> {
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    const POLL: Duration = Duration::from_millis(5);
+    let lock_path = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => {
+                return None;
+            }
+        }
+    }
+}
+
+/// Rewrite the TTL projection to one row per npub (`read_spool`'s fold), so
+/// an append-only spool cannot grow without bound. Atomic replace under the
+/// shared lock: readers see either the old complete file or the new one.
+pub fn compact_spool(path: &Path, now_secs: u64, ttl: Duration) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Some(_lock) = lock_spool(path) else {
+        return Ok(());
+    };
+    let rows = read_spool(path, None, now_secs, ttl);
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&serde_json::to_string(&row)?);
+        body.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Append one heartbeat to the shared TTL projection.
 pub fn append_spool(path: &Path, row: &PresenceSpoolRow) -> anyhow::Result<()> {
+    if path
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > SPOOL_COMPACT_BYTES)
+    {
+        let _ = compact_spool(path, row.ts, DEFAULT_PRESENCE_TTL);
+    }
     let value = serde_json::to_value(row)?;
     crate::jsonl::append_row(path, &value)
 }
@@ -202,6 +262,7 @@ impl PresenceBroker {
                             .write()
                             .retain(|_, p| !p.is_stale(now, ttl));
                         if let Some(path) = spool_for_task.as_ref() {
+                            let _ = compact_spool(path, now, ttl);
                             for row in read_spool(path, None, now, ttl) {
                                 let Some(p) = presence_from_spool(&row) else {
                                     continue;
@@ -453,5 +514,33 @@ mod tests {
         assert_eq!(got.state, PresenceState::Done);
         broker.shutdown();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compact_spool_keeps_last_row_per_npub_and_drops_stale() {
+        let dir =
+            std::env::temp_dir().join(format!("toron-presence-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = spool_path(&dir);
+        for (npub, ts) in [("aa", 100), ("aa", 200), ("bb", 1)] {
+            append_spool(
+                &path,
+                &PresenceSpoolRow {
+                    name: npub.into(),
+                    npub: npub.into(),
+                    state: "working".into(),
+                    status: None,
+                    ts,
+                    project: "demo".into(),
+                },
+            )
+            .expect("append");
+        }
+        compact_spool(&path, 200, Duration::from_secs(60)).expect("compact");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(body.lines().count(), 1, "one live row per npub: {body}");
+        assert!(body.contains("\"npub\":\"aa\""));
+        assert!(body.contains("\"ts\":200"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -93,6 +93,21 @@ pub enum KernelMsg {
         holder: String,
         expires_us: Option<i64>,
     },
+    /// Replace one lease with another in a single decision: release the
+    /// source and grant the target only if the target has no blocker. The
+    /// host publishes the two signed events after this applies.
+    Transfer {
+        from_id: String,
+        id: String,
+        holder: String,
+        path_pattern: String,
+        exclusive: bool,
+        expires_us: Option<i64>,
+        created_at_secs: i64,
+        epoch: u64,
+        state: EntryState,
+        now_us: i64,
+    },
     /// Sweep expired TTLs and stale intents at host time `now_us`.
     ExpireTick { now_us: i64 },
 }
@@ -100,11 +115,26 @@ pub enum KernelMsg {
 /// Intents the core journals; the host executes. No I/O in [`tick`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KernelEffect {
-    Granted { id: String },
-    Denied { id: String, reason: DenyReason },
-    Released { id: String },
-    Renewed { id: String },
-    Expired { ids: Vec<String> },
+    Granted {
+        id: String,
+    },
+    Denied {
+        id: String,
+        reason: DenyReason,
+    },
+    Released {
+        id: String,
+    },
+    Renewed {
+        id: String,
+    },
+    Expired {
+        ids: Vec<String>,
+    },
+    /// The transfer source was absent: no release happened.
+    MissingSource {
+        id: String,
+    },
 }
 
 /// Why an acquire was denied.
@@ -114,6 +144,8 @@ pub enum DenyReason {
     DuplicateId,
     /// Another holder's live exclusive lease overlaps.
     HardConflict { blocking_id: String },
+    /// A transfer source id is not in the model.
+    MissingSource { id: String },
 }
 
 /// Named pure predicates only — no inline boolean soup in [`tick`].
@@ -247,6 +279,77 @@ pub fn tick(model: &KernelModel, msg: &KernelMsg) -> (KernelModel, Vec<KernelEff
                 (next, Vec::new())
             }
         }
+        KernelMsg::Transfer {
+            from_id,
+            id,
+            holder,
+            path_pattern,
+            exclusive,
+            expires_us,
+            created_at_secs,
+            epoch,
+            state,
+            now_us,
+        } => {
+            if next.leases.contains_key(id) {
+                return (
+                    next,
+                    vec![KernelEffect::Denied {
+                        id: id.clone(),
+                        reason: DenyReason::DuplicateId,
+                    }],
+                );
+            }
+            let Some(source) = next.leases.remove(from_id) else {
+                return (
+                    next,
+                    vec![KernelEffect::Denied {
+                        id: from_id.clone(),
+                        reason: DenyReason::MissingSource {
+                            id: from_id.clone(),
+                        },
+                    }],
+                );
+            };
+            if let Some(blocking_id) = next
+                .leases
+                .values()
+                .find(|entry| entry_blocks(entry, holder, path_pattern, *now_us))
+                .map(|entry| entry.id.clone())
+            {
+                next.leases.insert(from_id.clone(), source);
+                return (
+                    next,
+                    vec![KernelEffect::Denied {
+                        id: id.clone(),
+                        reason: DenyReason::HardConflict { blocking_id },
+                    }],
+                );
+            }
+            next.leases.insert(
+                id.clone(),
+                LeaseEntry {
+                    id: id.clone(),
+                    holder: holder.clone(),
+                    path_pattern: path_pattern.clone(),
+                    exclusive: *exclusive,
+                    expires_us: *expires_us,
+                    created_at_secs: *created_at_secs,
+                    epoch: *epoch,
+                    state: *state,
+                    liveness_extended: false,
+                },
+            );
+            (
+                next,
+                vec![
+                    KernelEffect::Released {
+                        id: from_id.clone(),
+                    },
+                    KernelEffect::Granted { id: id.clone() },
+                ],
+            )
+        }
         KernelMsg::Renew {
             id,
             holder,
@@ -290,6 +393,7 @@ pub fn machine_config() -> serde_json::Value {
             {"on": "Acquire", "guard": "no_live_exclusive_conflict", "effects": ["Granted", "Denied"]},
             {"on": "Release", "guard": null, "effects": ["Released"]},
             {"on": "Renew", "guard": "holder_matches", "effects": ["Renewed"]},
+            {"on": "Transfer", "guard": "source_exists_and_target_unblocked", "effects": ["Released", "Granted", "Denied"]},
             {"on": "ExpireTick", "guard": null, "effects": ["Expired"]},
         ],
         "guards": ["ttl_live", "is_live", "intent_live", "entry_blocks"],
@@ -650,6 +754,103 @@ mod kernel_tests {
         model2.leases.get_mut("v").unwrap().liveness_extended = false;
         let (_, fx2) = tick(&model2, &acquire("b", "bob", "src/x.rs", true, 1_000));
         assert_eq!(fx2, vec![KernelEffect::Granted { id: "b".into() }]);
+    }
+
+    #[test]
+    fn transfer_releases_source_and_grants_target_in_one_tick() {
+        let now_us = 1_000;
+        let (held, _) = tick(
+            &KernelModel::new(),
+            &acquire("a", "alice", "src/**", true, now_us),
+        );
+        let (next, effects) = tick(
+            &held,
+            &KernelMsg::Transfer {
+                from_id: "a".into(),
+                id: "b".into(),
+                holder: "bob".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                expires_us: Some(now_us + 3_600_000_000),
+                created_at_secs: 1_700_000_000,
+                epoch: 1,
+                state: EntryState::Held,
+                now_us,
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![
+                KernelEffect::Released { id: "a".into() },
+                KernelEffect::Granted { id: "b".into() },
+            ]
+        );
+        assert!(!next.leases.contains_key("a"), "source is gone");
+        assert_eq!(
+            next.leases.get("b").map(|entry| entry.holder.as_str()),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn transfer_missing_source_is_denied_without_granting() {
+        let (next, effects) = tick(
+            &KernelModel::new(),
+            &KernelMsg::Transfer {
+                from_id: "missing".into(),
+                id: "b".into(),
+                holder: "bob".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                expires_us: None,
+                created_at_secs: 1_700_000_000,
+                epoch: 1,
+                state: EntryState::Held,
+                now_us: 1_000,
+            },
+        );
+        assert!(next.leases.is_empty());
+        assert!(matches!(
+            &effects[0],
+            KernelEffect::Denied {
+                reason: DenyReason::MissingSource { id },
+                ..
+            } if id == "missing"
+        ));
+    }
+
+    #[test]
+    fn blocked_transfer_keeps_the_source_lease() {
+        let now_us = 1_000;
+        let (held, _) = tick(
+            &KernelModel::new(),
+            &acquire("a", "alice", "old/**", true, now_us),
+        );
+        let (held, _) = tick(&held, &acquire("c", "carol", "src/**", true, now_us));
+        let (next, effects) = tick(
+            &held,
+            &KernelMsg::Transfer {
+                from_id: "a".into(),
+                id: "b".into(),
+                holder: "bob".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                expires_us: None,
+                created_at_secs: 1_700_000_000,
+                epoch: 1,
+                state: EntryState::Held,
+                now_us,
+            },
+        );
+        assert!(matches!(
+            &effects[0],
+            KernelEffect::Denied {
+                reason: DenyReason::HardConflict { blocking_id },
+                ..
+            } if blocking_id == "c"
+        ));
+        assert!(next.leases.contains_key("a"), "failed transfer rolls back");
+        assert!(!next.leases.contains_key("b"));
     }
 
     #[test]

@@ -2008,9 +2008,6 @@ impl Mailbox {
             .or_else(|| (!holder.reason.is_empty()).then(|| holder.reason.clone()))
             .unwrap_or_default();
 
-        if !self.kernel_release_lease(project_slug, &holder).await {
-            anyhow::bail!("kernel refused transfer release of {}", holder.id);
-        }
         let release_event = build_event(
             &from_keys,
             toron_kind(FILE_RESERVATION),
@@ -2025,11 +2022,6 @@ impl Mailbox {
             ),
             release_ts,
         )?;
-        self.bus.publish(release_event.clone()).await?;
-        self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
-            .await;
-        self.record_transition(project_slug, &d, "released", &release_event.id);
-
         let acquire_epoch = self.next_epoch_at(project_slug, &d).await;
         let acquire_event = build_event(
             &to_keys,
@@ -2049,7 +2041,8 @@ impl Mailbox {
         let (_, effects) = self
             .kernel_tick(
                 project_slug,
-                &KernelMsg::Acquire {
+                &KernelMsg::Transfer {
+                    from_id: holder.id.clone(),
                     id: acquire_id.clone(),
                     holder: to_keys.public_key().to_hex(),
                     path_pattern: path.to_string(),
@@ -2062,12 +2055,19 @@ impl Mailbox {
                 },
             )
             .await;
-        if !effects
+        let released = effects
             .iter()
-            .any(|effect| matches!(effect, KernelEffect::Granted { id } if id == &acquire_id))
-        {
-            anyhow::bail!("kernel denied transfer acquire for {to_agent} on {path}");
+            .any(|effect| matches!(effect, KernelEffect::Released { id } if id == &holder.id));
+        let granted = effects
+            .iter()
+            .any(|effect| matches!(effect, KernelEffect::Granted { id } if id == &acquire_id));
+        if !released || !granted {
+            anyhow::bail!("kernel denied transfer of {path} from {from_agent} to {to_agent}");
         }
+        self.bus.publish(release_event.clone()).await?;
+        self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
+            .await;
+        self.record_transition(project_slug, &d, "released", &release_event.id);
         self.bus.publish(acquire_event.clone()).await?;
         self.project_lease_upsert(LeaseUpsert {
             project_slug,

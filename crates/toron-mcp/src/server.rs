@@ -19,6 +19,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
 use toron_core::bus::in_process::InProcessBusConfig;
+use toron_core::bus::presence::{DEFAULT_PRESENCE_TTL, PresenceBroker, spool_path};
 use toron_core::mailbox::{Mailbox, UnwrappedMail};
 
 use crate::resources::{
@@ -37,6 +38,7 @@ use crate::workflow_host::WorkflowHost;
 pub struct ToronServer {
     bus: Option<Arc<dyn Bus>>,
     tools: Option<ToolServer>,
+    presence: Option<PresenceBroker>,
 }
 
 impl std::fmt::Debug for ToronServer {
@@ -44,8 +46,26 @@ impl std::fmt::Debug for ToronServer {
         f.debug_struct("ToronServer")
             .field("bus", &self.bus.is_some())
             .field("tools", &self.tools.is_some())
+            .field("presence", &self.presence.is_some())
             .finish()
     }
+}
+
+fn presence_ttl() -> std::time::Duration {
+    std::env::var("TORON_PRESENCE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_PRESENCE_TTL)
+}
+
+fn start_presence(mailbox: &Mailbox) -> PresenceBroker {
+    let root = toron_core::config::mailbox_root(mailbox.data_dir());
+    PresenceBroker::start_with_spool(
+        mailbox.bus().clone(),
+        presence_ttl(),
+        Some(spool_path(&root)),
+    )
 }
 
 impl ToronServer {
@@ -63,6 +83,7 @@ impl ToronServer {
             Ok(live) => mailbox.with_plane(std::sync::Arc::new(live)),
             Err(_) => mailbox,
         };
+        self.presence = Some(start_presence(&mailbox));
         self.bus = Some(bus);
         self.tools = Some(ToolServer::new(Arc::new(mailbox)));
         self
@@ -71,9 +92,17 @@ impl ToronServer {
     /// Attach a fully-wired mailbox (bus + index pool) backing the tool
     /// surface. The bus is shared so resource/subscription features work too.
     pub fn with_mailbox(mut self, mailbox: Mailbox) -> Self {
+        self.presence = Some(start_presence(&mailbox));
         self.bus = Some(mailbox.bus().clone());
         self.tools = Some(ToolServer::new(Arc::new(mailbox)));
         self
+    }
+
+    /// The live presence broker for this host. The broker folds kind-20001
+    /// off the bus together with the cross-process spool, so a heartbeat
+    /// written by the CLI is visible to the daemon (and vice versa).
+    pub const fn presence(&self) -> Option<&PresenceBroker> {
+        self.presence.as_ref()
     }
 
     /// The attached bus, if any.
