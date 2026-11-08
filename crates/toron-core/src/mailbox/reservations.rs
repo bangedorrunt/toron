@@ -3558,6 +3558,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// bd-lease-parity: the daemon and an in-process `Mailbox` read one
+    /// lease board. Both see the same expired-but-vouched conflict through
+    /// the shared SQLite cursor, and both clear it the moment the cursor
+    /// goes quiet — no process-local oracle on either side.
+    #[tokio::test]
+    async fn lease_board_parity_across_daemon_and_in_process_mailbox() {
+        use crate::mailbox::lease_liveness::read_activity_snapshot;
+        let (daemon, inproc, pool, db_path, dir_a, dir_b) =
+            two_mailboxes_one_store("lease-parity").await;
+        let holder = register(&daemon, "demo", "BlueLake").await;
+        // Each handle acts as its own pin: the keyring is process-local, the
+        // lease board is not. Both must reach the same verdict.
+        register(&daemon, "demo", "CheckerA").await;
+        register(&inproc, "demo", "CheckerB").await;
+        let holder_hex = holder.to_hex();
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        sqlx::query(
+            "INSERT INTO file_reservations (project_slug, agent_name, agent_pubkey, \
+             path_pattern, exclusive, reason, status, expires_ts_us, created_ts_us) \
+             VALUES ('demo', 'BlueLake', ?1, 'src/parity.rs', 1, 'bd-lease-parity', \
+             'active', ?2, ?3)",
+        )
+        .bind(&holder_hex)
+        .bind(now_us - 60_000_000)
+        .bind(now_us - 3_600_000_000)
+        .execute(&pool)
+        .await
+        .expect("expired mirror row");
+        sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
+             VALUES ('demo', 'BlueLake', 'P', ?1)",
+        )
+        .bind(now_us)
+        .execute(&pool)
+        .await
+        .expect("fresh cursor");
+
+        let map = read_activity_snapshot(&pool, DEFAULT_RESERVATION_TTL_SECS, now_us)
+            .await
+            .expect("snapshot");
+        assert!(map.contains_key(&holder_hex), "cursor vouches: {map:?}");
+
+        let daemon_report = daemon
+            .check_file_reservation_conflicts("demo", "CheckerA", &["src/parity.rs".into()])
+            .await
+            .expect("daemon check");
+        let inproc_report = inproc
+            .check_file_reservation_conflicts("demo", "CheckerB", &["src/parity.rs".into()])
+            .await
+            .expect("in-process check");
+        assert!(
+            !daemon_report.conflict_free && !inproc_report.conflict_free,
+            "both processes honor the vouched lease: {daemon_report:?} / {inproc_report:?}"
+        );
+        assert_eq!(
+            daemon_report.conflict_free, inproc_report.conflict_free,
+            "one lease board, two processes"
+        );
+        assert!(
+            daemon_report
+                .conflicts
+                .iter()
+                .any(|c| c.path == "src/parity.rs"),
+            "{daemon_report:?}"
+        );
+        assert!(
+            inproc_report
+                .conflicts
+                .iter()
+                .any(|c| c.path == "src/parity.rs"),
+            "{inproc_report:?}"
+        );
+
+        sqlx::query("DELETE FROM inbox_cursors WHERE project_slug = 'demo'")
+            .execute(&pool)
+            .await
+            .expect("quiet holder");
+        let daemon_clear = daemon
+            .check_file_reservation_conflicts("demo", "CheckerA", &["src/parity.rs".into()])
+            .await
+            .expect("daemon clear");
+        let inproc_clear = inproc
+            .check_file_reservation_conflicts("demo", "CheckerB", &["src/parity.rs".into()])
+            .await
+            .expect("in-process clear");
+        assert!(
+            daemon_clear.conflict_free && inproc_clear.conflict_free,
+            "both clear after the holder goes quiet: {daemon_clear:?} / {inproc_clear:?}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
     /// Captain probe: a LIVE lease published through one mailbox is visible
     /// to a check through a SECOND mailbox sharing only the store
     /// (different bus instance, different keyring dir — the daemon/CLI
