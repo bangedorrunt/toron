@@ -2064,11 +2064,19 @@ impl Mailbox {
         if !released || !granted {
             anyhow::bail!("kernel denied transfer of {path} from {from_agent} to {to_agent}");
         }
+        // Publish the acquire first: if that publish fails the source lease
+        // was never released, so the transfer cannot open a gap. The acquire
+        // epoch is newer, so the release cannot win resolution either way.
+        if let Err(error) = self.bus.publish(acquire_event.clone()).await {
+            // The kernel persisted the transfer before the provider call.
+            // The release was never published, so bus truth still holds the
+            // source: rebuild the fallback snapshot from it instead of
+            // leaving a durable claim for an acquire that does not exist.
+            let (model, _) = self.kernel_model_for(project_slug).await;
+            self.persist_kernel_model(project_slug, &model).await;
+            return Err(error.into());
+        }
         self.bus.publish(release_event.clone()).await?;
-        self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
-            .await;
-        self.record_transition(project_slug, &d, "released", &release_event.id);
-        self.bus.publish(acquire_event.clone()).await?;
         self.project_lease_upsert(LeaseUpsert {
             project_slug,
             agent_name: to_agent,
@@ -2080,6 +2088,9 @@ impl Mailbox {
             expires_ts_us: None,
         })
         .await;
+        self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
+            .await;
+        self.record_transition(project_slug, &d, "released", &release_event.id);
         self.record_transition(project_slug, &d, "acquired", &acquire_event.id);
 
         let held_by_target = self
@@ -2779,12 +2790,45 @@ mod tests {
     use super::*;
     use crate::bus::filter::ToronFilter;
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+    use crate::bus::{Bus, BusError, Filter, Health, PublishOk, Subscription};
     use crate::index::schema;
     use crate::mailbox::Mailbox;
     use crate::nostr::identity::AgentProfile;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const PASSPHRASE: &str = "reservation-test-pass";
+
+    struct FailAcquireBus {
+        inner: Arc<InProcessBus>,
+        fail_next_acquire: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for FailAcquireBus {
+        async fn publish(&self, event: crate::nostr::Event) -> Result<PublishOk, BusError> {
+            if event.content.contains("\"exclusive\"")
+                && self.fail_next_acquire.swap(false, Ordering::SeqCst)
+            {
+                return Err(BusError::Transport(
+                    "injected acquire publish failure".to_string(),
+                ));
+            }
+            self.inner.publish(event).await
+        }
+
+        async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
+            self.inner.subscribe(filter).await
+        }
+
+        async fn subscribe_trusted(&self, filter: Filter) -> Result<Subscription, BusError> {
+            self.inner.subscribe_trusted(filter).await
+        }
+
+        async fn health(&self) -> Result<Health, BusError> {
+            self.inner.health().await
+        }
+    }
 
     async fn test_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
         let db_path =
@@ -3468,6 +3512,91 @@ mod tests {
                 "the pure matcher disagrees on `{path}`"
             );
         }
+    }
+
+    /// A failed acquire publication must leave the source lease in force: the
+    /// release is not published until the acquire lands, so a transfer can
+    /// never open a gap where neither agent holds the path.
+    #[tokio::test]
+    async fn test_transfer_acquire_publish_failure_keeps_source_lease() {
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-transfer-fail-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let fail_next_acquire = Arc::new(AtomicBool::new(false));
+        let bus = FailAcquireBus {
+            inner: Arc::new(inner),
+            fail_next_acquire: fail_next_acquire.clone(),
+        };
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-transfer-fail-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = Mailbox::new(
+            Arc::new(bus),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase(PASSPHRASE)
+        .with_index_pool(pool);
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/failure.rs".to_string()],
+                None,
+                true,
+                Some("handoff"),
+            )
+            .await
+            .expect("A acquire");
+        let source_id = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active")
+            .into_iter()
+            .find(|r| r.path_pattern == "src/failure.rs")
+            .expect("source lease")
+            .id;
+
+        fail_next_acquire.store(true, Ordering::SeqCst);
+        let err = mailbox
+            .transfer_reservation("demo", "BlueLake", "RoseDune", "src/failure.rs", None)
+            .await
+            .expect_err("transfer publish must fail loud");
+        assert!(
+            format!("{err:#}").contains("injected acquire publish failure"),
+            "{err:#}"
+        );
+
+        let holders = mailbox.active_reservations("demo").await.expect("active");
+        let holder = holders
+            .iter()
+            .find(|r| r.path_pattern == "src/failure.rs")
+            .expect("source lease survives");
+        assert_eq!(holder.agent_name, "BlueLake");
+        let kernel = mailbox
+            .persisted_kernel_model("demo")
+            .await
+            .expect("kernel snapshot");
+        assert!(
+            kernel.leases.contains_key(&source_id),
+            "failed acquire rolls the fallback snapshot back to the source"
+        );
+        assert!(
+            !fail_next_acquire.load(Ordering::SeqCst),
+            "the injected failure was consumed"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// bd-pin-public-plane-s-easy.13 unhappy path: transferring a path the
