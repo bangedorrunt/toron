@@ -1,7 +1,7 @@
 # governed-by: ADR-0003
 [package]
 name = "toron-workflow"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2024"
 
 [dependencies]

@@ -1390,7 +1390,7 @@ impl Mailbox {
                      expires_ts_us, event_id \
                      FROM file_reservations \
                      WHERE project_slug = ?1 AND status = 'active' \
-                       AND expires_ts_us IS NOT NULL AND expires_ts_us < ?2",
+                       AND expires_ts_us IS NOT NULL AND expires_ts_us <= ?2",
                 )
                 .bind(project_slug)
                 .bind(now_us)
@@ -1398,14 +1398,53 @@ impl Mailbox {
                 .await
                 .unwrap_or_default();
             for (pubkey, path, reason, excl, exp_us, event_id) in expired_mirrors {
-                let dup = out
+                let dup_self = out
                     .iter()
-                    .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path && !l.expired);
+                    .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path);
+                let conflict = out
+                    .iter()
+                    .any(|l| (l.exclusive || excl != 0) && overlaps(&l.path_pattern, &path));
                 let live = durable_live
                     .as_ref()
                     .is_some_and(|m| m.contains_key(&pubkey));
-                if dup || !live {
+                if dup_self || conflict || !live {
                     continue;
+                }
+                let matched_event = event_id
+                    .as_deref()
+                    .and_then(|eid| events.iter().find(|e| e.id.to_hex() == eid))
+                    .or_else(|| {
+                        let d = format!("{project_slug}:{path}");
+                        events.iter().find(|e| {
+                            e.pubkey.to_hex() == pubkey
+                                && e.tags.iter().any(|t| {
+                                    let s = t.as_slice();
+                                    s.first().map(|x| x == "d").unwrap_or(false)
+                                        && s.get(1).map(|x| x == &d).unwrap_or(false)
+                                })
+                        })
+                    });
+                let mut epoch = matched_event.map(|e| lease_epoch(&e.content)).unwrap_or(0);
+                let mut created_at_secs = matched_event
+                    .map(|e| e.created_at.as_secs() as i64)
+                    .unwrap_or(0);
+                if epoch == 0
+                    && let Some(eid) = &event_id
+                    && let Ok(Some((raw, cat))) = sqlx::query_as::<_, (String, i64)>(
+                        "SELECT raw_json, created_at FROM bus_events WHERE event_id = ?1",
+                    )
+                    .bind(eid)
+                    .fetch_optional(pool)
+                    .await
+                {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+                        && let Some(c) = val.get("content").and_then(|c| c.as_str())
+                    {
+                        epoch = lease_epoch(c);
+                    }
+                    if created_at_secs == 0 {
+                        created_at_secs = cat;
+                    }
                 }
                 out.push(ResolvedLease {
                     id: event_id.unwrap_or_else(|| format!("mirror:{path}:{pubkey}")),
@@ -1415,8 +1454,8 @@ impl Mailbox {
                     reason,
                     expires_ts_us: Some(exp_us),
                     status: ReservationStatus::Held,
-                    created_at_secs: 0,
-                    epoch: 0,
+                    created_at_secs,
+                    epoch,
                     expired: true,
                     liveness_extended: true,
                 });
@@ -1454,7 +1493,7 @@ impl Mailbox {
                 continue;
             }
             if let Some(exp) = winning.tags.expiration()
-                && (exp.as_secs() as i64) < now_secs
+                && (exp.as_secs() as i64) <= now_secs
             {
                 continue;
             }
@@ -2583,6 +2622,18 @@ impl Mailbox {
         let Some(pool) = self.index_pool() else {
             return;
         };
+        if u.exclusive {
+            let _ = sqlx::query(
+                "UPDATE file_reservations SET status = 'superseded' \
+                 WHERE project_slug = ?1 AND path_pattern = ?2 AND agent_pubkey != ?3 \
+                   AND status = 'active'",
+            )
+            .bind(u.project_slug)
+            .bind(u.path_pattern)
+            .bind(u.agent_pubkey)
+            .execute(pool)
+            .await;
+        }
         let r = sqlx::query(
             "INSERT INTO file_reservations \
              (project_slug, agent_name, agent_pubkey, path_pattern, exclusive, reason, \
@@ -3723,7 +3774,7 @@ mod tests {
             )
             .await
             .expect("acquire stable");
-        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
         // Acquiring stamps an inbox poll, which the durable fallback treats
         // as liveness. Remove it so this test isolates pure TTL semantics.
         sqlx::query("DELETE FROM inbox_cursors WHERE project_slug = 'demo'")
@@ -6252,5 +6303,132 @@ mod tests {
             winner.id, release_again.id,
             "epoch 3 release clears epoch 2"
         );
+    }
+
+    #[tokio::test]
+    async fn liveness_extended_lease_preserves_fencing_epoch() {
+        let (mailbox, db_path, data_dir) = test_mailbox("liveness_epoch").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/epoch.rs".into()],
+                Some(60),
+                true,
+                None,
+            )
+            .await
+            .expect("initial acquire");
+
+        mailbox
+            .release_file_reservations("demo", "BlueLake", &["src/epoch.rs".into()])
+            .await
+            .expect("release to advance coordinate epoch");
+
+        let second = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/epoch.rs".into()],
+                Some(1),
+                true,
+                None,
+            )
+            .await
+            .expect("reacquire with 1s ttl");
+        assert_eq!(second.granted[0].epoch, 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
+
+        let active = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active reservations");
+        let lease = active
+            .iter()
+            .find(|r| r.path_pattern == "src/epoch.rs")
+            .expect("liveness extended lease exists");
+        assert_eq!(lease.epoch, 1);
+
+        let checked = mailbox
+            .check_claim_epoch("demo", "src/epoch.rs", 1)
+            .await
+            .expect("epoch check succeeds");
+        assert_eq!(checked.epoch, 1);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_extension_never_supersedes_live_exclusive_holder() {
+        let (mailbox, db_path, data_dir) = test_mailbox("liveness_no_split").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        let a_acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/split.rs".into()],
+                Some(1),
+                true,
+                None,
+            )
+            .await
+            .expect("a acquire fleeting");
+        assert_eq!(a_acq.granted.len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        let pool = mailbox.index_pool().expect("pool").clone();
+        sqlx::query("DELETE FROM inbox_cursors WHERE agent_name = 'BlueLake'")
+            .execute(&pool)
+            .await
+            .expect("lapse bluelake activity");
+
+        let b_acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/split.rs".into()],
+                Some(60),
+                true,
+                None,
+            )
+            .await
+            .expect("b acquire stable");
+        assert_eq!(
+            b_acq.granted.len(),
+            1,
+            "RoseDune acquire must succeed: {b_acq:?}"
+        );
+
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
+
+        let active = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active reservations");
+        let matching: Vec<_> = active
+            .iter()
+            .filter(|r| r.path_pattern == "src/split.rs")
+            .collect();
+
+        assert_eq!(
+            matching.len(),
+            1,
+            "Only one holder allowed, got: {matching:?}"
+        );
+        assert_eq!(matching[0].agent_name, "RoseDune");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

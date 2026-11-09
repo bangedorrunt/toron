@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-11-09
+
+### Fixed
+- **Session-pinned multiplexer plane (`PinnedPlane`).** Prevents per-call fallback oscillation between `rex` and `hc`, eliminating split-plane namespace querying and ghost lease wiping.
+- **Send armor deduplication and probe.** Fixed duplicate send-armor execution and half-open probe handling.
+- **Lease boundary realigned.** Realigned lease boundary checks and claim epoch hydration.
+
 ## [1.7.0] — 2026-11-09
 
 ### Added

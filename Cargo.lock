@@ -3419,7 +3419,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toron-cli"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3444,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "toron-core"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3479,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "toron-e2e"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "nostr",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "toron-mcp"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "toron-plane"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -3536,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "toron-workflow"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "chrono",

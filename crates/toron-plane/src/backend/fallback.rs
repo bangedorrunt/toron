@@ -23,6 +23,7 @@
 //! be serving through hc).
 
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde_json::Value;
 
@@ -30,6 +31,13 @@ use super::error::{BackendError, BackendErrorCode};
 use super::types::{PromptLanding, Subscription, WaitOptions, WorkspaceInfo};
 use super::{Backend, EventStream};
 use toron_core::pane_types::{AgentInfo, AgentStatus, PaneInfo};
+
+/// The plane pinned for a session (`PinnedPlane` / `FallbackBackend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanePin {
+    Primary,
+    Fallback,
+}
 
 /// When a failed call may be replayed on the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,14 +66,61 @@ fn may_replay(code: &BackendErrorCode, policy: Policy) -> bool {
 /// rex first, hc when rex is unreachable. The fallback is fixed at
 /// construction; an absent fallback leaves a primary-only backend whose
 /// transport errors surface unchanged.
+///
+/// Implements session pinning (`PinnedPlane`): once a call succeeds on the
+/// primary (or is explicitly pinned), mid-session transport failures on the
+/// primary surface directly rather than crossing namespaces to hc (which would
+/// return disjoint pane IDs and wipe rex identities/leases).
 pub struct FallbackBackend {
     primary: Box<dyn Backend>,
     fallback: Option<Box<dyn Backend>>,
+    pin: AtomicU8, // 0 = unpinned, 1 = primary, 2 = fallback
 }
+
+/// Alias for `FallbackBackend` under the session-pinned contract.
+pub type PinnedPlane = FallbackBackend;
 
 impl FallbackBackend {
     pub fn new(primary: Box<dyn Backend>, fallback: Option<Box<dyn Backend>>) -> Self {
-        Self { primary, fallback }
+        Self {
+            primary,
+            fallback,
+            pin: AtomicU8::new(0),
+        }
+    }
+
+    pub fn pinned(
+        primary: Box<dyn Backend>,
+        fallback: Option<Box<dyn Backend>>,
+        pin: PlanePin,
+    ) -> Self {
+        let pin_val = match pin {
+            PlanePin::Primary => 1,
+            PlanePin::Fallback => 2,
+        };
+        Self {
+            primary,
+            fallback,
+            pin: AtomicU8::new(pin_val),
+        }
+    }
+
+    /// Current pinned plane, if any.
+    pub fn pin(&self) -> Option<PlanePin> {
+        match self.pin.load(Ordering::Acquire) {
+            1 => Some(PlanePin::Primary),
+            2 => Some(PlanePin::Fallback),
+            _ => None,
+        }
+    }
+
+    /// Explicitly set the session plane pin.
+    pub fn set_pin(&self, pin: PlanePin) {
+        let val = match pin {
+            PlanePin::Primary => 1,
+            PlanePin::Fallback => 2,
+        };
+        self.pin.store(val, Ordering::Release);
     }
 
     /// The serving primary's name (`rex`), for diagnostics.
@@ -79,19 +134,35 @@ impl FallbackBackend {
     }
 
     /// One call against the primary, replayed on the fallback per `policy`.
-    /// The closure runs at most twice; a fallback failure surfaces as the
-    /// fallback's own error.
+    /// When pinned, calls strictly route to the pinned plane without crossing namespaces.
     fn run<T>(
         &self,
         policy: Policy,
         op: impl Fn(&dyn Backend) -> Result<T, BackendError>,
     ) -> Result<T, BackendError> {
-        match op(&*self.primary) {
-            Err(error) if may_replay(error.code(), policy) => match &self.fallback {
+        match self.pin() {
+            Some(PlanePin::Fallback) => match &self.fallback {
                 Some(fallback) => op(&**fallback),
-                None => Err(error),
+                None => op(&*self.primary),
             },
-            other => other,
+            Some(PlanePin::Primary) => op(&*self.primary),
+            None => match op(&*self.primary) {
+                Ok(val) => {
+                    self.set_pin(PlanePin::Primary);
+                    Ok(val)
+                }
+                Err(error) if may_replay(error.code(), policy) => match &self.fallback {
+                    Some(fallback) => {
+                        let res = op(&**fallback);
+                        if res.is_ok() {
+                            self.set_pin(PlanePin::Fallback);
+                        }
+                        res
+                    }
+                    None => Err(error),
+                },
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -498,5 +569,30 @@ mod fallback_tests {
         assert!(backend.has_fallback());
         let debug = format!("{backend:?}");
         assert!(debug.contains("primary: \"rex\""), "{debug}");
+    }
+
+    /// Once pinned to primary, mid-session failures (even Connect) must surface
+    /// directly rather than crossing namespaces to hc.
+    #[test]
+    fn a_pinned_primary_never_falls_back_on_mid_session_connect_failure() {
+        let primary = Scripted::new("rex", vec![None, Some(BackendErrorCode::Connect)]);
+        let fallback = Scripted::ok("hc");
+        let backend = backend(primary.clone(), Some(fallback.clone()));
+
+        assert!(backend.workspace_list().is_ok());
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(fallback.calls(), 0);
+        assert_eq!(backend.pin(), Some(PlanePin::Primary));
+
+        let error = backend
+            .workspace_list()
+            .expect_err("mid-session error must surface");
+        assert_eq!(error.code(), &BackendErrorCode::Connect);
+        assert_eq!(primary.calls(), 2);
+        assert_eq!(
+            fallback.calls(),
+            0,
+            "mid-session connect failure must never cross to hc"
+        );
     }
 }

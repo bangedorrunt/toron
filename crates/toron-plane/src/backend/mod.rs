@@ -16,7 +16,7 @@ pub mod superlogical;
 pub mod types;
 pub mod wait;
 
-pub use fallback::FallbackBackend;
+pub use fallback::{FallbackBackend, PinnedPlane, PlanePin};
 pub use hc::{
     Client as HcClient, HC_GENERATION, HcBackend, ID_PREFIX, MIN_HC_VERSION, TESTED_HC_VERSION,
 };
