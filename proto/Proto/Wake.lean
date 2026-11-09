@@ -135,6 +135,38 @@ theorem ring_needs_unread_mail (i : RingInput) (wm : Nat) (h : shouldRing i = .r
   · simp [h1] at h
   omega
 
+/-- When caught up (head ≤ cursor), the decision is strictly nothingUnread. -/
+theorem caught_up_is_nothing_unread (i : RingInput) (h : i.head ≤ i.cursor) :
+    shouldRing i = .nothingUnread := by
+  unfold shouldRing
+  simp [h]
+
+/-- An unverified binding never rings. -/
+theorem unverified_binding_never_rings (i : RingInput) (wm : Nat)
+    (hb : i.bindingVerified = false) (h : shouldRing i = .ring wm) : False := by
+  have ⟨hvb, _, _⟩ := ring_needs_a_verified_binding i wm h
+  simp [hb] at hvb
+
+/-- A stale binding generation never rings. -/
+theorem stale_gen_never_rings (i : RingInput) (wm : Nat)
+    (hg : i.bindingGen ≠ i.currentGen) (h : shouldRing i = .ring wm) : False := by
+  have ⟨_, hgen, _⟩ := ring_needs_a_verified_binding i wm h
+  exact hg hgen
+
+/-- A working pane for normal mail is always suppressed as Busy. -/
+theorem working_pane_normal_mail_is_busy (i : RingInput) (hu : i.cursor < i.head)
+    (hb : i.bindingVerified = true) (hg : i.bindingGen = i.currentGen) (hp : i.pane = .working)
+    (hurg : i.urgency = .normal) (hr : i.rings < maxRings i.urgency) :
+    shouldRing i = .busy := by
+  unfold shouldRing
+  have h1 : ¬ i.head ≤ i.cursor := by omega
+  have h2 : ¬ ((!i.bindingVerified || i.bindingGen != i.currentGen || i.pane == .gone) = true) := by
+    simp [hb, hg, hp]
+  have h3 : ¬ maxRings i.urgency ≤ i.rings := by omega
+  have h4 : (!ringable i.pane i.urgency) = true := by
+    simp [hp, hurg, ringable]
+  simp [h1, h2, h3, h4]
+
 /-- After a Hold, the clock sits at the due time and the very next
 decision is a ring. -/
 theorem hold_then_ring (i : RingInput) (u : Nat) (h : shouldRing i = .hold u) :
