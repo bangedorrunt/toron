@@ -312,6 +312,57 @@ pub struct AcquireResult {
     pub proposal: Option<serde_json::Value>,
 }
 
+/// An attempt token tying a bead attempt revision and agent pin to a coordinate lease.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttemptToken {
+    /// Target bead identifier.
+    pub bead_id: String,
+    /// Monotonically increasing issue status revision in beads.
+    pub status_revision: u64,
+    /// Canonical agent pin.
+    pub pin: String,
+}
+
+impl AttemptToken {
+    pub fn new(bead_id: impl Into<String>, status_revision: u64, pin: impl Into<String>) -> Self {
+        Self {
+            bead_id: bead_id.into(),
+            status_revision,
+            pin: pin.into(),
+        }
+    }
+
+    /// Stamp representation: `<bead_id>@r<status_revision>#<pin>`
+    pub fn to_stamp(&self) -> String {
+        format!("{}@r{}#{}", self.bead_id, self.status_revision, self.pin)
+    }
+
+    /// Parse stamp representation: `<bead_id>@r<status_revision>#<pin>`
+    pub fn parse_stamp(s: &str) -> Option<Self> {
+        let (bead_and_rev, pin) = s.rsplit_once('#')?;
+        let (bead_id, rev_str) = bead_and_rev.rsplit_once("@r")?;
+        let status_revision = rev_str.parse::<u64>().ok()?;
+        if bead_id.is_empty() || pin.is_empty() {
+            return None;
+        }
+        Some(Self {
+            bead_id: bead_id.to_string(),
+            status_revision,
+            pin: pin.to_string(),
+        })
+    }
+
+    /// Reservation reason: `<bead_id>`
+    pub fn reservation_reason(&self) -> &str {
+        &self.bead_id
+    }
+
+    /// Fencing epoch: `status_revision`
+    pub fn fencing_epoch(&self) -> u64 {
+        self.status_revision
+    }
+}
+
 /// bd-reservations-not-projected-5ohc: one granted/renewed lease to mirror
 /// into the durable `file_reservations` SQLite projection.
 struct LeaseUpsert<'a> {
@@ -476,6 +527,26 @@ struct AcquireProbe {
 }
 
 impl Mailbox {
+    /// Acquire reservations explicitly scoped with an [`AttemptToken`].
+    pub async fn file_reservation_with_token(
+        &self,
+        project_slug: &str,
+        token: &AttemptToken,
+        paths: &[String],
+        ttl_secs: Option<u64>,
+        exclusive: bool,
+    ) -> anyhow::Result<AcquireResult> {
+        self.file_reservation_paths(
+            project_slug,
+            &token.pin,
+            paths,
+            ttl_secs,
+            exclusive,
+            Some(token.reservation_reason()),
+        )
+        .await
+    }
+
     /// `file_reservation_paths` (acquire): request leases on `paths`. Conflict
     /// is checked symmetrically against OTHER agents' active reservations; own
     /// never conflicts. Two tiers (ADR-0011 Spec 4):
@@ -1227,7 +1298,7 @@ impl Mailbox {
             .active_reservations(project_slug)
             .await?
             .into_iter()
-            .filter(|r| r.reason == bead_id)
+            .filter(|r| r.reason == bead_id || r.reason.starts_with(&format!("{bead_id}@")))
             .collect();
 
         let mut released = 0usize;
@@ -1296,6 +1367,118 @@ impl Mailbox {
                     tracing::warn!(
                         d,
                         "release-by-reason notification DM to {holder_npub} failed: {e}"
+                    );
+                }
+            }
+            released_leases.push(ReleasedLease {
+                path: lease.path_pattern.clone(),
+                mode: if lease.exclusive {
+                    "exclusive"
+                } else {
+                    "shared"
+                }
+                .into(),
+                holder: lease.agent_name.clone(),
+            });
+        }
+        Ok(ReleaseResult {
+            released,
+            leases: released_leases,
+        })
+    }
+
+    /// Operator-signed release of all reservations whose reason matches `bead_id`
+    /// up to a maximum fencing epoch.
+    pub async fn release_by_reason_up_to_epoch(
+        &self,
+        project_slug: &str,
+        requestor_name: &str,
+        bead_id: &str,
+        max_epoch: u64,
+        notify_previous: bool,
+    ) -> anyhow::Result<ReleaseResult> {
+        let project_slug = &self.canonical_project(project_slug).await;
+        let operator = self
+            .operator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
+        let leases: Vec<Reservation> = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .filter(|r| {
+                let matches_reason =
+                    r.reason == bead_id || r.reason.starts_with(&format!("{bead_id}@"));
+                matches_reason && r.epoch <= max_epoch
+            })
+            .collect();
+
+        let mut released = 0usize;
+        let mut released_leases = Vec::new();
+        for lease in leases {
+            let d = format!("{project_slug}:{}", lease.path_pattern);
+            let target = revocation_target(&lease.id)?;
+            let tags = with_project_scoping(
+                toron_kind(FILE_RESERVATION),
+                vec![
+                    Tag::identifier(&d),
+                    Tag::custom("status", ["revoked"]),
+                    Tag::event(target),
+                    Tag::custom(
+                        "a",
+                        [format!("30031:{}:{d}", operator.public_key().to_hex())],
+                    ),
+                    Tag::custom("note", [format!("bead-fenced:{bead_id}:epoch<={max_epoch}")]),
+                ],
+                Some(project_slug),
+            );
+            let revoke = build_event(
+                operator,
+                toron_kind(FILE_RESERVATION),
+                marker_content("revoked", Some("bead-fenced"), lease.epoch),
+                tags,
+                Timestamp::now(),
+            )?;
+            assert!(is_revocation(&revoke), "revocation must be detectable");
+            if !self.kernel_release_lease(project_slug, &lease).await {
+                continue;
+            }
+            self.bus.publish(revoke.clone()).await?;
+            self.project_lease_status(
+                project_slug,
+                &lease.agent_pubkey,
+                &lease.path_pattern,
+                "revoked",
+            )
+            .await;
+            self.record_transition(project_slug, &d, "revoked", &revoke.id);
+            released += 1;
+
+            if notify_previous {
+                let holder_keys = Keys::generate();
+                let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
+                    .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
+                let rumor = crate::nostr::gift_wrap::build_rumor(
+                    holder_keys.public_key(),
+                    Timestamp::now(),
+                    crate::nostr::Kind::PrivateDirectMessage,
+                    vec![
+                        Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
+                        Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
+                        Tag::parse(["reason", bead_id]).expect("reason"),
+                        Tag::parse(["reservation-id", &lease.id]).expect("res"),
+                    ],
+                    format!(
+                        "reservation {} ({} by {}) released because bead {} reopened with epoch <= {}",
+                        lease.path_pattern, lease.agent_name, requestor_name, bead_id, max_epoch
+                    ),
+                );
+                let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
+                    .expect("wrap notify");
+                if let Err(e) = self.publish_dm(&wrap).await {
+                    tracing::warn!(
+                        d,
+                        "release-by-reason-up-to-epoch notification DM to {holder_npub} failed: {e}"
                     );
                 }
             }
@@ -6430,5 +6613,23 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn attempt_token_roundtrip_and_fencing() {
+        let token = AttemptToken::new("bd-test-42", 5, "AmberHarbor");
+        assert_eq!(token.reservation_reason(), "bd-test-42");
+        assert_eq!(token.fencing_epoch(), 5);
+
+        let stamp = token.to_stamp();
+        assert_eq!(stamp, "bd-test-42@r5#AmberHarbor");
+
+        let parsed = AttemptToken::parse_stamp(&stamp).expect("parse stamp");
+        assert_eq!(parsed, token);
+
+        assert!(AttemptToken::parse_stamp("invalid").is_none());
+        assert!(AttemptToken::parse_stamp("bd-test@rx#AmberHarbor").is_none());
+        assert!(AttemptToken::parse_stamp("@r1#AmberHarbor").is_none());
+        assert!(AttemptToken::parse_stamp("bd-test@r1#").is_none());
     }
 }

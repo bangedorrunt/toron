@@ -171,7 +171,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-09T05:17:37Z",
+  "generated_at": "2026-11-09T06:05:42Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -4473,5 +4473,5 @@
       "parity": "AM-Rust 38-tool surface"
     }
   ],
-  "toron_version": "1.7.1"
+  "toron_version": "1.7.2"
 }

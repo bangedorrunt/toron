@@ -166,6 +166,6 @@ mod tests {
     fn no_color_strips() {
         let s = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         let stripped = HackerNight::maybe_style(s);
-        assert!(stripped.fg.is_some() || std::env::var_os("NO_COLOR").is_some());
+        assert!(stripped.fg.is_some() || no_color());
     }
 }

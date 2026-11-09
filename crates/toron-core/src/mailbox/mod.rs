@@ -107,7 +107,7 @@ pub use receipts::{
     DivergenceKind, Receipt, ReceiptDivergence, ReceiptEvent, ReceiptState, ReceiptStore,
 };
 pub use reservations::{
-    AcquireResult, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
+    AcquireResult, AttemptToken, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
     PathConflict, ReleaseAsk, ReleaseDecision, ReleaseResponse, ReleaseResult, RenewResult,
     RequestRelease, RequestReleaseResult, RequestReleaseStatus, Reservation, ReservationStatus,
     TransferResult, overlaps, release_on_close_event, stale_closed_leases,
