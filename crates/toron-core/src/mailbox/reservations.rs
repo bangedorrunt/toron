@@ -1428,7 +1428,10 @@ impl Mailbox {
                         "a",
                         [format!("30031:{}:{d}", operator.public_key().to_hex())],
                     ),
-                    Tag::custom("note", [format!("bead-fenced:{bead_id}:epoch<={max_epoch}")]),
+                    Tag::custom(
+                        "note",
+                        [format!("bead-fenced:{bead_id}:epoch<={max_epoch}")],
+                    ),
                 ],
                 Some(project_slug),
             );

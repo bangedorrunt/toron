@@ -21,7 +21,7 @@ Init ==
 
 Dispatch(a) ==
     /\ bead_status = "Open"
-    /\ status_revision <= MaxRevisions
+    /\ status_revision < MaxRevisions
     /\ bead_status' = "InProgress"
     /\ current_attempt' = a
     /\ UNCHANGED <<status_revision, active_leases>>
@@ -54,12 +54,18 @@ Reopen ==
     \* release_by_reason_up_to_epoch revokes all leases with epoch <= current revision
     /\ active_leases' = {l \in active_leases : l.epoch > status_revision}
 
+Done ==
+    /\ status_revision = MaxRevisions
+    /\ bead_status \in {"Closed", "Open"}
+    /\ UNCHANGED vars
+
 Next ==
     \/ \E a \in Agents : Dispatch(a)
     \/ \E a \in Agents : AcquireLease(a)
     \/ \E a \in Agents : ReleaseLease(a)
     \/ Close
     \/ Reopen
+    \/ Done
 
 Spec == Init /\ [][Next]_vars
 
