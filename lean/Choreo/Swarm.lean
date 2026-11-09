@@ -4,9 +4,9 @@
   a verifier verdicts; the captain asks for approval. Par, so state 0 unions
   them per role.
 -/
-import Proto.Choreo
+import Choreo
 
-namespace Proto
+namespace Choreo
 
 def swarmCrew : List Global := [
   .send .crew .captain "progress",
@@ -21,4 +21,4 @@ def gSwarm : Global := .par [
   .send .captain .captain "approval",
 ]
 
-end Proto
+end Choreo

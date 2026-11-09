@@ -96,5 +96,5 @@ Update `models/ToronLeaseResolution.tla` and the coverage table above whenever:
 
 ## Not Covered & Related Skills
 
-- **Not covered**: Workflow effect journal lease claiming (`crates/toron-core/src/index/workflow_effects.rs`), multiplexer backend fallback latch (`crates/toron-plane/src/backend/fallback.rs`), and Lean 4 delivery/wake proofs (`proto/Proto/`).
+- **Not covered**: Workflow effect journal lease claiming (`crates/toron-core/src/index/workflow_effects.rs`), multiplexer backend fallback latch (`crates/toron-plane/src/backend/fallback.rs`), and Lean 4 delivery/wake proofs (`lean/Proto/`).
 - **Related skills**: `/statechart` (for running TLC and rendering statecharts), `/maintain-formal-verification-skill` (for updating this skill when `reservations.rs` evolves).

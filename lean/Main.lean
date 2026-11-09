@@ -1,5 +1,8 @@
 import Proto
+import Choreo
+import Choreo.Sound
 open Proto
+open Choreo
 
 /-! `lake exe proto vectors [--check FILE]`: every (state, event) pair over
 a small fixed universe, as JSONL `{"state":…,"event":…,"expect":…}`. The

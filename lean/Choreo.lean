@@ -5,7 +5,7 @@
   A copied `End` is an empty verb list; that is a different answer, and Rust
   only gets it when the pointer check is skipped.
 -/
-namespace Proto
+namespace Choreo
 
 inductive Role where
   | captain | supervisor | crew | peer | loopSelf | verifier
@@ -90,4 +90,4 @@ def Proj.verbsOf : Proj → List String
   | .verbs vs => vs
   | .notYet => []
 
-end Proto
+end Choreo

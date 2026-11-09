@@ -7,6 +7,8 @@ package proto where
 
 lean_lib Proto where
 
+lean_lib Choreo where
+
 @[default_target]
 lean_exe proto where
   root := `Main

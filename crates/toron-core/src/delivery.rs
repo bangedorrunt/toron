@@ -4,7 +4,7 @@
 //! Pure: `std + serde` only, no clock, no store, no kernel types. Every
 //! transition is one call to [`DeliveryFsm::step`], which returns the next
 //! state or a typed [`Reject`]; the caller persists the state it gets back.
-//! The Lean model (`proto/Proto/Delivery.lean`) states the same table and
+//! The Lean model (`lean/Proto/Delivery.lean`) states the same table and
 //! `tests/proto_vectors.rs` replays its vectors against this function.
 //!
 //! Invariants kept here (redesign §3.3; Lean P2/P3/P4/P5):

@@ -33,7 +33,7 @@
 //! `head > cursor` stays true the decision becomes [`RingDecision::Escalate`]
 //! after exactly [`MAX_RINGS`] rings (urgent: [`MAX_RINGS_URGENT`]); the
 //! caller emits the `deaf{r, wm}` fact then. No silent stall. The Lean twin
-//! is `proto/Proto/Wake.lean`; `tests/proto_vectors.rs` replays its vectors
+//! is `lean/Proto/Wake.lean`; `tests/proto_vectors.rs` replays its vectors
 //! against [`should_ring`].
 //!
 //! Known edge, by design: a pane that stays `working` (or `blocked`) for

@@ -8,12 +8,12 @@
   on `step` in `Fencing.lean`. `sendOk` is membership in `project`; the table
   is what makes that non-vacuous.
 -/
-import Proto.Choreo
-import Proto.Choreo.Swarm
-import Proto.Choreo.Loop
-import Proto.Choreo.Open
+import Choreo
+import Choreo.Swarm
+import Choreo.Loop
+import Choreo.Open
 
-namespace Proto
+namespace Choreo
 
 def project (t : Topology) (r : Role) (s : Nat) : Proj :=
   match t with
@@ -103,4 +103,4 @@ theorem supervisor_is_not_yet (r : Role) (s : Nat) :
 
 theorem allCells_count : allCells.length = 120 := rfl
 
-end Proto
+end Choreo

@@ -2,9 +2,9 @@
   governed-by: ADR-0041
   `G_OPEN`: peers request, reply, and notify. Nobody else sends.
 -/
-import Proto.Choreo
+import Choreo
 
-namespace Proto
+namespace Choreo
 
 def gOpen : Global := .par [
   .send .peer .peer "request",
@@ -12,4 +12,4 @@ def gOpen : Global := .par [
   .send .peer .peer "notify",
 ]
 
-end Proto
+end Choreo

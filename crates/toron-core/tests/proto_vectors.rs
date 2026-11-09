@@ -1,5 +1,5 @@
 // governed-by: ADR-0041
-//! Replays the Lean reference model's committed vectors (`proto/vectors/`)
+//! Replays the Lean reference model's committed vectors (`lean/vectors/`)
 //! against the Rust implementation: `DeliveryFsm::step` for every
 //! (state, event) pair, and the real SQLite store's L16 append for every
 //! log trace. Rust CI needs no Lean: the vectors are committed and the
@@ -13,7 +13,7 @@ use toron_core::wake::{RingDecision, RingInput, should_ring};
 
 fn vectors(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../proto/vectors")
+        .join("../../lean/vectors")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }

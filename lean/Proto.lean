@@ -4,8 +4,3 @@ import Proto.Wake
 import Proto.Fencing
 import Proto.AttemptToken
 import Proto.Workflow
-import Proto.Choreo
-import Proto.Choreo.Swarm
-import Proto.Choreo.Loop
-import Proto.Choreo.Open
-import Proto.Choreo.Sound
