@@ -1987,8 +1987,10 @@ impl Mailbox {
     /// Build the kernel model from projected leases (bd-y6t7): the host
     /// owns I/O (bus replay, mirrors, names); the tick owns grant/deny.
     /// Only Held/Intent rows decide — terminal markers never reach the
-    /// kernel. Errors degrade to an empty model (same as the old inline
-    /// view: no rows, no conflicts).
+    /// kernel. Leases reasoned by a closed bead are ignored (dynamic
+    /// self-reconciliation) so they do not block as hard/soft conflicts.
+    /// Errors degrade to an empty model (same as the old inline view: no
+    /// rows, no conflicts).
     async fn kernel_model_for(
         &self,
         project_slug: &str,
@@ -2012,6 +2014,11 @@ impl Mailbox {
             }
         };
         let names = self.agent_name_map(project_slug).await;
+        let closed_beads = if closed_bead_reconcile_enabled() {
+            closed_bead_ids_from_cwd_ancestors()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let mut model = KernelModel::new();
         let mut meta = std::collections::HashMap::new();
         for l in leases {
@@ -2020,6 +2027,9 @@ impl Mailbox {
                 ReservationStatus::Intent => EntryState::Intent,
                 _ => continue,
             };
+            if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(&l.reason, &closed_beads) {
+                continue;
+            }
             let name = names.get(&l.agent_pubkey).cloned().unwrap_or_default();
             meta.insert(l.id.clone(), (name, l.status));
             model.leases.insert(
@@ -2887,6 +2897,77 @@ impl Mailbox {
 /// ways — AM-Rust parity).
 pub fn overlaps(a: &str, b: &str) -> bool {
     pattern_matches(a, b) || pattern_matches(b, a)
+}
+
+/// True when `reason` names a closed bead (bd-*), so a lease may be ignored
+/// for conflict purposes (dynamic self-reconciliation).
+fn lease_reasoned_by_closed_bead(
+    reason: &str,
+    closed_beads: &std::collections::BTreeSet<String>,
+) -> bool {
+    if reason.is_empty() || !reason.starts_with("bd-") {
+        return false;
+    }
+    let bead = bead_id_from_reason(reason);
+    closed_beads.contains(bead)
+}
+
+/// Extract bead id from a lease reason (exact id or stamped `bd-..@rN#pin`).
+fn bead_id_from_reason(reason: &str) -> &str {
+    match reason.find('@') {
+        Some(i) if i > 0 => &reason[..i],
+        _ => reason,
+    }
+}
+
+/// Collect closed bead IDs from `.beads/issues.jsonl`, searching current dir
+/// and project ancestors. Best-effort: unreadable/missing files are ignored.
+fn closed_bead_ids_from_cwd_ancestors() -> std::collections::BTreeSet<String> {
+    let mut closed = std::collections::BTreeSet::new();
+    let Ok(mut dir) = std::env::current_dir() else {
+        return closed;
+    };
+    loop {
+        let path = dir.join(".beads").join("issues.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                if status == "closed" || status == "tombstone" {
+                    if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
+                        if id.starts_with("bd-") {
+                            closed.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    closed
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOSED_BEAD_RECONCILE_IN_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn closed_bead_reconcile_enabled() -> bool {
+    CLOSED_BEAD_RECONCILE_IN_TESTS.with(|v| v.get())
+}
+
+#[cfg(not(test))]
+fn closed_bead_reconcile_enabled() -> bool {
+    true
 }
 
 /// A located `request-release` rumor (author + metadata).
@@ -6634,5 +6715,92 @@ mod tests {
         assert!(AttemptToken::parse_stamp("bd-test@rx#AmberHarbor").is_none());
         assert!(AttemptToken::parse_stamp("@r1#AmberHarbor").is_none());
         assert!(AttemptToken::parse_stamp("bd-test@r1#").is_none());
+    }
+
+    #[test]
+    fn test_lease_reasoned_by_closed_bead() {
+        let mut closed = std::collections::BTreeSet::new();
+        closed.insert("bd-05yr".to_string());
+        closed.insert("bd-closed-test".to_string());
+
+        assert!(lease_reasoned_by_closed_bead("bd-05yr", &closed));
+        assert!(lease_reasoned_by_closed_bead("bd-05yr@r2#AmberHarbor", &closed));
+        assert!(lease_reasoned_by_closed_bead("bd-closed-test", &closed));
+        assert!(!lease_reasoned_by_closed_bead("bd-open-task", &closed));
+        assert!(!lease_reasoned_by_closed_bead("bd-open@r1#BlueLake", &closed));
+        assert!(!lease_reasoned_by_closed_bead("manual-claim", &closed));
+        assert!(!lease_reasoned_by_closed_bead("", &closed));
+    }
+
+    #[tokio::test]
+    async fn closed_bead_lease_does_not_block_acquire() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        super::CLOSED_BEAD_RECONCILE_IN_TESTS.with(|v| v.set(true));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::CLOSED_BEAD_RECONCILE_IN_TESTS.with(|v| v.set(false));
+            }
+        }
+        let _reset = Reset;
+
+        let orig = std::env::current_dir().expect("cwd");
+        let tmp = std::env::temp_dir().join(format!(
+            "toron-closed-bead-lease-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(tmp.join(".beads")).expect("beads dir");
+        std::fs::write(
+            tmp.join(".beads/issues.jsonl"),
+            "{\"id\":\"bd-closed-x\",\"status\":\"closed\"}\n",
+        )
+        .expect("write issues");
+        std::env::set_current_dir(&tmp).expect("chdir");
+
+        let (mailbox, db_path, data_dir) = test_mailbox("closed-bead-reconcile").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/reconcile.rs".to_string()],
+                Some(3600),
+                true,
+                Some("bd-closed-x"),
+            )
+            .await
+            .expect("initial acquire");
+        assert_eq!(acq.granted.len(), 1, "initial grant: {acq:?}");
+
+        let acq2 = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/reconcile.rs".to_string()],
+                Some(3600),
+                true,
+                Some("other"),
+            )
+            .await
+            .expect("acquire by peer");
+        assert_eq!(
+            acq2.granted.len(),
+            1,
+            "closed-bead lease must not block: conflicts={:?} soft={:?}",
+            acq2.conflicts, acq2.soft_conflicts
+        );
+        assert!(acq2.conflicts.is_empty(), "no hard conflicts: {acq2:?}");
+        assert!(
+            acq2.soft_conflicts.is_empty(),
+            "no soft conflicts: {acq2:?}"
+        );
+
+        std::env::set_current_dir(orig).expect("restore cwd");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
