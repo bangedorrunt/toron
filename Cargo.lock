@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-durable"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "elm-effect",
  "elm-effect-journal",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-elm"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "elm-effect",
  "elm-effect-journal",
@@ -862,9 +862,21 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-journal"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "elm-effect",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "elm-effect-xstate"
+version = "0.4.3"
+dependencies = [
+ "elm-effect",
+ "elm-effect-elm",
+ "elm-effect-journal",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3454,6 +3466,7 @@ dependencies = [
  "elm-effect-durable",
  "elm-effect-elm",
  "elm-effect-journal",
+ "elm-effect-xstate",
  "futures-util",
  "git2",
  "hex",

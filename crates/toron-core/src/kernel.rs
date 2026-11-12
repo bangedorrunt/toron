@@ -73,6 +73,7 @@ pub use elm_effect_journal::store::{
     Read as JournalRead, Row as JournalRow,
 };
 pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};
+pub use elm_effect_xstate::*;
 
 /// Terminal settlement for a run whose lifecycle the host owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

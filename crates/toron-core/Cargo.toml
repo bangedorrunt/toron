@@ -35,6 +35,7 @@ elm-effect = { path = "../../../elm-effect-rs/crates/elm-effect" }
 elm-effect-durable = { path = "../../../elm-effect-rs/crates/elm-effect-durable" }
 elm-effect-elm = { path = "../../../elm-effect-rs/crates/elm-effect-elm" }
 elm-effect-journal = { path = "../../../elm-effect-rs/crates/elm-effect-journal" }
+elm-effect-xstate = { path = "../../../elm-effect-rs/crates/elm-effect-xstate" }
 
 [features]
 # Test-only crash points for the comms outbox (TORON_FAULT=after_intent |
