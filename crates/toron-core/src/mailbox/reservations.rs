@@ -572,7 +572,21 @@ impl Mailbox {
 
         for path in paths {
             let now_us = Self::kernel_now_us();
-            let (model, meta) = self.kernel_model_for(project_slug).await;
+            let (mut model, meta) = self.kernel_model_for(project_slug).await;
+            let closed_beads = if closed_bead_reconcile_enabled() {
+                closed_bead_ids_from_cwd_ancestors()
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            if !closed_beads.is_empty() {
+                model.leases.retain(|id, _| {
+                    if let Some((_, _, reason)) = meta.get(id) {
+                        !lease_reasoned_by_closed_bead(reason, &closed_beads)
+                    } else {
+                        true
+                    }
+                });
+            }
             let ttl_secs = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
             let ttl_us = ttl_secs;
             let blockers = Self::kernel_blockers_for(
@@ -656,7 +670,7 @@ impl Mailbox {
                         reason: super::reservations_core::DenyReason::HardConflict { blocking_id },
                         ..
                     } = effect
-                        && let Some((name, _)) = meta.get(blocking_id)
+                        && let Some((name, _, _)) = meta.get(blocking_id)
                     {
                         holders.push(name.clone());
                         ids.push(blocking_id.clone());
@@ -785,7 +799,21 @@ impl Mailbox {
         };
         for path in paths {
             let now_us = Self::kernel_now_us();
-            let (model, meta) = self.kernel_model_for(project_slug).await;
+            let (mut model, meta) = self.kernel_model_for(project_slug).await;
+            let closed_beads = if closed_bead_reconcile_enabled() {
+                closed_bead_ids_from_cwd_ancestors()
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            if !closed_beads.is_empty() {
+                model.leases.retain(|id, _| {
+                    if let Some((_, _, reason)) = meta.get(id) {
+                        !lease_reasoned_by_closed_bead(reason, &closed_beads)
+                    } else {
+                        true
+                    }
+                });
+            }
             let blockers = Self::kernel_blockers_for(
                 &model,
                 &meta,
@@ -802,6 +830,11 @@ impl Mailbox {
 
             let mut soft = soft;
             let mut soft_ids = soft_ids;
+            let closed_beads = if closed_bead_reconcile_enabled() {
+                closed_bead_ids_from_cwd_ancestors()
+            } else {
+                std::collections::BTreeSet::new()
+            };
             for id in reservations_core::advisory_viewers(
                 &model,
                 &agent_keys.public_key().to_hex(),
@@ -811,7 +844,10 @@ impl Mailbox {
                 if hard_ids.contains(&id) {
                     continue;
                 }
-                if let Some((name, ReservationStatus::Held)) = meta.get(&id) {
+                if let Some((name, ReservationStatus::Held, reason)) = meta.get(&id) {
+                    if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(reason, &closed_beads) {
+                        continue;
+                    }
                     soft.push(name.clone());
                     soft_ids.push(id);
                 }
@@ -1987,16 +2023,14 @@ impl Mailbox {
     /// Build the kernel model from projected leases (bd-y6t7): the host
     /// owns I/O (bus replay, mirrors, names); the tick owns grant/deny.
     /// Only Held/Intent rows decide — terminal markers never reach the
-    /// kernel. Leases reasoned by a closed bead are ignored (dynamic
-    /// self-reconciliation) so they do not block as hard/soft conflicts.
-    /// Errors degrade to an empty model (same as the old inline view: no
-    /// rows, no conflicts).
+    /// kernel. Errors degrade to an empty model (same as the old inline view:
+    /// no rows, no conflicts).
     async fn kernel_model_for(
         &self,
         project_slug: &str,
     ) -> (
         KernelModel,
-        std::collections::HashMap<String, (String, ReservationStatus)>,
+        std::collections::HashMap<String, (String, ReservationStatus, String)>,
     ) {
         let leases = match self.resolved_leases(project_slug).await {
             Ok(leases) => leases,
@@ -2014,11 +2048,6 @@ impl Mailbox {
             }
         };
         let names = self.agent_name_map(project_slug).await;
-        let closed_beads = if closed_bead_reconcile_enabled() {
-            closed_bead_ids_from_cwd_ancestors()
-        } else {
-            std::collections::BTreeSet::new()
-        };
         let mut model = KernelModel::new();
         let mut meta = std::collections::HashMap::new();
         for l in leases {
@@ -2027,11 +2056,8 @@ impl Mailbox {
                 ReservationStatus::Intent => EntryState::Intent,
                 _ => continue,
             };
-            if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(&l.reason, &closed_beads) {
-                continue;
-            }
             let name = names.get(&l.agent_pubkey).cloned().unwrap_or_default();
-            meta.insert(l.id.clone(), (name, l.status));
+            meta.insert(l.id.clone(), (name, l.status, l.reason.clone()));
             model.leases.insert(
                 l.id.clone(),
                 LeaseEntry {
@@ -2087,12 +2113,19 @@ impl Mailbox {
     /// Decide one acquire through the kernel (bd-y6t7): returns every
     /// blocking (name, id, status) by re-ticking past each blocker on a
     /// scratch model. One decider — the old inline `conflict_view` is gone.
+    /// Leases reasoned by a closed bead are ignored (dynamic closed-bead
+    /// self-reconciliation) so they do not block incoming acquires.
     fn kernel_blockers_for(
         model: &KernelModel,
-        meta: &std::collections::HashMap<String, (String, ReservationStatus)>,
+        meta: &std::collections::HashMap<String, (String, ReservationStatus, String)>,
         probe: &AcquireProbe,
     ) -> Vec<(String, String, ReservationStatus)> {
         use super::reservations_core::{KernelEffect, KernelMsg};
+        let closed_beads = if closed_bead_reconcile_enabled() {
+            closed_bead_ids_from_cwd_ancestors()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let mut scratch = model.clone();
         let mut out = Vec::new();
         for _ in 0..=scratch.leases.len() {
@@ -2115,7 +2148,11 @@ impl Mailbox {
                     reason: super::reservations_core::DenyReason::HardConflict { blocking_id },
                     ..
                 }) => {
-                    if let Some((name, status)) = meta.get(&blocking_id) {
+                    if let Some((name, status, reason)) = meta.get(&blocking_id) {
+                        if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(reason, &closed_beads) {
+                            scratch.leases.remove(&blocking_id);
+                            continue;
+                        }
                         out.push((name.clone(), blocking_id.clone(), *status));
                     }
                     scratch.leases.remove(&blocking_id);
@@ -2939,12 +2976,11 @@ fn closed_bead_ids_from_cwd_ancestors() -> std::collections::BTreeSet<String> {
                     continue;
                 };
                 let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                if status == "closed" || status == "tombstone" {
-                    if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
-                        if id.starts_with("bd-") {
-                            closed.insert(id.to_string());
-                        }
-                    }
+                if (status == "closed" || status == "tombstone")
+                    && let Some(id) = v.get("id").and_then(|s| s.as_str())
+                    && id.starts_with("bd-")
+                {
+                    closed.insert(id.to_string());
                 }
             }
         }
@@ -6734,8 +6770,6 @@ mod tests {
 
     #[tokio::test]
     async fn closed_bead_lease_does_not_block_acquire() {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _cwd_guard = CWD_LOCK.lock().unwrap();
         super::CLOSED_BEAD_RECONCILE_IN_TESTS.with(|v| v.set(true));
         struct Reset;
         impl Drop for Reset {
@@ -6744,19 +6778,6 @@ mod tests {
             }
         }
         let _reset = Reset;
-
-        let orig = std::env::current_dir().expect("cwd");
-        let tmp = std::env::temp_dir().join(format!(
-            "toron-closed-bead-lease-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(tmp.join(".beads")).expect("beads dir");
-        std::fs::write(
-            tmp.join(".beads/issues.jsonl"),
-            "{\"id\":\"bd-closed-x\",\"status\":\"closed\"}\n",
-        )
-        .expect("write issues");
-        std::env::set_current_dir(&tmp).expect("chdir");
 
         let (mailbox, db_path, data_dir) = test_mailbox("closed-bead-reconcile").await;
         register(&mailbox, "demo", "BlueLake").await;
@@ -6769,7 +6790,7 @@ mod tests {
                 &["src/reconcile.rs".to_string()],
                 Some(3600),
                 true,
-                Some("bd-closed-x"),
+                Some("bd-05yr"),
             )
             .await
             .expect("initial acquire");
@@ -6798,9 +6819,7 @@ mod tests {
             "no soft conflicts: {acq2:?}"
         );
 
-        std::env::set_current_dir(orig).expect("restore cwd");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
