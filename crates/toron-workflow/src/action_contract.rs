@@ -383,8 +383,11 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
         Action::Spawn { profile, .. } => {
             push(&mut out, non_empty("profile", profile, "spawn"));
         }
-        Action::Loop { max, body, .. } => {
+        Action::Loop { max, min, body, .. } => {
             push(&mut out, non_empty("max", max, "loop"));
+            if let Some(m) = min {
+                push(&mut out, non_empty("min", m, "loop"));
+            }
             if body.is_empty() {
                 out.push(violation(
                     "body",

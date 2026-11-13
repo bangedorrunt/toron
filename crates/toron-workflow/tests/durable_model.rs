@@ -2223,6 +2223,7 @@ fn loop_step(
         build_slot: false,
         action: Action::Loop {
             max: max.into(),
+            min: None,
             until: until.map(str::to_string),
             body,
         },
@@ -2237,6 +2238,106 @@ fn loop_workflow(max: &str, until: Option<&str>, on_error: StepOnError) -> Workf
         vec![named("check", dm("check"), StepOnError::Continue)],
         on_error,
     )])
+}
+
+fn loop_step_with_min(
+    name: &str,
+    max: &str,
+    min: Option<&str>,
+    until: Option<&str>,
+    body: Vec<Step>,
+    on_error: StepOnError,
+) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Loop {
+            max: max.into(),
+            min: min.map(str::to_string),
+            until: until.map(str::to_string),
+            body,
+        },
+    }
+}
+
+fn loop_workflow_with_min(max: &str, min: Option<&str>, until: Option<&str>, on_error: StepOnError) -> Workflow {
+    workflow(vec![loop_step_with_min(
+        "spin",
+        max,
+        min,
+        until,
+        vec![named("check", dm("check"), StepOnError::Continue)],
+        on_error,
+    )])
+}
+
+fn loop_model_with_min(max: &str, min: Option<&str>, until: Option<&str>, on_error: StepOnError) -> RunModel {
+    RunModel::new(
+        "run-loop",
+        loop_workflow_with_min(max, min, until, on_error),
+        serde_json::json!({}),
+    )
+}
+
+/// min gates until: until true after pass 1 still runs pass 2 when min is 2;
+/// the same loop with min absent stops after 1.
+#[test]
+fn loop_min_gates_until_until_min_passes() {
+    // min absent: until true after pass 1 stops at 1.
+    let model = loop_model("5", Some("steps_check_ok == true"), StepOnError::Continue);
+    let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    assert!(matches!(
+        effects.as_slice(),
+        [RunEffect::ExecuteStep { iteration: Some(1), .. }]
+    ));
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 2_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        model.outputs["spin"],
+        json!({"ok": true, "iterations": 1, "stopped": "until"})
+    );
+
+    // min 2: until true after pass 1 still runs pass 2.
+    let model = loop_model_with_min("5", Some("2"), Some("steps_check_ok == true"), StepOnError::Continue);
+    let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    assert!(matches!(
+        effects.as_slice(),
+        [RunEffect::ExecuteStep { iteration: Some(1), .. }]
+    ));
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 2_000,
+        },
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [RunEffect::ExecuteStep { iteration: Some(2), .. }]
+        ),
+        "min 2 forces pass 2 despite until true: {effects:?}"
+    );
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 3_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        model.outputs["spin"],
+        json!({"ok": true, "iterations": 2, "stopped": "until"})
+    );
 }
 
 fn loop_model(max: &str, until: Option<&str>, on_error: StepOnError) -> RunModel {

@@ -4615,6 +4615,7 @@ steps:
                     graph_node(
                         Action::Loop {
                             max: "3".into(),
+                            min: None,
                             until: None,
                             body: vec![linear_step()],
                         },
@@ -4638,6 +4639,7 @@ steps:
                 build_slot: false,
                 action: Action::Loop {
                     max: "{{inputs.max_iters}}".into(),
+                    min: None,
                     until: Some("steps_notify_ok == true".into()),
                     body: vec![linear_step()],
                 },
@@ -4647,6 +4649,7 @@ steps:
             let mut unbounded = wf.clone();
             unbounded.steps[0].action = Action::Loop {
                 max: "{{steps.plan.n}}".into(),
+                min: None,
                 until: None,
                 body: vec![linear_step()],
             };

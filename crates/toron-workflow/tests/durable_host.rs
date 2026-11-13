@@ -2465,6 +2465,7 @@ fn loop_step(
         build_slot: false,
         action: Action::Loop {
             max: max.into(),
+            min: None,
             until: until.map(str::to_string),
             body,
         },

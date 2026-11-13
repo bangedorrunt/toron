@@ -92,6 +92,10 @@ pub enum ParkReason {
     Spawn,
 }
 
+fn default_loop_min() -> u32 {
+    1
+}
+
 /// One bounded loop's progress (bd-loop-rewrites-fap8).
 ///
 /// Persisted with the model, so a restart resumes at the same iteration
@@ -102,6 +106,9 @@ pub struct LoopProgress {
     pub iteration: u32,
     /// The resolved bound (1..=MAX_LOOP_ITERS).
     pub max: u32,
+    /// Minimum passes before `until` may stop the loop (1 = legacy behavior).
+    #[serde(default = "default_loop_min")]
+    pub min: u32,
 }
 
 /// Which arm a [`PlanEntry::ArmEnd`] closes.
@@ -690,16 +697,26 @@ pub(crate) fn next_effects(
             } => {
                 let name = plan_step_name(model, authored);
                 let step = model.workflow.steps.get(authored).cloned();
-                let Some(Action::Loop { max, .. }) = step.as_ref().map(|s| s.action.clone()) else {
+                let Some(Action::Loop { max, min, .. }) = step.as_ref().map(|s| s.action.clone()) else {
                     continue;
                 };
-                match resolve_loop_max(&max, &model.trigger, &outputs_map(&model.outputs)) {
-                    Ok(max_n) => {
+                let bound = resolve_loop_max(&max, &model.trigger, &outputs_map(&model.outputs)).and_then(|max_n| {
+                    resolve_loop_min(min.as_deref(), &model.trigger, &outputs_map(&model.outputs)).and_then(|min_n| {
+                        if min_n > max_n {
+                            Err(format!("loop min {min_n} exceeds max {max_n}"))
+                        } else {
+                            Ok((max_n, min_n))
+                        }
+                    })
+                });
+                match bound {
+                    Ok((max_n, min_n)) => {
                         model.loops.insert(
                             name,
                             LoopProgress {
                                 iteration: 1,
                                 max: max_n,
+                                min: min_n,
                             },
                         );
                         model.step_index += 1;
@@ -745,10 +762,15 @@ pub(crate) fn next_effects(
                 let progress = model.loops.get(&name).copied().unwrap_or(LoopProgress {
                     iteration: 1,
                     max: 1,
+                    min: 1,
                 });
-                let verdict = until
-                    .as_deref()
-                    .map(|guard| evaluate_pure_guard(guard, &model.trigger, &model.outputs));
+                let verdict = if progress.iteration >= progress.min {
+                    until
+                        .as_deref()
+                        .map(|guard| evaluate_pure_guard(guard, &model.trigger, &model.outputs))
+                } else {
+                    None
+                };
                 let exited = match verdict {
                     Some(PureGuard::True) => Some(serde_json::json!({
                         "ok": true,
@@ -807,6 +829,7 @@ pub(crate) fn next_effects(
                             LoopProgress {
                                 iteration: progress.iteration + 1,
                                 max: progress.max,
+                                min: progress.min,
                             },
                         );
                         model.step_index = body_start;
@@ -920,6 +943,35 @@ pub(crate) fn resolve_loop_max(
     if bound > u64::from(MAX_LOOP_ITERS) {
         return Err(format!(
             "loop max {bound} exceeds the bounded cap {MAX_LOOP_ITERS}"
+        ));
+    }
+    Ok(bound as u32)
+}
+
+/// Resolve a loop minimum from the fold's pure inputs, mirroring
+/// [`resolve_loop_max`]. Absent means 1: the guard may stop the loop after
+/// the first pass, exactly as before `min` existed.
+pub(crate) fn resolve_loop_min(
+    min: Option<&str>,
+    trigger: &serde_json::Value,
+    outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Result<u32, String> {
+    let Some(min) = min else {
+        return Ok(1);
+    };
+    let rendered = resolve_template_ref(min, trigger, outputs)
+        .and_then(|value| match value {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        })
+        .or_else(|| min.trim().parse().ok());
+    let bound = rendered
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| format!("loop min {min:?} must render to a positive integer"))?;
+    if bound > u64::from(MAX_LOOP_ITERS) {
+        return Err(format!(
+            "loop min {bound} exceeds the bounded cap {MAX_LOOP_ITERS}"
         ));
     }
     Ok(bound as u32)
@@ -1094,7 +1146,7 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                     }
                 }
             }
-            Action::Loop { max, until, body } => {
+            Action::Loop { max, min, until, body } => {
                 let literal = max.trim().parse::<u64>().is_ok();
                 let template = max.trim().starts_with("{{") && max.trim().ends_with("}}");
                 if !literal && !template {
@@ -1108,6 +1160,39 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                         "step '{}' loop `max` reads an upstream output, which is not resolvable before the loop starts",
                         step_name(step, index)
                     ));
+                }
+                if let Some(min) = min {
+                    let min_literal = min.trim().parse::<u64>().is_ok();
+                    let min_template =
+                        min.trim().starts_with("{{") && min.trim().ends_with("}}");
+                    if !min_literal && !min_template {
+                        return Some(format!(
+                            "step '{}' loop `min` {min:?} must be a positive integer or a trigger/inputs template",
+                            step_name(step, index)
+                        ));
+                    }
+                    if min.contains("{{steps.") {
+                        return Some(format!(
+                            "step '{}' loop `min` reads an upstream output, which is not resolvable before the loop starts",
+                            step_name(step, index)
+                        ));
+                    }
+                    if let Ok(min_n) = min.trim().parse::<u64>() {
+                        if min_n < 1 {
+                            return Some(format!(
+                                "step '{}' loop `min` must be at least 1",
+                                step_name(step, index)
+                            ));
+                        }
+                        if let Ok(max_n) = max.trim().parse::<u64>() {
+                            if min_n > max_n {
+                                return Some(format!(
+                                    "step '{}' loop `min` {min_n} exceeds `max` {max_n}",
+                                    step_name(step, index)
+                                ));
+                            }
+                        }
+                    }
                 }
                 if let Some(guard) = until
                     && let Err(reason) = check_pure_guard(guard)
@@ -3079,5 +3164,54 @@ mod tests {
             PersistedWorkflowModel::Graph(model) => assert_eq!(model.run_id, "run-graph"),
             PersistedWorkflowModel::Linear(_) => panic!("tagged graph row decoded as linear"),
         }
+    }
+
+    fn empty_outputs() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    #[test]
+    fn loop_min_defaults_to_one_when_absent() {
+        let trigger = serde_json::json!({});
+        assert_eq!(resolve_loop_min(None, &trigger, &empty_outputs()), Ok(1));
+    }
+
+    #[test]
+    fn loop_min_parses_literal() {
+        let trigger = serde_json::json!({});
+        assert_eq!(
+            resolve_loop_min(Some("3"), &trigger, &empty_outputs()),
+            Ok(3)
+        );
+        assert_eq!(
+            resolve_loop_min(Some(" 2 "), &trigger, &empty_outputs()),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn loop_min_rejects_nonpositive_and_noninteger() {
+        let trigger = serde_json::json!({});
+        assert!(resolve_loop_min(Some("0"), &trigger, &empty_outputs()).is_err());
+        assert!(resolve_loop_min(Some(""), &trigger, &empty_outputs()).is_err());
+        assert!(resolve_loop_min(Some("abc"), &trigger, &empty_outputs()).is_err());
+    }
+
+    #[test]
+    fn loop_min_rejects_over_cap() {
+        let trigger = serde_json::json!({});
+        let over = (MAX_LOOP_ITERS + 1).to_string();
+        let err = resolve_loop_min(Some(&over), &trigger, &empty_outputs())
+            .expect_err("over cap must fail");
+        assert!(err.contains("bounded cap"), "{err}");
+    }
+
+    #[test]
+    fn loop_min_renders_trigger_template() {
+        let trigger = serde_json::json!({"min_passes": "4"});
+        assert_eq!(
+            resolve_loop_min(Some("{{trigger.min_passes}}"), &trigger, &empty_outputs()),
+            Ok(4)
+        );
     }
 }

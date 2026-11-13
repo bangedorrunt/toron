@@ -819,6 +819,7 @@ mod tests {
             },
             Action::Loop {
                 max: "1".into(),
+                min: None,
                 until: None,
                 body: vec![leaf_delay()],
             },
