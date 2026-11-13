@@ -1378,12 +1378,12 @@ impl Mailbox {
             self.record_transition(project_slug, &d, "revoked", &revoke.id);
             released += 1;
 
-            if notify_previous {
-                let holder_keys = Keys::generate();
+            if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
                 let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
                     .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
+                let subject = format!("reservation released: {}", lease.path_pattern);
                 let rumor = crate::nostr::gift_wrap::build_rumor(
-                    holder_keys.public_key(),
+                    operator.public_key(),
                     Timestamp::now(),
                     crate::nostr::Kind::PrivateDirectMessage,
                     vec![
@@ -1391,13 +1391,14 @@ impl Mailbox {
                         Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
                         Tag::parse(["reason", bead_id]).expect("reason"),
                         Tag::parse(["reservation-id", &lease.id]).expect("res"),
+                        Tag::parse(["subject", &subject]).expect("subject"),
                     ],
                     format!(
-                        "reservation {} ({} by {}) released because bead {} closed",
+                        "reservation {} (holder {}) released by {} (reason {})",
                         lease.path_pattern, lease.agent_name, requestor_name, bead_id
                     ),
                 );
-                let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
+                let wrap = crate::nostr::gift_wrap::gift_wrap(operator, &holder_npub, rumor)
                     .expect("wrap notify");
                 if let Err(e) = self.publish_dm(&wrap).await {
                     tracing::warn!(
@@ -1493,12 +1494,12 @@ impl Mailbox {
             self.record_transition(project_slug, &d, "revoked", &revoke.id);
             released += 1;
 
-            if notify_previous {
-                let holder_keys = Keys::generate();
+            if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
                 let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
                     .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
+                let subject = format!("reservation released: {}", lease.path_pattern);
                 let rumor = crate::nostr::gift_wrap::build_rumor(
-                    holder_keys.public_key(),
+                    operator.public_key(),
                     Timestamp::now(),
                     crate::nostr::Kind::PrivateDirectMessage,
                     vec![
@@ -1506,13 +1507,14 @@ impl Mailbox {
                         Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
                         Tag::parse(["reason", bead_id]).expect("reason"),
                         Tag::parse(["reservation-id", &lease.id]).expect("res"),
+                        Tag::parse(["subject", &subject]).expect("subject"),
                     ],
                     format!(
-                        "reservation {} ({} by {}) released because bead {} reopened with epoch <= {}",
+                        "reservation {} (holder {}) released by {} because {} reopened with epoch <= {}",
                         lease.path_pattern, lease.agent_name, requestor_name, bead_id, max_epoch
                     ),
                 );
-                let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
+                let wrap = crate::nostr::gift_wrap::gift_wrap(operator, &holder_npub, rumor)
                     .expect("wrap notify");
                 if let Err(e) = self.publish_dm(&wrap).await {
                     tracing::warn!(
@@ -6040,6 +6042,192 @@ mod tests {
             .expect("conflict check");
         assert!(rep.conflict_free, "src/x.rs released without waiting TTL");
         assert!(rep.conflicts.is_empty(), "{:?}", rep.conflicts);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-hlirm: releasing your OWN lease by reason must not DM you the
+    /// notice you just triggered.
+    #[tokio::test]
+    async fn test_release_by_reason_self_release_sends_no_notice() {
+        let (mailbox, db_path, data_dir) = test_mailbox("hlirm-self").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/self.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-SELF"),
+            )
+            .await
+            .expect("acquire self lease");
+
+        let r = mailbox
+            .release_by_reason("demo", "BlueLake", "bd-SELF", true)
+            .await
+            .expect("self release");
+        assert_eq!(r.released, 1);
+
+        let wraps = collect_replay(
+            mailbox.bus.as_ref(),
+            ToronFilter::new().kinds([Kind::GiftWrap]).build(),
+        )
+        .await
+        .expect("wraps");
+        assert!(
+            wraps.is_empty(),
+            "a self release must not notify the releaser, got {} DM(s)",
+            wraps.len()
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-hlirm: releasing ANOTHER holder's lease sends one notice, signed by
+    /// the stable operator identity (never a throwaway key), with a subject
+    /// and text that states the true cause from this call site.
+    #[tokio::test]
+    async fn test_release_by_reason_notifies_other_holder_truthfully() {
+        let (mailbox, db_path, data_dir) = test_mailbox("hlirm-other").await;
+        let _holder_pub = register(&mailbox, "demo", "BlueLake").await;
+        let holder_keys = mailbox
+            .agent_keys_for("demo", "BlueLake")
+            .expect("holder keys");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/other.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-OTHER"),
+            )
+            .await
+            .expect("acquire other lease");
+
+        let r = mailbox
+            .release_by_reason("demo", "RoseDune", "bd-OTHER", true)
+            .await
+            .expect("release other holder");
+        assert_eq!(r.released, 1);
+
+        let operator = mailbox.operator().expect("operator").public_key();
+        let wraps = collect_replay(
+            mailbox.bus.as_ref(),
+            ToronFilter::new().kinds([Kind::GiftWrap]).build(),
+        )
+        .await
+        .expect("wraps");
+        let notice = wraps
+            .iter()
+            .filter_map(|w| crate::nostr::gift_wrap::unwrap(&holder_keys, w).ok())
+            .find(|g| {
+                g.rumor.tags.iter().any(|t| {
+                    t.as_slice() == ["toron-kind".to_string(), "reservation-revoked".to_string()]
+                })
+            })
+            .expect("one reservation-revoked notice");
+        assert_eq!(
+            notice.rumor.pubkey, operator,
+            "notice must be signed by the stable operator identity, never Keys::generate()"
+        );
+        let subject = notice
+            .rumor
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("subject"))
+            .and_then(|t| t.as_slice().get(1))
+            .cloned()
+            .unwrap_or_default();
+        assert!(!subject.trim().is_empty(), "notice must carry a subject");
+        assert!(
+            notice.rumor.content.contains("released by RoseDune"),
+            "text names the true cause (requestor): {}",
+            notice.rumor.content
+        );
+        assert!(
+            notice.rumor.content.contains("bd-OTHER"),
+            "text names the reason: {}",
+            notice.rumor.content
+        );
+        assert!(
+            !notice.rumor.content.contains("closed"),
+            "a voluntary release must not claim a bead closure: {}",
+            notice.rumor.content
+        );
+        assert_eq!(
+            wraps
+                .iter()
+                .filter_map(|w| crate::nostr::gift_wrap::unwrap(&holder_keys, w).ok())
+                .filter(|g| {
+                    g.rumor.tags.iter().any(|t| {
+                        t.as_slice()
+                            == ["toron-kind".to_string(), "reservation-revoked".to_string()]
+                    })
+                })
+                .count(),
+            1,
+            "exactly one notice"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-hlirm: the epoch-fenced release names a reopen, not a closure, and
+    /// carries the same stable sender + subject.
+    #[tokio::test]
+    async fn test_release_by_reason_up_to_epoch_names_the_reopen() {
+        let (mailbox, db_path, data_dir) = test_mailbox("hlirm-epoch").await;
+        let _holder_pub = register(&mailbox, "demo", "BlueLake").await;
+        let holder_keys = mailbox
+            .agent_keys_for("demo", "BlueLake")
+            .expect("holder keys");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/epoch.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-EPOCH"),
+            )
+            .await
+            .expect("acquire epoch lease");
+
+        let r = mailbox
+            .release_by_reason_up_to_epoch("demo", "RoseDune", "bd-EPOCH", 0, true)
+            .await
+            .expect("epoch release");
+        assert_eq!(r.released, 1);
+
+        let operator = mailbox.operator().expect("operator").public_key();
+        let wraps = collect_replay(
+            mailbox.bus.as_ref(),
+            ToronFilter::new().kinds([Kind::GiftWrap]).build(),
+        )
+        .await
+        .expect("wraps");
+        let notice = wraps
+            .iter()
+            .filter_map(|w| crate::nostr::gift_wrap::unwrap(&holder_keys, w).ok())
+            .find(|g| {
+                g.rumor.tags.iter().any(|t| {
+                    t.as_slice() == ["toron-kind".to_string(), "reservation-revoked".to_string()]
+                })
+            })
+            .expect("one reservation-revoked notice");
+        assert_eq!(notice.rumor.pubkey, operator, "stable sender");
+        assert!(
+            notice.rumor.content.contains("reopened"),
+            "epoch release names the reopen: {}",
+            notice.rumor.content
+        );
+        assert!(!notice.rumor.content.contains("bead bd-EPOCH closed"));
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
