@@ -100,6 +100,7 @@ fn approval_awaits_then_lands_decision() {
     let model = model(vec![step(
         Action::RequestApproval {
             message: "approve?".into(),
+            timeout_secs: Some(60),
         },
         StepOnError::Continue,
     )]);
@@ -319,6 +320,7 @@ fn graph_approval_alias_is_wave_ordered() {
             "aa",
             Action::RequestApproval {
                 message: "approve aa?".into(),
+                timeout_secs: Some(60),
             },
             &[][..],
             StepOnError::Continue,
@@ -327,6 +329,7 @@ fn graph_approval_alias_is_wave_ordered() {
             "zz",
             Action::RequestApproval {
                 message: "approve zz?".into(),
+                timeout_secs: Some(60),
             },
             &[][..],
             StepOnError::Continue,

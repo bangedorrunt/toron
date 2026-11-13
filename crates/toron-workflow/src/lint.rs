@@ -600,7 +600,7 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 check_action(report, &step.action);
             }
         }
-        Action::RequestApproval { message } => {
+        Action::RequestApproval { message, .. } => {
             if message.trim().is_empty() {
                 report.issues.push(LintIssue {
                     level: Level::Warning,

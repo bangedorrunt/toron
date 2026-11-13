@@ -268,6 +268,7 @@ async fn approval_parks_with_a_watchdog_and_lands_the_decision() {
             "run-approval",
             workflow(vec![step(Action::RequestApproval {
                 message: "ship it?".into(),
+                timeout_secs: Some(60),
             })]),
             json!({}),
             1_000,
@@ -391,6 +392,7 @@ async fn out_of_phase_transitions_are_typed_errors() {
             "run-phase",
             workflow(vec![step(Action::RequestApproval {
                 message: "wait".into(),
+                timeout_secs: Some(60),
             })]),
             json!({}),
             0,
@@ -815,6 +817,7 @@ async fn graph_delay_and_approval_park_at_the_earliest_deadline() {
             "gate",
             Action::RequestApproval {
                 message: "ship?".into(),
+                timeout_secs: Some(60),
             },
             &[],
         ),

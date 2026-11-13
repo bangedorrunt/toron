@@ -707,7 +707,7 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
                 out.push(b.clone());
             }
         }
-        Action::RequestApproval { message } => out.push(message.clone()),
+        Action::RequestApproval { message, .. } => out.push(message.clone()),
         Action::Delay { .. } => {}
         Action::Retry { step, .. } => collect_step_strings(step, out),
         Action::Branch {

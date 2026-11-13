@@ -1421,7 +1421,7 @@ fn step_effects(
                 reason: ParkReason::Delay,
             }]
         }
-        Action::RequestApproval { message } => {
+        Action::RequestApproval { message, .. } => {
             model.phase = RunPhase::AwaitingApproval {
                 step: name.clone(),
                 message: message.clone(),
@@ -2838,7 +2838,7 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
-                Action::RequestApproval { message } => {
+                Action::RequestApproval { message, .. } => {
                     let payload = build_approval_payload(
                         &model.run_id,
                         &model.workflow.name,

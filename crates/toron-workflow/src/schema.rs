@@ -614,7 +614,16 @@ pub enum Action {
         body: Option<String>,
     },
     /// Request a human approval (suspends the run — WF-08 fix is bd-oge).
-    RequestApproval { message: String },
+    ///
+    /// `timeout_secs` bounds the wait (ADR-0021 D5.2, bd-36zlq): a run parked
+    /// on an approval with no cap is a hang with extra steps, so the workflow
+    /// verify lowering reports a missing/zero cap as an unbounded wait.
+    RequestApproval {
+        message: String,
+        /// Upper bound on the wait, seconds. Absent or 0 = unbounded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
     /// Wait (in-process cap 270s per Buzz; the durable engine has no such cap).
     Delay { secs: u64 },
     /// Park the run until `until_ms` (bd-ynef, ADR-0036).
@@ -1263,6 +1272,23 @@ steps:
             step("action: request_approval\nmessage: ok?"),
             Action::RequestApproval { .. }
         ));
+        assert!(matches!(
+            step("action: request_approval\nmessage: ok?"),
+            Action::RequestApproval {
+                timeout_secs: None,
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                step("action: request_approval\nmessage: ok?\ntimeout_secs: 90"),
+                Action::RequestApproval {
+                    timeout_secs: Some(90),
+                    ..
+                }
+            ),
+            "bd-36zlq: the approval timeout is a schema field"
+        );
         assert!(matches!(
             step("action: delay\nsecs: 5"),
             Action::Delay { .. }

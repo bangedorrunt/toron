@@ -788,6 +788,7 @@ mod tests {
             },
             Action::RequestApproval {
                 message: "m".into(),
+                timeout_secs: Some(60),
             },
             Action::Delay { secs: 1 },
             Action::Retry {

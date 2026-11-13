@@ -4528,6 +4528,7 @@ mod tests {
                 build_slot: false,
                 action: Action::RequestApproval {
                     message: "ship it?".into(),
+                    timeout_secs: Some(60),
                 },
             }],
             graph: None,
@@ -4646,6 +4647,7 @@ mod tests {
                     GraphNode {
                         action: Action::RequestApproval {
                             message: "ship the DAG?".into(),
+                            timeout_secs: Some(60),
                         },
                         needs: vec![],
                         guard: None,
@@ -4804,6 +4806,7 @@ mod tests {
                     build_slot: false,
                     action: Action::RequestApproval {
                         message: "ship it?".into(),
+                        timeout_secs: Some(60),
                     },
                 },
             ],
