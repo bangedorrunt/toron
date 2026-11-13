@@ -1166,6 +1166,21 @@ async fn job_progress(mailbox: &Mailbox, args: &JobProgressArgs) -> anyhow::Resu
 }
 
 async fn job_result(mailbox: &Mailbox, args: &JobResultArgs) -> anyhow::Result<()> {
+    // The witness file is validated BEFORE anything is published: a loud
+    // failure here sends nothing, so no half-reported job exists.
+    let witness = match &args.witness {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read witness {}", path.display()))?;
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("parse witness {}", path.display()))?;
+            if !value.is_object() {
+                anyhow::bail!("witness {} must be a JSON object", path.display());
+            }
+            Some(value)
+        }
+        None => None,
+    };
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let _ = find_request(mailbox, &args.project, &args.job_id).await?;
     let job = EventId::from_hex(&args.job_id).context("job id parses")?;
@@ -1174,7 +1189,8 @@ async fn job_result(mailbox: &Mailbox, args: &JobResultArgs) -> anyhow::Result<(
             JobStatusArg::Ok => "ok".to_string(),
             JobStatusArg::Failed => "failed".to_string(),
         },
-        body: args.body.clone(),
+        body: args.body.clone().unwrap_or_default(),
+        witness,
     };
     let ev = build_job_result(&keys, job, &result, Timestamp::now())?;
     mailbox.bus().publish(ev.clone()).await?;

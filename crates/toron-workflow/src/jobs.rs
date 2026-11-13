@@ -74,6 +74,11 @@ pub struct JobResult {
     /// Outcome body.
     #[serde(default)]
     pub body: String,
+    /// Witness JSON the finisher attached (`toron job result --witness`).
+    /// Absent on pre-witness payloads; the engine lifts a present witness
+    /// into the awaiting step's output (ADR-0021 D4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<serde_json::Value>,
 }
 
 /// A job error payload (kind-43006).
@@ -286,6 +291,7 @@ fn job_state_inner(job: EventId, events: &[Event], arrivals: Option<&ClaimArriva
                 let r: JobResult = serde_json::from_str(&ev.content).unwrap_or(JobResult {
                     status: "done".into(),
                     body: ev.content.clone(),
+                    witness: None,
                 });
                 return JobState::Done(r.status);
             }
@@ -515,6 +521,7 @@ mod tests {
             &JobResult {
                 status: "ok".into(),
                 body: "done".into(),
+                witness: None,
             },
             Timestamp::from(TS + 3),
         )
@@ -638,5 +645,22 @@ mod tests {
                 .is_err(),
             "wrong shape refuses"
         );
+    }
+
+    /// A 43004 witness rides the payload and parses back; absent stays None.
+    #[test]
+    fn dispatch_await_job_result_carries_witness() {
+        let with = JobResult {
+            status: "ok".into(),
+            body: "done".into(),
+            witness: Some(serde_json::json!({"contract": "signed"})),
+        };
+        let text = serde_json::to_string(&with).expect("serializes");
+        assert!(text.contains("witness"), "witness on the wire");
+        let back: JobResult = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back.witness, with.witness);
+        let legacy: JobResult =
+            serde_json::from_str(r#"{"status":"ok","body":"done"}"#).expect("parses");
+        assert_eq!(legacy.witness, None);
     }
 }

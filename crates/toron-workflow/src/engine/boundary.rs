@@ -777,6 +777,9 @@ mod tests {
                 assignee: "a".into(),
                 spec: test_spec(),
                 channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
             },
             Action::CallWebhook {
                 url: "https://x".into(),

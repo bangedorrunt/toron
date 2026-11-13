@@ -551,6 +551,15 @@ impl DispatchSpec {
     }
 }
 
+/// Closed await mode for `dispatch_job` (ADR-0021 D4.1). One variant:
+/// `result`, spelled `result` on the wire. Anything else fails parse —
+/// there is no silent fire-and-forget degrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchAwait {
+    Result,
+}
+
 /// A workflow action (one of the ADR Phase-2 set).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -573,11 +582,28 @@ pub enum Action {
     /// Add a reaction (kind-7) to a message.
     React { message_id: String, emoji: String },
     /// Dispatch a job to an agent (kind-43001; bounded semaphore A7).
+    /// With `await: result` the run suspends until the job's 43004 result
+    /// or 43006 error (ADR-0021 D4.1), bounded by `no_claim_timeout` and
+    /// `result_timeout`; without it the dispatch fires and forgets.
     DispatchJob {
         assignee: String,
         spec: DispatchSpec,
         #[serde(default)]
         channel: Option<String>,
+        /// `await: result` suspends until the job's terminal event.
+        /// Absent means fire-and-forget (today's behaviour).
+        #[serde(default, rename = "await", skip_serializing_if = "Option::is_none")]
+        await_: Option<DispatchAwait>,
+        /// Abort an unawaited-claimed job after N seconds (default 600;
+        /// explicit 0 is the only no-timeout spelling — ADR-0032 Spec 3).
+        /// Shared default with Spawn's (bd-ge1zo).
+        #[serde(default = "default_no_claim_timeout")]
+        no_claim_timeout: u64,
+        /// Abort a claimed-but-unsettled await after N seconds. Required
+        /// when `await: result` is set (a lint ERROR otherwise — D5.2
+        /// forbids unbounded waits); ignored without `await`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_timeout: Option<u64>,
     },
     /// Call an external webhook (SSRF-guarded in the engine, bd-k8s).
     CallWebhook {
@@ -1628,5 +1654,86 @@ steps:
             panic!("dispatch");
         };
         assert_eq!(spec.context, Some(ContextMode::Fresh));
+    }
+
+    fn dispatch_await_fixture(extra: &str) -> Workflow {
+        parse_workflow(&format!(
+            "name: t\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: {{ task: hi }}\n{extra}"
+        ))
+        .expect("fixture parses")
+    }
+
+    /// `await: result` parses to the closed variant with claim defaults.
+    #[test]
+    fn dispatch_await_result_parses() {
+        let wf = dispatch_await_fixture("    await: result\n    result_timeout: 60\n");
+        let Action::DispatchJob {
+            await_,
+            no_claim_timeout,
+            result_timeout,
+            ..
+        } = &wf.steps[0].action
+        else {
+            panic!("dispatch");
+        };
+        assert_eq!(*await_, Some(DispatchAwait::Result));
+        assert_eq!(*no_claim_timeout, 600);
+        assert_eq!(*result_timeout, Some(60));
+    }
+
+    /// `await: true` and `await: bogus` fail parse loudly; absent is None.
+    #[test]
+    fn dispatch_await_true_and_bogus_fail_parse() {
+        for bad in ["    await: true\n", "    await: bogus\n"] {
+            let yaml = format!(
+                "name: t\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: {{ task: hi }}\n{bad}    result_timeout: 60\n"
+            );
+            parse_workflow(&yaml).expect_err("non-result await fails");
+        }
+    }
+
+    /// Absent `await` reads as None with the Spawn-shared claim default.
+    #[test]
+    fn dispatch_await_absent_gives_none() {
+        let wf = dispatch_await_fixture("");
+        let Action::DispatchJob {
+            await_,
+            no_claim_timeout,
+            result_timeout,
+            ..
+        } = &wf.steps[0].action
+        else {
+            panic!("dispatch");
+        };
+        assert_eq!(*await_, None);
+        assert_eq!(*no_claim_timeout, 600);
+        assert_eq!(*result_timeout, None);
+    }
+
+    /// `await: result` without a finite `result_timeout` is a lint ERROR.
+    #[test]
+    fn dispatch_await_lint_requires_result_timeout() {
+        let bad = dispatch_await_fixture("    await: result\n");
+        let report = crate::lint::lint_workflow(&bad);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == crate::lint::Level::Error
+                    && i.message.contains("result_timeout")),
+            "names the bound: {:?}",
+            report.issues
+        );
+        let good = dispatch_await_fixture("    await: result\n    result_timeout: 60\n");
+        let report = crate::lint::lint_workflow(&good);
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !(i.level == crate::lint::Level::Error
+                    && i.message.contains("result_timeout"))),
+            "clean with a timeout: {:?}",
+            report.issues
+        );
     }
 }

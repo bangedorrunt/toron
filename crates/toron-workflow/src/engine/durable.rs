@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
+use crate::schema::{Action, DispatchAwait, Graph, GraphNode, Step, StepOnError, Workflow};
 
 use super::boundary::{ActionPartition, is_failure_value, partition};
 use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
@@ -62,6 +62,27 @@ pub enum RunPhase {
         /// Absolute claim deadline, when the step set one.
         deadline_ms: Option<u64>,
     },
+    /// Waiting for a dispatched job's 43004/43006 (bd-ge1zo, ADR-0021 D4.1).
+    ///
+    /// The 43001 publication happens through the normal ExecuteStep path,
+    /// so a restart does NOT republish — resume re-issues only the park.
+    /// A pre-publication crash therefore waits out the claim deadline and
+    /// fails loud, never hangs.
+    AwaitingJob {
+        /// Step name.
+        node: String,
+        /// Absolute claim deadline (None = explicit 0, waits unboundedly).
+        claim_deadline_ms: Option<u64>,
+        /// Absolute result deadline once claimed (None = waits unboundedly;
+        /// the lint gate forbids omitting `result_timeout`).
+        result_deadline_ms: Option<u64>,
+        /// Whether a 43002 claim arrived (switches the active deadline).
+        claimed: bool,
+        /// Claim bound in seconds, for the timeout error text.
+        no_claim_timeout: u64,
+        /// Result bound in seconds, for the timeout error text.
+        result_timeout: Option<u64>,
+    },
     /// Waiting for a human decision on `step`.
     AwaitingApproval {
         /// Step name.
@@ -90,6 +111,8 @@ pub enum ParkReason {
     Park,
     /// A spawn-await claim deadline (bd-spawn-park-toron-vwu3).
     Spawn,
+    /// A dispatch-await claim/result deadline (bd-ge1zo, ADR-0021 D4.1).
+    Job,
 }
 
 fn default_loop_min() -> u32 {
@@ -357,6 +380,31 @@ pub enum RunMsg {
         /// Host time, unix millis.
         now_ms: u64,
     },
+    /// A dispatched job was claimed (43002).
+    JobClaimed {
+        /// Step name.
+        node: String,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A dispatched job settled (43004 with the step output value).
+    JobSettled {
+        /// Step name.
+        node: String,
+        /// The step output value (`{ok:true, job, witness, body}`).
+        value: serde_json::Value,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A dispatched job errored (43006).
+    JobFailed {
+        /// Step name.
+        node: String,
+        /// Failure text.
+        error: String,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
     /// An approval decision arrived.
     Approval {
         /// Decision value.
@@ -567,6 +615,55 @@ pub fn advance_with(
                     spawns,
                 );
             }
+            if let RunPhase::AwaitingJob {
+                node,
+                claim_deadline_ms,
+                result_deadline_ms,
+                claimed,
+                no_claim_timeout,
+                result_timeout,
+            } = next.phase.clone()
+            {
+                let (deadline, error) = if claimed {
+                    (
+                        result_deadline_ms,
+                        result_timeout.map(|t| {
+                            format!(
+                                "dispatch await {node}: result_timeout after {t}s with no 43004/43006"
+                            )
+                        }),
+                    )
+                } else {
+                    (
+                        claim_deadline_ms,
+                        Some(format!(
+                            "dispatch await {node}: no claim after {no_claim_timeout}s"
+                        )),
+                    )
+                };
+                let Some(deadline) = deadline else {
+                    return (next, Vec::new());
+                };
+                if deadline > *now_ms {
+                    return (
+                        next,
+                        vec![RunEffect::ParkUntil {
+                            until_ms: deadline,
+                            reason: ParkReason::Job,
+                        }],
+                    );
+                }
+                let Some(error) = error else {
+                    return (next, Vec::new());
+                };
+                return settle_spawn(
+                    &mut next,
+                    &node,
+                    serde_json::json!({"ok": false, "error": error}),
+                    *now_ms,
+                    spawns,
+                );
+            }
             if !matches!(next.phase, RunPhase::Parked { .. }) {
                 return (next, Vec::new());
             }
@@ -614,6 +711,64 @@ pub fn advance_with(
             now_ms,
         } => {
             let RunPhase::AwaitingSpawn { node: awaiting, .. } = next.phase.clone() else {
+                return (next, Vec::new());
+            };
+            if &awaiting != node {
+                return (next, Vec::new());
+            }
+            let landed = serde_json::json!({ "ok": false, "error": error });
+            settle_spawn(&mut next, node, landed, *now_ms, spawns)
+        }
+        RunMsg::JobClaimed { node, now_ms } => {
+            let result_timeout = match &next.phase {
+                RunPhase::AwaitingJob {
+                    node: awaiting,
+                    claimed: false,
+                    result_timeout,
+                    ..
+                } if awaiting == node => *result_timeout,
+                _ => return (next, Vec::new()),
+            };
+            let result_deadline_ms = result_timeout
+                .filter(|t| *t > 0)
+                .map(|t| now_ms.saturating_add(t.saturating_mul(1_000)));
+            if let RunPhase::AwaitingJob {
+                claimed,
+                result_deadline_ms: slot,
+                ..
+            } = &mut next.phase
+            {
+                *claimed = true;
+                *slot = result_deadline_ms;
+            }
+            let mut effects = Vec::new();
+            if let Some(until_ms) = result_deadline_ms {
+                effects.push(RunEffect::ParkUntil {
+                    until_ms,
+                    reason: ParkReason::Job,
+                });
+            }
+            (next, effects)
+        }
+        RunMsg::JobSettled {
+            node,
+            value,
+            now_ms,
+        } => {
+            let RunPhase::AwaitingJob { node: awaiting, .. } = next.phase.clone() else {
+                return (next, Vec::new());
+            };
+            if &awaiting != node {
+                return (next, Vec::new());
+            }
+            settle_spawn(&mut next, node, value.clone(), *now_ms, spawns)
+        }
+        RunMsg::JobFailed {
+            node,
+            error,
+            now_ms,
+        } => {
+            let RunPhase::AwaitingJob { node: awaiting, .. } = next.phase.clone() else {
                 return (next, Vec::new());
             };
             if &awaiting != node {
@@ -1063,6 +1218,38 @@ fn step_effects(
             }
             effects
         }
+        Action::DispatchJob {
+            await_: Some(DispatchAwait::Result),
+            no_claim_timeout,
+            result_timeout,
+            ..
+        } => {
+            // D4.1: publish through the normal ExecuteStep path, then
+            // suspend on the job's terminal. The 43001 goes out exactly as
+            // a fire-and-forget dispatch would; the fold only adds the wait.
+            let claim_deadline_ms = (*no_claim_timeout > 0)
+                .then(|| now_ms.saturating_add(no_claim_timeout.saturating_mul(1_000)));
+            model.phase = RunPhase::AwaitingJob {
+                node: name.clone(),
+                claim_deadline_ms,
+                result_deadline_ms: None,
+                claimed: false,
+                no_claim_timeout: *no_claim_timeout,
+                result_timeout: *result_timeout,
+            };
+            let mut effects = vec![RunEffect::ExecuteStep {
+                index: authored,
+                step: Box::new(step),
+                iteration,
+            }];
+            if let Some(until_ms) = claim_deadline_ms {
+                effects.push(RunEffect::ParkUntil {
+                    until_ms,
+                    reason: ParkReason::Job,
+                });
+            }
+            effects
+        }
         action => {
             if matches!(partition(action), ActionPartition::HostSink { .. }) {
                 model.phase = RunPhase::Running;
@@ -1299,6 +1486,29 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
             node: node.clone(),
             spec: spec.clone(),
         }],
+        RunPhase::AwaitingJob {
+            claim_deadline_ms,
+            result_deadline_ms,
+            claimed,
+            ..
+        } => {
+            // No republish: the 43001 went out through ExecuteStep before the
+            // suspend, so resume re-issues only the park. A pre-publication
+            // crash waits out the claim deadline and fails loud, never hangs.
+            let deadline = if *claimed {
+                *result_deadline_ms
+            } else {
+                *claim_deadline_ms
+            };
+            deadline
+                .map(|until_ms| {
+                    vec![RunEffect::ParkUntil {
+                        until_ms,
+                        reason: ParkReason::Job,
+                    }]
+                })
+                .unwrap_or_default()
+        }
         RunPhase::AwaitingApproval { step, message } => vec![RunEffect::AwaitApproval {
             step: step.clone(),
             message: message.clone(),
@@ -3212,6 +3422,163 @@ mod tests {
         assert_eq!(
             resolve_loop_min(Some("{{trigger.min_passes}}"), &trigger, &empty_outputs()),
             Ok(4)
+        );
+    }
+
+    fn dispatch_await_workflow(extra: &str) -> Workflow {
+        crate::schema::parse_workflow(&format!(
+            "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: {{ task: hi }}\n{extra}"
+        ))
+        .expect("fixture parses")
+    }
+
+    fn suspend_await_job(wf: Workflow, now_ms: u64) -> RunModel {
+        let mut model = RunModel::new("run", wf, serde_json::json!({}));
+        let effects = next_effects(&mut model, now_ms, &[]);
+        assert!(
+            matches!(&model.phase, RunPhase::AwaitingJob { node, claimed: false, .. } if node == "j"),
+            "suspends: {:?}",
+            model.phase
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, RunEffect::ExecuteStep { .. })),
+            "dispatch still publishes: {effects:?}"
+        );
+        model
+    }
+
+    /// `await: result` suspends with a bounded claim park, still publishing.
+    #[test]
+    fn dispatch_await_suspends_with_bounded_claim_park() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let mut model = RunModel::new("run", wf, serde_json::json!({}));
+        let effects = next_effects(&mut model, 1_000, &[]);
+        assert!(
+            matches!(&model.phase, RunPhase::AwaitingJob { node, claimed: false, .. } if node == "j"),
+            "suspends: {:?}",
+            model.phase
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                RunEffect::ParkUntil {
+                    until_ms: 601_000,
+                    ..
+                }
+            )),
+            "bounded claim park: {effects:?}"
+        );
+    }
+
+    /// No claim past the deadline is a typed failure; terminal is quiet.
+    #[test]
+    fn dispatch_await_no_claim_times_out() {
+        let wf = dispatch_await_workflow(
+            "    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        );
+        let model = suspend_await_job(wf, 1_000);
+        let (next, effects) = advance_with(&model, &RunMsg::Woke { now_ms: 601_001 }, &[]);
+        assert!(
+            matches!(&next.phase, RunPhase::Failed { .. }),
+            "timed out: {:?}",
+            next.phase
+        );
+        assert_eq!(effects.len(), 1, "one Fail cmd: {effects:?}");
+        let (next, effects) = advance_with(&next, &RunMsg::Woke { now_ms: 602_000 }, &[]);
+        assert!(effects.is_empty(), "terminal emits nothing: {effects:?}");
+        let _ = next;
+    }
+
+    /// Claimed but no 43004/43006 past `result_timeout` names step + bound.
+    #[test]
+    fn dispatch_await_claimed_no_result_times_out() {
+        let wf = dispatch_await_workflow(
+            "    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        );
+        let model = suspend_await_job(wf, 1_000);
+        let (next, _) = advance_with(
+            &model,
+            &RunMsg::JobClaimed {
+                node: "j".into(),
+                now_ms: 2_000,
+            },
+            &[],
+        );
+        assert!(
+            matches!(&next.phase, RunPhase::AwaitingJob { claimed: true, .. }),
+            "claimed: {:?}",
+            next.phase
+        );
+        let (next, effects) = advance_with(&next, &RunMsg::Woke { now_ms: 62_001 }, &[]);
+        let RunPhase::Failed { error } = &next.phase else {
+            panic!("timed out: {:?}", next.phase);
+        };
+        assert!(error.contains('j'), "names the step: {error}");
+        assert!(error.contains("result_timeout"), "names the bound: {error}");
+        assert_eq!(effects.len(), 1, "one Fail cmd");
+    }
+
+    /// A 43004 with witness lands as the step output, witness included.
+    #[test]
+    fn dispatch_await_result_with_witness_ok() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let model = suspend_await_job(wf, 1_000);
+        let value = serde_json::json!({
+            "ok": true, "job": "abc",
+            "witness": {"contract": "signed"}, "body": "done",
+        });
+        let (next, _) = advance_with(
+            &model,
+            &RunMsg::JobSettled {
+                node: "j".into(),
+                value: value.clone(),
+                now_ms: 2_000,
+            },
+            &[],
+        );
+        assert_eq!(next.outputs.get("j"), Some(&value));
+        assert!(
+            next.outputs["j"].get("witness").is_some(),
+            "witness lifted: {:?}",
+            next.outputs["j"]
+        );
+    }
+
+    /// A 43006 is a typed failure carrying the job's message.
+    #[test]
+    fn dispatch_await_error_is_typed_failure() {
+        let wf = dispatch_await_workflow(
+            "    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        );
+        let model = suspend_await_job(wf, 1_000);
+        let (next, effects) = advance_with(
+            &model,
+            &RunMsg::JobFailed {
+                node: "j".into(),
+                error: "agent blew up".into(),
+                now_ms: 2_000,
+            },
+            &[],
+        );
+        let RunPhase::Failed { error } = &next.phase else {
+            panic!("failed: {:?}", next.phase);
+        };
+        assert!(error.contains("agent blew up"), "carries message: {error}");
+        assert_eq!(effects.len(), 1, "one Fail cmd");
+    }
+
+    /// No `await` dispatches exactly as today: ExecuteStep, stays Running.
+    #[test]
+    fn dispatch_without_await_matches_today() {
+        let wf = dispatch_await_workflow("");
+        let mut model = RunModel::new("run", wf, serde_json::json!({}));
+        let effects = next_effects(&mut model, 1_000, &[]);
+        assert!(matches!(model.phase, RunPhase::Running));
+        assert!(
+            matches!(effects.as_slice(), [RunEffect::ExecuteStep { .. }]),
+            "today's effects exactly: {effects:?}"
         );
     }
 }

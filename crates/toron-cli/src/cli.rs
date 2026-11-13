@@ -1712,15 +1712,19 @@ pub struct JobResultArgs {
     /// ok | failed.
     #[arg(long, value_enum, required = true)]
     pub status: JobStatusArg,
-    /// Outcome body (receipt, summary).
-    #[arg(long, required = true)]
-    pub body: String,
+    /// Outcome body (receipt, summary). Optional when --witness is given.
+    #[arg(long, required_unless_present = "witness")]
+    pub body: Option<String>,
     /// Project slug.
     #[arg(long, required = true)]
     pub project: String,
     /// Reporting agent's canonical name (ADR-0018).
     #[arg(long = "as", required = true)]
     pub as_name: String,
+    /// Witness file: JSON object attached to the 43004 payload (D4.1).
+    /// When present, --body becomes optional.
+    #[arg(long)]
+    pub witness: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]

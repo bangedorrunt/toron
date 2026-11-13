@@ -408,6 +408,9 @@ mod tests {
             assignee: "oc-beta".into(),
             spec: crate::workflow_host::test_spec(json!({ "i": i })),
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         };
         for i in 0..5 {
             let out = drive_async(&afx, action(i), "run-coal-buffer").await;
@@ -591,6 +594,9 @@ mod tests {
                     assignee: "oc".into(),
                     spec: crate::workflow_host::test_spec(json!({ "i": i })),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
                 &format!("run-cap-flush-{i}"),
             )
@@ -695,6 +701,9 @@ mod tests {
                             assignee: "oc".into(),
                             spec: crate::workflow_host::test_spec(json!({ "i": t * 1000 + i })),
                             channel: None,
+                            await_: None,
+                            no_claim_timeout: 600,
+                            result_timeout: None,
                         },
                         &format!("run-burst-{t}-{i}"),
                     )
@@ -978,6 +987,9 @@ steps:
                 assignee: "oc".into(),
                 spec: crate::workflow_host::test_spec(json!({ "text": "e1" })),
                 channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
             },
             "run-coal-lock-e1",
         )
@@ -988,6 +1000,9 @@ steps:
                 assignee: "oc".into(),
                 spec: crate::workflow_host::test_spec(json!({ "text": "e2" })),
                 channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
             },
             "run-coal-lock-e2",
         )
@@ -1001,6 +1016,9 @@ steps:
                     assignee: "oc".into(),
                     spec: crate::workflow_host::test_spec(json!({ "text": "e3" })),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
                 "run-coal-lock-e3",
             )
@@ -1017,6 +1035,9 @@ steps:
                     assignee: "gk".into(),
                     spec: crate::workflow_host::test_spec(json!({ "text": "e4" })),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
                 "run-coal-lock-e4",
             )
@@ -1090,6 +1111,9 @@ steps:
                     assignee: "oc".into(),
                     spec: crate::workflow_host::test_spec(json!({ "text": "after-poison" })),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
                 "run-poison",
             )
@@ -2516,6 +2540,9 @@ steps:
                     assignee: "oc".into(),
                     spec: crate::workflow_host::test_spec(serde_json::json!({ "t": 1 })),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
                 "run-flushnow",
             )
@@ -2830,6 +2857,9 @@ steps:
             assignee: "oc".into(),
             spec: crate::workflow_host::test_spec(serde_json::json!({ "nosign": 1 })),
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         };
         let (_, key, _) = test_invocation(action.clone(), "run-fencing-nosign");
         for _ in 0..2 {

@@ -1667,6 +1667,133 @@ fn job_result_sets_done_visible_to_show() {
     );
 }
 
+/// D4.1: `--witness` with a non-object JSON file fails BEFORE publishing —
+/// the job stays open, no 43004 exists.
+#[test]
+fn job_result_witness_non_object_fails_before_publish() {
+    let _g = plane_guard();
+    let job_id = make_open_job("witness-bad");
+
+    let claimed = plane_run(&[
+        "job",
+        "claim",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        claimed.status.success(),
+        "claim: {}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+
+    let dir = std::env::temp_dir().join(format!("toron-witness-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let bad = dir.join("witness.json");
+    std::fs::write(&bad, "[1,2,3]").expect("write witness");
+
+    let out = plane_run(&[
+        "job",
+        "result",
+        &job_id,
+        "--status",
+        "ok",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--witness",
+        bad.to_str().expect("path"),
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "non-object witness must exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let shown = plane_run(&["job", "show", &job_id, "--project", "demo", "--json"]);
+    assert!(
+        shown.status.success(),
+        "show: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let row: Value = serde_json::from_slice(&shown.stdout).expect("show JSON");
+    assert_ne!(
+        row["state"],
+        serde_json::json!("done"),
+        "no 43004 was published"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D4.1: a valid witness object is accepted without --body and closes the
+/// job (payload content is pinned by the jobs.rs witness round-trip test).
+#[test]
+fn job_result_witness_object_closes_job_without_body() {
+    let _g = plane_guard();
+    let job_id = make_open_job("witness-good");
+
+    let claimed = plane_run(&[
+        "job",
+        "claim",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        claimed.status.success(),
+        "claim: {}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+
+    let dir = std::env::temp_dir().join(format!("toron-witness-good-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let good = dir.join("witness.json");
+    std::fs::write(&good, r#"{"contract":"signed","checks":["a"]}"#).expect("write witness");
+
+    let out = plane_run(&[
+        "job",
+        "result",
+        &job_id,
+        "--status",
+        "ok",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--witness",
+        good.to_str().expect("path"),
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "witness result must exit 0 without --body, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let shown = plane_run(&["job", "show", &job_id, "--project", "demo", "--json"]);
+    assert!(
+        shown.status.success(),
+        "show: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let row: Value = serde_json::from_slice(&shown.stdout).expect("show JSON");
+    assert_eq!(
+        row["state"],
+        serde_json::json!("done"),
+        "witness result closes the job"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn job_cancel_requester_only() {
     let _g = plane_guard();

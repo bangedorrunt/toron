@@ -374,6 +374,82 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             .map(|(_, spec)| spawn_key(&spec.run_id, &spec.node, 1))
     }
 
+    /// The current dispatch-await node, when the run is parked on one.
+    pub fn awaiting_job(&self) -> Option<&str> {
+        match &self.model.phase {
+            ModelPhase::AwaitingJob { node, .. } => Some(node.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A dispatched job was claimed (43002).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_claimed(&mut self, node: &str, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
+        self.require_awaiting_job(node, "job_claimed")?;
+        self.apply(
+            RunMsg::JobClaimed {
+                node: node.to_string(),
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A dispatched job settled (43004 with the step output value).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_settled(
+        &mut self,
+        node: &str,
+        value: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<RunEffect>, HostError> {
+        self.require_awaiting_job(node, "job_settled")?;
+        self.apply(
+            RunMsg::JobSettled {
+                node: node.to_string(),
+                value,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A dispatched job failed (43006).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_failed(
+        &mut self,
+        node: &str,
+        error: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<Vec<RunEffect>, HostError> {
+        self.require_awaiting_job(node, "job_failed")?;
+        self.apply(
+            RunMsg::JobFailed {
+                node: node.to_string(),
+                error: error.into(),
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    fn require_awaiting_job(&self, node: &str, verb: &str) -> Result<(), HostError> {
+        if matches!(&self.model.phase, ModelPhase::AwaitingJob { node: awaiting, .. } if awaiting == node)
+        {
+            return Ok(());
+        }
+        Err(self.wrong_phase(verb))
+    }
+
     fn require_awaiting_spawn(&self, node: &str, verb: &str) -> Result<(), HostError> {
         if matches!(&self.model.phase, ModelPhase::AwaitingSpawn { node: awaiting, .. } if awaiting == node)
         {
@@ -576,6 +652,7 @@ fn phase_name(phase: &ModelPhase) -> &'static str {
         ModelPhase::Running => "running",
         ModelPhase::Parked { .. } => "parked",
         ModelPhase::AwaitingSpawn { .. } => "awaiting_spawn",
+        ModelPhase::AwaitingJob { .. } => "awaiting_job",
         ModelPhase::AwaitingApproval { .. } => "awaiting_approval",
         ModelPhase::Succeeded => "succeeded",
         ModelPhase::Failed { .. } => "failed",

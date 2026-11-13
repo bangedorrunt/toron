@@ -29,7 +29,7 @@
 //!   call site.
 
 use crate::lint::{Level, LintIssue, LintReport};
-use crate::schema::{Action, Graph, Step, Workflow};
+use crate::schema::{Action, DispatchAwait, Graph, Step, Workflow};
 
 /// The 21 canonical principle names (ADR-0019 Spec 5, pstack-derived). This
 /// is the in-crate fixture fallback — byte-identical to flywheel's
@@ -90,6 +90,7 @@ fn shape_of(name: &str) -> Option<PlaybookShape> {
 pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[&str]) {
     lint_principles(report, wf, principle_names);
     lint_phase_rules(report, wf);
+    lint_dispatch_await(report, wf);
 
     let Some(shape) = shape_of(&wf.name) else {
         return;
@@ -99,6 +100,37 @@ pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[
         PlaybookShape::BugFix => lint_bug_fix(report, wf),
         PlaybookShape::Prototype | PlaybookShape::Arena => lint_prototype_arena(report, wf),
         PlaybookShape::Forensics => lint_forensics(report, wf),
+    }
+}
+
+/// ADR-0021 D4.1/D5.2: `dispatch_job` with `await: result` waits boundedly.
+/// A missing or unresolvable `result_timeout` is an ERROR naming the bound —
+/// an unbounded wait is never silent. Fires on any workflow, like the phase
+/// rules (not playbook-shape scoped).
+fn lint_dispatch_await(report: &mut LintReport, wf: &Workflow) {
+    for step in &wf.steps {
+        for s in step_or_nested(step) {
+            let Action::DispatchJob {
+                await_,
+                result_timeout,
+                ..
+            } = &s.action
+            else {
+                continue;
+            };
+            if *await_ != Some(DispatchAwait::Result) {
+                continue;
+            }
+            if result_timeout.is_none() {
+                error(
+                    report,
+                    format!(
+                        "dispatch_job '{}' sets await: result without result_timeout: an unbounded wait is forbidden (D5.2)",
+                        s.name.as_deref().unwrap_or("<unnamed>")
+                    ),
+                );
+            }
+        }
     }
 }
 
