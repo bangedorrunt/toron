@@ -14,7 +14,7 @@ use super::armor::{
 use super::dispatch::{DispatchRequest, DispatchResult, EffectDispatcher, durable_route};
 use super::durable::{
     GraphEffect, JobWatchOutcome, JobWatchSpec, JobWatcher, RunEffect, RunPhase as ModelPhase,
-    await_job_watch, needs_graph_model, watch_job_once,
+    await_job_watch, bus_job_watcher, needs_graph_model,
 };
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
 use super::leaf::LeafSeams;
@@ -2130,14 +2130,7 @@ impl WorkflowHost {
                         // Watch straight from the mailbox bus: no seam, no
                         // republish, no second driver can interleave — the
                         // fold's phase guards the node either way.
-                        let bus = self.bus.clone();
-                        let watcher: JobWatcher = std::sync::Arc::new(move |spec: JobWatchSpec| {
-                            let bus = bus.clone();
-                            Box::pin(async move { watch_job_once(&bus, &spec).await })
-                                as std::pin::Pin<
-                                    Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>,
-                                >
-                        });
+                        let watcher: JobWatcher = bus_job_watcher(self.bus.clone());
                         let outcome = await_job_watch(
                             &watcher,
                             JobWatchSpec {

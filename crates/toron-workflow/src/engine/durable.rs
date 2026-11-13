@@ -454,7 +454,7 @@ pub enum JobWatchOutcome {
 /// watcher resolves the mail wait, the timeout stays a pure model deadline.
 /// A missing (`None`) deadline waits unboundedly — the lint gate, not the
 /// fold, forbids unbounded waits.
-pub(crate) async fn await_job_watch(
+pub async fn await_job_watch(
     watcher: &JobWatcher,
     spec: JobWatchSpec,
     deadline_ms: Option<u64>,
@@ -589,6 +589,18 @@ fn more_terminal(current: Option<JobWatchOutcome>, next: JobWatchOutcome) -> Job
         Some(cur) if !next_terminal => cur,
         _ => next,
     }
+}
+
+/// Build the mailbox-backed [`JobWatcher`] every host needs: subscribe on
+/// the bus and resolve one [`JobWatchSpec`] wait against it. One
+/// construction site — hosts call this instead of closing over
+/// [`watch_job_once`] themselves.
+pub fn bus_job_watcher(bus: Arc<dyn Bus>) -> JobWatcher {
+    Arc::new(move |spec: JobWatchSpec| {
+        let bus = bus.clone();
+        Box::pin(async move { watch_job_once(&bus, &spec).await })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>>
+    })
 }
 
 /// The host's job watcher: resolve one [`JobWatchSpec`] wait against the
@@ -4050,7 +4062,7 @@ mod tests {
     /// drain the replay to EOSE and settle on the stored 43004 — never
     /// return the stale 43002 and hang the run.
     mod watch_bus_tests {
-        use super::super::{JobWatchOutcome, JobWatchSpec, watch_job_once};
+        use super::super::{JobWatchOutcome, JobWatchSpec, bus_job_watcher, watch_job_once};
         use std::sync::Arc;
         use toron_core::bus::in_process::InProcessBusConfig;
         use toron_core::bus::{Bus, InProcessBus};
@@ -4146,6 +4158,26 @@ mod tests {
             };
             assert_eq!(value.get("body").and_then(|v| v.as_str()), Some("did it"));
             assert!(value.get("witness").is_some(), "witness lifted: {value}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The public host constructor over the same bus yields the same
+        /// terminal: one construction site for every host (bd-ge1zo 2a).
+        #[tokio::test]
+        async fn bus_job_watcher_settles_replayed_result() {
+            let (bus, path) = open_bus().await;
+            let job = seed_claimed_then_settled(&bus).await;
+            let watcher = bus_job_watcher(bus);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                watcher(spec(&job, false)),
+            )
+            .await
+            .expect("watch must not hang");
+            let JobWatchOutcome::Settled(value) = outcome else {
+                panic!("bus_job_watcher must settle on the stored 43004");
+            };
+            assert_eq!(value.get("body").and_then(|v| v.as_str()), Some("did it"));
             let _ = std::fs::remove_file(&path);
         }
 
