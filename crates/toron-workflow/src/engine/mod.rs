@@ -679,6 +679,10 @@ impl WorkflowEngine {
             leaf: self.leaf_seams(),
             workflows: self.workflow_resolver.clone(),
             spawn: launcher,
+            // No bus handle here: production driving goes through the host
+            // runner (which watches from the mailbox bus); the drive path
+            // takes an injected watcher, and tests fake it.
+            job_watcher: None,
             approval_sink: self.approval_sink.clone(),
             spawn_sink: self.spawn_sink.clone(),
             spawn_specs: self.spawn_specs.clone(),

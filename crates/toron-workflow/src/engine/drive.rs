@@ -27,7 +27,8 @@ use toron_core::index::durable_workflow::RunState;
 use toron_core::kernel::EngineStorage;
 
 use super::durable::{
-    GraphEffect, GraphModel, RunEffect, RunPhase as ModelPhase, needs_graph_model,
+    GraphEffect, GraphModel, JobWatchOutcome, JobWatchSpec, JobWatcher, RunEffect,
+    RunPhase as ModelPhase, await_job_watch, needs_graph_model,
 };
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
 use super::leaf::LeafSeams;
@@ -95,6 +96,10 @@ pub struct DriveSeams {
     /// The engine's spawn launcher: register a waiter, announce the key on the
     /// sink, await the consumer.
     pub spawn: SpawnLauncher,
+    /// The engine's job watcher: watch one published 43001 for its
+    /// 43002/43004/43006 terminal. `None` fails a WatchJob loud — the same
+    /// fail-closed shape as a missing spawn launcher.
+    pub job_watcher: Option<JobWatcher>,
     /// Approval waiters (shared with the engine).
     pub approvals: Waiters,
     /// Where parked ids are announced.
@@ -278,6 +283,81 @@ where
                             .map_err(|e| {
                                 anyhow::anyhow!("run {run_id}: spawn timeout failed: {e}")
                             })?
+                        }
+                    };
+                    run = back;
+                    follow.append(&mut more);
+                }
+                RunEffect::WatchJob { node, job_id } => {
+                    let deadline = match run.model().phase {
+                        ModelPhase::AwaitingJob {
+                            claim_deadline_ms,
+                            result_deadline_ms,
+                            claimed,
+                            ..
+                        } => {
+                            if claimed {
+                                result_deadline_ms
+                            } else {
+                                claim_deadline_ms
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(watcher) = &seams.job_watcher else {
+                        anyhow::bail!("run {run_id}: no job watcher: cannot await job {job_id}");
+                    };
+                    let outcome = await_job_watch(
+                        watcher,
+                        JobWatchSpec {
+                            job_id: job_id.clone(),
+                            deadline_ms: deadline,
+                        },
+                        deadline,
+                        now_ms(),
+                    )
+                    .await;
+                    let at = now_ms();
+                    let (back, mut more) = match outcome {
+                        JobWatchOutcome::Claimed => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_claimed(&node, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job claim failed: {e}"))?
+                        }
+                        JobWatchOutcome::Settled(value) => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_settled(&node, value, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job settle failed: {e}"))?
+                        }
+                        JobWatchOutcome::Failed(error) => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_failed(&node, error, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job fail failed: {e}"))?
+                        }
+                        JobWatchOutcome::TimedOut => {
+                            let at = deadline.unwrap_or_else(now_ms).max(now_ms());
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.woke(at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job timeout failed: {e}"))?
                         }
                     };
                     run = back;
@@ -570,5 +650,268 @@ impl RunState for MemRunState {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod dispatch_await_drive_tests {
+    use super::super::durable::{JobWatchOutcome, JobWatchSpec, JobWatcher};
+    use super::super::durable_host::DurableRun;
+    use super::super::leaf::LeafSeams;
+    use super::super::spawn::SpawnLauncher;
+    use super::super::{
+        ActionInvocation, ApprovalSink, AsyncEffectRunner, EffectJournalMode, SpawnSink,
+        WorkflowResolver,
+    };
+    use super::{DriveSeams, Waiters, drive_linear};
+    use crate::schema::parse_workflow;
+    use serde_json::{Value, json};
+    use sqlx::SqlitePool;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use toron_core::index::durable_engine::ToronEngineStore;
+    use toron_core::index::durable_workflow::SyncWorkflowState;
+    use toron_core::index::schema::{connect, migrate};
+    use toron_core::journal::{JournalDb, ToronJournal};
+    use toron_core::kernel::OurEngine;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn test_workflow(fail: bool) -> crate::schema::Workflow {
+        parse_workflow(&format!(
+            "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: {{ task: hi }}\n    await: result\n    result_timeout: 60\n{}",
+            if fail { "    on_error: fail_run\n" } else { "" }
+        ))
+        .expect("fixture parses")
+    }
+
+    fn leaf_runner() -> AsyncEffectRunner {
+        Arc::new(|_inv: &ActionInvocation| {
+            Box::pin(async move { Ok(json!({"ok": true, "job_id": "job-1", "published": true})) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>,
+                >
+        })
+    }
+
+    fn queue_watcher(
+        outcomes: Vec<JobWatchOutcome>,
+    ) -> (JobWatcher, Arc<Mutex<VecDeque<JobWatchOutcome>>>) {
+        let queue: Arc<Mutex<VecDeque<JobWatchOutcome>>> = Default::default();
+        queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(outcomes);
+        let q = queue.clone();
+        let watcher: JobWatcher = Arc::new(move |_spec: JobWatchSpec| {
+            let q = q.clone();
+            Box::pin(async move {
+                q.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front()
+                    .unwrap_or(JobWatchOutcome::TimedOut)
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>>
+        });
+        (watcher, queue)
+    }
+
+    fn drive_seams(job_watcher: JobWatcher) -> DriveSeams {
+        let spawn: SpawnLauncher = Arc::new(|_spec| {
+            Box::pin(async move { Err(anyhow::anyhow!("no spawn in this test")) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>,
+                >
+        });
+        let children: crate::engine::drive::ChildDriver = Arc::new(|_, _, _| {
+            Box::pin(async move { Err(anyhow::anyhow!("no children in this test")) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>,
+                >
+        });
+        DriveSeams {
+            leaf: LeafSeams {
+                async_runner: Some(leaf_runner()),
+                sync_runner: None,
+                verify_sink: Default::default(),
+                journal_mode: EffectJournalMode::Recording,
+            },
+            workflows: Arc::new(|_: &str| None) as WorkflowResolver,
+            spawn,
+            job_watcher: Some(job_watcher),
+            approvals: Waiters::default(),
+            approval_sink: ApprovalSink::default(),
+            spawn_sink: SpawnSink::default(),
+            spawn_specs: Default::default(),
+            children,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn open_db(
+        tag: &str,
+    ) -> (
+        SqlitePool,
+        OurEngine<ToronEngineStore, ToronJournal>,
+        SyncWorkflowState,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-dispatch-drive-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test.sqlite");
+        let pool = connect(path.to_str().expect("path"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+        let handle = tokio::runtime::Handle::current();
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool.clone(), "host", 64), &handle),
+        );
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        (pool, engine, state)
+    }
+
+    /// A fake 43004 settles the await with the witness in steps.<name>.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_await_drive_completes_with_witness() {
+        let (_pool, engine, state) = open_db("witness").await;
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(json!({
+                "ok": true, "job": "job-1",
+                "witness": {"contract": "signed"}, "body": "done",
+            })),
+        ]);
+        let seams = drive_seams(watcher);
+        let wf = test_workflow(false);
+        let (run, effects) =
+            DurableRun::open(engine, state, "run-witness", wf, json!({}), now_ms()).expect("open");
+        let out = drive_linear(run, effects, &seams)
+            .await
+            .expect("drive completes");
+        assert_eq!(
+            out.get("j").and_then(|s| s.get("witness")),
+            Some(&json!({"contract": "signed"})),
+            "witness lands in steps.j: {out}"
+        );
+        assert_eq!(
+            out.get("j").and_then(|s| s.get("body")),
+            Some(&json!("done"))
+        );
+    }
+
+    /// No 43004/43006 past the result timeout is a typed failure naming
+    /// the step and the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_await_drive_no_result_times_out() {
+        let (_pool, engine, state) = open_db("timeout").await;
+        let (watcher, _queue) =
+            queue_watcher(vec![JobWatchOutcome::Claimed, JobWatchOutcome::TimedOut]);
+        let seams = drive_seams(watcher);
+        let wf = test_workflow(true);
+        let (run, effects) =
+            DurableRun::open(engine, state, "run-timeout", wf, json!({}), now_ms()).expect("open");
+        let out = drive_linear(run, effects, &seams)
+            .await
+            .expect("drive reaches terminal");
+        let text = serde_json::to_string(&out).expect("renders");
+        assert!(text.contains("result_timeout"), "names the bound: {text}");
+        assert!(text.contains('j'), "names the step: {text}");
+    }
+
+    /// Restart mid-wait resumes the watch — and never republishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_await_drive_restart_resumes_watch_without_republish() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-dispatch-drive-restart-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test.sqlite");
+        let pool = connect(path.to_str().expect("path"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+        let handle = tokio::runtime::Handle::current();
+        let wf = test_workflow(false);
+
+        let effects = {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool.clone(), "host", 64), &handle),
+            );
+            let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+            let (mut run, effects) = DurableRun::open(
+                engine,
+                state,
+                "run-restart",
+                wf.clone(),
+                json!({}),
+                now_ms(),
+            )
+            .expect("open");
+            let effects = run
+                .step_done(
+                    json!({"ok": true, "job_id": "job-1", "published": true}),
+                    now_ms(),
+                )
+                .expect("step done records the job");
+            assert_eq!(effects.len(), 1, "one WatchJob: {effects:?}");
+            effects
+        };
+        drop(effects);
+
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool, "host", 64), &handle),
+        );
+        let state = SyncWorkflowState::spawn(
+            connect(dir.join("test.sqlite").to_str().expect("path"))
+                .await
+                .expect("reconnect"),
+            &handle,
+        );
+        let (watcher, _queue) = queue_watcher(vec![JobWatchOutcome::Settled(json!({
+            "ok": true, "job": "job-1",
+            "witness": {"contract": "signed"}, "body": "done",
+        }))]);
+        let seams = drive_seams(watcher);
+        let (run, effects) =
+            DurableRun::open(engine, state, "run-restart", wf, json!({}), now_ms())
+                .expect("reopen");
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                crate::engine::durable::RunEffect::WatchJob { job_id, .. } if job_id == "job-1"
+            )),
+            "resume re-issues the watch: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, crate::engine::durable::RunEffect::ExecuteStep { .. })),
+            "resume never republishes: {effects:?}"
+        );
+        let out = drive_linear(run, effects, &seams)
+            .await
+            .expect("drive completes after resume");
+        assert_eq!(
+            out.get("j").and_then(|s| s.get("witness")),
+            Some(&json!({"contract": "signed"})),
+            "witness lands after resume: {out}"
+        );
     }
 }

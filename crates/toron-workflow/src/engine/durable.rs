@@ -18,8 +18,14 @@
 //! their turn. No clock, no I/O.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use nostr::prelude::EventId;
 use serde::{Deserialize, Serialize};
+use toron_core::bus::{Bus, Filter, SubscriptionEvent};
+use toron_core::nostr::kinds::{JOB_ACCEPTED, JOB_ERROR, JOB_RESULT, toron_kind};
+
+use crate::jobs::{JobError, JobResult, job_parent};
 
 use crate::schema::{Action, DispatchAwait, Graph, GraphNode, Step, StepOnError, Workflow};
 
@@ -65,12 +71,14 @@ pub enum RunPhase {
     /// Waiting for a dispatched job's 43004/43006 (bd-ge1zo, ADR-0021 D4.1).
     ///
     /// The 43001 publication happens through the normal ExecuteStep path,
-    /// so a restart does NOT republish — resume re-issues only the park.
-    /// A pre-publication crash therefore waits out the claim deadline and
-    /// fails loud, never hangs.
+    /// so a restart does NOT republish — resume re-issues the watch and the
+    /// park. A pre-publication crash therefore waits out the claim deadline
+    /// and fails loud, never hangs.
     AwaitingJob {
         /// Step name.
         node: String,
+        /// Published 43001 id (hex); empty until the StepDone receipt lands.
+        job: String,
         /// Absolute claim deadline (None = explicit 0, waits unboundedly).
         claim_deadline_ms: Option<u64>,
         /// Absolute result deadline once claimed (None = waits unboundedly;
@@ -416,6 +424,130 @@ pub enum RunMsg {
     Cancel,
 }
 
+/// What the host watches for one dispatched job (bd-ge1zo, ADR-0021 D4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobWatchSpec {
+    /// Published 43001 job id (hex).
+    pub job_id: String,
+    /// Absolute deadline for the current wait (claim or result), if any.
+    pub deadline_ms: Option<u64>,
+}
+
+/// One watch wait's outcome, bounded by the model's deadline.
+#[derive(Debug)]
+pub enum JobWatchOutcome {
+    /// A 43002 claim arrived.
+    Claimed,
+    /// A 43004 arrived; carries the step output value.
+    Settled(serde_json::Value),
+    /// A 43006 arrived; carries the job's message.
+    Failed(String),
+    /// The deadline passed with no terminal mail.
+    TimedOut,
+}
+
+/// Watch one job's 43002/43004/43006 with the injected watcher, bounded by
+/// the model's deadline. Mirrors the `await_spawn_launch` contract: the
+/// watcher resolves the mail wait, the timeout stays a pure model deadline.
+/// A missing (`None`) deadline waits unboundedly — the lint gate, not the
+/// fold, forbids unbounded waits.
+pub(crate) async fn await_job_watch(
+    watcher: &JobWatcher,
+    spec: JobWatchSpec,
+    deadline_ms: Option<u64>,
+    now_ms: u64,
+) -> JobWatchOutcome {
+    let Some(deadline) = deadline_ms else {
+        return watcher(spec).await;
+    };
+    if deadline <= now_ms {
+        return JobWatchOutcome::TimedOut;
+    }
+    match tokio::time::timeout(
+        tokio::time::Duration::from_millis(deadline - now_ms),
+        watcher(spec),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => JobWatchOutcome::TimedOut,
+    }
+}
+
+/// Watch one published 43001 until its 43002/43004/43006 arrives (bd-ge1zo).
+/// Returns the first terminal mail for this job; ignores other jobs'
+/// traffic and EOSE markers. A closed stream ends loudly (typed failure),
+/// never hangs: without a bus there is nothing left to wait for.
+/// No deadline here — the caller bounds the wait through [`await_job_watch`].
+pub(crate) async fn watch_job_once(bus: &Arc<dyn Bus>, job_id: &str) -> JobWatchOutcome {
+    let Ok(want) = EventId::from_hex(job_id) else {
+        return JobWatchOutcome::Failed(format!("dispatch await: unparseable job id {job_id:?}"));
+    };
+    let mut sub = match bus
+        .subscribe(Filter::new().kinds([
+            toron_kind(JOB_ACCEPTED),
+            toron_kind(JOB_RESULT),
+            toron_kind(JOB_ERROR),
+        ]))
+        .await
+    {
+        Ok(sub) => sub,
+        Err(e) => {
+            return JobWatchOutcome::Failed(format!(
+                "dispatch await: job watch subscribe failed: {e:#}"
+            ));
+        }
+    };
+    loop {
+        match sub.next().await {
+            Some(SubscriptionEvent::Event(ev)) => {
+                if job_parent(&ev).as_ref() != Some(&want) {
+                    continue;
+                }
+                match ev.kind.as_u16() {
+                    JOB_ACCEPTED => return JobWatchOutcome::Claimed,
+                    JOB_RESULT => {
+                        let r: JobResult = serde_json::from_str(&ev.content).unwrap_or(JobResult {
+                            status: "done".into(),
+                            body: ev.content.clone(),
+                            witness: None,
+                        });
+                        return JobWatchOutcome::Settled(serde_json::json!({
+                            "ok": true,
+                            "job": job_id,
+                            "witness": r.witness,
+                            "body": r.body,
+                        }));
+                    }
+                    JOB_ERROR => {
+                        let e: JobError = serde_json::from_str(&ev.content).unwrap_or(JobError {
+                            message: ev.content.clone(),
+                        });
+                        return JobWatchOutcome::Failed(e.message);
+                    }
+                    _ => continue,
+                }
+            }
+            // EOSE markers carry no terminal: keep waiting.
+            Some(_) => continue,
+            None => {
+                return JobWatchOutcome::Failed("dispatch await: job watch stream closed".into());
+            }
+        }
+    }
+}
+
+/// The host's job watcher: resolve one [`JobWatchSpec`] wait against the
+/// mailbox. Injected like [`super::spawn::SpawnLauncher`]; tests fake it,
+/// the embedding wires the bus subscription.
+pub type JobWatcher = std::sync::Arc<
+    dyn Fn(
+            JobWatchSpec,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// One effect the host must run. Data only.
 #[derive(Clone, Debug)]
 pub enum RunEffect {
@@ -450,6 +582,16 @@ pub enum RunEffect {
         node: String,
         /// The self-contained spec the consumer reads.
         spec: SpawnSpec,
+    },
+    /// Watch a published 43001 for its 43002/43004/43006 terminal.
+    /// Emitted once the publication receipt yields the job id (StepDone)
+    /// and again after a claim, for the result wait. Watching never
+    /// republishes: a restart re-issues the watch, never the dispatch.
+    WatchJob {
+        /// Step name.
+        node: String,
+        /// The published 43001 job id (hex).
+        job_id: String,
     },
     /// Wait for an approval decision.
     AwaitApproval {
@@ -543,6 +685,51 @@ pub fn advance_with(
             (next, effects)
         }
         RunMsg::StepDone { value, now_ms } => {
+            if let RunPhase::AwaitingJob { node, .. } = next.phase.clone() {
+                // The 43001 publication receipt landed: record the job id
+                // and start watching it. A failure value means publication
+                // itself failed and settles loud; a receipt without a job
+                // id (buffered/deferred/skipped) can never be watched, so
+                // it fails fast instead of waiting out a dead deadline.
+                let Some((authored, step)) = next
+                    .plan
+                    .step_at(next.step_index)
+                    .map(|(authored, step)| (authored, step.clone()))
+                else {
+                    return (next, Vec::new());
+                };
+                let name = step_name(&step, authored);
+                if node != name {
+                    return (next, Vec::new());
+                }
+                if is_failure_value(value) {
+                    return settle_spawn(&mut next, &node, value.clone(), *now_ms, spawns);
+                }
+                let Some(job_id) = value.get("job_id").and_then(|v| v.as_str()) else {
+                    return settle_spawn(
+                        &mut next,
+                        &node,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "dispatch await {node}: publish did not return a job id (deferred delivery)"
+                            ),
+                        }),
+                        *now_ms,
+                        spawns,
+                    );
+                };
+                if let RunPhase::AwaitingJob { job, .. } = &mut next.phase {
+                    *job = job_id.to_string();
+                }
+                return (
+                    next,
+                    vec![RunEffect::WatchJob {
+                        node,
+                        job_id: job_id.to_string(),
+                    }],
+                );
+            }
             if next.phase != RunPhase::Running {
                 return (next, Vec::new());
             }
@@ -622,6 +809,7 @@ pub fn advance_with(
                 claimed,
                 no_claim_timeout,
                 result_timeout,
+                ..
             } = next.phase.clone()
             {
                 let (deadline, error) = if claimed {
@@ -720,13 +908,14 @@ pub fn advance_with(
             settle_spawn(&mut next, node, landed, *now_ms, spawns)
         }
         RunMsg::JobClaimed { node, now_ms } => {
-            let result_timeout = match &next.phase {
+            let (result_timeout, job_id) = match &next.phase {
                 RunPhase::AwaitingJob {
                     node: awaiting,
                     claimed: false,
                     result_timeout,
+                    job,
                     ..
-                } if awaiting == node => *result_timeout,
+                } if awaiting == node => (*result_timeout, job.clone()),
                 _ => return (next, Vec::new()),
             };
             let result_deadline_ms = result_timeout
@@ -741,7 +930,12 @@ pub fn advance_with(
                 *claimed = true;
                 *slot = result_deadline_ms;
             }
-            let mut effects = Vec::new();
+            // Keep watching for the terminal: the park alone would sleep
+            // past the result in drivers that only wake on effects.
+            let mut effects = vec![RunEffect::WatchJob {
+                node: node.to_string(),
+                job_id,
+            }];
             if let Some(until_ms) = result_deadline_ms {
                 effects.push(RunEffect::ParkUntil {
                     until_ms,
@@ -1231,6 +1425,7 @@ fn step_effects(
                 .then(|| now_ms.saturating_add(no_claim_timeout.saturating_mul(1_000)));
             model.phase = RunPhase::AwaitingJob {
                 node: name.clone(),
+                job: String::new(),
                 claim_deadline_ms,
                 result_deadline_ms: None,
                 claimed: false,
@@ -1487,27 +1682,36 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
             spec: spec.clone(),
         }],
         RunPhase::AwaitingJob {
+            node,
+            job,
             claim_deadline_ms,
             result_deadline_ms,
             claimed,
             ..
         } => {
             // No republish: the 43001 went out through ExecuteStep before the
-            // suspend, so resume re-issues only the park. A pre-publication
-            // crash waits out the claim deadline and fails loud, never hangs.
+            // suspend, so resume re-issues the watch and the park. A
+            // pre-publication crash (no job id yet) waits out the claim
+            // deadline and fails loud, never hangs.
+            let mut effects = Vec::new();
+            if !job.is_empty() {
+                effects.push(RunEffect::WatchJob {
+                    node: node.clone(),
+                    job_id: job.clone(),
+                });
+            }
             let deadline = if *claimed {
                 *result_deadline_ms
             } else {
                 *claim_deadline_ms
             };
-            deadline
-                .map(|until_ms| {
-                    vec![RunEffect::ParkUntil {
-                        until_ms,
-                        reason: ParkReason::Job,
-                    }]
-                })
-                .unwrap_or_default()
+            if let Some(until_ms) = deadline {
+                effects.push(RunEffect::ParkUntil {
+                    until_ms,
+                    reason: ParkReason::Job,
+                });
+            }
+            effects
         }
         RunPhase::AwaitingApproval { step, message } => vec![RunEffect::AwaitApproval {
             step: step.clone(),
@@ -3567,6 +3771,163 @@ mod tests {
         };
         assert!(error.contains("agent blew up"), "carries message: {error}");
         assert_eq!(effects.len(), 1, "one Fail cmd");
+    }
+
+    /// A StepDone carrying the 43001 receipt records the job id and emits
+    /// a WatchJob for it — the hole D4 exists to close.
+    #[test]
+    fn dispatch_await_step_done_records_job_and_watches() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let model = suspend_await_job(wf, 1_000);
+        let (next, effects) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": true, "job_id": "abc", "published": true}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let RunPhase::AwaitingJob { node, job, .. } = &next.phase else {
+            panic!("still awaiting: {:?}", next.phase);
+        };
+        assert_eq!(node, "j");
+        assert_eq!(job, "abc");
+        assert_eq!(effects.len(), 1, "one WatchJob: {effects:?}");
+        let RunEffect::WatchJob { node, job_id } = &effects[0] else {
+            panic!("watches: {effects:?}");
+        };
+        assert_eq!(node, "j");
+        assert_eq!(job_id, "abc");
+    }
+
+    /// A StepDone receipt without a job id cannot be watched: fail loud
+    /// instead of waiting out a claim deadline that can never fire.
+    #[test]
+    fn dispatch_await_step_done_without_job_id_fails() {
+        let wf = dispatch_await_workflow(
+            "    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        );
+        let model = suspend_await_job(wf, 1_000);
+        let (next, effects) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": true, "coalesced": true}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let RunPhase::Failed { error } = &next.phase else {
+            panic!("failed: {:?}", next.phase);
+        };
+        assert!(error.contains("did not return a job id"), "{error}");
+        assert_eq!(effects.len(), 1, "one Fail cmd");
+    }
+
+    /// A failed publication settles as a typed failure.
+    #[test]
+    fn dispatch_await_step_done_failure_value_fails() {
+        let wf = dispatch_await_workflow(
+            "    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        );
+        let model = suspend_await_job(wf, 1_000);
+        let (next, _) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": false, "error": "publish boom"}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let RunPhase::Failed { error } = &next.phase else {
+            panic!("failed: {:?}", next.phase);
+        };
+        assert!(error.contains("publish boom"), "carries it: {error}");
+    }
+
+    /// A claim after the receipt re-arms the watch for the result wait.
+    #[test]
+    fn dispatch_await_claimed_watches_for_result() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let model = suspend_await_job(wf, 1_000);
+        let (model, _) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": true, "job_id": "abc"}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let (next, effects) = advance_with(
+            &model,
+            &RunMsg::JobClaimed {
+                node: "j".into(),
+                now_ms: 2_000,
+            },
+            &[],
+        );
+        let watches: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                RunEffect::WatchJob { node, job_id } => Some((node.clone(), job_id.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            watches,
+            vec![("j".to_string(), "abc".to_string())],
+            "re-armed for the result wait: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                RunEffect::ParkUntil {
+                    until_ms: 62_000,
+                    ..
+                }
+            )),
+            "result deadline parked: {effects:?}"
+        );
+        let _ = next;
+    }
+
+    /// A restart mid-wait re-issues the watch and the park — never a
+    /// republish (no ExecuteStep), with or without a recorded job id.
+    #[test]
+    fn dispatch_await_resume_watches_without_republish() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let model = suspend_await_job(wf, 1_000);
+        let effects = resume_effects(&model);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, RunEffect::ExecuteStep { .. })),
+            "never republishes: {effects:?}"
+        );
+        let (model, _) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": true, "job_id": "abc"}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let effects = resume_effects(&model);
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                RunEffect::WatchJob {
+                    node,
+                    job_id,
+                } if node == "j" && job_id == "abc"
+            )),
+            "watch resumes: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, RunEffect::ExecuteStep { .. })),
+            "still no republish: {effects:?}"
+        );
     }
 
     /// No `await` dispatches exactly as today: ExecuteStep, stays Running.

@@ -484,7 +484,9 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     pub fn woke(&mut self, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
         if !matches!(
             self.model.phase,
-            ModelPhase::Parked { .. } | ModelPhase::AwaitingSpawn { .. }
+            ModelPhase::Parked { .. }
+                | ModelPhase::AwaitingSpawn { .. }
+                | ModelPhase::AwaitingJob { .. }
         ) {
             return Err(self.wrong_phase("woke"));
         }
@@ -601,7 +603,8 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             RunEffect::ExecuteStep { .. }
             | RunEffect::Unsupported { .. }
             | RunEffect::StartSpawn { .. }
-            | RunEffect::SpawnDetached { .. } => Ok(()),
+            | RunEffect::SpawnDetached { .. }
+            | RunEffect::WatchJob { .. } => Ok(()),
             RunEffect::ParkUntil { until_ms, .. } => self.park(*until_ms, 0, now_ms),
             RunEffect::AwaitApproval { .. } => self.park(
                 now_ms.saturating_add(APPROVAL_WAIT_MS),
@@ -633,7 +636,12 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     }
 
     fn require_running(&self, verb: &str) -> Result<(), HostError> {
-        if matches!(self.model.phase, ModelPhase::Running) {
+        // AwaitingJob also accepts step completions: the StepDone receipt
+        // carries the 43001 job id the watch needs (bd-ge1zo).
+        if matches!(
+            self.model.phase,
+            ModelPhase::Running | ModelPhase::AwaitingJob { .. }
+        ) {
             return Ok(());
         }
         Err(self.wrong_phase(verb))

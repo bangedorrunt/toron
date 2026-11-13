@@ -12,7 +12,10 @@ use super::armor::{
     passthrough,
 };
 use super::dispatch::{DispatchRequest, DispatchResult, EffectDispatcher, durable_route};
-use super::durable::{GraphEffect, RunEffect, RunPhase as ModelPhase, needs_graph_model};
+use super::durable::{
+    GraphEffect, JobWatchOutcome, JobWatchSpec, JobWatcher, RunEffect, RunPhase as ModelPhase,
+    await_job_watch, needs_graph_model, watch_job_once,
+};
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
 use super::leaf::LeafSeams;
 use super::linear_step::{GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step};
@@ -2100,6 +2103,78 @@ impl WorkflowHost {
                                     Box::new(move |mut run| run.woke(now).map(|eff| (run, eff)))
                                 }
                             };
+                        let Some((back, mut eff)) = self.drive_verb(&run_id, run, then).await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        outputs = run.model().outputs.clone().into_iter().collect();
+                        follow.append(&mut eff);
+                    }
+                    RunEffect::WatchJob { node, job_id } => {
+                        let deadline = match run.model().phase {
+                            ModelPhase::AwaitingJob {
+                                claim_deadline_ms,
+                                result_deadline_ms,
+                                claimed,
+                                ..
+                            } => {
+                                if claimed {
+                                    result_deadline_ms
+                                } else {
+                                    claim_deadline_ms
+                                }
+                            }
+                            _ => None,
+                        };
+                        // Watch straight from the mailbox bus: no seam, no
+                        // republish, no second driver can interleave — the
+                        // fold's phase guards the node either way.
+                        let bus = self.bus.clone();
+                        let watcher: JobWatcher = std::sync::Arc::new(move |spec: JobWatchSpec| {
+                            let bus = bus.clone();
+                            Box::pin(async move { watch_job_once(&bus, &spec.job_id).await })
+                                as std::pin::Pin<
+                                    Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>,
+                                >
+                        });
+                        let outcome = await_job_watch(
+                            &watcher,
+                            JobWatchSpec {
+                                job_id: job_id.clone(),
+                                deadline_ms: deadline,
+                            },
+                            deadline,
+                            durable_now_ms(),
+                        )
+                        .await;
+                        let then: SpawnSettleStep = match outcome {
+                            JobWatchOutcome::Claimed => {
+                                let node = node.clone();
+                                Box::new(move |mut run| {
+                                    run.job_claimed(&node, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::Settled(value) => {
+                                let node = node.clone();
+                                Box::new(move |mut run| {
+                                    run.job_settled(&node, value, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::Failed(error) => {
+                                let node = node.clone();
+                                Box::new(move |mut run| {
+                                    run.job_failed(&node, error, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::TimedOut => {
+                                let now = durable_now_ms().max(deadline.unwrap_or(0));
+                                Box::new(move |mut run| run.woke(now).map(|eff| (run, eff)))
+                            }
+                        };
                         let Some((back, mut eff)) = self.drive_verb(&run_id, run, then).await
                         else {
                             return;
