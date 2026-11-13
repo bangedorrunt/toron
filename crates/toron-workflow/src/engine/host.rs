@@ -2112,7 +2112,7 @@ impl WorkflowHost {
                         follow.append(&mut eff);
                     }
                     RunEffect::WatchJob { node, job_id } => {
-                        let deadline = match run.model().phase {
+                        let (deadline, claimed) = match run.model().phase {
                             ModelPhase::AwaitingJob {
                                 claim_deadline_ms,
                                 result_deadline_ms,
@@ -2120,12 +2120,12 @@ impl WorkflowHost {
                                 ..
                             } => {
                                 if claimed {
-                                    result_deadline_ms
+                                    (result_deadline_ms, true)
                                 } else {
-                                    claim_deadline_ms
+                                    (claim_deadline_ms, false)
                                 }
                             }
-                            _ => None,
+                            _ => (None, false),
                         };
                         // Watch straight from the mailbox bus: no seam, no
                         // republish, no second driver can interleave — the
@@ -2133,7 +2133,7 @@ impl WorkflowHost {
                         let bus = self.bus.clone();
                         let watcher: JobWatcher = std::sync::Arc::new(move |spec: JobWatchSpec| {
                             let bus = bus.clone();
-                            Box::pin(async move { watch_job_once(&bus, &spec.job_id).await })
+                            Box::pin(async move { watch_job_once(&bus, &spec).await })
                                 as std::pin::Pin<
                                     Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>,
                                 >
@@ -2143,6 +2143,7 @@ impl WorkflowHost {
                             JobWatchSpec {
                                 job_id: job_id.clone(),
                                 deadline_ms: deadline,
+                                claimed,
                             },
                             deadline,
                             durable_now_ms(),

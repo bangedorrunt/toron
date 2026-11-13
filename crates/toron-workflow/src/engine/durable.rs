@@ -431,6 +431,9 @@ pub struct JobWatchSpec {
     pub job_id: String,
     /// Absolute deadline for the current wait (claim or result), if any.
     pub deadline_ms: Option<u64>,
+    /// True once the fold recorded the 43002: the re-watch skips the
+    /// already-seen claim and waits for the 43004/43006.
+    pub claimed: bool,
 }
 
 /// One watch wait's outcome, bounded by the model's deadline.
@@ -479,16 +482,21 @@ pub(crate) async fn await_job_watch(
 /// traffic and EOSE markers. A closed stream ends loudly (typed failure),
 /// never hangs: without a bus there is nothing left to wait for.
 /// No deadline here — the caller bounds the wait through [`await_job_watch`].
-pub(crate) async fn watch_job_once(bus: &Arc<dyn Bus>, job_id: &str) -> JobWatchOutcome {
+pub(crate) async fn watch_job_once(bus: &Arc<dyn Bus>, spec: &JobWatchSpec) -> JobWatchOutcome {
+    let job_id = spec.job_id.as_str();
     let Ok(want) = EventId::from_hex(job_id) else {
         return JobWatchOutcome::Failed(format!("dispatch await: unparseable job id {job_id:?}"));
     };
     let mut sub = match bus
-        .subscribe(Filter::new().kinds([
-            toron_kind(JOB_ACCEPTED),
-            toron_kind(JOB_RESULT),
-            toron_kind(JOB_ERROR),
-        ]))
+        .subscribe(
+            Filter::new()
+                .kinds([
+                    toron_kind(JOB_ACCEPTED),
+                    toron_kind(JOB_RESULT),
+                    toron_kind(JOB_ERROR),
+                ])
+                .event(want),
+        )
         .await
     {
         Ok(sub) => sub,
@@ -498,42 +506,88 @@ pub(crate) async fn watch_job_once(bus: &Arc<dyn Bus>, job_id: &str) -> JobWatch
             ));
         }
     };
+    // The bus replays stored history before live mail, so the replay can
+    // hold the 43002 AND the terminal. Drain to EOSE and keep the most
+    // terminal mail seen (result/error beat claim); a re-watch after the
+    // fold recorded the claim skips the already-seen claim and waits live.
+    let mut replay_best: Option<JobWatchOutcome> = None;
+    let mut live = false;
     loop {
         match sub.next().await {
             Some(SubscriptionEvent::Event(ev)) => {
                 if job_parent(&ev).as_ref() != Some(&want) {
                     continue;
                 }
-                match ev.kind.as_u16() {
-                    JOB_ACCEPTED => return JobWatchOutcome::Claimed,
+                let outcome = match ev.kind.as_u16() {
+                    JOB_ACCEPTED => JobWatchOutcome::Claimed,
                     JOB_RESULT => {
                         let r: JobResult = serde_json::from_str(&ev.content).unwrap_or(JobResult {
                             status: "done".into(),
                             body: ev.content.clone(),
                             witness: None,
                         });
-                        return JobWatchOutcome::Settled(serde_json::json!({
+                        JobWatchOutcome::Settled(serde_json::json!({
                             "ok": true,
                             "job": job_id,
                             "witness": r.witness,
                             "body": r.body,
-                        }));
+                        }))
                     }
                     JOB_ERROR => {
                         let e: JobError = serde_json::from_str(&ev.content).unwrap_or(JobError {
                             message: ev.content.clone(),
                         });
-                        return JobWatchOutcome::Failed(e.message);
+                        JobWatchOutcome::Failed(e.message)
                     }
+                    _ => continue,
+                };
+                if !live {
+                    replay_best = Some(more_terminal(replay_best.take(), outcome));
+                    continue;
+                }
+                if spec.claimed && matches!(outcome, JobWatchOutcome::Claimed) {
+                    continue;
+                }
+                return outcome;
+            }
+            Some(SubscriptionEvent::Eose) => {
+                if live {
+                    continue;
+                }
+                live = true;
+                match replay_best.take() {
+                    Some(JobWatchOutcome::Settled(value)) => {
+                        return JobWatchOutcome::Settled(value);
+                    }
+                    Some(JobWatchOutcome::Failed(error)) => {
+                        return JobWatchOutcome::Failed(error);
+                    }
+                    Some(JobWatchOutcome::Claimed) if !spec.claimed => {
+                        return JobWatchOutcome::Claimed;
+                    }
+                    // No terminal, or only the already-seen claim: wait live.
                     _ => continue,
                 }
             }
-            // EOSE markers carry no terminal: keep waiting.
+            // Closed markers carry no terminal: keep waiting.
             Some(_) => continue,
             None => {
                 return JobWatchOutcome::Failed("dispatch await: job watch stream closed".into());
             }
         }
+    }
+}
+
+/// The most terminal of two watched mails: a result/error beats a claim.
+/// Two terminals in one replay should not happen; last wins.
+fn more_terminal(current: Option<JobWatchOutcome>, next: JobWatchOutcome) -> JobWatchOutcome {
+    let next_terminal = matches!(
+        next,
+        JobWatchOutcome::Settled(_) | JobWatchOutcome::Failed(_)
+    );
+    match current {
+        Some(cur) if !next_terminal => cur,
+        _ => next,
     }
 }
 
@@ -908,10 +962,13 @@ pub fn advance_with(
             settle_spawn(&mut next, node, landed, *now_ms, spawns)
         }
         RunMsg::JobClaimed { node, now_ms } => {
+            // A duplicate claim re-arms the same wait: the fold never
+            // answers a claim with nothing, so the run cannot stall with
+            // no WatchJob and no park in flight. (A duplicate cannot loop:
+            // the re-watch carries claimed and skips the seen 43002.)
             let (result_timeout, job_id) = match &next.phase {
                 RunPhase::AwaitingJob {
                     node: awaiting,
-                    claimed: false,
                     result_timeout,
                     job,
                     ..
@@ -3890,6 +3947,51 @@ mod tests {
         let _ = next;
     }
 
+    /// A duplicate claim after the re-watch re-arms the wait again: the
+    /// fold never answers a claim with nothing, so the run cannot stall
+    /// with no WatchJob and no park in flight.
+    #[test]
+    fn dispatch_await_duplicate_claim_still_rewatches() {
+        let wf = dispatch_await_workflow("    await: result\n    result_timeout: 60\n");
+        let model = suspend_await_job(wf, 1_000);
+        let (model, _) = advance_with(
+            &model,
+            &RunMsg::StepDone {
+                value: serde_json::json!({"ok": true, "job_id": "abc"}),
+                now_ms: 1_001,
+            },
+            &[],
+        );
+        let (model, _) = advance_with(
+            &model,
+            &RunMsg::JobClaimed {
+                node: "j".into(),
+                now_ms: 2_000,
+            },
+            &[],
+        );
+        assert!(
+            matches!(&model.phase, RunPhase::AwaitingJob { claimed: true, .. }),
+            "claimed: {:?}",
+            model.phase
+        );
+        let (_, effects) = advance_with(
+            &model,
+            &RunMsg::JobClaimed {
+                node: "j".into(),
+                now_ms: 3_000,
+            },
+            &[],
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                RunEffect::WatchJob { node, job_id } if node == "j" && job_id == "abc"
+            )),
+            "re-watch re-armed, never nothing: {effects:?}"
+        );
+    }
+
     /// A restart mid-wait re-issues the watch and the park — never a
     /// republish (no ExecuteStep), with or without a recorded job id.
     #[test]
@@ -3941,5 +4043,121 @@ mod tests {
             matches!(effects.as_slice(), [RunEffect::ExecuteStep { .. }]),
             "today's effects exactly: {effects:?}"
         );
+    }
+
+    /// Bus-backed watch tests (bd-ge1zo rework 2): the bus replays stored
+    /// history before live mail, so a watch opened after the claim must
+    /// drain the replay to EOSE and settle on the stored 43004 — never
+    /// return the stale 43002 and hang the run.
+    mod watch_bus_tests {
+        use super::super::{JobWatchOutcome, JobWatchSpec, watch_job_once};
+        use std::sync::Arc;
+        use toron_core::bus::in_process::InProcessBusConfig;
+        use toron_core::bus::{Bus, InProcessBus};
+        use toron_core::index::schema;
+        use toron_core::nostr::event::build_event;
+        use toron_core::nostr::kinds::{JOB_ACCEPTED, JOB_REQUEST, JOB_RESULT, toron_kind};
+        use toron_core::nostr::{Keys, Tag, Timestamp};
+
+        async fn open_bus() -> (Arc<dyn Bus>, std::path::PathBuf) {
+            let path =
+                std::env::temp_dir().join(format!("toron-watch-{}.sqlite", uuid::Uuid::new_v4()));
+            let pool = schema::connect(path.to_str().unwrap())
+                .await
+                .expect("connect");
+            schema::migrate(&pool).await.expect("migrate");
+            let bus = InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus");
+            (Arc::new(bus) as Arc<dyn Bus>, path)
+        }
+
+        async fn publish_at(
+            bus: &Arc<dyn Bus>,
+            keys: &Keys,
+            kind: u16,
+            job_hex: &str,
+            content: &str,
+            created_at: Timestamp,
+        ) -> String {
+            let ev = build_event(
+                keys,
+                toron_kind(kind),
+                content,
+                [Tag::parse(["e", job_hex]).expect("e tag")],
+                created_at,
+            )
+            .expect("build");
+            let hex = ev.id.to_hex();
+            bus.publish(ev).await.expect("publish");
+            hex
+        }
+
+        /// 43001, then 43002, then 43004 — all stored before the watch opens.
+        /// Staggered whole-second `created_at`s so the replay order is
+        /// deterministic: the stale claim always sorts before the result.
+        async fn seed_claimed_then_settled(bus: &Arc<dyn Bus>) -> String {
+            let requester = Keys::generate();
+            let claimer = Keys::generate();
+            let base = Timestamp::now().as_secs();
+            let at = |ago: u64| Timestamp::from_secs(base.saturating_sub(ago));
+            let job = publish_at(
+                bus,
+                &requester,
+                JOB_REQUEST,
+                "parent",
+                r#"{"task":"hi"}"#,
+                at(20),
+            )
+            .await;
+            publish_at(bus, &claimer, JOB_ACCEPTED, &job, "claimed", at(10)).await;
+            let result = serde_json::json!({
+                "status": "done",
+                "body": "did it",
+                "witness": {"contract": "signed"},
+            });
+            publish_at(bus, &claimer, JOB_RESULT, &job, &result.to_string(), at(0)).await;
+            job
+        }
+
+        fn spec(job: &str, claimed: bool) -> JobWatchSpec {
+            JobWatchSpec {
+                job_id: job.into(),
+                deadline_ms: None,
+                claimed,
+            }
+        }
+
+        async fn watch(bus: &Arc<dyn Bus>, job: &str, claimed: bool) -> JobWatchOutcome {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                watch_job_once(bus, &spec(job, claimed)),
+            )
+            .await
+            .expect("watch must not hang")
+        }
+
+        #[tokio::test]
+        async fn watch_before_claim_settles_on_stored_result() {
+            let (bus, path) = open_bus().await;
+            let job = seed_claimed_then_settled(&bus).await;
+            let JobWatchOutcome::Settled(value) = watch(&bus, &job, false).await else {
+                panic!("unclaimed watch must settle on the stored 43004");
+            };
+            assert_eq!(value.get("body").and_then(|v| v.as_str()), Some("did it"));
+            assert!(value.get("witness").is_some(), "witness lifted: {value}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn rewatch_after_claim_skips_stale_claim() {
+            let (bus, path) = open_bus().await;
+            let job = seed_claimed_then_settled(&bus).await;
+            let JobWatchOutcome::Settled(value) = watch(&bus, &job, true).await else {
+                panic!("re-watch must skip the seen claim and settle");
+            };
+            assert_eq!(value.get("body").and_then(|v| v.as_str()), Some("did it"));
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

@@ -289,7 +289,7 @@ where
                     follow.append(&mut more);
                 }
                 RunEffect::WatchJob { node, job_id } => {
-                    let deadline = match run.model().phase {
+                    let (deadline, claimed) = match run.model().phase {
                         ModelPhase::AwaitingJob {
                             claim_deadline_ms,
                             result_deadline_ms,
@@ -297,12 +297,12 @@ where
                             ..
                         } => {
                             if claimed {
-                                result_deadline_ms
+                                (result_deadline_ms, true)
                             } else {
-                                claim_deadline_ms
+                                (claim_deadline_ms, false)
                             }
                         }
-                        _ => None,
+                        _ => (None, false),
                     };
                     let Some(watcher) = &seams.job_watcher else {
                         anyhow::bail!("run {run_id}: no job watcher: cannot await job {job_id}");
@@ -312,6 +312,7 @@ where
                         JobWatchSpec {
                             job_id: job_id.clone(),
                             deadline_ms: deadline,
+                            claimed,
                         },
                         deadline,
                         now_ms(),
