@@ -297,6 +297,215 @@ async fn approval_parks_with_a_watchdog_and_lands_the_decision() {
     .expect("approval");
 }
 
+fn wave_swarm_gate() -> Workflow {
+    toron_workflow::schema::parse_workflow(
+        "name: wave-swarm-gate\n\
+         trigger:\n  type: webhook\n\
+         steps:\n\
+         \x20 - name: gate\n\
+         \x20   action: dispatch_job\n\
+         \x20   assignee: x\n\
+         \x20   await: result\n\
+         \x20   no_claim_timeout: 600\n\
+         \x20   result_timeout: 7200\n\
+         \x20   spec:\n\
+         \x20     profile: '@planner'\n\
+         \x20     stage: wave-gate\n\
+         \x20     task: gate the wave\n\
+         \x20   on_error: fail_run\n",
+    )
+    .expect("wave-swarm gate fixture parses")
+}
+
+/// The wave-swarm gate shape with a claimed job that never settles: the run
+/// ends in a typed `result_timeout` failure, the engine row is Failed, and the
+/// terminal state emits nothing — never a hang, never a late success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wave_swarm_gate_result_timeout_is_a_journaled_typed_failure() {
+    let path = unique_db("witness-timeout");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || -> Result<(), HostError> {
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool.clone(), "witness", 64), &handle),
+        );
+        let (mut run, effects) = DurableRun::open(
+            engine,
+            state,
+            "run-witness",
+            wave_swarm_gate(),
+            json!({}),
+            1_000,
+        )?;
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, RunEffect::ExecuteStep { index: 0, .. })),
+            "the gate publishes its job before awaiting: {effects:?}"
+        );
+        assert_eq!(run.awaiting_job(), Some("gate"));
+
+        let effects = run.job_claimed("gate", 2_000)?;
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                RunEffect::ParkUntil {
+                    until_ms: 7_202_000,
+                    ..
+                }
+            )),
+            "the claim arms the result deadline: {effects:?}"
+        );
+
+        let effects = run.woke(7_202_001)?;
+        assert!(
+            matches!(effects.as_slice(), [RunEffect::Fail { step, .. }] if step == "gate"),
+            "one typed fail cmd: {effects:?}"
+        );
+        let RunPhase::Failed { error } = &run.model().phase else {
+            panic!("timed out: {:?}", run.model().phase);
+        };
+        assert!(error.contains("gate"), "names the step: {error}");
+        assert!(error.contains("result_timeout"), "names the bound: {error}");
+        assert_eq!(
+            run.engine().query("run-witness").expect("query").phase,
+            EnginePhase::Failed,
+            "the failure is the journaled terminal, not just a model field"
+        );
+
+        assert!(
+            matches!(
+                run.woke(7_300_000),
+                Err(HostError::WrongPhase { .. })
+            ),
+            "a terminal run refuses every further verb"
+        );
+        assert!(
+            matches!(
+                run.job_settled("gate", json!({"ok": true}), 7_300_001),
+                Err(HostError::WrongPhase { .. })
+            ),
+            "a late settle cannot land after the terminal"
+        );
+        assert!(
+            run.model().outputs.get("gate").is_none_or(|v| v["ok"] != json!(true)),
+            "the late value never lands: {:?}",
+            run.model().outputs
+        );
+        Ok(())
+    })
+    .await
+    .expect("join")
+    .expect("witness timeout");
+
+    let _ = std::fs::remove_file(path);
+}
+
+fn beads_lifecycle_polish() -> Workflow {
+    toron_workflow::schema::parse_workflow(
+        "name: beads-lifecycle-polish\n\
+         trigger:\n  type: webhook\n\
+         steps:\n\
+         \x20 - name: polish\n\
+         \x20   action: loop\n\
+         \x20   min: 2\n\
+         \x20   max: 5\n\
+         \x20   until: 'steps_converged_ok == true && steps_converged_changed == false'\n\
+         \x20   on_error: fail_run\n\
+         \x20   body:\n\
+         \x20     - name: round\n\
+         \x20       action: dispatch_job\n\
+         \x20       assignee: x\n\
+         \x20       spec:\n\
+         \x20         profile: '@planner'\n\
+         \x20         stage: plan-polish\n\
+         \x20         task: another polish round\n\
+         \x20       on_error: fail_run\n\
+         \x20     - name: converged\n\
+         \x20       action: verify\n\
+         \x20       command: flywheel __plan-fence converged\n\
+         \x20       on_error: continue\n",
+    )
+    .expect("beads-lifecycle polish fixture parses")
+}
+
+/// The beads-lifecycle polish loop through the engine: two rounds minimum, and
+/// the first round that reports an unchanged digest stops the loop with
+/// `stopped: until` — a third round never runs and the run succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn beads_lifecycle_polish_stops_on_an_unchanged_digest() {
+    let path = unique_db("polish");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || -> Result<(), HostError> {
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool.clone(), "polish", 64), &handle),
+        );
+        let (mut run, effects) = DurableRun::open(
+            engine,
+            state,
+            "run-polish",
+            beads_lifecycle_polish(),
+            json!({}),
+            1_000,
+        )?;
+        let mut rounds = 0;
+        let mut effects = effects;
+        loop {
+            let executed = effects
+                .iter()
+                .find_map(|e| match e {
+                    RunEffect::ExecuteStep { step, .. } => Some(step.action.type_name()),
+                    _ => None,
+                })
+                .expect("every round runs one host step");
+            match executed {
+                "dispatch_job" => {
+                    rounds += 1;
+                    effects = run.step_done(json!({"ok": true, "round": rounds}), 1_000)?;
+                }
+                "verify" => {
+                    let changed = rounds == 1;
+                    effects = run.step_done(json!({"ok": true, "changed": changed}), 1_000)?;
+                }
+                other => panic!("unexpected step {other}"),
+            }
+            if effects.iter().any(|e| matches!(e, RunEffect::Complete { .. })) {
+                break;
+            }
+            assert!(rounds <= 2, "the loop must not run a third round");
+        }
+        assert_eq!(rounds, 2, "min 2 ran; the unchanged round stopped it");
+        assert_eq!(
+            run.model().outputs["polish"],
+            json!({"ok": true, "iterations": 2, "stopped": "until"}),
+            "the stop condition is the until guard, not exhaustion"
+        );
+        assert_eq!(
+            run.engine().query("run-polish").expect("query").phase,
+            EnginePhase::Settled
+        );
+        Ok(())
+    })
+    .await
+    .expect("join")
+    .expect("polish convergence");
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_shapes_stay_on_the_old_engine() {
     let path = unique_db("unsupported");
