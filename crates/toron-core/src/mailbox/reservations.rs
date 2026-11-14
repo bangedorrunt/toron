@@ -6278,6 +6278,20 @@ mod tests {
             "default TTL must be {}s from the event's own created_at",
             DEFAULT_RESERVATION_TTL_SECS
         );
+        // The test's own name is the other half of the contract: a
+        // reservation is a HEARTBEAT (minutes), never the 90-day envelope.
+        // Stated as a value bound so setting the default to the envelope
+        // value fails here instead of merely agreeing with itself.
+        assert_ne!(
+            DEFAULT_RESERVATION_TTL_SECS,
+            crate::bus::DEFAULT_ENVELOPE_TTL_SECS,
+            "the default lease TTL must not be the envelope TTL"
+        );
+        assert!(
+            DEFAULT_RESERVATION_TTL_SECS <= 600,
+            "the default lease TTL is the heartbeat, saw {}s",
+            DEFAULT_RESERVATION_TTL_SECS
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
