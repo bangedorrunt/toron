@@ -569,7 +569,12 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 line: None,
             });
         }
-        Action::Loop { max, min, until, body } => {
+        Action::Loop {
+            max,
+            min,
+            until,
+            body,
+        } => {
             if max.trim().is_empty() {
                 report.issues.push(LintIssue {
                     level: Level::Error,
@@ -577,14 +582,14 @@ fn check_action(report: &mut LintReport, action: &Action) {
                     line: None,
                 });
             }
-            if let Some(m) = min {
-                if m.trim().is_empty() {
-                    report.issues.push(LintIssue {
-                        level: Level::Error,
-                        message: "loop requires a non-empty `min`".into(),
-                        line: None,
-                    });
-                }
+            if let Some(m) = min
+                && m.trim().is_empty()
+            {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "loop requires a non-empty `min`".into(),
+                    line: None,
+                });
             }
             if body.is_empty() {
                 report.issues.push(LintIssue {

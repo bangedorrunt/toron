@@ -125,6 +125,84 @@ fn approval_awaits_then_lands_decision() {
 }
 
 #[test]
+fn approval_times_out_at_the_deadline_as_a_typed_timeout() {
+    let model = model(vec![step(
+        Action::RequestApproval {
+            message: "approve?".into(),
+            timeout_secs: Some(1),
+        },
+        StepOnError::FailRun,
+    )]);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    // Before the deadline (2_000 ms) the wait is unchanged.
+    let (model, effects) = advance(&model, &RunMsg::Woke { now_ms: 1_999 });
+    assert!(matches!(model.phase, RunPhase::AwaitingApproval { .. }));
+    assert!(effects.is_empty());
+
+    // At the deadline it settles as a typed Timeout: not approved, not
+    // rejected, and the step is named.
+    let (model, effects) = advance(&model, &RunMsg::Woke { now_ms: 2_000 });
+    let RunPhase::Failed { error } = &model.phase else {
+        panic!("timed out: {:?}", model.phase);
+    };
+    assert!(error.contains("approval timed out"), "{error}");
+    let [RunEffect::Fail { step, output }] = effects.as_slice() else {
+        panic!("one typed failure: {effects:?}");
+    };
+    assert_eq!(step, "step_1");
+    assert_eq!(output["kind"], json!("timeout"));
+    assert!(
+        output["error"].as_str().unwrap_or("").contains("step_1"),
+        "{output}"
+    );
+}
+
+#[test]
+fn approval_without_timeout_stays_unbounded() {
+    let model = model(vec![step(
+        Action::RequestApproval {
+            message: "approve?".into(),
+            timeout_secs: None,
+        },
+        StepOnError::FailRun,
+    )]);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::Woke {
+            now_ms: 1_000_000_000,
+        },
+    );
+    assert!(
+        matches!(model.phase, RunPhase::AwaitingApproval { .. }),
+        "absent timeout_secs is unbounded: {:?}",
+        model.phase
+    );
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn approval_before_the_deadline_lands_normally() {
+    let model = model(vec![step(
+        Action::RequestApproval {
+            message: "approve?".into(),
+            timeout_secs: Some(1),
+        },
+        StepOnError::FailRun,
+    )]);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::Approval {
+            decision: json!({"outcome": "approved"}),
+            now_ms: 1_999,
+        },
+    );
+    assert_eq!(model.phase, RunPhase::Succeeded);
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+}
+
+#[test]
 fn failure_policy_continue_vs_fail_run() {
     let continue_model = model(vec![step(
         Action::Verify {
@@ -242,6 +320,44 @@ fn executed(effects: &[GraphEffect]) -> Vec<&str> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn graph_approval_times_out_at_the_deadline_as_a_typed_timeout() {
+    let nodes = [(
+        "gate",
+        Action::RequestApproval {
+            message: "ok?".into(),
+            timeout_secs: Some(1),
+        },
+        &[][..],
+        StepOnError::FailRun,
+    )];
+    let (model, effects) = advance_graph(&graph_model(&nodes), &GraphMsg::Start { now_ms: 1_000 });
+    assert!(
+        matches!(model.node_state["gate"], NodeState::AwaitingApproval { .. }),
+        "waiting: {effects:?}"
+    );
+
+    let (model, effects) = advance_graph(&model, &GraphMsg::Woke { now_ms: 1_999 });
+    assert!(matches!(
+        model.node_state["gate"],
+        NodeState::AwaitingApproval { .. }
+    ));
+    assert!(effects.is_empty());
+
+    let (model, effects) = advance_graph(&model, &GraphMsg::Woke { now_ms: 2_000 });
+    assert!(
+        matches!(model.phase, GraphPhase::Failed { .. }),
+        "{:?}",
+        model.phase
+    );
+    let [GraphEffect::Fail { fail }] = effects.as_slice() else {
+        panic!("one typed graph failure: {effects:?}");
+    };
+    assert_eq!(fail.node, "gate");
+    assert_eq!(fail.kind, "timeout");
+    assert!(fail.error.contains("approval timed out"), "{}", fail.error);
 }
 
 /// Dijkstra diamond: scout → plan → {fix_a, fix_b} → ship. Each node is
@@ -2265,7 +2381,12 @@ fn loop_step_with_min(
     }
 }
 
-fn loop_workflow_with_min(max: &str, min: Option<&str>, until: Option<&str>, on_error: StepOnError) -> Workflow {
+fn loop_workflow_with_min(
+    max: &str,
+    min: Option<&str>,
+    until: Option<&str>,
+    on_error: StepOnError,
+) -> Workflow {
     workflow(vec![loop_step_with_min(
         "spin",
         max,
@@ -2276,7 +2397,12 @@ fn loop_workflow_with_min(max: &str, min: Option<&str>, until: Option<&str>, on_
     )])
 }
 
-fn loop_model_with_min(max: &str, min: Option<&str>, until: Option<&str>, on_error: StepOnError) -> RunModel {
+fn loop_model_with_min(
+    max: &str,
+    min: Option<&str>,
+    until: Option<&str>,
+    on_error: StepOnError,
+) -> RunModel {
     RunModel::new(
         "run-loop",
         loop_workflow_with_min(max, min, until, on_error),
@@ -2293,7 +2419,10 @@ fn loop_min_gates_until_until_min_passes() {
     let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
     assert!(matches!(
         effects.as_slice(),
-        [RunEffect::ExecuteStep { iteration: Some(1), .. }]
+        [RunEffect::ExecuteStep {
+            iteration: Some(1),
+            ..
+        }]
     ));
     let (model, effects) = advance(
         &model,
@@ -2309,11 +2438,19 @@ fn loop_min_gates_until_until_min_passes() {
     );
 
     // min 2: until true after pass 1 still runs pass 2.
-    let model = loop_model_with_min("5", Some("2"), Some("steps_check_ok == true"), StepOnError::Continue);
+    let model = loop_model_with_min(
+        "5",
+        Some("2"),
+        Some("steps_check_ok == true"),
+        StepOnError::Continue,
+    );
     let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
     assert!(matches!(
         effects.as_slice(),
-        [RunEffect::ExecuteStep { iteration: Some(1), .. }]
+        [RunEffect::ExecuteStep {
+            iteration: Some(1),
+            ..
+        }]
     ));
     let (model, effects) = advance(
         &model,
@@ -2325,7 +2462,10 @@ fn loop_min_gates_until_until_min_passes() {
     assert!(
         matches!(
             effects.as_slice(),
-            [RunEffect::ExecuteStep { iteration: Some(2), .. }]
+            [RunEffect::ExecuteStep {
+                iteration: Some(2),
+                ..
+            }]
         ),
         "min 2 forces pass 2 despite until true: {effects:?}"
     );

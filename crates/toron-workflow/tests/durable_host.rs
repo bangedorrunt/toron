@@ -279,8 +279,8 @@ async fn approval_parks_with_a_watchdog_and_lands_the_decision() {
         );
         assert_eq!(
             run.engine().query("run-approval").expect("query").until_ms,
-            Some(1_000 + 86_400_000),
-            "a watchdog park, so a forgotten approval resurfaces"
+            Some(1_000 + 60_000),
+            "the step's timeout_secs arms the wake; an absent bound keeps the watchdog"
         );
 
         let effects = run.approve(json!({"outcome": "approved"}), 2_000)?;
@@ -401,7 +401,9 @@ async fn out_of_phase_transitions_are_typed_errors() {
             run.step_done(json!({}), 0),
             Err(HostError::WrongPhase { .. })
         ));
-        assert!(matches!(run.woke(0), Err(HostError::WrongPhase { .. })));
+        // A timer message is legal while awaiting approval (the deadline
+        // wake); it is not a decision and, before the deadline, does nothing.
+        assert!(run.woke(0)?.is_empty(), "a premature timer is a no-op");
         run.cancel(0)?;
         assert!(matches!(run.cancel(0), Err(HostError::WrongPhase { .. })));
         Ok(())

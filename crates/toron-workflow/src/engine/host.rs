@@ -2054,7 +2054,7 @@ impl WorkflowHost {
                         run = back;
                         follow.append(&mut eff);
                     }
-                    RunEffect::AwaitApproval { step, message } => {
+                    RunEffect::AwaitApproval { step, message, .. } => {
                         self.park_durable_approval(
                             &run_id,
                             &workflow,
@@ -2449,7 +2449,7 @@ impl WorkflowHost {
             let mut parked_for_human = false;
             for effect in parks {
                 match effect {
-                    GraphEffect::AwaitApproval { node, payload } => {
+                    GraphEffect::AwaitApproval { node, payload, .. } => {
                         let message = payload
                             .get("message")
                             .and_then(|m| m.as_str())

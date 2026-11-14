@@ -487,6 +487,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             ModelPhase::Parked { .. }
                 | ModelPhase::AwaitingSpawn { .. }
                 | ModelPhase::AwaitingJob { .. }
+                | ModelPhase::AwaitingApproval { .. }
         ) {
             return Err(self.wrong_phase("woke"));
         }
@@ -543,12 +544,19 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             ModelPhase::AwaitingSpawn {
                 deadline_ms: None, ..
             } => {}
-            ModelPhase::AwaitingApproval { .. } => {
-                self.park(
-                    now_ms.saturating_add(APPROVAL_WAIT_MS),
-                    APPROVAL_WAIT_SECS,
-                    now_ms,
-                )?;
+            ModelPhase::AwaitingApproval {
+                deadline_ms,
+                timeout_secs,
+                ..
+            } => {
+                let (until, secs) = match deadline_ms {
+                    Some(deadline) => (deadline, timeout_secs.unwrap_or(APPROVAL_WAIT_SECS)),
+                    None => (now_ms.saturating_add(APPROVAL_WAIT_MS), APPROVAL_WAIT_SECS),
+                };
+                self.park(until, secs, now_ms)?;
+                if until <= now_ms {
+                    return self.apply(RunMsg::Woke { now_ms }, now_ms);
+                }
             }
             ModelPhase::Running if self.model.plan.step_at(self.model.step_index).is_none() => {
                 let mut next = self.model.clone();
@@ -606,11 +614,17 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             | RunEffect::SpawnDetached { .. }
             | RunEffect::WatchJob { .. } => Ok(()),
             RunEffect::ParkUntil { until_ms, .. } => self.park(*until_ms, 0, now_ms),
-            RunEffect::AwaitApproval { .. } => self.park(
-                now_ms.saturating_add(APPROVAL_WAIT_MS),
-                APPROVAL_WAIT_SECS,
-                now_ms,
-            ),
+            RunEffect::AwaitApproval {
+                deadline_ms,
+                timeout_secs,
+                ..
+            } => {
+                let (until, secs) = match deadline_ms {
+                    Some(deadline) => (*deadline, timeout_secs.unwrap_or(APPROVAL_WAIT_SECS)),
+                    None => (now_ms.saturating_add(APPROVAL_WAIT_MS), APPROVAL_WAIT_SECS),
+                };
+                self.park(until, secs, now_ms)
+            }
             RunEffect::Complete { .. } => {
                 end_run(&mut self.engine, &key, RunEnd::Succeeded).map_err(HostError::from)
             }
@@ -1167,9 +1181,14 @@ fn park_deadline(model: &GraphModel, now_ms: u64) -> Option<(u64, u64)> {
         .values()
         .filter_map(|state| match state {
             NodeState::Parked { until_ms, .. } => Some((*until_ms, 0)),
-            NodeState::AwaitingApproval { .. } => {
-                Some((now_ms.saturating_add(APPROVAL_WAIT_MS), APPROVAL_WAIT_SECS))
-            }
+            NodeState::AwaitingApproval {
+                deadline_ms,
+                timeout_secs,
+                ..
+            } => match deadline_ms {
+                Some(deadline) => Some((*deadline, timeout_secs.unwrap_or(APPROVAL_WAIT_SECS))),
+                None => Some((now_ms.saturating_add(APPROVAL_WAIT_MS), APPROVAL_WAIT_SECS)),
+            },
             _ => None,
         })
         .min_by_key(|(until_ms, _)| *until_ms)

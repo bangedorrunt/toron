@@ -223,22 +223,57 @@ where
                     run = back;
                     follow.append(&mut more);
                 }
-                RunEffect::AwaitApproval { step, message } => {
+                RunEffect::AwaitApproval {
+                    step,
+                    message,
+                    deadline_ms,
+                    ..
+                } => {
                     let wait_id = run_id.clone();
                     let rx = seams.approvals.register(&wait_id);
                     seams.approval_sink.lock().await.push(wait_id.clone());
                     let _ = message;
-                    let decided = rx
-                        .await
-                        .map_err(|_| anyhow::anyhow!("run {run_id}: approval {step} cancelled"))?;
+                    let decided = match deadline_ms {
+                        Some(deadline) => {
+                            let wait = deadline.saturating_sub(now_ms());
+                            match tokio::time::timeout(std::time::Duration::from_millis(wait), rx)
+                                .await
+                            {
+                                Ok(Ok(v)) => Some(v),
+                                Ok(Err(_)) => {
+                                    return Err(anyhow::anyhow!(
+                                        "run {run_id}: approval {step} cancelled"
+                                    ));
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                        None => Some(rx.await.map_err(|_| {
+                            anyhow::anyhow!("run {run_id}: approval {step} cancelled")
+                        })?),
+                    };
                     let at = now_ms();
-                    let (back, mut more) = verb(move || {
-                        let mut run = run;
-                        let effects = run.approve(decided, at)?;
-                        Ok::<_, HostError>((run, effects))
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("run {run_id}: approval failed: {e}"))?;
+                    let (back, mut more) = match decided {
+                        Some(decided) => verb(move || {
+                            let mut run = run;
+                            let effects = run.approve(decided, at)?;
+                            Ok::<_, HostError>((run, effects))
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("run {run_id}: approval failed: {e}"))?,
+                        None => {
+                            let deadline = deadline_ms.unwrap_or(at);
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.woke(deadline)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!("run {run_id}: approval timeout failed: {e}")
+                            })?
+                        }
+                    };
                     run = back;
                     follow.append(&mut more);
                 }
@@ -855,7 +890,7 @@ mod dispatch_await_drive_tests {
                 ToronJournal::spawn(JournalDb::new(pool.clone(), "host", 64), &handle),
             );
             let state = SyncWorkflowState::spawn(pool.clone(), &handle);
-            let (mut run, effects) = DurableRun::open(
+            let (mut run, _opened) = DurableRun::open(
                 engine,
                 state,
                 "run-restart",

@@ -97,6 +97,12 @@ pub enum RunPhase {
         step: String,
         /// Prompt shown to the operator.
         message: String,
+        /// Absolute deadline (ms). `None` = unbounded (no `timeout_secs`).
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+        /// The authored bound, for the timeout error text.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
     /// Terminal success.
     Succeeded,
@@ -665,6 +671,10 @@ pub enum RunEffect {
         step: String,
         /// Prompt.
         message: String,
+        /// Absolute deadline (ms); `None` = unbounded.
+        deadline_ms: Option<u64>,
+        /// Authored bound in seconds.
+        timeout_secs: Option<u64>,
     },
     /// Terminal success.
     Complete {
@@ -829,6 +839,25 @@ pub fn advance_with(
             (next, effects)
         }
         RunMsg::Woke { now_ms } => {
+            if let RunPhase::AwaitingApproval {
+                step,
+                deadline_ms: Some(deadline),
+                timeout_secs,
+                ..
+            } = next.phase.clone()
+            {
+                if *now_ms < deadline {
+                    return (next, Vec::new());
+                }
+                let secs = timeout_secs.unwrap_or(0);
+                let value = serde_json::json!({
+                    "ok": false,
+                    "kind": "timeout",
+                    "step": step.clone(),
+                    "error": format!("approval timed out after {secs}s: {step}"),
+                });
+                return settle_spawn(&mut next, &step, value, *now_ms, spawns);
+            }
             if let RunPhase::AwaitingSpawn {
                 node,
                 spec,
@@ -1115,18 +1144,25 @@ pub(crate) fn next_effects(
             } => {
                 let name = plan_step_name(model, authored);
                 let step = model.workflow.steps.get(authored).cloned();
-                let Some(Action::Loop { max, min, .. }) = step.as_ref().map(|s| s.action.clone()) else {
+                let Some(Action::Loop { max, min, .. }) = step.as_ref().map(|s| s.action.clone())
+                else {
                     continue;
                 };
-                let bound = resolve_loop_max(&max, &model.trigger, &outputs_map(&model.outputs)).and_then(|max_n| {
-                    resolve_loop_min(min.as_deref(), &model.trigger, &outputs_map(&model.outputs)).and_then(|min_n| {
-                        if min_n > max_n {
-                            Err(format!("loop min {min_n} exceeds max {max_n}"))
-                        } else {
-                            Ok((max_n, min_n))
-                        }
-                    })
-                });
+                let bound = resolve_loop_max(&max, &model.trigger, &outputs_map(&model.outputs))
+                    .and_then(|max_n| {
+                        resolve_loop_min(
+                            min.as_deref(),
+                            &model.trigger,
+                            &outputs_map(&model.outputs),
+                        )
+                        .and_then(|min_n| {
+                            if min_n > max_n {
+                                Err(format!("loop min {min_n} exceeds max {max_n}"))
+                            } else {
+                                Ok((max_n, min_n))
+                            }
+                        })
+                    });
                 match bound {
                     Ok((max_n, min_n)) => {
                         model.loops.insert(
@@ -1421,14 +1457,24 @@ fn step_effects(
                 reason: ParkReason::Delay,
             }]
         }
-        Action::RequestApproval { message, .. } => {
+        Action::RequestApproval {
+            message,
+            timeout_secs,
+        } => {
+            let deadline_ms = timeout_secs
+                .filter(|s| *s > 0)
+                .map(|s| now_ms.saturating_add(s.saturating_mul(1_000)));
             model.phase = RunPhase::AwaitingApproval {
                 step: name.clone(),
                 message: message.clone(),
+                deadline_ms,
+                timeout_secs: *timeout_secs,
             };
             vec![RunEffect::AwaitApproval {
                 step: name,
                 message: message.clone(),
+                deadline_ms,
+                timeout_secs: *timeout_secs,
             }]
         }
         Action::Spawn {
@@ -1597,7 +1643,12 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                     }
                 }
             }
-            Action::Loop { max, min, until, body } => {
+            Action::Loop {
+                max,
+                min,
+                until,
+                body,
+            } => {
                 let literal = max.trim().parse::<u64>().is_ok();
                 let template = max.trim().starts_with("{{") && max.trim().ends_with("}}");
                 if !literal && !template {
@@ -1614,8 +1665,7 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                 }
                 if let Some(min) = min {
                     let min_literal = min.trim().parse::<u64>().is_ok();
-                    let min_template =
-                        min.trim().starts_with("{{") && min.trim().ends_with("}}");
+                    let min_template = min.trim().starts_with("{{") && min.trim().ends_with("}}");
                     if !min_literal && !min_template {
                         return Some(format!(
                             "step '{}' loop `min` {min:?} must be a positive integer or a trigger/inputs template",
@@ -1635,13 +1685,13 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                                 step_name(step, index)
                             ));
                         }
-                        if let Ok(max_n) = max.trim().parse::<u64>() {
-                            if min_n > max_n {
-                                return Some(format!(
-                                    "step '{}' loop `min` {min_n} exceeds `max` {max_n}",
-                                    step_name(step, index)
-                                ));
-                            }
+                        if let Ok(max_n) = max.trim().parse::<u64>()
+                            && min_n > max_n
+                        {
+                            return Some(format!(
+                                "step '{}' loop `min` {min_n} exceeds `max` {max_n}",
+                                step_name(step, index)
+                            ));
                         }
                     }
                 }
@@ -1782,9 +1832,16 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
             }
             effects
         }
-        RunPhase::AwaitingApproval { step, message } => vec![RunEffect::AwaitApproval {
+        RunPhase::AwaitingApproval {
+            step,
+            message,
+            deadline_ms,
+            timeout_secs,
+        } => vec![RunEffect::AwaitApproval {
             step: step.clone(),
             message: message.clone(),
+            deadline_ms: *deadline_ms,
+            timeout_secs: *timeout_secs,
         }],
         RunPhase::Running => match model.plan.step_at(model.step_index) {
             Some((authored, step)) => vec![RunEffect::ExecuteStep {
@@ -1872,6 +1929,12 @@ pub enum NodeState {
         attempt: u32,
         /// The exact promise data the host published.
         payload: serde_json::Value,
+        /// Absolute deadline (ms); `None` = unbounded.
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+        /// Authored bound in seconds.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
     /// Landed.
     Settled,
@@ -2137,6 +2200,10 @@ pub enum GraphEffect {
         node: String,
         /// The exact promise data the host publishes.
         payload: serde_json::Value,
+        /// Absolute deadline (ms); `None` = unbounded.
+        deadline_ms: Option<u64>,
+        /// Authored bound in seconds.
+        timeout_secs: Option<u64>,
     },
     /// Open (or re-attach to) one `call_workflow` child run.
     ChildRun {
@@ -2379,6 +2446,51 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                 return (next, Vec::new());
             }
             let mut effects = Vec::new();
+            let timed_out: Vec<(String, Option<u64>)> = next
+                .node_state
+                .iter()
+                .filter_map(|(node, state)| match state {
+                    NodeState::AwaitingApproval {
+                        deadline_ms: Some(deadline),
+                        timeout_secs,
+                        ..
+                    } if *deadline <= *now_ms => Some((node.clone(), *timeout_secs)),
+                    _ => None,
+                })
+                .collect();
+            for (node, secs) in timed_out {
+                let error = format!("approval timed out after {}s: {node}", secs.unwrap_or(0));
+                let on_error = next
+                    .workflow
+                    .graph
+                    .as_ref()
+                    .and_then(|g| g.nodes.get(&node))
+                    .map(|n| n.on_error);
+                if on_error == Some(StepOnError::FailRun) {
+                    let fail = GraphFail {
+                        node: node.clone(),
+                        error: error.clone(),
+                        kind: "timeout".to_string(),
+                        disposition: disposition_for_kind("timeout", None).as_str().to_string(),
+                        leaf_preview: serde_json::Value::Null,
+                        attempts: None,
+                    };
+                    next.phase = GraphPhase::Failed {
+                        error: fail.error.clone(),
+                    };
+                    return (next, vec![GraphEffect::Fail { fail }]);
+                }
+                next.outputs.insert(
+                    node.clone(),
+                    serde_json::json!({
+                        "ok": false,
+                        "kind": "timeout",
+                        "node": node.clone(),
+                        "error": error,
+                    }),
+                );
+                next.node_state.insert(node, NodeState::Settled);
+            }
             let parked: Vec<(String, NodeState)> = next
                 .node_state
                 .iter()
@@ -2587,12 +2699,17 @@ pub fn resume_graph_effects(model: &GraphModel) -> Vec<GraphEffect> {
                 until_ms: *until_ms,
                 reason: *reason,
             }),
-            NodeState::AwaitingApproval { payload, .. } => {
-                effects.push(GraphEffect::AwaitApproval {
-                    node: node.clone(),
-                    payload: payload.clone(),
-                })
-            }
+            NodeState::AwaitingApproval {
+                payload,
+                deadline_ms,
+                timeout_secs,
+                ..
+            } => effects.push(GraphEffect::AwaitApproval {
+                node: node.clone(),
+                payload: payload.clone(),
+                deadline_ms: *deadline_ms,
+                timeout_secs: *timeout_secs,
+            }),
             NodeState::AwaitingChild {
                 child_run_id,
                 workflow,
@@ -2838,7 +2955,13 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
-                Action::RequestApproval { message, .. } => {
+                Action::RequestApproval {
+                    message,
+                    timeout_secs,
+                } => {
+                    let deadline_ms = timeout_secs
+                        .filter(|s| *s > 0)
+                        .map(|s| now_ms.saturating_add(s.saturating_mul(1_000)));
                     let payload = build_approval_payload(
                         &model.run_id,
                         &model.workflow.name,
@@ -2854,11 +2977,15 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                             wave,
                             attempt: 1,
                             payload: payload.clone(),
+                            deadline_ms,
+                            timeout_secs: *timeout_secs,
                         },
                     );
                     effects.push(GraphEffect::AwaitApproval {
                         node: name.clone(),
                         payload,
+                        deadline_ms,
+                        timeout_secs: *timeout_secs,
                     });
                     dispatched += 1;
                 }
