@@ -1326,16 +1326,68 @@ impl Mailbox {
         notify_previous: bool,
     ) -> anyhow::Result<ReleaseResult> {
         let project_slug = &self.canonical_project(project_slug).await;
-        let operator = self
-            .operator
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
         let leases: Vec<Reservation> = self
             .active_reservations(project_slug)
             .await?
             .into_iter()
             .filter(|r| r.reason == bead_id || r.reason.starts_with(&format!("{bead_id}@")))
             .collect();
+        self.revoke_leases(
+            project_slug,
+            requestor_name,
+            leases,
+            &format!("bead-closed:{bead_id}"),
+            bead_id,
+            notify_previous,
+        )
+        .await
+    }
+
+    /// Operator-signed release of every lease held by one agent pin (the
+    /// `flywheel retire` path). Filtered by HOLDER, so a sibling holding a
+    /// lease on the same bead keeps it; unlike `release_by_reason`, which
+    /// releases by the lease's reason tag.
+    pub async fn release_by_holder(
+        &self,
+        project_slug: &str,
+        requestor_name: &str,
+        holder: &str,
+        notify_previous: bool,
+    ) -> anyhow::Result<ReleaseResult> {
+        let project_slug = &self.canonical_project(project_slug).await;
+        let leases: Vec<Reservation> = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .filter(|r| r.agent_name == holder)
+            .collect();
+        self.revoke_leases(
+            project_slug,
+            requestor_name,
+            leases,
+            &format!("holder-retired:{holder}"),
+            holder,
+            notify_previous,
+        )
+        .await
+    }
+
+    /// The one revocation body behind [`Self::release_by_reason`] and
+    /// [`Self::release_by_holder`]: operator-signed revocation events, the
+    /// kernel release, the projection status, and the optional NIP-17 notify.
+    async fn revoke_leases(
+        &self,
+        project_slug: &str,
+        requestor_name: &str,
+        leases: Vec<Reservation>,
+        note: &str,
+        reason_tag: &str,
+        notify_previous: bool,
+    ) -> anyhow::Result<ReleaseResult> {
+        let operator = self
+            .operator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
 
         let mut released = 0usize;
         let mut released_leases = Vec::new();
@@ -1352,14 +1404,14 @@ impl Mailbox {
                         "a",
                         [format!("30031:{}:{d}", operator.public_key().to_hex())],
                     ),
-                    Tag::custom("note", [format!("bead-closed:{bead_id}")]),
+                    Tag::custom("note", [note.to_string()]),
                 ],
                 Some(project_slug),
             );
             let revoke = build_event(
                 operator,
                 toron_kind(FILE_RESERVATION),
-                marker_content("revoked", Some("bead-closed"), lease.epoch),
+                marker_content("revoked", Some(note), lease.epoch),
                 tags,
                 Timestamp::now(),
             )?;
@@ -1389,13 +1441,13 @@ impl Mailbox {
                     vec![
                         Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
                         Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
-                        Tag::parse(["reason", bead_id]).expect("reason"),
+                        Tag::parse(["reason", reason_tag]).expect("reason"),
                         Tag::parse(["reservation-id", &lease.id]).expect("res"),
                         Tag::parse(["subject", &subject]).expect("subject"),
                     ],
                     format!(
                         "reservation {} (holder {}) released by {} (reason {})",
-                        lease.path_pattern, lease.agent_name, requestor_name, bead_id
+                        lease.path_pattern, lease.agent_name, requestor_name, reason_tag
                     ),
                 );
                 let wrap = crate::nostr::gift_wrap::gift_wrap(operator, &holder_npub, rumor)
@@ -6042,6 +6094,52 @@ mod tests {
             .expect("conflict check");
         assert!(rep.conflict_free, "src/x.rs released without waiting TTL");
         assert!(rep.conflicts.is_empty(), "{:?}", rep.conflicts);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-rilvn: release-by-holder is filtered by HOLDER, so a sibling
+    /// holding a lease on the SAME bead reason keeps it (unlike
+    /// release-by-reason, which is filtered by the reason tag).
+    #[tokio::test]
+    async fn test_release_by_holder_revokes_only_that_holder() {
+        let (mailbox, db_path, data_dir) = test_mailbox("rilvn-holder").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RedStone").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/a.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-SAME"),
+            )
+            .await
+            .expect("acquire a");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "RedStone",
+                &["src/b.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-SAME"),
+            )
+            .await
+            .expect("acquire b");
+
+        let r = mailbox
+            .release_by_holder("demo", "operator", "BlueLake", false)
+            .await
+            .expect("release by holder");
+        assert_eq!(r.released, 1, "exactly BlueLake's lease");
+
+        let active = mailbox.active_reservations("demo").await.expect("active");
+        assert_eq!(active.len(), 1, "the sibling's lease stays: {active:?}");
+        assert_eq!(active[0].agent_name, "RedStone");
+        assert_eq!(active[0].path_pattern, "src/b.rs");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
