@@ -6238,9 +6238,8 @@ mod tests {
     /// reservation TTL, and `with-lease` renews while it runs.
     #[tokio::test]
     async fn test_default_lease_ttl_is_the_reservation_heartbeat_not_the_envelope() {
-        let (mailbox, _db, data_dir) = test_mailbox("locks-default-ttl").await;
+        let (mailbox, db, data_dir) = test_mailbox("locks-default-ttl").await;
         register(&mailbox, "demo", "BlueLake").await;
-        let before = Timestamp::now().as_secs() as i64;
         mailbox
             .file_reservation_paths(
                 "demo",
@@ -6260,11 +6259,23 @@ mod tests {
             .find(|r| r.path_pattern == "src/a.rs")
             .expect("the lease is on the board");
         let expires_secs = row.expires_ts_us.expect("default TTL stamps an expiry") / 1_000_000;
-        let window = expires_secs - before;
-        assert!(
-            (DEFAULT_RESERVATION_TTL_SECS as i64 - 5..=DEFAULT_RESERVATION_TTL_SECS as i64 + 5)
-                .contains(&window),
-            "default TTL must be {}s, saw {window}s",
+        // Measured from the lease event's OWN stamps: the expiry is
+        // `created + ttl` on the same `created` timestamp, so the delta is
+        // exact regardless of how loaded the suite is. A wall-clock window
+        // (the old ±5s) flaked when the acquire took longer than the window.
+        let pool = schema::connect(db.to_str().expect("db path is UTF-8"))
+            .await
+            .expect("connect");
+        let created_at: i64 =
+            sqlx::query_scalar("SELECT created_at FROM bus_events WHERE event_id = ?1")
+                .bind(&row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the lease event's own created_at");
+        assert_eq!(
+            expires_secs - created_at,
+            DEFAULT_RESERVATION_TTL_SECS as i64,
+            "default TTL must be {}s from the event's own created_at",
             DEFAULT_RESERVATION_TTL_SECS
         );
         let _ = std::fs::remove_dir_all(&data_dir);
