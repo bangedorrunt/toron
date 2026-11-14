@@ -385,6 +385,31 @@ impl Mailbox {
         identity::upsert_captain_alias(pool, &canonical, pin).await
     }
 
+    /// Clear the `captain` alias on the live mailbox (the same delete the
+    /// toron CLI writes). Returns the pin that was bound, if any.
+    pub async fn clear_captain_alias(&self, project_slug: &str) -> anyhow::Result<Option<String>> {
+        let canonical = self.canonical_project(project_slug).await;
+        let pool = self
+            .index_pool()
+            .ok_or_else(|| anyhow::anyhow!("no index pool for the captain alias"))?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT canonical FROM agent_name_aliases \
+             WHERE project_slug = ?1 AND alias = 'captain'",
+        )
+        .bind(&canonical)
+        .fetch_optional(pool)
+        .await?;
+        if current.is_some() {
+            sqlx::query(
+                "DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+            )
+            .bind(&canonical)
+            .execute(pool)
+            .await?;
+        }
+        Ok(current)
+    }
+
     /// The canonical `captain` alias pin for a project. `project_slug` may be
     /// the slug or a path-form key: the ONE resolver canonicalizes, then reads
     /// over the project read set, so a row written by
