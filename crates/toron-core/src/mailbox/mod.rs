@@ -374,6 +374,48 @@ impl Mailbox {
         aliases::canonicalize(self.index_pool.as_ref(), slug).await
     }
 
+    /// Set the `captain` alias on the live mailbox (the same upsert the toron
+    /// CLI writes). `project_slug` is canonicalized, so a slug input keys the
+    /// row exactly as `toron contact captain --project <slug>` does.
+    pub async fn set_captain_alias(&self, project_slug: &str, pin: &str) -> anyhow::Result<()> {
+        let canonical = self.canonical_project(project_slug).await;
+        let pool = self
+            .index_pool()
+            .ok_or_else(|| anyhow::anyhow!("no index pool for the captain alias"))?;
+        identity::upsert_captain_alias(pool, &canonical, pin).await
+    }
+
+    /// The canonical `captain` alias pin for a project. `project_slug` may be
+    /// the slug or a path-form key: the ONE resolver canonicalizes, then reads
+    /// over the project read set, so a row written by
+    /// `toron contact captain --project <slug>` (keyed by the slug) is found
+    /// from a path lookup too. Mirrors `whois`'s alias resolution.
+    pub async fn captain_alias(&self, project_slug: &str) -> anyhow::Result<Option<String>> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(None);
+        };
+        let canonical = self.canonical_project(project_slug).await;
+        let mut keys = vec![canonical.clone()];
+        for key in self.project_read_set(&canonical).await {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        for key in keys {
+            let row: Option<String> = sqlx::query_scalar(
+                "SELECT canonical FROM agent_name_aliases \
+                 WHERE project_slug = ?1 AND alias = 'captain'",
+            )
+            .bind(&key)
+            .fetch_optional(pool)
+            .await?;
+            if row.is_some() {
+                return Ok(row);
+            }
+        }
+        Ok(None)
+    }
+
     /// ADR-0017: the read-side alias expansion of `slug` — the caller's own
     /// spelling, the canonical root, and every stored alias of that root.
     /// Queries over this set see rows written under any spelling (legacy

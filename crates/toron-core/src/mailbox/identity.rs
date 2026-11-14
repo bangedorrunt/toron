@@ -2106,7 +2106,7 @@ pub fn resolve_pin_for_pane(
 /// in `agent_name_aliases` — no event projection, so the daemon-mode CLI may
 /// write it against the durable root directly (guard precedent,
 /// bd-pin-public-plane-s-easy.14) without opening a second mailbox.
-async fn upsert_captain_alias(
+pub(crate) async fn upsert_captain_alias(
     pool: &sqlx::SqlitePool,
     project_slug: &str,
     canonical_pin: &str,
