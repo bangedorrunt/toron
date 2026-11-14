@@ -374,6 +374,9 @@ struct LeaseUpsert<'a> {
     reason: &'a str,
     event_id: &'a str,
     expires_ts_us: Option<i64>,
+    /// The fencing epoch of the lease event (persisted so an expired mirror
+    /// keeps its epoch after the bus prunes the event).
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -699,6 +702,7 @@ impl Mailbox {
                 expires_ts_us: ttl
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
+                epoch,
             })
             .await;
             result.granted.push(GrantedReservation {
@@ -845,7 +849,9 @@ impl Mailbox {
                     continue;
                 }
                 if let Some((name, ReservationStatus::Held, reason)) = meta.get(&id) {
-                    if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(reason, &closed_beads) {
+                    if !closed_beads.is_empty()
+                        && lease_reasoned_by_closed_bead(reason, &closed_beads)
+                    {
                         continue;
                     }
                     soft.push(name.clone());
@@ -1004,6 +1010,7 @@ impl Mailbox {
                 expires_ts_us: ttl
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
+                epoch: res.epoch,
             })
             .await;
             result.reservations.push(GrantedReservation {
@@ -1660,10 +1667,14 @@ impl Mailbox {
             None => None,
         };
         if let Some(pool) = self.index_pool() {
-            let expired_mirrors: Vec<(String, String, String, i64, i64, Option<String>)> =
+            // `epoch` rides the projection row: the bus PRUNES an expired
+            // lease event (`expires_at <= now`), so re-deriving the epoch from
+            // the event was a race (it read 0 after a prune and broke the
+            // holder's fencing check). The row's own stamp is the authority.
+            let expired_mirrors: Vec<(String, String, String, i64, i64, Option<String>, i64)> =
                 sqlx::query_as(
                     "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
-                     expires_ts_us, event_id \
+                     expires_ts_us, event_id, epoch \
                      FROM file_reservations \
                      WHERE project_slug = ?1 AND status = 'active' \
                        AND expires_ts_us IS NOT NULL AND expires_ts_us <= ?2",
@@ -1673,7 +1684,7 @@ impl Mailbox {
                 .fetch_all(pool)
                 .await
                 .unwrap_or_default();
-            for (pubkey, path, reason, excl, exp_us, event_id) in expired_mirrors {
+            for (pubkey, path, reason, excl, exp_us, event_id, row_epoch) in expired_mirrors {
                 let dup_self = out
                     .iter()
                     .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path);
@@ -1700,27 +1711,20 @@ impl Mailbox {
                                 })
                         })
                     });
-                let mut epoch = matched_event.map(|e| lease_epoch(&e.content)).unwrap_or(0);
+                let epoch = row_epoch.max(0) as u64;
                 let mut created_at_secs = matched_event
                     .map(|e| e.created_at.as_secs() as i64)
                     .unwrap_or(0);
-                if epoch == 0
+                if created_at_secs == 0
                     && let Some(eid) = &event_id
-                    && let Ok(Some((raw, cat))) = sqlx::query_as::<_, (String, i64)>(
+                    && let Ok(Some((_raw, cat))) = sqlx::query_as::<_, (String, i64)>(
                         "SELECT raw_json, created_at FROM bus_events WHERE event_id = ?1",
                     )
                     .bind(eid)
                     .fetch_optional(pool)
                     .await
                 {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-                        && let Some(c) = val.get("content").and_then(|c| c.as_str())
-                    {
-                        epoch = lease_epoch(c);
-                    }
-                    if created_at_secs == 0 {
-                        created_at_secs = cat;
-                    }
+                    created_at_secs = cat;
                 }
                 out.push(ResolvedLease {
                     id: event_id.unwrap_or_else(|| format!("mirror:{path}:{pubkey}")),
@@ -2203,7 +2207,9 @@ impl Mailbox {
                     ..
                 }) => {
                     if let Some((name, status, reason)) = meta.get(&blocking_id) {
-                        if !closed_beads.is_empty() && lease_reasoned_by_closed_bead(reason, &closed_beads) {
+                        if !closed_beads.is_empty()
+                            && lease_reasoned_by_closed_bead(reason, &closed_beads)
+                        {
                             scratch.leases.remove(&blocking_id);
                             continue;
                         }
@@ -2412,6 +2418,7 @@ impl Mailbox {
             reason: &effective_reason,
             event_id: &acquire_event.id.to_hex(),
             expires_ts_us: None,
+            epoch: acquire_epoch,
         })
         .await;
         self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
@@ -2924,12 +2931,13 @@ impl Mailbox {
         let r = sqlx::query(
             "INSERT INTO file_reservations \
              (project_slug, agent_name, agent_pubkey, path_pattern, exclusive, reason, \
-              status, event_id, expires_ts_us, created_ts_us) \
-             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) \
+              status, event_id, expires_ts_us, created_ts_us, epoch) \
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) \
              ON CONFLICT(project_slug, path_pattern, agent_pubkey) DO UPDATE SET \
                agent_name=excluded.agent_name, exclusive=excluded.exclusive, \
                reason=excluded.reason, status='active', event_id=excluded.event_id, \
-               expires_ts_us=excluded.expires_ts_us, created_ts_us=excluded.created_ts_us",
+               expires_ts_us=excluded.expires_ts_us, created_ts_us=excluded.created_ts_us, \
+               epoch=excluded.epoch",
         )
         .bind(u.project_slug)
         .bind(u.agent_name)
@@ -2942,6 +2950,7 @@ impl Mailbox {
         .bind(crate::index::writer::Clock::now_us(
             &crate::index::writer::SystemClock,
         ))
+        .bind(u.epoch as i64)
         .execute(pool)
         .await;
         if let Err(e) = r {
@@ -6959,15 +6968,35 @@ mod tests {
         let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
         mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
 
+        let resolved = mailbox
+            .resolved_leases("demo")
+            .await
+            .expect("resolved leases");
+        let lease = resolved
+            .iter()
+            .find(|r| r.path_pattern == "src/epoch.rs")
+            .expect("liveness extended lease exists");
+        // The assertion that can fail: this lease is past its 1s deadline and
+        // is kept ONLY by the holder's liveness, with the epoch the event
+        // stamped (persisted on the projection row, so a bus prune cannot
+        // lose it).
+        assert!(
+            lease.expired,
+            "the 1s lease is past its deadline: {lease:?}"
+        );
+        assert!(
+            lease.liveness_extended,
+            "kept only by the holder's liveness: {lease:?}"
+        );
+        assert_eq!(lease.epoch, 1, "the extension preserves the fencing epoch");
         let active = mailbox
             .active_reservations("demo")
             .await
             .expect("active reservations");
-        let lease = active
-            .iter()
-            .find(|r| r.path_pattern == "src/epoch.rs")
-            .expect("liveness extended lease exists");
-        assert_eq!(lease.epoch, 1);
+        assert!(
+            active.iter().any(|r| r.path_pattern == "src/epoch.rs"),
+            "the extended lease is on the active board"
+        );
 
         let checked = mailbox
             .check_claim_epoch("demo", "src/epoch.rs", 1)
@@ -7071,10 +7100,16 @@ mod tests {
         closed.insert("bd-closed-test".to_string());
 
         assert!(lease_reasoned_by_closed_bead("bd-05yr", &closed));
-        assert!(lease_reasoned_by_closed_bead("bd-05yr@r2#AmberHarbor", &closed));
+        assert!(lease_reasoned_by_closed_bead(
+            "bd-05yr@r2#AmberHarbor",
+            &closed
+        ));
         assert!(lease_reasoned_by_closed_bead("bd-closed-test", &closed));
         assert!(!lease_reasoned_by_closed_bead("bd-open-task", &closed));
-        assert!(!lease_reasoned_by_closed_bead("bd-open@r1#BlueLake", &closed));
+        assert!(!lease_reasoned_by_closed_bead(
+            "bd-open@r1#BlueLake",
+            &closed
+        ));
         assert!(!lease_reasoned_by_closed_bead("manual-claim", &closed));
         assert!(!lease_reasoned_by_closed_bead("", &closed));
     }
@@ -7122,7 +7157,8 @@ mod tests {
             acq2.granted.len(),
             1,
             "closed-bead lease must not block: conflicts={:?} soft={:?}",
-            acq2.conflicts, acq2.soft_conflicts
+            acq2.conflicts,
+            acq2.soft_conflicts
         );
         assert!(acq2.conflicts.is_empty(), "no hard conflicts: {acq2:?}");
         assert!(

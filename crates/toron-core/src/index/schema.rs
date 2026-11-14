@@ -50,6 +50,27 @@ pub struct AdditiveTable {
     pub ddl: &'static str,
 }
 
+/// An additive COLUMN: a nullable (or defaulted) column an older binary
+/// simply ignores. Applied idempotently after [`MIGRATOR`] — a `PRAGMA
+/// table_info` check, then `ALTER TABLE ADD COLUMN` — and recorded nowhere, so
+/// it raises no version an older binary checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdditiveColumn {
+    /// The table the column belongs to.
+    pub table: &'static str,
+    /// The column name.
+    pub column: &'static str,
+    /// The `ALTER TABLE … ADD COLUMN` statement.
+    pub ddl: &'static str,
+}
+
+/// Every additive column, in apply order.
+pub static ADDITIVE_COLUMNS: &[AdditiveColumn] = &[AdditiveColumn {
+    table: "file_reservations",
+    column: "epoch",
+    ddl: "ALTER TABLE file_reservations ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
+}];
+
 /// Every additive table, in apply order.
 pub static ADDITIVE_TABLES: &[AdditiveTable] = &[
     AdditiveTable {
@@ -138,6 +159,20 @@ async fn ensure_additive(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await
             .with_context(|| format!("additive table {}", table.name))?;
+    }
+    for col in ADDITIVE_COLUMNS {
+        let present: Option<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) WHERE name = ?2")
+                .bind(col.table)
+                .bind(col.column)
+                .fetch_optional(pool)
+                .await?;
+        if present.is_none() {
+            sqlx::query(col.ddl)
+                .execute(pool)
+                .await
+                .with_context(|| format!("additive column {}.{}", col.table, col.column))?;
+        }
     }
     Ok(())
 }
