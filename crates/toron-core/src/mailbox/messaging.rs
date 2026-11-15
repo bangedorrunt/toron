@@ -607,6 +607,7 @@ impl Mailbox {
                 Tag::parse(["thread", &thread_ref]).expect("thread"),
                 Tag::parse(["importance", &importance]).expect("importance"),
                 Tag::parse(["from", &args.sender_name]).expect("from"),
+                Tag::parse(["mid", &visible_id]).expect("mid"),
             ];
             if let Ok(ev) = build_event(
                 &sender_keys,
