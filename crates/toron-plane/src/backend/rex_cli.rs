@@ -1277,23 +1277,40 @@ pub mod rex_map {
     /// `/` misses it (bd-0uzrq.10 live leg, 09:28).
     ///
     /// At a prompt the footer's lower line is the context row: it ends in the
-    /// window percentage `(NN%)`. During a turn that row is replaced by the
-    /// progress row, which carries `N shell` and the truncated interrupt hint
-    /// (`es...upt   1 shell  770.3K (77%)`) or the `↓` jump marker. So: a
-    /// percentage ending, minus the progress markers.
+    /// window percentage `(NN%)`, or — before the session has counted a token
+    /// and again after a compaction — it is the bare `<path>:<branch>` label
+    /// (bd-0uzrq.15). During a turn that row is replaced by the progress row,
+    /// which carries `N shell` and the truncated interrupt hint
+    /// (`es...upt   1 shell  770.3K (77%)`) or the `↓` jump marker.
+    ///
+    /// The percentage arm and the label-only arm both look at the same last
+    /// three lines, and a progress row ANYWHERE in them means the turn is
+    /// running: the progress row is drawn at the bottom of a live turn, so a
+    /// footer above it is a leftover, not a prompt.
     #[must_use]
     pub fn screen_shows_a_prompt(screen: &str) -> bool {
-        screen
+        let lines: Vec<&str> = screen
             .lines()
             .rev()
             .filter(|line| !line.trim().is_empty())
             .take(3)
-            .any(is_context_row)
+            .collect();
+        if lines.is_empty() || lines.iter().any(|line| is_progress_row(line)) {
+            return false;
+        }
+        lines.iter().any(|line| ends_in_window_percentage(line))
+            || lines.iter().any(|line| is_label_only_context_row(line))
     }
 
-    /// One footer line: a context row ends in `(NN%)`; a progress row carries
-    /// the shell counter, the interrupt hint, or the jump marker.
-    fn is_context_row(line: &str) -> bool {
+    /// The progress row: the shell counter, the truncated interrupt hint, or the
+    /// jump marker. Never a prompt, whatever else it carries.
+    fn is_progress_row(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("shell") || lower.contains("esc") || line.contains('\u{2193}')
+    }
+
+    /// One footer line that ends in `(NN%)` and is not the progress row.
+    fn ends_in_window_percentage(line: &str) -> bool {
         let row = line.trim_end();
         let Some(open) = row.rfind('(') else {
             return false;
@@ -1308,8 +1325,40 @@ pub mod rex_map {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return false;
         }
-        let lower = row.to_ascii_lowercase();
-        !(lower.contains("shell") || lower.contains("esc") || row.contains('\u{2193}'))
+        !is_progress_row(row)
+    }
+
+    /// The bare context row: `<path>:<branch>`, optionally followed by the
+    /// footer hints.
+    ///
+    /// opencode renders this instead of the counter exactly while the session
+    /// has no context accounting. Live repro of 2.2.7 at 80 columns
+    /// (bd-0uzrq.15, scratch session): a fresh session shows
+    /// `/private/tmp/uz15/scratch:main   shift+tab agents  ctrl+p commands`,
+    /// one turn changes it to `…:main  34.2K (13%)  ctrl+p commands`, `/compact`
+    /// drops the counter again, and the next response restores it. At 43
+    /// columns the hints do not fit, so the row collapses to
+    /// `…/work…/flywheel:adr-0021-stage-contracts` (CyanCove's live shape).
+    fn is_label_only_context_row(line: &str) -> bool {
+        let row = line.trim();
+        if row.is_empty() || is_progress_row(row) {
+            return false;
+        }
+        let Some((label, rest)) = row.split_once(':') else {
+            return false;
+        };
+        let label = label.trim_end();
+        if !(label.starts_with('/') || label.starts_with('…') || label.starts_with('~')) {
+            return false;
+        }
+        if label.len() < 2 {
+            return false;
+        }
+        let branch = rest.split_whitespace().next().unwrap_or("");
+        !branch.is_empty()
+            && branch
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
     }
 
     /// Age of the newest `program_status` record, in seconds, from its
@@ -1788,6 +1837,22 @@ mod wire_contract_tests {
     const WORKING_SCREEN_DEFAULT: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a48\n\n                          Jump to latest\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  750.1K (75%)\n";
     const WORKING_SCREEN_WIDE: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a480 34b981; do\n\n                          Jump to latest\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  721.4K (72%)\n";
 
+    /// bd-0uzrq.15: the SAME 2.2.7 pane (80 cols, scratch session 01a1df74)
+    /// through one session's life. The counter is a property of the session's
+    /// context accounting, not of width or of the pane's history.
+    ///
+    /// Fresh, before any turn: no counter, the footer hints take its place.
+    const IDLE_NO_STATS_FRESH: &str = "  ┃  Build auto · Iceman Contributor Free OpenCode Go\n   /private/tmp/uz15/scratch:main            shift+tab agents  ctrl+p commands\n  ⊙ 3 MCP /mcps                                                          2.2.7\n";
+    /// After one turn: the counter appears.
+    const IDLE_WITH_STATS_AFTER_TURN: &str = "  ┃  Build auto · Iceman Contributor Free OpenCode Go\n  /private/tmp/uz15/scratch:main                  34.2K (13%)  ctrl+p commands\n";
+    /// After `/compact`: the counter is gone again (the compaction summary is
+    /// on screen above, which is why a stale `working` record is plausible here).
+    const IDLE_NO_STATS_AFTER_COMPACT: &str = "  ┃  Build auto · Iceman Contributor Free OpenCode Go\n  /private/tmp/uz15/scratch:main             shift+tab agents  ctrl+p commands\n";
+    /// The same shape on CyanCove's live 43-column pane: the hints do not fit,
+    /// so the row collapses to the elided label alone.
+    const IDLE_NO_STATS_NARROW: &str =
+        "  DeepSeek V4.1 Flash 1017  high\n\n…/work…/flywheel:adr-0021-stage-contracts\n";
+
     /// An idle capture, from block 77a480 at the same instant: records say
     /// `idle` and the screen agrees. Both signals on the same side.
     const IDLE_RECORDS: &str = r#"{"records":[{"state":"idle","app":"opencode","effective_app":"opencode","updated_at":"2026-11-15T18:53:22.738181+11:00","owner":{"pid":67198,"name":"opencode.exe"}}]}"#;
@@ -1911,6 +1976,74 @@ mod wire_contract_tests {
             )
             .0,
             AgentStatus::Idle
+        );
+    }
+
+    /// bd-0uzrq.15: a session with no context accounting shows a context row
+    /// with NO counter. The counter is absent exactly while the session has
+    /// counted no token yet — a fresh session, and again after a compaction —
+    /// and comes back with the next response.
+    #[test]
+    fn a_context_row_without_the_counter_is_still_a_prompt() {
+        for (what, screen) in [
+            ("fresh session, no turn yet", IDLE_NO_STATS_FRESH),
+            ("after a compaction", IDLE_NO_STATS_AFTER_COMPACT),
+            ("the same shape at 43 columns", IDLE_NO_STATS_NARROW),
+        ] {
+            assert!(
+                screen_shows_a_prompt(screen),
+                "a label-only context row is a prompt ({what})"
+            );
+        }
+        assert!(
+            screen_shows_a_prompt(IDLE_WITH_STATS_AFTER_TURN),
+            "the counter's return is still a prompt"
+        );
+
+        // A path with a colon is ordinary tool output too, and mid-turn it must
+        // not read as a prompt: the progress row in the last three lines wins.
+        let working_with_a_path_above =
+            "    edited src/cmd/ship.rs:128\n\n  es...upt   1 shell  721.4K (72%)\n";
+        assert!(
+            !screen_shows_a_prompt(working_with_a_path_above),
+            "a progress row under a file path is still a turn"
+        );
+        let path_as_last_line_mid_turn = "    cargo test\n\n  /Users/bangedorrunt/workspace/flywheel/src/cmd/ship.rs:128\n  es...upt   1 shell  721.4K (72%)\n";
+        assert!(
+            !screen_shows_a_prompt(path_as_last_line_mid_turn),
+            "the progress row is last, so nothing below it can be a footer"
+        );
+        // A URL is not a path:label footer.
+        assert!(
+            !screen_shows_a_prompt("    see https://example.com/a:b for the reason\n"),
+            "a URL must not read as a context row"
+        );
+        // And the stability rule still gates the new shape.
+        let (first, sample) = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            None,
+            IDLE_NO_STATS_FRESH,
+            1_000,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            first,
+            AgentStatus::Working,
+            "one capture of the new shape is still not enough"
+        );
+        let (second, _) = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            sample,
+            IDLE_NO_STATS_FRESH,
+            1_000 + PROMPT_STABLE_SECS,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            second,
+            AgentStatus::Idle,
+            "a stable label-only footer overrules a stale working record"
         );
     }
 
