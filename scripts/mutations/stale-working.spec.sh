@@ -30,8 +30,15 @@ mutation "D2  the screen overrules a FRESH working record" \
     find='            && record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS)' \
     replace='            && true'
 
-mutation "D3  a mid-turn screen reads as a prompt" \
+mutation "D3  the context row must start with / again (the live narrow footer)" \
     file=$REX \
     expect=a_stale_working_record_is_overruled_by_the_idle_footer \
-    find='                trimmed.starts_with('"'"'/'"'"')' \
-    replace='                true'
+    find='        let row = line.trim_end();' \
+    replace='        let row = line.trim_end();
+        if !row.trim_start().starts_with('"'"'/'"'"') { return false; }'
+
+mutation "D4  the progress markers are not consulted" \
+    file=$REX \
+    expect=a_stale_working_record_is_overruled_by_the_idle_footer \
+    find='        let lower = row.to_ascii_lowercase();' \
+    replace='        let lower = String::new();'

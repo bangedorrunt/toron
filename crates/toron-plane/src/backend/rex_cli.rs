@@ -1222,12 +1222,16 @@ pub mod rex_map {
 
     /// Does this screen show a pane AT A PROMPT?
     ///
-    /// opencode's footer has two shapes. At a prompt the lower line is the
-    /// context row, flush left, ending in the window percentage
-    /// (`/flywheel:adr-0021-stage-  577.5K (58%)`). During a turn that row is
-    /// replaced by the indented progress row
-    /// (`  es...upt   1 shell  721.4K (72%)`). Both fixtures are in the tests,
-    /// captured from the live panes on 2026-11-15.
+    /// The footer's SHAPE decides, never its first character: opencode elides
+    /// BOTH ends of the context row on a narrow pane, so the live capture reads
+    /// `…/flywheel:adr-0021-stage-…  767.9K (77%)` and any check on the leading
+    /// `/` misses it (bd-0uzrq.10 live leg, 09:28).
+    ///
+    /// At a prompt the footer's lower line is the context row: it ends in the
+    /// window percentage `(NN%)`. During a turn that row is replaced by the
+    /// progress row, which carries `N shell` and the truncated interrupt hint
+    /// (`es...upt   1 shell  770.3K (77%)`) or the `↓` jump marker. So: a
+    /// percentage ending, minus the progress markers.
     #[must_use]
     pub fn screen_shows_a_prompt(screen: &str) -> bool {
         screen
@@ -1235,14 +1239,31 @@ pub mod rex_map {
             .rev()
             .filter(|line| !line.trim().is_empty())
             .take(3)
-            .any(|line| {
-                let row = line.trim_end();
-                let trimmed = row.trim_start();
-                // The prompt rises to column 1; a turn's progress row is
-                // indented. The percentage window is what makes it the footer
-                // rather than some `/command` in the transcript.
-                trimmed.starts_with('/') && row.ends_with(')') && row.matches('%').count() == 1
-            })
+            .any(is_context_row)
+    }
+
+    /// One footer line: a context row ends in `(NN%)`; a progress row carries
+    /// the shell counter, the interrupt hint, or the jump marker.
+    fn is_context_row(line: &str) -> bool {
+        let row = line.trim_end();
+        let Some(open) = row.rfind('(') else {
+            return false;
+        };
+        let tail = &row[open + 1..];
+        let Some(pct) = tail.strip_suffix(')') else {
+            return false;
+        };
+        let Some(digits) = pct.strip_suffix('%') else {
+            return false;
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let lower = row.to_ascii_lowercase();
+        if lower.contains("shell") || lower.contains("esc") || row.contains('\u{2193}') {
+            return false;
+        }
+        true
     }
 
     /// Age of the newest `program_status` record, in seconds, from its
@@ -1706,13 +1727,20 @@ mod wire_contract_tests {
         {"id":"ses_e24d69cd7ffeC1B6BlnKWvUz6z","state":"working","app":"opencode","effective_app":"opencode","title":"Toron new work wm 352","updated_at":"2026-11-15T18:56:36.144927+11:00","owner":{"pid":88709,"name":"opencode.exe"}}
     ]}"#;
 
-    /// The same pane's screen at that moment: the idle footer, with the context
-    /// row starting at column 1 and no shell counter.
-    const IDLE_SCREEN: &str = "    identity.\n\n    Build  DeepSeek V4.1 Flash 1017\n    43.6s  58.2 tok/s\n\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n /flywheel:adr-0021-stage-  577.5K (58%)\n";
+    /// The idle footer at three widths. opencode elides BOTH ends of the
+    /// context row when the pane is narrow, so the live 09:28 capture (narrow)
+    /// starts with `…`, not `/`. The wide one is block 77a480's real capture;
+    /// the default width sits between them (same row, no elision).
+    const IDLE_SCREEN_NARROW: &str = "    Nothing installed all cycle; every\n    proof built its own binary in the\n    export.\n\n    Build  DeepSeek V4.1 Flash 1017\n    59m 45s  40.6 tok/s\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n \u{2026}/flywheel:adr-0021-stage-\u{2026}  767.9K (77%)\n";
+    const IDLE_SCREEN_DEFAULT: &str = "    Nothing installed all cycle.\n\n    Build  DeepSeek V4.1 Flash 1017\n    59m 45s  40.6 tok/s\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n /flywheel:adr-0021-stage-30412  767.9K (77%)\n";
+    const IDLE_SCREEN_WIDE: &str = "    identity.\n\n    Build  DeepSeek V4.1 Flash 1017\n    43.6s  58.2 tok/s\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n /flywheel:adr-0021-stage-  577.5K (58%)\n";
 
-    /// The screen of a pane mid-turn: the progress row is indented and carries
-    /// the background-shell count (truncated interrupt hint included).
-    const WORKING_SCREEN: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a48\n\n                          Jump to latest\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  721.4K (72%)\n";
+    /// The progress row at three widths: the shell counter and the truncated
+    /// interrupt hint survive every width. Narrow is this pane's live capture
+    /// (block 01a1d6a1, 770.3K); wide is the same pane mid-turn at 721.4K.
+    const WORKING_SCREEN_NARROW: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in\n\n                          Jump to latest\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  770.3K (77%)\n";
+    const WORKING_SCREEN_DEFAULT: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a48\n\n                          Jump to latest\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  750.1K (75%)\n";
+    const WORKING_SCREEN_WIDE: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a480 34b981; do\n\n                          Jump to latest\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  721.4K (72%)\n";
 
     /// An idle capture, from block 77a480 at the same instant: records say
     /// `idle` and the screen agrees. Both signals on the same side.
@@ -1730,42 +1758,58 @@ mod wire_contract_tests {
             super::rex_map::status_from_program_status(&records),
             AgentStatus::Working
         );
-        assert!(
-            screen_shows_a_prompt(IDLE_SCREEN),
-            "the idle footer is recognised"
-        );
-        assert!(
-            !screen_shows_a_prompt(WORKING_SCREEN),
-            "a mid-turn screen is not a prompt"
-        );
+        for (width, screen) in [
+            ("narrow", IDLE_SCREEN_NARROW),
+            ("default", IDLE_SCREEN_DEFAULT),
+            ("wide", IDLE_SCREEN_WIDE),
+        ] {
+            assert!(
+                screen_shows_a_prompt(screen),
+                "the idle footer is recognised at {width} width"
+            );
+        }
+        for (width, screen) in [
+            ("narrow", WORKING_SCREEN_NARROW),
+            ("default", WORKING_SCREEN_DEFAULT),
+            ("wide", WORKING_SCREEN_WIDE),
+        ] {
+            assert!(
+                !screen_shows_a_prompt(screen),
+                "a mid-turn footer is not a prompt at {width} width"
+            );
+        }
 
         // Stale past the threshold: the screen wins.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, Some(STALE_WORKING_SECS), IDLE_SCREEN),
+            status_with_screen(
+                AgentStatus::Working,
+                Some(STALE_WORKING_SECS),
+                IDLE_SCREEN_NARROW
+            ),
             AgentStatus::Idle,
             "a silent working record over an idle footer is idle"
         );
         // Fresh: the record wins. A turn's tail can look idle between tools.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, Some(5), IDLE_SCREEN),
+            status_with_screen(AgentStatus::Working, Some(5), IDLE_SCREEN_NARROW),
             AgentStatus::Working,
             "a fresh record is never overruled"
         );
         // Stale but the screen shows a turn: the record wins.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, Some(600), WORKING_SCREEN),
+            status_with_screen(AgentStatus::Working, Some(600), WORKING_SCREEN_NARROW),
             AgentStatus::Working,
             "a working screen confirms the record"
         );
         // An unknown age never overrules.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, None, IDLE_SCREEN),
+            status_with_screen(AgentStatus::Working, None, IDLE_SCREEN_NARROW),
             AgentStatus::Working,
             "no age, no overrule"
         );
         // Other statuses are not touched.
         assert_eq!(
-            status_with_screen(AgentStatus::Idle, Some(600), WORKING_SCREEN),
+            status_with_screen(AgentStatus::Idle, Some(600), WORKING_SCREEN_NARROW),
             AgentStatus::Idle
         );
     }
@@ -1806,6 +1850,6 @@ mod wire_contract_tests {
     fn an_idle_record_needs_no_screen() {
         let records: Value = serde_json::from_str(IDLE_RECORDS).unwrap();
         assert_eq!(status_from_program_status(&records), AgentStatus::Idle);
-        assert!(screen_shows_a_prompt(IDLE_SCREEN));
+        assert!(screen_shows_a_prompt(IDLE_SCREEN_NARROW));
     }
 }
