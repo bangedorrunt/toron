@@ -1260,10 +1260,7 @@ pub mod rex_map {
             return false;
         }
         let lower = row.to_ascii_lowercase();
-        if lower.contains("shell") || lower.contains("esc") || row.contains('\u{2193}') {
-            return false;
-        }
-        true
+        !(lower.contains("shell") || lower.contains("esc") || row.contains('\u{2193}'))
     }
 
     /// Age of the newest `program_status` record, in seconds, from its
