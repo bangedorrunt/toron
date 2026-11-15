@@ -1302,11 +1302,21 @@ pub mod rex_map {
             || lines.iter().any(|line| is_label_only_context_row(line))
     }
 
-    /// The progress row: the shell counter, the truncated interrupt hint, or the
-    /// jump marker. Never a prompt, whatever else it carries.
+    /// The progress row: the interrupt hint. A turn in flight always offers the
+    /// way to stop it, and nothing else in the footer does.
+    ///
+    /// The hint elides in the middle on a narrow pane — `es...upt` for `esc
+    /// interrupt` — so both forms count (bd-0uzrq.19).
+    ///
+    /// The shell counter and the `↓` jump marker are NOT turn markers: the same
+    /// footer carries them at a FINISHED turn while a background shell still
+    /// runs (`…/flywheel:adr…  ↓ 1 shell · 112.9K (43%)`, PurpleGorge live at
+    /// 14:52Z). Vetoing on those made exactly the stale-`working` case .10
+    /// exists for — opencode never emits idle after a turn that ran a
+    /// background shell — impossible to overrule.
     fn is_progress_row(line: &str) -> bool {
         let lower = line.to_ascii_lowercase();
-        lower.contains("shell") || lower.contains("esc") || line.contains('\u{2193}')
+        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")
     }
 
     /// One footer line that ends in `(NN%)` and is not the progress row.
@@ -1837,6 +1847,19 @@ mod wire_contract_tests {
     const WORKING_SCREEN_DEFAULT: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a48\n\n                          Jump to latest\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  750.1K (75%)\n";
     const WORKING_SCREEN_WIDE: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a480 34b981; do\n\n                          Jump to latest\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  721.4K (72%)\n";
 
+    /// bd-0uzrq.19: an IDLE footer that still offers a background shell and the
+    /// jump marker. Live capture, PurpleGorge block 01a1d6a2-6ed7 at 14:52Z:
+    /// the answer had finished (rex record `idle`) while a background e2e run
+    /// kept going. This is the .10 shape — opencode emits no `idle` after such a
+    /// turn — so the footer, not the record, has to be believed here.
+    const IDLE_WITH_BACKGROUND_SHELL: &str =
+        "    I’ll mail SlateHarbor with the receipt.\n\n\n ┃  auto Iceman Contributor Free\n\n …/flywheel:adr…  ↓ 1 shell · 112.9K (43%)\n";
+
+    /// The same pane mid-turn at two widths: the interrupt hint is what marks a
+    /// live turn, elided or not.
+    const WORKING_INTERRUPT_HINT: &str = "  DeepSeek V4.1 Flash 1017  high\n\n  ⬝⬝⬝ esc interrupt  200.7K (20%)\n";
+    const WORKING_TRUNCATED_HINT: &str = "  DeepSeek V4.1 Flash 1017  high\n\n  es...upt  ↓ 1 shell  770.3K (77%)\n";
+
     /// bd-0uzrq.15: the SAME 2.2.7 pane (80 cols, scratch session 01a1df74)
     /// through one session's life. The counter is a property of the session's
     /// context accounting, not of width or of the pane's history.
@@ -2044,6 +2067,55 @@ mod wire_contract_tests {
             second,
             AgentStatus::Idle,
             "a stable label-only footer overrules a stale working record"
+        );
+    }
+
+    /// bd-0uzrq.19: the turn marker is the interrupt hint, never the shell
+    /// counter. A FINISHED turn that ran a background shell keeps the counter
+    /// and the jump marker, and opencode emits no `idle` after such a turn, so
+    /// a veto on `shell`/`↓` left exactly the .10 case unoverrulable.
+    #[test]
+    fn a_background_shell_at_idle_is_a_prompt() {
+        assert!(
+            screen_shows_a_prompt(IDLE_WITH_BACKGROUND_SHELL),
+            "an idle footer that still lists a background shell is a prompt"
+        );
+        for (what, screen) in [
+            ("the elided hint", WORKING_TRUNCATED_HINT),
+            ("the full hint", WORKING_INTERRUPT_HINT),
+        ] {
+            assert!(
+                !screen_shows_a_prompt(screen),
+                "a live turn is not a prompt ({what})"
+            );
+        }
+
+        // .14 still gates it: one capture could be a tool-call gap.
+        let (first, sample) = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            None,
+            IDLE_WITH_BACKGROUND_SHELL,
+            1_000,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            first,
+            AgentStatus::Working,
+            "one capture of the idle-with-shell footer is not enough"
+        );
+        let (second, _) = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            sample,
+            IDLE_WITH_BACKGROUND_SHELL,
+            1_000 + PROMPT_STABLE_SECS,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            second,
+            AgentStatus::Idle,
+            "a stable idle-with-shell footer overrules a stale working record"
         );
     }
 

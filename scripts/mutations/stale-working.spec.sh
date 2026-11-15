@@ -14,7 +14,7 @@
 # capture), covered by the live leg.
 
 CARGO_ARGS=(-p toron-plane --lib)
-TEST_FILTER=(stale_working idle_footer record_age tool_call_gap context_row)
+TEST_FILTER=(stale_working idle_footer record_age tool_call_gap context_row background_shell)
 
 REX=crates/toron-plane/src/backend/rex_cli.rs
 
@@ -42,6 +42,18 @@ mutation "D4  the progress markers are not consulted" \
     expect=a_stale_working_record_is_overruled_by_the_idle_footer \
     find='        let lower = line.to_ascii_lowercase();' \
     replace='        let lower = String::new();' 
+
+mutation "D10 the shell counter is a turn marker again (bd-0uzrq.19)" \
+    file=$REX \
+    expect=a_background_shell_at_idle_is_a_prompt \
+    find='        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
+    replace='        lower.contains("shell") || lower.contains("esc")'
+
+mutation "D11 nothing marks a live turn" \
+    file=$REX \
+    expect=a_background_shell_at_idle_is_a_prompt \
+    find='        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
+    replace='        false'
 
 mutation "D5  a single capture counts as a stable footer" \
     file=$REX \
