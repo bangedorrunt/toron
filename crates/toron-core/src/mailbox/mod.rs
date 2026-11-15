@@ -717,6 +717,33 @@ pub async fn collect_replay(bus: &dyn Bus, filter: Filter) -> Result<Vec<Event>,
     Ok(events)
 }
 
+/// [`collect_replay`] that must reach its EOSE marker (bd-0uzrq.12).
+///
+/// A subscription that ends early — a `Closed` frame, a relay EOSE deadline, a
+/// dropped sender — is a TRUNCATED history, not a short one. For a caller that
+/// answers "what exists" (the lease board, a conflict board) the two are
+/// indistinguishable, so a truncation reads as "nothing exists" and the claim
+/// is granted from an empty board. That is fail-open on the exact question the
+/// reservation exists to answer, so this variant refuses instead.
+pub async fn collect_replay_to_eose(bus: &dyn Bus, filter: Filter) -> Result<Vec<Event>, BusError> {
+    let mut sub = bus.subscribe(filter).await?;
+    let mut events = Vec::new();
+    while let Some(item) = sub.next().await {
+        match item {
+            SubscriptionEvent::Event(e) => events.push(e),
+            SubscriptionEvent::Eose => return Ok(events),
+            SubscriptionEvent::Closed(why) => {
+                return Err(BusError::Subscription(format!(
+                    "subscription closed before EOSE ({why}): history is truncated, not empty"
+                )));
+            }
+        }
+    }
+    Err(BusError::Subscription(
+        "subscription ended before EOSE: history is truncated, not empty".to_string(),
+    ))
+}
+
 /// Rebuild gate for the inbound unwrap pipeline (bd-gtqe).
 ///
 /// A pipeline build is expensive: it queries the agents roster and fans out

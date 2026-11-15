@@ -534,6 +534,14 @@ struct AcquireProbe {
     now_us: i64,
 }
 
+/// Expired-lease mirror row, in SELECT order: agent pubkey, path pattern,
+/// reason, exclusive, expires_ts_us, event id, epoch.
+type ExpiredMirror = (String, String, String, i64, i64, Option<String>, i64);
+
+/// Per-lease metadata the kernel needs beside the model: holder NAME, status,
+/// and the lease reason (bead id for `release-by-reason`).
+type LeaseMeta = std::collections::HashMap<String, (String, ReservationStatus, String)>;
+
 impl Mailbox {
     /// Acquire reservations explicitly scoped with an [`AttemptToken`].
     pub async fn file_reservation_with_token(
@@ -605,7 +613,7 @@ impl Mailbox {
 
         for path in paths {
             let now_us = Self::kernel_now_us();
-            let (mut model, meta) = self.kernel_model_for(project_slug).await;
+            let (mut model, meta) = self.try_kernel_model_for(project_slug).await?;
             let closed_beads = if closed_bead_reconcile_enabled() {
                 closed_bead_ids_from_cwd_ancestors()
             } else {
@@ -880,7 +888,7 @@ impl Mailbox {
         };
         for path in paths {
             let now_us = Self::kernel_now_us();
-            let (mut model, meta) = self.kernel_model_for(project_slug).await;
+            let (mut model, meta) = self.try_kernel_model_for(project_slug).await?;
             let closed_beads = if closed_bead_reconcile_enabled() {
                 closed_bead_ids_from_cwd_ancestors()
             } else {
@@ -1725,7 +1733,7 @@ impl Mailbox {
         project_slug: &str,
     ) -> anyhow::Result<Vec<ResolvedLease>> {
         let filter = kind_project_filter(toron_kind(FILE_RESERVATION), project_slug);
-        let events = collect_replay(self.bus.as_ref(), filter).await?;
+        let events = super::collect_replay_to_eose(self.bus.as_ref(), filter).await?;
         let operator = self.operator.as_ref().map(nostr::key::Keys::public_key);
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut out = Self::resolve_leases_from_events(&events, operator, now_secs);
@@ -1750,19 +1758,18 @@ impl Mailbox {
             // lease event (`expires_at <= now`), so re-deriving the epoch from
             // the event was a race (it read 0 after a prune and broke the
             // holder's fencing check). The row's own stamp is the authority.
-            let expired_mirrors: Vec<(String, String, String, i64, i64, Option<String>, i64)> =
-                sqlx::query_as(
-                    "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
+            let expired_mirrors: Vec<ExpiredMirror> = sqlx::query_as(
+                "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
                      expires_ts_us, event_id, epoch \
                      FROM file_reservations \
                      WHERE project_slug = ?1 AND status = 'active' \
                        AND expires_ts_us IS NOT NULL AND expires_ts_us <= ?2",
-                )
-                .bind(project_slug)
-                .bind(now_us)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+            )
+            .bind(project_slug)
+            .bind(now_us)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
             for (pubkey, path, reason, excl, exp_us, event_id, row_epoch) in expired_mirrors {
                 let dup_self = out
                     .iter()
@@ -2159,22 +2166,30 @@ impl Mailbox {
 
     /// Build the kernel model from projected leases (bd-y6t7): the host
     /// owns I/O (bus replay, mirrors, names); the tick owns grant/deny.
-    /// Only Held/Intent rows decide — terminal markers never reach the
-    /// kernel. Errors degrade to an empty model (same as the old inline view:
-    /// no rows, no conflicts).
-    async fn kernel_model_for(
+    /// Only Held/Intent rows decide — terminal markers never reach the kernel.
+    ///
+    /// A board that could not be built is a REFUSAL, not an empty board
+    /// (bd-0uzrq.12): every caller that decides a grant fetches it through
+    /// [`Self::try_kernel_model_for`]. [`Self::kernel_model_for`] keeps the
+    /// stale-snapshot fallback for write-only callers, where a miss can only
+    /// fail in the safe direction.
+    async fn try_kernel_model_for(
         &self,
         project_slug: &str,
-    ) -> (
-        KernelModel,
-        std::collections::HashMap<String, (String, ReservationStatus, String)>,
-    ) {
+    ) -> anyhow::Result<(KernelModel, LeaseMeta)> {
+        let leases = self.resolved_leases(project_slug).await?;
+        let names = self.agent_name_map(project_slug).await;
+        Ok(Self::kernel_model_from(leases, &names))
+    }
+
+    async fn kernel_model_for(&self, project_slug: &str) -> (KernelModel, LeaseMeta) {
         let leases = match self.resolved_leases(project_slug).await {
             Ok(leases) => leases,
             Err(error) => {
-                // A failed bus projection must not collapse to an empty lease
-                // board and grant a conflicting acquire. The persisted kernel
-                // snapshot is stale by definition, but it is fail-closed.
+                // Write-only paths (renew/release/transfer) degrade to the
+                // persisted snapshot: a renew that misses is safe (the lease
+                // expires) and a release that misses is safe (the lease
+                // lingers). No GRANT is decided from this.
                 tracing::warn!("reservation projection read failed ({project_slug}): {error}");
                 return (
                     self.persisted_kernel_model(project_slug)
@@ -2185,6 +2200,13 @@ impl Mailbox {
             }
         };
         let names = self.agent_name_map(project_slug).await;
+        Self::kernel_model_from(leases, &names)
+    }
+
+    fn kernel_model_from(
+        leases: Vec<ResolvedLease>,
+        names: &std::collections::HashMap<String, String>,
+    ) -> (KernelModel, LeaseMeta) {
         let mut model = KernelModel::new();
         let mut meta = std::collections::HashMap::new();
         for l in leases {
@@ -2254,7 +2276,7 @@ impl Mailbox {
     /// self-reconciliation) so they do not block incoming acquires.
     fn kernel_blockers_for(
         model: &KernelModel,
-        meta: &std::collections::HashMap<String, (String, ReservationStatus, String)>,
+        meta: &LeaseMeta,
         probe: &AcquireProbe,
     ) -> Vec<(String, String, ReservationStatus)> {
         use super::reservations_core::{KernelEffect, KernelMsg};
@@ -3354,6 +3376,123 @@ mod tests {
             .with_agent_passphrase(PASSPHRASE)
             .with_index_pool(pool);
         (mailbox, db_path, data_dir)
+    }
+
+    /// A bus whose SUBSCRIPTIONS can be truncated on demand while publish and
+    /// health still reach the real store (bd-0uzrq.12): the shape of a relay
+    /// that hits its EOSE deadline, or a sender that dies mid-replay.
+    struct TruncatedReplayBus {
+        inner: Arc<InProcessBus>,
+        truncated: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for TruncatedReplayBus {
+        async fn publish(&self, event: crate::nostr::Event) -> Result<PublishOk, BusError> {
+            self.inner.publish(event).await
+        }
+
+        async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
+            if !self.truncated.load(Ordering::SeqCst) {
+                return self.inner.subscribe(filter).await;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(crate::bus::SubscriptionEvent::Closed(
+                        "relay EOSE deadline".to_string(),
+                    ))
+                    .await;
+            });
+            Ok(Subscription::new(
+                crate::bus::SubscriptionId::new("truncated"),
+                rx,
+            ))
+        }
+
+        async fn subscribe_trusted(&self, filter: Filter) -> Result<Subscription, BusError> {
+            self.subscribe(filter).await
+        }
+
+        async fn health(&self) -> Result<Health, BusError> {
+            self.inner.health().await
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn test_mailbox_truncatable(
+        tag: &str,
+    ) -> (
+        Mailbox,
+        Arc<AtomicBool>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db_path =
+            std::env::temp_dir().join(format!("toron-res-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let truncated = Arc::new(AtomicBool::new(false));
+        let wrapper = TruncatedReplayBus {
+            inner: bus,
+            truncated: truncated.clone(),
+        };
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-res-data-{tag}-{}", uuid::Uuid::new_v4()));
+        let mailbox = Mailbox::new(
+            Arc::new(wrapper),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase(PASSPHRASE)
+        .with_index_pool(pool);
+        (mailbox, truncated, db_path, data_dir)
+    }
+
+    /// bd-0uzrq.12: a replay that cannot complete is a REFUSAL, never an empty
+    /// board. The control half proves the SAME claim is granted while the
+    /// replay is intact, so the refusal is caused by the truncation and not by
+    /// the claim or the identity.
+    #[tokio::test]
+    async fn a_replay_that_cannot_read_refuses_the_acquire() {
+        let (mailbox, truncated, db_path, data_dir) = test_mailbox_truncatable("fail-closed").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        let path = vec!["src/failclosed.rs".to_string()];
+        let control = mailbox
+            .file_reservation_paths("demo", "BlueLake", &path, Some(60), true, Some("control"))
+            .await;
+        assert_eq!(
+            control.expect("the intact replay grants").granted.len(),
+            1,
+            "control: an intact board grants the claim"
+        );
+
+        truncated.store(true, Ordering::SeqCst);
+        let refused = mailbox
+            .file_reservation_paths("demo", "BlueLake", &path, Some(60), true, Some("truncated"))
+            .await;
+        assert!(
+            refused.is_err(),
+            "a truncated replay must REFUSE the claim, never grant from an empty board: {refused:?}"
+        );
+        assert!(
+            formats_truncation(refused.as_ref().err()),
+            "the refusal must name the truncation, not read as a bare grant/conflict: {refused:?}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    fn formats_truncation(error: Option<&anyhow::Error>) -> bool {
+        error.is_some_and(|e| format!("{e:#}").contains("EOSE"))
     }
 
     /// Two mailboxes over ONE store: separate bus instances (own subscriber
