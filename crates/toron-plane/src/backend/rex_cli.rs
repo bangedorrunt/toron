@@ -1195,6 +1195,13 @@ pub mod rex_map {
     /// between two tool calls; two minutes of silence cannot be a turn.
     pub const STALE_WORKING_SECS: u64 = 120;
 
+    /// How long the idle footer must stay IDENTICAL before it counts as a turn
+    /// that ended (bd-0uzrq.14). opencode re-renders its idle footer in the gap
+    /// between two tool calls, so one capture that looks like a prompt is not
+    /// evidence — the live 11:12:37Z ring was typed into a running turn whose
+    /// commits bracket the drain.
+    pub const PROMPT_STABLE_SECS: i64 = 10;
+
     /// The ONE idle detector, shared by every consumer of a rex status (the
     /// captain watch and the dispatcher both reach it through `block_state`).
     ///
@@ -1204,20 +1211,62 @@ pub mod rex_map {
     /// turn that ran a background shell, so the record sits at `working`
     /// forever while the pane is at its prompt. The second signal is the
     /// screen: when a stale `working` record is contradicted by opencode's
-    /// idle footer, believe the screen.
+    /// idle footer, believe the screen — but only once that footer has been
+    /// STABLE, because a single capture cannot tell a tool-call gap from a
+    /// finished turn (bd-0uzrq.14).
+    ///
+    /// `prev` is the last sample this detector returned for the pin. The
+    /// sample carries a digest of the capture and the instant it was first
+    /// seen; an identical digest on a later capture keeps that instant, so the
+    /// caller only has to remember the last returned sample.
     #[must_use]
-    pub fn status_with_screen(
+    pub fn status_with_stable_screen(
         status: AgentStatus,
         record_age_secs: Option<u64>,
+        prev: Option<PromptSample>,
         screen: &str,
-    ) -> AgentStatus {
-        if status == AgentStatus::Working
-            && record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS)
-            && screen_shows_a_prompt(screen)
-        {
-            return AgentStatus::Idle;
+        now_unix: i64,
+        min_stable_secs: i64,
+    ) -> (AgentStatus, Option<PromptSample>) {
+        let stale = record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS);
+        if status != AgentStatus::Working || !stale || !screen_shows_a_prompt(screen) {
+            return (status, None);
         }
-        status
+        let digest = screen_prompt_digest(screen);
+        let sample = match prev {
+            Some(p) if p.digest == digest => p,
+            _ => PromptSample {
+                digest,
+                first_seen_unix: now_unix,
+            },
+        };
+        let stable = now_unix.saturating_sub(sample.first_seen_unix) >= min_stable_secs;
+        let verdict = if stable {
+            AgentStatus::Idle
+        } else {
+            AgentStatus::Working
+        };
+        (verdict, Some(sample))
+    }
+
+    /// One retained sample of an at-prompt capture: what the screen said and
+    /// when this detector first saw it say that.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PromptSample {
+        pub digest: u64,
+        pub first_seen_unix: i64,
+    }
+
+    /// Digest of a capture, for "is this the same screen?". FNV-1a: stable
+    /// across runs and cheap on a pane-sized string.
+    #[must_use]
+    pub fn screen_prompt_digest(screen: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in screen.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 
     /// Does this screen show a pane AT A PROMPT?
@@ -1547,8 +1596,8 @@ pub mod rex_map {
 #[cfg(test)]
 mod wire_contract_tests {
     use super::rex_map::{
-        STALE_WORKING_SECS, newest_record_age_secs, screen_shows_a_prompt,
-        status_from_program_status, status_with_screen,
+        PROMPT_STABLE_SECS, STALE_WORKING_SECS, newest_record_age_secs, screen_shows_a_prompt,
+        status_from_program_status, status_with_stable_screen,
     };
     use super::*;
     use crate::backend::AgentStatus;
@@ -1776,38 +1825,161 @@ mod wire_contract_tests {
             );
         }
 
-        // Stale past the threshold: the screen wins.
-        assert_eq!(
-            status_with_screen(
-                AgentStatus::Working,
-                Some(STALE_WORKING_SECS),
-                IDLE_SCREEN_NARROW
-            ),
-            AgentStatus::Idle,
-            "a silent working record over an idle footer is idle"
+        // Stale past the threshold, and the footer has now been stable for
+        // longer than the minimum: the screen wins.
+        let first = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            None,
+            IDLE_SCREEN_NARROW,
+            1_000,
+            PROMPT_STABLE_SECS,
         );
-        // Fresh: the record wins. A turn's tail can look idle between tools.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, Some(5), IDLE_SCREEN_NARROW),
+            first.0,
+            AgentStatus::Working,
+            "ONE capture never overrules — it could be a tool-call gap"
+        );
+        let second = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(STALE_WORKING_SECS),
+            first.1,
+            IDLE_SCREEN_NARROW,
+            1_000 + PROMPT_STABLE_SECS,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            second.0,
+            AgentStatus::Idle,
+            "a stable idle footer over a silent working record is idle"
+        );
+        // Fresh: the record wins, and no screen evidence is even considered.
+        let fresh = status_with_stable_screen(
+            AgentStatus::Working,
+            Some(5),
+            None,
+            IDLE_SCREEN_NARROW,
+            1_000,
+            PROMPT_STABLE_SECS,
+        );
+        assert_eq!(
+            fresh.0,
             AgentStatus::Working,
             "a fresh record is never overruled"
         );
+        assert!(
+            fresh.1.is_none(),
+            "a fresh record needs no screen evidence at all"
+        );
         // Stale but the screen shows a turn: the record wins.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, Some(600), WORKING_SCREEN_NARROW),
+            status_with_stable_screen(
+                AgentStatus::Working,
+                Some(600),
+                None,
+                WORKING_SCREEN_NARROW,
+                1_000,
+                PROMPT_STABLE_SECS
+            )
+            .0,
             AgentStatus::Working,
             "a working screen confirms the record"
         );
         // An unknown age never overrules.
         assert_eq!(
-            status_with_screen(AgentStatus::Working, None, IDLE_SCREEN_NARROW),
+            status_with_stable_screen(
+                AgentStatus::Working,
+                None,
+                None,
+                IDLE_SCREEN_NARROW,
+                1_000,
+                PROMPT_STABLE_SECS
+            )
+            .0,
             AgentStatus::Working,
             "no age, no overrule"
         );
         // Other statuses are not touched.
         assert_eq!(
-            status_with_screen(AgentStatus::Idle, Some(600), WORKING_SCREEN_NARROW),
+            status_with_stable_screen(
+                AgentStatus::Idle,
+                Some(600),
+                None,
+                WORKING_SCREEN_NARROW,
+                1_000,
+                PROMPT_STABLE_SECS
+            )
+            .0,
             AgentStatus::Idle
+        );
+    }
+
+    /// bd-0uzrq.14: opencode re-renders its idle footer in the gap between two
+    /// tool calls, so ONE capture that looks like a prompt is not a finished
+    /// turn. The live proof is the 11:12:37Z ring: the turn's commits bracket
+    /// the drain (11:01:00Z .. 11:14:04Z), so the pane was at a tool-call gap.
+    #[test]
+    fn a_tool_call_gap_is_not_a_finished_turn() {
+        let fold = |prev, screen: &str, now: i64| {
+            status_with_stable_screen(
+                AgentStatus::Working,
+                Some(STALE_WORKING_SECS),
+                prev,
+                screen,
+                now,
+                PROMPT_STABLE_SECS,
+            )
+        };
+
+        // One capture: still working, however perfect the footer looks.
+        let (verdict, sample) = fold(None, IDLE_SCREEN_NARROW, 1_000);
+        assert_eq!(
+            verdict,
+            AgentStatus::Working,
+            "a single capture cannot tell a gap from a finished turn"
+        );
+        assert!(sample.is_some(), "the first capture is remembered");
+
+        // Two captures CLOSER than the minimum: still working.
+        let (verdict, _) = fold(sample, IDLE_SCREEN_NARROW, 1_000 + PROMPT_STABLE_SECS - 1);
+        assert_eq!(
+            verdict,
+            AgentStatus::Working,
+            "the footer must hold for the whole minimum"
+        );
+
+        // Two captures with different content: the gap changed, so it was not
+        // an idle pane — a prompt does not redraw between tools.
+        let (verdict, moved) = fold(sample, IDLE_SCREEN_DEFAULT, 1_000 + PROMPT_STABLE_SECS);
+        assert_eq!(
+            verdict,
+            AgentStatus::Working,
+            "a footer that changed is not stable"
+        );
+        assert_ne!(
+            moved.map(|s| s.first_seen_unix),
+            Some(1_000),
+            "a different screen restarts the clock"
+        );
+
+        // The second capture shows a turn: working, whatever the digest says.
+        let (verdict, _) = fold(
+            sample,
+            WORKING_SCREEN_NARROW,
+            1_000 + PROMPT_STABLE_SECS * 3,
+        );
+        assert_eq!(
+            verdict,
+            AgentStatus::Working,
+            "a progress row means the turn is running"
+        );
+
+        // Same footer, far enough apart: the turn is over.
+        let (verdict, _) = fold(sample, IDLE_SCREEN_NARROW, 1_000 + PROMPT_STABLE_SECS);
+        assert_eq!(
+            verdict,
+            AgentStatus::Idle,
+            "a footer that has not moved for the minimum IS a finished turn"
         );
     }
 

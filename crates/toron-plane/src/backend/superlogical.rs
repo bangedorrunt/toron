@@ -19,6 +19,8 @@
 //! `Result`. No elm-effect program.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
@@ -30,9 +32,10 @@ use crate::backend::rex_cli;
 
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
-    STALE_WORKING_SECS, board_of, capture_format, child_exit_from_line, newest_record_age_secs,
-    parse_process_view, split_direction, state_labels_from_board, status_for_block,
-    status_from_program_status, status_with_screen,
+    PROMPT_STABLE_SECS, PromptSample, STALE_WORKING_SECS, board_of, capture_format,
+    child_exit_from_line, newest_record_age_secs, parse_process_view, split_direction,
+    state_labels_from_board, status_for_block, status_from_program_status,
+    status_with_stable_screen,
 };
 use rex_cli::{
     Rex, RexBlock, RexEventStream, RexFail, RexSession, RexTarget, block_close_args, capture_args,
@@ -84,6 +87,14 @@ pub fn subscribe_session(
 /// Superlogical backend over the `rex` CLI.
 pub struct SuperlogicalBackend;
 
+/// The last at-prompt capture per `session/block`, so the idle verdict can
+/// require a STABLE footer across two observations (bd-0uzrq.14). Both
+/// consumers reach `block_state` as static calls, so the sample has to live
+/// beside them; entries older than an hour are dropped on the next insert.
+fn prompt_samples() -> &'static Mutex<HashMap<String, PromptSample>> {
+    static SAMPLES: OnceLock<Mutex<HashMap<String, PromptSample>>> = OnceLock::new();
+    SAMPLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 /// bd-rex-reliability-ioyz (A+B): create ONE crew block with the pin label
 /// **at creation** and `--keep-open`.
 ///
@@ -238,6 +249,10 @@ impl SuperlogicalBackend {
         // says working AND the record has been silent past the threshold do we
         // pay for a screen capture, and only the screen can overrule it. This
         // is the ONE detector: every consumer reaches it through here.
+        // bd-0uzrq.14: one capture is not enough — opencode re-renders its idle
+        // footer between tool calls, so the footer must be stable across two
+        // captures before the turn counts as over. The sample lives here, keyed
+        // by session/block, because both consumers arrive as static calls.
         if status == AgentStatus::Working {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -248,7 +263,25 @@ impl SuperlogicalBackend {
                 && let Ok(out) = rex.run(&capture_args(session, block, "text"))
             {
                 let screen = String::from_utf8_lossy(&out.stdout);
-                return Ok((status_with_screen(status, age, &screen), labels));
+                let key = format!("{session}/{block}");
+                let prev = prompt_samples()
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&key).copied());
+                let (verdict, sample) =
+                    status_with_stable_screen(status, age, prev, &screen, now, PROMPT_STABLE_SECS);
+                if let Ok(mut map) = prompt_samples().lock() {
+                    match sample {
+                        Some(s) => {
+                            map.retain(|_, held| now.saturating_sub(held.first_seen_unix) < 3600);
+                            map.insert(key, s);
+                        }
+                        None => {
+                            map.remove(&key);
+                        }
+                    }
+                }
+                return Ok((verdict, labels));
             }
         }
         Ok((status, labels))

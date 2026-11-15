@@ -14,21 +14,21 @@
 # capture), covered by the live leg.
 
 CARGO_ARGS=(-p toron-plane --lib)
-TEST_FILTER=(stale_working idle_footer record_age)
+TEST_FILTER=(stale_working idle_footer record_age tool_call_gap)
 
 REX=crates/toron-plane/src/backend/rex_cli.rs
 
 mutation "D1  OSC alone is trusted, so a stuck working record stays working" \
     file=$REX \
     expect=a_stale_working_record_is_overruled_by_the_idle_footer \
-    find='        if status == AgentStatus::Working' \
-    replace='        if false && status == AgentStatus::Working'
+    find='        if status != AgentStatus::Working || !stale || !screen_shows_a_prompt(screen) {' \
+    replace='        if true {'
 
 mutation "D2  the screen overrules a FRESH working record" \
     file=$REX \
     expect=a_stale_working_record_is_overruled_by_the_idle_footer \
-    find='            && record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS)' \
-    replace='            && true'
+    find='        let stale = record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS);' \
+    replace='        let stale = true;'
 
 mutation "D3  the context row must start with / again (the live narrow footer)" \
     file=$REX \
@@ -42,3 +42,21 @@ mutation "D4  the progress markers are not consulted" \
     expect=a_stale_working_record_is_overruled_by_the_idle_footer \
     find='        let lower = row.to_ascii_lowercase();' \
     replace='        let lower = String::new();'
+
+mutation "D5  a single capture counts as a stable footer" \
+    file=$REX \
+    expect=a_tool_call_gap_is_not_a_finished_turn \
+    find='        let stable = now_unix.saturating_sub(sample.first_seen_unix) >= min_stable_secs;' \
+    replace='        let stable = true;'
+
+mutation "D6  the footer digest is ignored, so a redrawn gap looks stable" \
+    file=$REX \
+    expect=a_tool_call_gap_is_not_a_finished_turn \
+    find='            Some(p) if p.digest == digest => p,' \
+    replace='            Some(p) => p,'
+
+mutation "D7  any elapsed time counts, so the minimum is not enforced" \
+    file=$REX \
+    expect=a_tool_call_gap_is_not_a_finished_turn \
+    find='        let stable = now_unix.saturating_sub(sample.first_seen_unix) >= min_stable_secs;' \
+    replace='        let stable = now_unix.saturating_sub(sample.first_seen_unix) >= 0;'
