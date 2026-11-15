@@ -219,11 +219,20 @@ impl ToJson for GrantedReservation {
 
 impl ToJson for PathConflict {
     fn to_json(&self) -> Value {
-        json!({
+        let mut out = json!({
             "path": self.path,
             "holders": self.holders,
             "reservation_ids": self.reservation_ids,
-        })
+        });
+        // bd-0uzrq.7: a loser must be able to prove which lease won, so the
+        // fencing epochs ride the conflict when known. Omitted when empty
+        // (older rows, older fixtures).
+        if !self.epochs.is_empty()
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.insert("epochs".into(), json!(self.epochs));
+        }
+        out
     }
 }
 
@@ -638,6 +647,21 @@ mod to_json_tests {
             epochs: vec![],
         };
         assert_eq!(p.to_json()["holders"], json!(["h"])); // PathConflict
+        assert!(
+            p.to_json().get("epochs").is_none(),
+            "epochs are omitted when empty"
+        );
+        let with_epoch = PathConflict {
+            path: "p".to_string(),
+            holders: vec!["h".to_string()],
+            reservation_ids: vec!["id".to_string()],
+            epochs: vec![7],
+        };
+        assert_eq!(
+            with_epoch.to_json()["epochs"],
+            json!([7]),
+            "the winner's epoch rides the conflict (bd-0uzrq.7)"
+        );
         let a = AcquireResult {
             granted: vec![g.clone()],
             conflicts: vec![],
