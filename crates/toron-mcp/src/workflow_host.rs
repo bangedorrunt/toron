@@ -2331,6 +2331,7 @@ steps:
                 "request_approval",
                 Action::RequestApproval {
                     message: "m".into(),
+                    timeout_secs: None,
                 },
             ),
             (
@@ -4626,6 +4627,7 @@ steps:
                     graph_node(
                         Action::RequestApproval {
                             message: "ship?".into(),
+                            timeout_secs: None,
                         },
                         &["first"],
                     ),
