@@ -303,6 +303,13 @@ impl Mailbox {
                 return Err(anyhow::anyhow!(super::surface::group_refused_msg(raw)));
             }
         }
+        if args.subject.trim().is_empty() && args.body_md.trim().is_empty() {
+            // Live: an agent sent a mail with neither subject nor body, and the
+            // recipient could not tell it from a system notice (bd-ncgyf).
+            anyhow::bail!(
+                "refusing an empty mail: subject and body are both empty (a ping needs one of them)"
+            );
+        }
         let resolved = self.resolve_recipients(&args).await?;
         if resolved.is_empty() {
             anyhow::bail!("no recipients (to/cc/bcc all empty)");
@@ -2611,6 +2618,52 @@ mod tests {
             .expect("inbox unlimited");
         assert_eq!(all.len(), 4, "no limit returns every row");
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ncgyf: an agent sent a mail with NEITHER subject nor body; the
+    /// recipient could not tell it from a system notice. Refuse it at the one
+    /// send path, typed.
+    #[tokio::test]
+    async fn send_refuses_a_mail_with_no_subject_and_no_body() {
+        let (mailbox, db_path, data_dir) = test_mailbox("empty-mail").await;
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_recv, _) = register(&mailbox, "demo", "BlueLake").await;
+        let empty = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "   ".into(),
+            body_md: "\n".into(),
+            ..Default::default()
+        };
+        let err = mailbox
+            .send_message(&empty)
+            .await
+            .expect_err("an empty mail is refused");
+        assert!(
+            format!("{err:#}").contains("subject and body are both empty"),
+            "the refusal names the reason: {err:#}"
+        );
+        let subject_only = SendMessage {
+            subject: "ping".into(),
+            body_md: String::new(),
+            ..empty.clone()
+        };
+        mailbox
+            .send_message(&subject_only)
+            .await
+            .expect("a subject-only ping is a real mail");
+        let body_only = SendMessage {
+            subject: String::new(),
+            body_md: "just the body".into(),
+            ..empty
+        };
+        mailbox
+            .send_message(&body_only)
+            .await
+            .expect("a body-only mail is a real mail");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
