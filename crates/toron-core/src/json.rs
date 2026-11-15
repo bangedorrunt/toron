@@ -635,6 +635,7 @@ mod to_json_tests {
             path: "p".to_string(),
             holders: vec!["h".to_string()],
             reservation_ids: vec![],
+            epochs: vec![],
         };
         assert_eq!(p.to_json()["holders"], json!(["h"])); // PathConflict
         let a = AcquireResult {
