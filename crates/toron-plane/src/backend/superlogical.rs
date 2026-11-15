@@ -30,12 +30,13 @@ use crate::backend::rex_cli;
 
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
-    board_of, capture_format, child_exit_from_line, parse_process_view, split_direction,
-    state_labels_from_board, status_for_block, status_from_program_status,
+    STALE_WORKING_SECS, board_of, capture_format, child_exit_from_line, newest_record_age_secs,
+    parse_process_view, split_direction, state_labels_from_board, status_for_block,
+    status_from_program_status, status_with_screen,
 };
 use rex_cli::{
-    Rex, RexBlock, RexEventStream, RexFail, RexSession, RexTarget, block_close_args, events_args,
-    list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
+    Rex, RexBlock, RexEventStream, RexFail, RexSession, RexTarget, block_close_args, capture_args,
+    events_args, list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
     parse_created_session, parse_sessions, parse_target_resolve, process_args, program_status_args,
     read_tail_format, read_whole_format, rename_args, run_args, send_key_args, session_kill_args,
     split_args, split_labelled_args, target_resolve_args, write_args,
@@ -226,15 +227,31 @@ impl SuperlogicalBackend {
         let records = rex.json(&program_status_args(session, block))?;
         let (board, order) = board_of(&records);
         let labels = state_labels_from_board(&board);
-        if board.is_empty() {
+        let status = if board.is_empty() {
             let process = rex.json(&process_args(session, block))?;
-            Ok((
-                status_for_block(&board, &order, &parse_process_view(&process)),
-                labels,
-            ))
+            status_for_block(&board, &order, &parse_process_view(&process))
         } else {
-            Ok((status_from_program_status(&records), labels))
+            status_from_program_status(&records)
+        };
+        // bd-0uzrq.10: a `working` record can be a lie (opencode does not emit
+        // `idle` after a turn that ran a background shell). Only when the fold
+        // says working AND the record has been silent past the threshold do we
+        // pay for a screen capture, and only the screen can overrule it. This
+        // is the ONE detector: every consumer reaches it through here.
+        if status == AgentStatus::Working {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let age = newest_record_age_secs(&records, now);
+            if age.is_some_and(|secs| secs >= STALE_WORKING_SECS)
+                && let Ok(out) = rex.run(&capture_args(session, block, "text"))
+            {
+                let screen = String::from_utf8_lossy(&out.stdout);
+                return Ok((status_with_screen(status, age, &screen), labels));
+            }
         }
+        Ok((status, labels))
     }
 
     fn block_status(rex: &Rex, session: &str, block: &str) -> Result<AgentStatus, RexFail> {

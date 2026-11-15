@@ -1190,6 +1190,80 @@ pub mod rex_map {
         }
     }
 
+    /// How long a `working` record must sit unchanged before the screen is
+    /// allowed to overrule it (bd-0uzrq.10). One turn's tail can look idle
+    /// between two tool calls; two minutes of silence cannot be a turn.
+    pub const STALE_WORKING_SECS: u64 = 120;
+
+    /// The ONE idle detector, shared by every consumer of a rex status (the
+    /// captain watch and the dispatcher both reach it through `block_state`).
+    ///
+    /// OSC first: `idle` is at a prompt, `blocked` is a blocked child, `error`
+    /// is Unknown. But `working` is not trustworthy on its own — opencode
+    /// emits `state=working` at turn start and does NOT emit `idle` after a
+    /// turn that ran a background shell, so the record sits at `working`
+    /// forever while the pane is at its prompt. The second signal is the
+    /// screen: when a stale `working` record is contradicted by opencode's
+    /// idle footer, believe the screen.
+    #[must_use]
+    pub fn status_with_screen(
+        status: AgentStatus,
+        record_age_secs: Option<u64>,
+        screen: &str,
+    ) -> AgentStatus {
+        if status == AgentStatus::Working
+            && record_age_secs.is_some_and(|age| age >= STALE_WORKING_SECS)
+            && screen_shows_a_prompt(screen)
+        {
+            return AgentStatus::Idle;
+        }
+        status
+    }
+
+    /// Does this screen show a pane AT A PROMPT?
+    ///
+    /// opencode's footer has two shapes. At a prompt the lower line is the
+    /// context row, flush left, ending in the window percentage
+    /// (`/flywheel:adr-0021-stage-  577.5K (58%)`). During a turn that row is
+    /// replaced by the indented progress row
+    /// (`  es...upt   1 shell  721.4K (72%)`). Both fixtures are in the tests,
+    /// captured from the live panes on 2026-11-15.
+    #[must_use]
+    pub fn screen_shows_a_prompt(screen: &str) -> bool {
+        screen
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(3)
+            .any(|line| {
+                let row = line.trim_end();
+                let trimmed = row.trim_start();
+                // The prompt rises to column 1; a turn's progress row is
+                // indented. The percentage window is what makes it the footer
+                // rather than some `/command` in the transcript.
+                trimmed.starts_with('/') && row.ends_with(')') && row.matches('%').count() == 1
+            })
+    }
+
+    /// Age of the newest `program_status` record, in seconds, from its
+    /// `updated_at` (RFC3339 with an offset, as rex emits it). `None` when no
+    /// record carries a parseable stamp — an unreadable age never overrules
+    /// the fold.
+    #[must_use]
+    pub fn newest_record_age_secs(records: &Value, now_epoch_secs: i64) -> Option<u64> {
+        let mut newest: Option<i64> = None;
+        for record in record_slice(records) {
+            let Some(stamp) = record.get("updated_at").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(epoch) = parse_rfc3339_epoch(stamp) else {
+                continue;
+            };
+            newest = Some(newest.map_or(epoch, |cur: i64| cur.max(epoch)));
+        }
+        newest.map(|epoch| now_epoch_secs.saturating_sub(epoch).max(0) as u64)
+    }
+
     /// Records first, process fallback: an empty board (no program ever
     /// reported — the opencode steady state) folds the foreground process;
     /// any record at all keeps the records fold, including explicit Unknown.
@@ -1233,6 +1307,42 @@ pub mod rex_map {
             "vt" => "vt",
             _ => "text",
         }
+    }
+
+    /// Epoch seconds from an RFC3339 stamp with a numeric offset, which is the
+    /// shape rex emits (`2026-11-15T18:56:36.144457+11:00`). Fractional seconds
+    /// are dropped: the caller compares whole seconds.
+    fn parse_rfc3339_epoch(stamp: &str) -> Option<i64> {
+        let bytes = stamp.as_bytes();
+        if bytes.len() < 19 {
+            return None;
+        }
+        let num = |range: std::ops::Range<usize>| -> Option<i64> {
+            stamp.get(range)?.parse::<i64>().ok()
+        };
+        let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+        let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        let rest = stamp.get(19..)?;
+        let offset_secs = if rest.starts_with('Z') || rest.starts_with('z') {
+            0
+        } else {
+            let plus = rest.find(['+', '-'])?;
+            let sign: i64 = if rest.as_bytes()[plus] == b'-' { -1 } else { 1 };
+            let (oh, om) = rest.get(plus + 1..)?.split_once(':')?;
+            sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60)
+        };
+        // Days since the Unix epoch (Howard Hinnant's civil_from_days, reversed).
+        let y = year - i64::from(month <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = (month + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs)
     }
 
     fn record_slice(value: &Value) -> Vec<&Value> {
@@ -1418,6 +1528,10 @@ pub mod rex_map {
 
 #[cfg(test)]
 mod wire_contract_tests {
+    use super::rex_map::{
+        STALE_WORKING_SECS, newest_record_age_secs, screen_shows_a_prompt,
+        status_from_program_status, status_with_screen,
+    };
     use super::*;
     use crate::backend::AgentStatus;
     use serde_json::json;
@@ -1578,5 +1692,120 @@ mod wire_contract_tests {
             .expect("complete blob");
         assert_eq!(chunk.data, "x");
         assert!(chunk.eof);
+    }
+
+    // --- bd-0uzrq.10: the ONE idle detector --------------------------------
+
+    /// Captured live 2026-11-15T18:56:36+11:00 from block 01a1d6a1 (StormyDesert,
+    /// opencode): the pane was at its prompt with NO turn running, and the
+    /// records still said `working` — opencode does not emit `idle` after a turn
+    /// that ran a background shell. This is the pair that made the dispatcher
+    /// never drain a queued wake.
+    const STUCK_WORKING_RECORDS: &str = r#"{"records":[
+        {"state":"working","app":"opencode","effective_app":"opencode","title":"Toron new work wm 352","updated_at":"2026-11-15T18:56:36.144457+11:00","owner":{"pid":88709,"name":"opencode.exe"}},
+        {"id":"ses_e24d69cd7ffeC1B6BlnKWvUz6z","state":"working","app":"opencode","effective_app":"opencode","title":"Toron new work wm 352","updated_at":"2026-11-15T18:56:36.144927+11:00","owner":{"pid":88709,"name":"opencode.exe"}}
+    ]}"#;
+
+    /// The same pane's screen at that moment: the idle footer, with the context
+    /// row starting at column 1 and no shell counter.
+    const IDLE_SCREEN: &str = "    identity.\n\n    Build  DeepSeek V4.1 Flash 1017\n    43.6s  58.2 tok/s\n\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n /flywheel:adr-0021-stage-  577.5K (58%)\n";
+
+    /// The screen of a pane mid-turn: the progress row is indented and carries
+    /// the background-shell count (truncated interrupt hint included).
+    const WORKING_SCREEN: &str = "    $ cd /Users/bangedorrunt/workspace/flywheel && for b in 77a48\n\n                          Jump to latest\n\n\n\n  DeepSeek V4.1 Flash 1017  high\n\n  es...upt   1 shell  721.4K (72%)\n";
+
+    /// An idle capture, from block 77a480 at the same instant: records say
+    /// `idle` and the screen agrees. Both signals on the same side.
+    const IDLE_RECORDS: &str = r#"{"records":[{"state":"idle","app":"opencode","effective_app":"opencode","updated_at":"2026-11-15T18:53:22.738181+11:00","owner":{"pid":67198,"name":"opencode.exe"}}]}"#;
+
+    #[test]
+    fn a_stale_working_record_is_overruled_by_the_idle_footer() {
+        let records: Value = serde_json::from_str(STUCK_WORKING_RECORDS).unwrap();
+        assert_eq!(
+            status_from_program_status(&records),
+            AgentStatus::Working,
+            "the records alone say working: this is the bug"
+        );
+        assert_eq!(
+            super::rex_map::status_from_program_status(&records),
+            AgentStatus::Working
+        );
+        assert!(
+            screen_shows_a_prompt(IDLE_SCREEN),
+            "the idle footer is recognised"
+        );
+        assert!(
+            !screen_shows_a_prompt(WORKING_SCREEN),
+            "a mid-turn screen is not a prompt"
+        );
+
+        // Stale past the threshold: the screen wins.
+        assert_eq!(
+            status_with_screen(AgentStatus::Working, Some(STALE_WORKING_SECS), IDLE_SCREEN),
+            AgentStatus::Idle,
+            "a silent working record over an idle footer is idle"
+        );
+        // Fresh: the record wins. A turn's tail can look idle between tools.
+        assert_eq!(
+            status_with_screen(AgentStatus::Working, Some(5), IDLE_SCREEN),
+            AgentStatus::Working,
+            "a fresh record is never overruled"
+        );
+        // Stale but the screen shows a turn: the record wins.
+        assert_eq!(
+            status_with_screen(AgentStatus::Working, Some(600), WORKING_SCREEN),
+            AgentStatus::Working,
+            "a working screen confirms the record"
+        );
+        // An unknown age never overrules.
+        assert_eq!(
+            status_with_screen(AgentStatus::Working, None, IDLE_SCREEN),
+            AgentStatus::Working,
+            "no age, no overrule"
+        );
+        // Other statuses are not touched.
+        assert_eq!(
+            status_with_screen(AgentStatus::Idle, Some(600), WORKING_SCREEN),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn the_record_age_comes_from_its_own_stamp() {
+        let age_of = |iso: &str, now: i64| -> Option<u64> {
+            let records: Value =
+                serde_json::from_str(&format!(r#"{{"records":[{{"updated_at":"{iso}"}}]}}"#))
+                    .unwrap();
+            newest_record_age_secs(&records, now)
+        };
+        assert_eq!(age_of("1970-01-01T00:00:10Z", 100), Some(90));
+        assert_eq!(
+            age_of("1970-01-01T01:00:00+01:00", 100),
+            Some(100),
+            "an offset stamp normalises to UTC"
+        );
+        // The live fixture's absolute epoch is not hardcoded: two nows pin the
+        // DELTA, and the 1970 cases above pin the parser's absolute answer.
+        let records: Value = serde_json::from_str(STUCK_WORKING_RECORDS).unwrap();
+        let a = newest_record_age_secs(&records, 2_000_000_000).expect("fixture stamp parses");
+        let b = newest_record_age_secs(&records, 2_000_000_300).expect("fixture stamp parses");
+        assert_eq!(b, a + 300, "300s later is 300s older");
+        assert_eq!(
+            newest_record_age_secs(&serde_json::json!({"records": []}), 100),
+            None,
+            "no record, no age"
+        );
+        assert_eq!(
+            newest_record_age_secs(&serde_json::json!({"records":[{"state":"working"}]}), 100),
+            None,
+            "a record with no stamp never overrules"
+        );
+    }
+
+    #[test]
+    fn an_idle_record_needs_no_screen() {
+        let records: Value = serde_json::from_str(IDLE_RECORDS).unwrap();
+        assert_eq!(status_from_program_status(&records), AgentStatus::Idle);
+        assert!(screen_shows_a_prompt(IDLE_SCREEN));
     }
 }
