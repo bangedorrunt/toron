@@ -778,12 +778,18 @@ impl Mailbox {
             .read(true)
             .write(true)
             .open(&lock_path)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Rounds, not a wall clock: the wait must yield, never block the
+        // runtime. Two callers in one process (join!, a shared executor) are
+        // one task, so a synchronous sleep here starves the HOLDER out of its
+        // own poll and the lock is never released (measured, bd-0uzrq.7).
+        // 30s absorbs a slow decision (an in-process store read has been
+        // measured at 10s) while still failing loud on a leaked holder.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(std::io::Error::other("reserve lock timed out"));
@@ -7091,17 +7097,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// bd-0uzrq.7 MEASURED, updated: the lock is now taken BEFORE any snapshot,
-    /// pooled connection or the key cache (lock ordering), and with a 50ms
-    /// stagger the claim resolves correctly — but with NO stagger the waiter
-    /// still times out (10s) while the holder stalls inside its body. The
-    /// holder reaches `body` and then never finishes, so the cycle is between
-    /// the holder's own awaits and the waiter's presence, not the file lock
-    /// order. Instrumenting the holder's await (key cache vs bus fanout vs
-    /// pool) is the next step; ignored so the suite is green and the gap is
-    /// explicit.
+    /// bd-0uzrq.7: two acquires on one exclusive path with NO happens-before
+    /// ordering. The per-coordinate lock serialises the decision, so exactly
+    /// one is granted and the other is told who won, with the epoch. The wait
+    /// must yield (see `lock_reserve_coordinate`): both futures are one task
+    /// here, so a synchronous sleep let the WAITER starve the HOLDER's poll.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "bd-0uzrq.7: no-stagger same-path acquires stall the holder even with the lock taken first; see the comment"]
     async fn same_tick_double_acquire_grants_exactly_one() {
         let (mailbox, db_path, data_dir) = test_mailbox("double-claim").await;
         register(&mailbox, "demo", "BlueLake").await;
