@@ -1316,7 +1316,21 @@ pub mod rex_map {
     /// background shell — impossible to overrule.
     fn is_progress_row(line: &str) -> bool {
         let lower = line.to_ascii_lowercase();
-        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")
+        // `esc` as a WORD: a path, branch or model can carry it
+        // (`…/descent:main`, a `rescue` branch) and that must not veto an idle
+        // footer — the false veto would bite hardest in the stale-`working`
+        // case, which is the one it exists for.
+        has_word(&lower, "esc") || lower.contains("es...upt") || lower.contains("es…upt")
+    }
+
+    /// `needle` bounded by non-alphanumerics on both sides.
+    fn has_word(line: &str, needle: &str) -> bool {
+        line.match_indices(needle).any(|(at, _)| {
+            let before = line[..at].chars().next_back();
+            let after = line[at + needle.len()..].chars().next();
+            !before.is_some_and(|c| c.is_ascii_alphanumeric())
+                && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+        })
     }
 
     /// One footer line that ends in `(NN%)` and is not the progress row.
@@ -1852,13 +1866,22 @@ mod wire_contract_tests {
     /// the answer had finished (rex record `idle`) while a background e2e run
     /// kept going. This is the .10 shape — opencode emits no `idle` after such a
     /// turn — so the footer, not the record, has to be believed here.
-    const IDLE_WITH_BACKGROUND_SHELL: &str =
-        "    I’ll mail SlateHarbor with the receipt.\n\n\n ┃  auto Iceman Contributor Free\n\n …/flywheel:adr…  ↓ 1 shell · 112.9K (43%)\n";
+    const IDLE_WITH_BACKGROUND_SHELL: &str = "    I’ll mail SlateHarbor with the receipt.\n\n\n ┃  auto Iceman Contributor Free\n\n …/flywheel:adr…  ↓ 1 shell · 112.9K (43%)\n";
 
     /// The same pane mid-turn at two widths: the interrupt hint is what marks a
     /// live turn, elided or not.
-    const WORKING_INTERRUPT_HINT: &str = "  DeepSeek V4.1 Flash 1017  high\n\n  ⬝⬝⬝ esc interrupt  200.7K (20%)\n";
-    const WORKING_TRUNCATED_HINT: &str = "  DeepSeek V4.1 Flash 1017  high\n\n  es...upt  ↓ 1 shell  770.3K (77%)\n";
+    const WORKING_INTERRUPT_HINT: &str =
+        "  DeepSeek V4.1 Flash 1017  high\n\n  ⬝⬝⬝ esc interrupt  200.7K (20%)\n";
+    const WORKING_TRUNCATED_HINT: &str =
+        "  DeepSeek V4.1 Flash 1017  high\n\n  es...upt  ↓ 1 shell  770.3K (77%)\n";
+
+    /// bd-0uzrq.19: an idle label-only footer whose PATH carries `esc`. A
+    /// substring match vetoes it, and the stale-`working` case is exactly where
+    /// that false veto would strand a crew. The branch carries `rescue` for the
+    /// same reason.
+    const IDLE_LABEL_WITH_ESC_IN_PATH: &str =
+        "  DeepSeek V4.1 Flash 1017  high\n\n  …/descent:main  shift+tab agents  ctrl+p commands\n";
+    const IDLE_LABEL_WITH_RESCUE_BRANCH: &str = "  DeepSeek V4.1 Flash 1017  high\n\n  /work/flywheel:rescue  shift+tab agents  ctrl+p commands\n";
 
     /// bd-0uzrq.15: the SAME 2.2.7 pane (80 cols, scratch session 01a1df74)
     /// through one session's life. The counter is a property of the session's
@@ -2087,6 +2110,15 @@ mod wire_contract_tests {
             assert!(
                 !screen_shows_a_prompt(screen),
                 "a live turn is not a prompt ({what})"
+            );
+        }
+        for (what, screen) in [
+            ("a repo named descent", IDLE_LABEL_WITH_ESC_IN_PATH),
+            ("a rescue branch", IDLE_LABEL_WITH_RESCUE_BRANCH),
+        ] {
+            assert!(
+                screen_shows_a_prompt(screen),
+                "'esc' inside a path or branch is not the interrupt hint ({what})"
             );
         }
 

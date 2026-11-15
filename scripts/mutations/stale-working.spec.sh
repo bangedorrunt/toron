@@ -46,14 +46,20 @@ mutation "D4  the progress markers are not consulted" \
 mutation "D10 the shell counter is a turn marker again (bd-0uzrq.19)" \
     file=$REX \
     expect=a_background_shell_at_idle_is_a_prompt \
-    find='        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
+    find='        has_word(&lower, "esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
     replace='        lower.contains("shell") || lower.contains("esc")'
 
 mutation "D11 nothing marks a live turn" \
     file=$REX \
     expect=a_background_shell_at_idle_is_a_prompt \
-    find='        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
+    find='        has_word(&lower, "esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
     replace='        false'
+
+mutation "D12 esc is a substring again, so a path vetoes an idle footer" \
+    file=$REX \
+    expect=a_background_shell_at_idle_is_a_prompt \
+    find='        has_word(&lower, "esc") || lower.contains("es...upt") || lower.contains("es…upt")' \
+    replace='        lower.contains("esc") || lower.contains("es...upt") || lower.contains("es…upt")'
 
 mutation "D5  a single capture counts as a stable footer" \
     file=$REX \
