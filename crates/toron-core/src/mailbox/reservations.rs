@@ -575,26 +575,35 @@ impl Mailbox {
         reason: Option<&str>,
     ) -> anyhow::Result<AcquireResult> {
         let project_slug = &self.canonical_project(project_slug).await;
-        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
-        let mut result = AcquireResult::default();
-
-        for path in paths {
-            // Serialise the decision per coordinate (bd-0uzrq.7). Every acquire
-            // path (CLI, MCP tool, coalition) funnels through here, so the lock
-            // cannot be bypassed by a caller.
-            let _coordinate = match self.lock_reserve_coordinate(project_slug, path).await {
-                Ok(guard) => guard,
+        // Take every coordinate lock BEFORE any snapshot, transaction, pooled
+        // connection or the key cache (bd-0uzrq.7). Taking them after the
+        // snapshot made a holder block on a resource the waiter already held,
+        // which is a lock-order cycle: with a stagger it never showed, with no
+        // stagger it hung the holder. Sorted so two multi-path acquires cannot
+        // wedge each other.
+        let mut ordered: Vec<&String> = paths.iter().collect();
+        ordered.sort();
+        let mut _coordinate_locks = Vec::with_capacity(ordered.len());
+        for path in &ordered {
+            match self.lock_reserve_coordinate(project_slug, path).await {
+                Ok(guard) => _coordinate_locks.push(guard),
                 Err(e) => {
+                    tracing::warn!("reservation acquire lock failed for {path}: {e}");
+                    let mut result = AcquireResult::default();
                     result.conflicts.push(PathConflict {
-                        path: path.clone(),
+                        path: (*path).clone(),
                         holders: Vec::new(),
                         reservation_ids: Vec::new(),
                         epochs: Vec::new(),
                     });
-                    tracing::warn!("reservation acquire lock failed for {path}: {e}");
-                    continue;
+                    return Ok(result);
                 }
-            };
+            }
+        }
+        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
+        let mut result = AcquireResult::default();
+
+        for path in paths {
             let now_us = Self::kernel_now_us();
             let (mut model, meta) = self.kernel_model_for(project_slug).await;
             let closed_beads = if closed_bead_reconcile_enabled() {
@@ -7082,15 +7091,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// bd-0uzrq.7 MEASURED: with NO stagger at all the lock WAITER times out
-    /// (10s) while the holder never releases, even on a 2-thread runtime —
-    /// the holder's body evidently awaits something the waiter is needed for.
-    /// With a 50ms stagger the same claim resolves correctly (the test below),
-    /// and different paths never contend, so the lock itself is sound; the
-    /// interaction inside the holder is what still needs naming. Ignored so
-    /// the suite is green and the gap is explicit.
+    /// bd-0uzrq.7 MEASURED, updated: the lock is now taken BEFORE any snapshot,
+    /// pooled connection or the key cache (lock ordering), and with a 50ms
+    /// stagger the claim resolves correctly — but with NO stagger the waiter
+    /// still times out (10s) while the holder stalls inside its body. The
+    /// holder reaches `body` and then never finishes, so the cycle is between
+    /// the holder's own awaits and the waiter's presence, not the file lock
+    /// order. Instrumenting the holder's await (key cache vs bus fanout vs
+    /// pool) is the next step; ignored so the suite is green and the gap is
+    /// explicit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "bd-0uzrq.7: simultaneous same-path acquires stall the lock holder; see the test comment"]
+    #[ignore = "bd-0uzrq.7: no-stagger same-path acquires stall the holder even with the lock taken first; see the comment"]
     async fn same_tick_double_acquire_grants_exactly_one() {
         let (mailbox, db_path, data_dir) = test_mailbox("double-claim").await;
         register(&mailbox, "demo", "BlueLake").await;

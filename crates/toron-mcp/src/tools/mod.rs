@@ -227,6 +227,36 @@ mod tests {
     use crate::tools::system::WhoisArgs;
     use serde_json::json;
 
+    /// bd-0uzrq.7: the loser of a same-path claim must get the winner pin AND
+    /// the fencing epoch through the MCP tool, which is how crews mostly
+    /// acquire. The rendering is shared with the CLI through ToJson; this
+    /// pins the MCP envelope specifically.
+    #[test]
+    fn reservation_conflict_renders_the_winner_epoch() {
+        use toron_core::mailbox::reservations::{AcquireResult, PathConflict};
+        let result = AcquireResult {
+            granted: Vec::new(),
+            conflicts: vec![PathConflict {
+                path: "src/x.rs".into(),
+                holders: vec!["BlueLake".into()],
+                reservation_ids: vec!["id-1".into()],
+                epochs: vec![7],
+            }],
+            soft_conflicts: Vec::new(),
+            proposal: None,
+        };
+        let out = ToolOutput::result(Ok(result));
+        let rendered = out.0.expect("the tool returns the conflict JSON");
+        assert_eq!(
+            rendered["conflicts"][0]["holders"][0], "BlueLake",
+            "the winner pin rides the conflict: {rendered}"
+        );
+        assert_eq!(
+            rendered["conflicts"][0]["epochs"][0], 7,
+            "and its epoch: {rendered}"
+        );
+    }
+
     #[test]
     fn tool_error_envelope_is_conservative_and_parseable() {
         for (msg, code, retryable) in [
