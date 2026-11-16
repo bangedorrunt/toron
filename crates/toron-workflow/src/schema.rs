@@ -747,7 +747,11 @@ pub enum Action {
         #[serde(deserialize_with = "de_loop_max")]
         max: String,
         /// Minimum passes before `until` is evaluated. Absent means 1.
-        #[serde(default, deserialize_with = "de_opt_loop_min", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "de_opt_loop_min",
+            skip_serializing_if = "Option::is_none"
+        )]
         min: Option<String>,
         /// Guard evaluated after each pass. True stops successfully.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1183,16 +1187,20 @@ steps:
             .remove(0)
             .action
         };
-        match step("action: loop\nmax: 5\nmin: 2\nbody:\n  - action: send_dm\n    to: a\n    body: b") {
+        match step(
+            "action: loop\nmax: 5\nmin: 2\nbody:\n  - action: send_dm\n    to: a\n    body: b",
+        ) {
             Action::Loop { min: Some(m), .. } => assert_eq!(m, "2"),
             other => panic!("expected loop with min Some(2), got {other:?}"),
         }
-        match step("action: loop\nmax: 5\nmin: \"{{inputs.n}}\"\nbody:\n  - action: send_dm\n    to: a\n    body: b") {
+        match step(
+            "action: loop\nmax: 5\nmin: \"{{inputs.n}}\"\nbody:\n  - action: send_dm\n    to: a\n    body: b",
+        ) {
             Action::Loop { min: Some(m), .. } => assert_eq!(m, "{{inputs.n}}"),
             other => panic!("expected loop with template min, got {other:?}"),
         }
         match step("action: loop\nmax: 5\nbody:\n  - action: send_dm\n    to: a\n    body: b") {
-            Action::Loop { min: None, .. } => {},
+            Action::Loop { min: None, .. } => {}
             other => panic!("expected loop with min None, got {other:?}"),
         }
     }

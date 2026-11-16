@@ -747,7 +747,12 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
                 out.push(t.clone());
             }
         }
-        Action::Loop { max, min, until, body } => {
+        Action::Loop {
+            max,
+            min,
+            until,
+            body,
+        } => {
             out.push(max.clone());
             if let Some(m) = min {
                 out.push(m.clone());
