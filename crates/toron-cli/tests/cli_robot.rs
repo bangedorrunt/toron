@@ -944,6 +944,38 @@ fn reserve_sweep_releases_only_closed_reasons() {
         "only the closed reason: {report}"
     );
 
+    // bd-9zqjo: the documented form names the tracker PATH instead of --repo.
+    // It must reach the same closed set (here: one closed, nothing left to
+    // release), so a path that is accepted but ignored is caught.
+    let swept_path = own_run(&[
+        "reserve",
+        "sweep",
+        "--closed-beads",
+        repo.join(".beads/issues.jsonl").to_str().unwrap(),
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--no-notify",
+        "--json",
+    ]);
+    assert!(
+        swept_path.status.success(),
+        "path form: {}",
+        String::from_utf8_lossy(&swept_path.stderr)
+    );
+    let report = json(&swept_path);
+    assert_eq!(
+        report["closed_beads"].as_u64(),
+        Some(1),
+        "the path form read the same tracker: {report}"
+    );
+    assert_eq!(
+        report["released"].as_u64(),
+        Some(0),
+        "nothing left to release: {report}"
+    );
+
     let after = json(&own_run(&[
         "reserve",
         "list",
@@ -4232,4 +4264,51 @@ fn embedded_fallback_exists_once() {
         hits[0].0,
         hits[0].1
     );
+}
+
+/// bd-9zqjo: the documented form takes the tracker path. `--closed-beads` used
+/// to be a bare boolean, so the form the skill tells people to use
+/// (`--closed-beads .beads/issues.jsonl`) was a clap usage error and departed
+/// pins had to be released one reason at a time.
+#[test]
+fn reserve_sweep_accepts_the_documented_closed_beads_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "toron-sweep-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(dir.join(".beads")).expect("mkdir .beads");
+    let issues = dir.join(".beads/issues.jsonl");
+    std::fs::write(&issues, "{\"id\":\"bd-x\",\"status\":\"closed\"}\n").expect("tracker");
+
+    let out = toron()
+        .args([
+            "reserve",
+            "sweep",
+            "--project",
+            "demo",
+            "--as",
+            "PathAgent",
+            "--closed-beads",
+            issues.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("spawn toron");
+    assert!(
+        out.status.success(),
+        "the documented path form must parse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("dry-run emits JSON");
+    assert_eq!(
+        report["args"]["closed_beads"].as_str(),
+        Some(issues.to_str().unwrap()),
+        "the preview names the tracker it was given: {report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

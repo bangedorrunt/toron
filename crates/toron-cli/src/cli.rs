@@ -971,9 +971,10 @@ pub struct ReserveSweepArgs {
     #[arg(long = "as", required = true)]
     pub agent: String,
     /// Sweep leases whose reason names a CLOSED bead. Required: it is the
-    /// only sweep source (`<repo>/.beads/issues.jsonl`).
-    #[arg(long)]
-    pub closed_beads: bool,
+    /// only sweep source. Bare, it reads `<repo>/.beads/issues.jsonl`; it also
+    /// takes an explicit tracker path, which is the form the skill documents.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "ISSUES")]
+    pub closed_beads: Option<String>,
     /// Repository root holding `.beads/` (default: current directory).
     #[arg(long)]
     pub repo: Option<std::path::PathBuf>,

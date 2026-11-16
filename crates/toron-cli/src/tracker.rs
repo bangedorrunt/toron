@@ -16,7 +16,13 @@ pub fn issues_path(repo: &Path) -> PathBuf {
 
 /// Closed bead ids from `<repo>/.beads/issues.jsonl` (empty when absent).
 pub fn closed_bead_ids(repo: &Path) -> BTreeSet<String> {
-    let Ok(raw) = std::fs::read_to_string(issues_path(repo)) else {
+    closed_bead_ids_at(&issues_path(repo))
+}
+
+/// Closed bead ids from one tracker file (empty when absent or unreadable).
+/// The explicit path is the form `reserve sweep --closed-beads <path>` takes.
+pub fn closed_bead_ids_at(path: &Path) -> BTreeSet<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return BTreeSet::new();
     };
     let mut closed = BTreeSet::new();

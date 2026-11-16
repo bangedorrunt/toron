@@ -135,23 +135,29 @@ fn annotate_stale_rows(
 fn sweep_closed_set(
     args: &crate::cli::ReserveSweepArgs,
 ) -> anyhow::Result<(std::path::PathBuf, std::collections::BTreeSet<String>)> {
-    if !args.closed_beads {
+    let Some(explicit) = args.closed_beads.as_deref() else {
         anyhow::bail!(
             "`reserve sweep` needs --closed-beads (the only sweep source: <repo>/.beads/issues.jsonl)"
         );
-    }
+    };
     let repo = args
         .repo
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let issues = crate::tracker::issues_path(&repo);
+    // Bare form: the repo's own tracker. Explicit form: the path the caller
+    // named, which is what the skill documents (bd-9zqjo).
+    let issues = if explicit.is_empty() {
+        crate::tracker::issues_path(&repo)
+    } else {
+        std::path::PathBuf::from(explicit)
+    };
     if !issues.exists() {
         anyhow::bail!(
-            "no tracker at {} — run from the repo root or pass --repo",
+            "no tracker at {} — pass --closed-beads <path> or --repo <root>",
             issues.display()
         );
     }
-    let closed = crate::tracker::closed_bead_ids(&repo);
+    let closed = crate::tracker::closed_bead_ids_at(&issues);
     Ok((repo, closed))
 }
 
@@ -961,7 +967,13 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
                 "project_key": a.project,
                 "agent_name": a.agent,
                 "repo": a.repo.as_ref().map(|p| p.display().to_string()),
-                "closed_beads": a.closed_beads,
+                "closed_beads": a.closed_beads.as_deref().map(|path| {
+                    if path.is_empty() {
+                        "<repo>/.beads/issues.jsonl".to_string()
+                    } else {
+                        path.to_string()
+                    }
+                }),
             }),
             "nothing was released; the preview reads no board or tracker — run without -n \
              to discover the closed-reason leases and release them",
