@@ -654,7 +654,10 @@ mod verify_result_json_tests {
             ..plain
         };
         let text = serde_json::to_string(&parsed).expect("serializes");
-        assert!(text.contains("\"ready\""), "the parsed value rides along: {text}");
+        assert!(
+            text.contains("\"ready\""),
+            "the parsed value rides along: {text}"
+        );
         let back: VerifyResult = serde_json::from_str(&text).expect("round-trips");
         assert_eq!(back.json, parsed.json);
     }
