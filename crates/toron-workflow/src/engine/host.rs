@@ -13,8 +13,8 @@ use super::armor::{
 };
 use super::dispatch::{DispatchRequest, DispatchResult, EffectDispatcher, durable_route};
 use super::durable::{
-    GraphEffect, JobWatchOutcome, JobWatchSpec, JobWatcher, RunEffect, RunPhase as ModelPhase,
-    await_job_watch, bus_job_watcher, needs_graph_model,
+    GraphEffect, JobWatchOutcome, JobWatchSpec, JobWatcher, NodeState, RunEffect,
+    RunPhase as ModelPhase, await_job_watch, bus_job_watcher, needs_graph_model,
 };
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
 use super::leaf::LeafSeams;
@@ -997,6 +997,12 @@ type HostDurableGraphRun = DurableGraphRun<ToronEngineStore, ToronJournal, SyncW
 /// (bd-spawn-launcher-flip-d8mv): settled, failed, or timed out.
 type SpawnSettleStep =
     Box<dyn FnOnce(HostDurableRun) -> Result<(HostDurableRun, Vec<RunEffect>), HostError> + Send>;
+
+/// One graph-model verb fed back into the run (bd-jhz8x.5).
+type GraphSettleStep = Box<
+    dyn FnOnce(HostDurableGraphRun) -> Result<(HostDurableGraphRun, Vec<GraphEffect>), HostError>
+        + Send,
+>;
 
 /// A persisted durable row is one model or the other; the workflow tells them
 /// apart on open, and the shape is stored with the model.
@@ -2366,6 +2372,18 @@ impl WorkflowHost {
             let mut follow: Vec<GraphEffect> = Vec::new();
             let mut parks: Vec<GraphEffect> = Vec::new();
             for effect in std::mem::take(&mut effects) {
+                // bd-jhz8x.5: a terminal model refuses further transitions, so
+                // the rest of a finished batch (parks, watches) is moot.
+                if run.model().is_terminal()
+                    && !matches!(
+                        effect,
+                        GraphEffect::Fail { .. }
+                            | GraphEffect::Complete { .. }
+                            | GraphEffect::Cancelled
+                    )
+                {
+                    continue;
+                }
                 match effect {
                     GraphEffect::ExecuteNode {
                         node,
@@ -2408,6 +2426,74 @@ impl WorkflowHost {
                         let then = move |mut run: HostDurableGraphRun| {
                             run.node_done(&node, value, durable_now_ms())
                                 .map(|eff| (run, eff))
+                        };
+                        let Some((back, mut eff)) = self.drive_graph_verb(&run_id, run, then).await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        follow.append(&mut eff);
+                    }
+                    GraphEffect::WatchJob { node, job_id } => {
+                        // bd-jhz8x.5: the graph model awaits a dispatched job
+                        // exactly as the linear model does; this mirrors the
+                        // linear `RunEffect::WatchJob` arm above, reading the
+                        // deadlines from the node's own state.
+                        let (deadline, claimed) = match run.model().node_state.get(&node) {
+                            Some(NodeState::AwaitingJob {
+                                claim_deadline_ms,
+                                result_deadline_ms,
+                                claimed,
+                                ..
+                            }) => {
+                                if *claimed {
+                                    (*result_deadline_ms, true)
+                                } else {
+                                    (*claim_deadline_ms, false)
+                                }
+                            }
+                            _ => (None, false),
+                        };
+                        let watcher: JobWatcher = bus_job_watcher(self.bus.clone());
+                        let outcome = await_job_watch(
+                            &watcher,
+                            JobWatchSpec {
+                                job_id: job_id.clone(),
+                                deadline_ms: deadline,
+                                claimed,
+                            },
+                            deadline,
+                            durable_now_ms(),
+                        )
+                        .await;
+                        let then: GraphSettleStep = match outcome {
+                            JobWatchOutcome::Claimed => {
+                                let node = node.clone();
+                                Box::new(move |mut run: HostDurableGraphRun| {
+                                    run.job_claimed(&node, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::Settled(value) => {
+                                let node = node.clone();
+                                Box::new(move |mut run: HostDurableGraphRun| {
+                                    run.job_settled(&node, value, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::Failed(error) => {
+                                let node = node.clone();
+                                Box::new(move |mut run: HostDurableGraphRun| {
+                                    run.job_failed(&node, error, durable_now_ms())
+                                        .map(|eff| (run, eff))
+                                })
+                            }
+                            JobWatchOutcome::TimedOut => {
+                                let now = durable_now_ms().max(deadline.unwrap_or(0));
+                                Box::new(move |mut run: HostDurableGraphRun| {
+                                    run.woke(now).map(|eff| (run, eff))
+                                })
+                            }
                         };
                         let Some((back, mut eff)) = self.drive_graph_verb(&run_id, run, then).await
                         else {

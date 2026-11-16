@@ -34,7 +34,7 @@ use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
     MAX_LOOP_ITERS, MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload,
     disposition_for_kind, durable_child_trigger, fail_run_value, is_approval_decision,
-    leaf_preview_for_value, parallel_fanout_count, resolve_template_ref, validate_graph_runtime,
+    parallel_fanout_count, resolve_template_ref, validate_graph_runtime,
 };
 
 use super::spawn::{SpawnSpec, unknown_profile_error};
@@ -1872,6 +1872,9 @@ pub enum NodeParkReason {
     Delay,
     /// A retryable failure is waiting out its backoff before a re-dispatch.
     Retry,
+    /// A dispatched job is being awaited; the wake is its claim/result
+    /// deadline (bd-jhz8x.5).
+    Job,
 }
 
 /// Where one node of a graph run is.
@@ -1920,6 +1923,31 @@ pub enum NodeState {
         /// The exact trigger the child opens with.
         trigger: serde_json::Value,
     },
+    /// Waiting for a dispatched job's terminal (bd-jhz8x.5), the graph model's
+    /// twin of the linear `RunPhase::AwaitingJob`. The publish receipt landed,
+    /// so the node keeps the job id and BOTH deadlines instead of settling on
+    /// the receipt; a resume re-issues the watch, never the publish.
+    AwaitingJob {
+        /// Wave the node was scheduled in.
+        wave: usize,
+        /// Scheduler-level attempt (1-based).
+        attempt: u32,
+        /// Published 43001 id (hex).
+        job: String,
+        /// Absolute claim deadline; `None` = the authored bound was 0.
+        #[serde(default)]
+        claim_deadline_ms: Option<u64>,
+        /// Absolute result deadline once claimed.
+        #[serde(default)]
+        result_deadline_ms: Option<u64>,
+        /// Whether a 43002 claim arrived (switches the active deadline).
+        claimed: bool,
+        /// Claim bound in seconds, for the timeout error text.
+        no_claim_timeout: u64,
+        /// Result bound in seconds, for the timeout error text.
+        #[serde(default)]
+        result_timeout: Option<u64>,
+    },
     /// Waiting on an operator decision. The payload is stored, not recomputed,
     /// so a resume republishes byte-identical evidence.
     AwaitingApproval {
@@ -1947,6 +1975,7 @@ impl NodeState {
             self,
             Self::Executing { .. }
                 | Self::Parked { .. }
+                | Self::AwaitingJob { .. }
                 | Self::AwaitingApproval { .. }
                 | Self::AwaitingChild { .. }
         )
@@ -2088,6 +2117,32 @@ pub enum GraphMsg {
         /// Host time, unix millis.
         now_ms: u64,
     },
+    /// A dispatched job was claimed (43002): switch the active deadline to the
+    /// result bound and keep watching.
+    JobClaimed {
+        /// Node name.
+        node: String,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A dispatched job settled (43004 with the step output value).
+    JobSettled {
+        /// Node name.
+        node: String,
+        /// The settled step output value.
+        value: serde_json::Value,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A dispatched job failed (43006, or a watched job that died).
+    JobFailed {
+        /// Node name.
+        node: String,
+        /// Why.
+        error: String,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
     /// A park (delay or retry backoff) is due.
     Woke {
         /// Host time, unix millis.
@@ -2184,6 +2239,15 @@ pub enum GraphEffect {
         inputs: BTreeMap<String, serde_json::Value>,
         /// The foreach item this copy renders as `{{item}}`, when it is one.
         item: Option<serde_json::Value>,
+    },
+    /// Watch one dispatched job for its terminal (bd-jhz8x.5). The node is in
+    /// [`NodeState::AwaitingJob`]; a duplicate watch is safe, the claim/settle
+    /// verbs are idempotent per node.
+    WatchJob {
+        /// Node name.
+        node: String,
+        /// Published job id.
+        job_id: String,
     },
     /// Park the run until the earliest node deadline.
     ParkUntil {
@@ -2380,66 +2444,138 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                     );
                 }
             }
-            if !failed || on_error != Some(StepOnError::FailRun) {
-                next.outputs.insert(node.clone(), value.clone());
-                next.node_state.insert(node.clone(), NodeState::Settled);
-                let effects = schedule(&mut next, *now_ms);
-                return (next, effects);
-            }
-            let kind = value
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if retrying {
-                let disposition =
-                    disposition_for_kind(&kind, value.get("disposition").and_then(|v| v.as_str()));
-                let fail = GraphFail {
-                    node: node.clone(),
-                    error: value
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("step failed")
-                        .to_string(),
-                    kind,
-                    disposition: disposition.as_str().to_string(),
-                    leaf_preview: serde_json::json!(leaf_preview_for_value(value)),
-                    attempts: Some(attempt),
-                };
-                next.phase = GraphPhase::Failed {
-                    error: fail.error.clone(),
-                };
-                return (next, vec![GraphEffect::Fail { fail }]);
-            }
-            let output = if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
-                value.clone()
-            } else {
-                fail_run_value(node, value, None)
+            // bd-jhz8x.5: a `dispatch_job await: result` node does NOT settle
+            // on its publish receipt — it waits for the job's terminal, exactly
+            // as the linear model's `AwaitingJob` does. A receipt with no job id
+            // can never be watched, so it fails loud instead of waiting out a
+            // deadline nothing will ever answer.
+            let dispatch_await = match node_def.as_ref().map(|n| &n.action) {
+                Some(Action::DispatchJob {
+                    await_: Some(DispatchAwait::Result),
+                    no_claim_timeout,
+                    result_timeout,
+                    ..
+                }) => Some((*no_claim_timeout, *result_timeout)),
+                _ => None,
             };
-            let disposition = if kind.is_empty() {
-                String::new()
-            } else {
-                disposition_for_kind(&kind, None).as_str().to_string()
+            let late_value;
+            let value = match (dispatch_await, is_failure_value(value)) {
+                (Some((no_claim_timeout, result_timeout)), false) => {
+                    match value.get("job_id").and_then(serde_json::Value::as_str) {
+                        Some(job_id) => {
+                            let claim_deadline_ms = (no_claim_timeout > 0).then(|| {
+                                now_ms.saturating_add(no_claim_timeout.saturating_mul(1_000))
+                            });
+                            next.node_state.insert(
+                                node.clone(),
+                                NodeState::AwaitingJob {
+                                    wave,
+                                    attempt,
+                                    job: job_id.to_string(),
+                                    claim_deadline_ms,
+                                    result_deadline_ms: None,
+                                    claimed: false,
+                                    no_claim_timeout,
+                                    result_timeout,
+                                },
+                            );
+                            // Keep watching for the terminal: the park alone
+                            // would sleep past a result in drivers that only
+                            // wake on effects.
+                            let mut effects = vec![GraphEffect::WatchJob {
+                                node: node.clone(),
+                                job_id: job_id.to_string(),
+                            }];
+                            if let Some(until_ms) = claim_deadline_ms {
+                                effects.push(GraphEffect::ParkUntil {
+                                    node: node.clone(),
+                                    until_ms,
+                                    reason: NodeParkReason::Job,
+                                });
+                            }
+                            return (next, effects);
+                        }
+                        None => {
+                            late_value = serde_json::json!({
+                                "ok": false,
+                                "error": format!(
+                                    "dispatch await {node}: publish did not return a job id (deferred delivery)"
+                                ),
+                            });
+                            &late_value
+                        }
+                    }
+                }
+                _ => value,
             };
-            let fail = GraphFail {
+            let effects =
+                settle_graph_node(&mut next, node, value, *now_ms, retrying.then_some(attempt));
+            (next, effects)
+        }
+        GraphMsg::JobClaimed { node, now_ms } => {
+            // A duplicate claim re-arms the same wait, so the run cannot stall
+            // with no WatchJob and no park in flight.
+            let (job, result_timeout) = match next.node_state.get(node).cloned() {
+                Some(NodeState::AwaitingJob {
+                    job,
+                    result_timeout,
+                    ..
+                }) => (job, result_timeout),
+                _ => return (next, Vec::new()),
+            };
+            let result_deadline_ms = result_timeout
+                .filter(|t| *t > 0)
+                .map(|t| now_ms.saturating_add(t.saturating_mul(1_000)));
+            if let Some(NodeState::AwaitingJob {
+                claimed,
+                result_deadline_ms: slot,
+                ..
+            }) = next.node_state.get_mut(node)
+            {
+                *claimed = true;
+                *slot = result_deadline_ms;
+            }
+            let mut effects = vec![GraphEffect::WatchJob {
                 node: node.clone(),
-                error: output
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("step failed")
-                    .to_string(),
-                kind,
-                disposition,
-                leaf_preview: output
-                    .get("leaf_preview")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                attempts: None,
-            };
-            next.phase = GraphPhase::Failed {
-                error: fail.error.clone(),
-            };
-            (next, vec![GraphEffect::Fail { fail }])
+                job_id: job,
+            }];
+            if let Some(until_ms) = result_deadline_ms {
+                effects.push(GraphEffect::ParkUntil {
+                    node: node.clone(),
+                    until_ms,
+                    reason: NodeParkReason::Job,
+                });
+            }
+            (next, effects)
+        }
+        GraphMsg::JobSettled {
+            node,
+            value,
+            now_ms,
+        } => {
+            if !matches!(
+                next.node_state.get(node),
+                Some(NodeState::AwaitingJob { .. })
+            ) {
+                return (next, Vec::new());
+            }
+            let effects = settle_graph_node(&mut next, node, value, *now_ms, None);
+            (next, effects)
+        }
+        GraphMsg::JobFailed {
+            node,
+            error,
+            now_ms,
+        } => {
+            if !matches!(
+                next.node_state.get(node),
+                Some(NodeState::AwaitingJob { .. })
+            ) {
+                return (next, Vec::new());
+            }
+            let value = serde_json::json!({ "ok": false, "error": error });
+            let effects = settle_graph_node(&mut next, node, &value, *now_ms, None);
+            (next, effects)
         }
         GraphMsg::Woke { now_ms } => {
             if next.phase != GraphPhase::Running || next.is_terminal() {
@@ -2516,6 +2652,9 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                     continue;
                 }
                 match reason {
+                    // A job park is owned by the AwaitingJob state (handled
+                    // above); the node itself is not parked.
+                    NodeParkReason::Job => {}
                     NodeParkReason::Delay => {
                         next.outputs.insert(
                             node.clone(),
@@ -2542,6 +2681,62 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                             item,
                         });
                     }
+                }
+            }
+            // bd-jhz8x.5: an awaited job's deadline. Claim first, then result,
+            // with the same typed texts the linear model uses.
+            let job_deadlines: Vec<(String, u64, Option<String>)> = next
+                .node_state
+                .iter()
+                .filter_map(|(node, state)| match state {
+                    NodeState::AwaitingJob {
+                        claim_deadline_ms,
+                        result_deadline_ms,
+                        claimed,
+                        no_claim_timeout,
+                        result_timeout,
+                        ..
+                    } => {
+                        let (deadline, error) = if *claimed {
+                            (
+                                *result_deadline_ms,
+                                result_timeout.map(|t| {
+                                    format!(
+                                        "dispatch await {node}: result_timeout after {t}s with no 43004/43006"
+                                    )
+                                }),
+                            )
+                        } else {
+                            (
+                                *claim_deadline_ms,
+                                Some(format!(
+                                    "dispatch await {node}: no claim after {no_claim_timeout}s"
+                                )),
+                            )
+                        };
+                        Some((node.clone(), deadline?, error))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (node, until_ms, error) in job_deadlines {
+                if until_ms > *now_ms {
+                    // A wake that arrived early still owes the park: a driver
+                    // that only continues on effects would otherwise stop.
+                    effects.push(GraphEffect::ParkUntil {
+                        node,
+                        until_ms,
+                        reason: NodeParkReason::Job,
+                    });
+                    continue;
+                }
+                let Some(error) = error else {
+                    continue;
+                };
+                let value = serde_json::json!({ "ok": false, "error": error });
+                effects.extend(settle_graph_node(&mut next, &node, &value, *now_ms, None));
+                if next.is_terminal() {
+                    return (next, effects);
                 }
             }
             if next.is_in_flight() {
@@ -2699,6 +2894,32 @@ pub fn resume_graph_effects(model: &GraphModel) -> Vec<GraphEffect> {
                 until_ms: *until_ms,
                 reason: *reason,
             }),
+            NodeState::AwaitingJob {
+                job,
+                claim_deadline_ms,
+                result_deadline_ms,
+                claimed,
+                ..
+            } => {
+                if !job.is_empty() {
+                    effects.push(GraphEffect::WatchJob {
+                        node: node.clone(),
+                        job_id: job.clone(),
+                    });
+                }
+                let deadline = if *claimed {
+                    *result_deadline_ms
+                } else {
+                    *claim_deadline_ms
+                };
+                if let Some(until_ms) = deadline {
+                    effects.push(GraphEffect::ParkUntil {
+                        node: node.clone(),
+                        until_ms,
+                        reason: NodeParkReason::Job,
+                    });
+                }
+            }
             NodeState::AwaitingApproval {
                 payload,
                 deadline_ms,
@@ -2724,6 +2945,64 @@ pub fn resume_graph_effects(model: &GraphModel) -> Vec<GraphEffect> {
         }
     }
     effects
+}
+
+/// Land one node's value: apply `is_failure_value` + `on_error`, then settle
+/// the node or fail the run. Shared by `NodeDone` and the job-await verbs
+/// (bd-jhz8x.5), so a WATCHED job's terminal lands exactly as a leaf's own
+/// value would — one failure classifier, not two.
+fn settle_graph_node(
+    next: &mut GraphModel,
+    node: &str,
+    value: &serde_json::Value,
+    now_ms: u64,
+    attempts: Option<u32>,
+) -> Vec<GraphEffect> {
+    let on_error = next
+        .workflow
+        .graph
+        .as_ref()
+        .and_then(|g| g.nodes.get(node))
+        .map(|n| n.on_error);
+    if !is_failure_value(value) || on_error != Some(StepOnError::FailRun) {
+        next.outputs.insert(node.to_string(), value.clone());
+        next.node_state.insert(node.to_string(), NodeState::Settled);
+        return schedule(next, now_ms);
+    }
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let output = if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
+        value.clone()
+    } else {
+        fail_run_value(node, value, None)
+    };
+    let disposition = if kind.is_empty() {
+        String::new()
+    } else {
+        disposition_for_kind(&kind, None).as_str().to_string()
+    };
+    let fail = GraphFail {
+        node: node.to_string(),
+        error: output
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("step failed")
+            .to_string(),
+        kind,
+        disposition,
+        leaf_preview: output
+            .get("leaf_preview")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        attempts,
+    };
+    next.phase = GraphPhase::Failed {
+        error: fail.error.clone(),
+    };
+    vec![GraphEffect::Fail { fail }]
 }
 
 /// Schedule the next wave, or settle the run.
@@ -3778,6 +4057,283 @@ mod tests {
 
     fn empty_outputs() -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
+    }
+
+    /// One graph node: `j` dispatches a job and awaits its result.
+    fn await_graph_model() -> GraphModel {
+        let mut wf = crate::schema::parse_workflow(
+            "name: g\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    no_claim_timeout: 600\n    result_timeout: 7200\n    on_error: fail_run\n",
+        )
+        .expect("parse dispatch await");
+        wf.graph = Some(wf.to_graph());
+        GraphModel::new("run-await", wf, serde_json::json!({}))
+    }
+
+    /// bd-jhz8x.5: a `dispatch_job await: result` graph node WAITS for the
+    /// job's terminal instead of settling on its publish receipt — the graph
+    /// model's twin of the linear `AwaitingJob`. This is what makes a wave's
+    /// stage actually depend on its job.
+    #[test]
+    fn graph_dispatch_await_waits_for_the_job_terminal() {
+        let (model, effects) =
+            advance_graph(&await_graph_model(), &GraphMsg::Start { now_ms: 1_000 });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::ExecuteNode { node, .. } if node == "j")),
+            "{effects:?}"
+        );
+
+        // The publish receipt is NOT the result: the node holds the job id and
+        // both deadlines, and the run cannot schedule past it.
+        let (model, effects) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "job_id": "job-1", "published": true}),
+                now_ms: 1_000,
+            },
+        );
+        assert!(
+            matches!(
+                model.node_state.get("j"),
+                Some(NodeState::AwaitingJob { job, claimed: false, .. }) if job == "job-1"
+            ),
+            "{:?}",
+            model.node_state
+        );
+        assert!(
+            model.outputs.is_empty(),
+            "a publish receipt is not a result: {:?}",
+            model.outputs
+        );
+        assert_eq!(model.phase, GraphPhase::Running);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::WatchJob { node, job_id } if node == "j" && job_id == "job-1")),
+            "{effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                GraphEffect::ParkUntil {
+                    until_ms: 601_000,
+                    reason: NodeParkReason::Job,
+                    ..
+                }
+            )),
+            "the claim bound parks the run: {effects:?}"
+        );
+
+        // A claim switches the active deadline to the result bound.
+        let (model, effects) = advance_graph(
+            &model,
+            &GraphMsg::JobClaimed {
+                node: "j".into(),
+                now_ms: 2_000,
+            },
+        );
+        assert!(
+            matches!(
+                model.node_state.get("j"),
+                Some(NodeState::AwaitingJob {
+                    claimed: true,
+                    result_deadline_ms: Some(7_202_000),
+                    ..
+                })
+            ),
+            "{:?}",
+            model.node_state
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::WatchJob { .. })),
+            "a claim keeps watching for the terminal: {effects:?}"
+        );
+
+        // The terminal lands the job's own value and the run completes.
+        let (model, effects) = advance_graph(
+            &model,
+            &GraphMsg::JobSettled {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "witness": {"seen": true}}),
+                now_ms: 3_000,
+            },
+        );
+        assert!(matches!(
+            model.node_state.get("j"),
+            Some(NodeState::Settled)
+        ));
+        assert_eq!(
+            model.outputs.get("j").and_then(|v| v.get("witness")),
+            Some(&serde_json::json!({"seen": true}))
+        );
+        assert_eq!(model.phase, GraphPhase::Succeeded);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::Complete { .. })),
+            "{effects:?}"
+        );
+    }
+
+    /// The awaited job's deadline fails TYPED, naming the node and the bound,
+    /// and an unclaimed job never settles green.
+    #[test]
+    fn graph_dispatch_await_times_out_typed() {
+        let (model, _) = advance_graph(&await_graph_model(), &GraphMsg::Start { now_ms: 1_000 });
+        let (model, _) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "job_id": "job-1", "published": true}),
+                now_ms: 1_000,
+            },
+        );
+
+        // Under the claim bound it is still just a wait.
+        let (model, effects) = advance_graph(&model, &GraphMsg::Woke { now_ms: 600_999 });
+        assert!(matches!(
+            model.node_state.get("j"),
+            Some(NodeState::AwaitingJob { .. })
+        ));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                GraphEffect::ParkUntil {
+                    until_ms: 601_000,
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+
+        // At the bound: the same typed refusal the linear model writes.
+        let (model, effects) = advance_graph(&model, &GraphMsg::Woke { now_ms: 601_000 });
+        assert!(
+            matches!(model.phase, GraphPhase::Failed { .. }),
+            "{:?}",
+            model.phase
+        );
+        let fail = effects
+            .iter()
+            .find_map(|e| match e {
+                GraphEffect::Fail { fail } => Some(fail),
+                _ => None,
+            })
+            .expect("a typed failure");
+        assert_eq!(fail.node, "j");
+        assert!(fail.error.contains("no claim"), "{}", fail.error);
+        assert!(fail.error.contains("600s"), "{}", fail.error);
+    }
+
+    /// A publish receipt with no job id can never be watched: it fails loud
+    /// instead of waiting out a deadline nothing will answer.
+    #[test]
+    fn graph_dispatch_await_without_a_job_id_fails_loud() {
+        let (model, _) = advance_graph(&await_graph_model(), &GraphMsg::Start { now_ms: 1_000 });
+        let (model, effects) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "published": true, "deferred": true}),
+                now_ms: 1_000,
+            },
+        );
+        assert!(
+            matches!(model.phase, GraphPhase::Failed { .. }),
+            "{:?}",
+            model.phase
+        );
+        let fail = effects
+            .iter()
+            .find_map(|e| match e {
+                GraphEffect::Fail { fail } => Some(fail),
+                _ => None,
+            })
+            .expect("a typed failure");
+        assert!(
+            fail.error.contains("did not return a job id"),
+            "{}",
+            fail.error
+        );
+    }
+
+    /// A watched job that failed honours the node's `on_error`.
+    #[test]
+    fn graph_dispatch_await_job_failure_goes_to_on_error() {
+        let (model, _) = advance_graph(&await_graph_model(), &GraphMsg::Start { now_ms: 1_000 });
+        let (model, _) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "job_id": "job-1", "published": true}),
+                now_ms: 1_000,
+            },
+        );
+        let (model, effects) = advance_graph(
+            &model,
+            &GraphMsg::JobFailed {
+                node: "j".into(),
+                error: "agent blew up".into(),
+                now_ms: 2_000,
+            },
+        );
+        assert!(matches!(model.phase, GraphPhase::Failed { .. }));
+        let fail = effects
+            .iter()
+            .find_map(|e| match e {
+                GraphEffect::Fail { fail } => Some(fail),
+                _ => None,
+            })
+            .expect("a typed failure");
+        assert!(fail.error.contains("agent blew up"), "{}", fail.error);
+    }
+
+    /// A restart re-issues the WATCH, never the publish: the receipt is the
+    /// one thing a resumed run must not repeat.
+    #[test]
+    fn graph_resume_reissues_the_watch_not_the_publish() {
+        let (model, _) = advance_graph(&await_graph_model(), &GraphMsg::Start { now_ms: 1_000 });
+        let (model, _) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: "j".into(),
+                value: serde_json::json!({"ok": true, "job_id": "job-1", "published": true}),
+                now_ms: 1_000,
+            },
+        );
+        let effects = resume_graph_effects(&model);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::WatchJob { job_id, .. } if job_id == "job-1")),
+            "{effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::ParkUntil { .. })),
+            "{effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, GraphEffect::ExecuteNode { .. })),
+            "a resume never republishes: {effects:?}"
+        );
+
+        // The new state survives the store's own encoding.
+        let row = serde_json::to_string(&PersistedWorkflowModel::Graph(Box::new(model.clone())))
+            .expect("encode");
+        let PersistedWorkflowModel::Graph(back) =
+            PersistedWorkflowModel::decode(&row).expect("decode")
+        else {
+            panic!("a graph row roundtrips as a graph");
+        };
+        assert_eq!(back.node_state.get("j"), model.node_state.get("j"));
     }
 
     #[test]

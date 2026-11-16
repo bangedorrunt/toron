@@ -930,6 +930,66 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
         )
     }
 
+    /// A dispatched job was claimed (43002) for `node`.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_claimed(&mut self, node: &str, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_awaiting_job(node, "job_claimed")?;
+        self.apply(
+            GraphMsg::JobClaimed {
+                node: node.to_string(),
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A dispatched job settled (43004 with the step output value).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_settled(
+        &mut self,
+        node: &str,
+        value: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_awaiting_job(node, "job_settled")?;
+        self.apply(
+            GraphMsg::JobSettled {
+                node: node.to_string(),
+                value,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A dispatched job failed (43006, or a watched job that died).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a job.
+    pub fn job_failed(
+        &mut self,
+        node: &str,
+        error: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_awaiting_job(node, "job_failed")?;
+        self.apply(
+            GraphMsg::JobFailed {
+                node: node.to_string(),
+                error: error.into(),
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
     /// A `call_workflow` child finished successfully
     /// (bd-durable-call-workflow-mg6y).
     ///
@@ -1088,6 +1148,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
             match effect {
                 GraphEffect::ExecuteNode { .. }
                 | GraphEffect::Unsupported { .. }
+                | GraphEffect::WatchJob { .. }
                 | GraphEffect::ParkUntil { .. }
                 | GraphEffect::AwaitApproval { .. }
                 | GraphEffect::ChildRun { .. }
@@ -1115,6 +1176,16 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
         if matches!(
             self.model.node_state.get(node),
             Some(NodeState::Executing { .. })
+        ) {
+            return Ok(());
+        }
+        Err(self.wrong_phase(verb))
+    }
+
+    fn require_awaiting_job(&self, node: &str, verb: &str) -> Result<(), HostError> {
+        if matches!(
+            self.model.node_state.get(node),
+            Some(NodeState::AwaitingJob { .. })
         ) {
             return Ok(());
         }

@@ -27,7 +27,7 @@ use toron_core::index::durable_workflow::RunState;
 use toron_core::kernel::EngineStorage;
 
 use super::durable::{
-    GraphEffect, GraphModel, JobWatchOutcome, JobWatchSpec, JobWatcher, RunEffect,
+    GraphEffect, GraphModel, JobWatchOutcome, JobWatchSpec, JobWatcher, NodeState, RunEffect,
     RunPhase as ModelPhase, await_job_watch, needs_graph_model,
 };
 use super::durable_host::{DurableGraphRun, DurableRun, HostError};
@@ -480,6 +480,19 @@ where
         }
         let mut follow = Vec::new();
         for effect in std::mem::take(&mut effects) {
+            // bd-jhz8x.5: a verb can end the run while its batch still holds
+            // parks and watches for siblings; feeding those to a terminal model
+            // is a refused transition that hides the real failure.
+            if run.model().is_terminal()
+                && !matches!(
+                    effect,
+                    GraphEffect::Fail { .. }
+                        | GraphEffect::Complete { .. }
+                        | GraphEffect::Cancelled
+                )
+            {
+                continue;
+            }
             match effect {
                 GraphEffect::ExecuteNode {
                     node,
@@ -524,6 +537,85 @@ where
                         Ok::<_, HostError>((run, effects))
                     })
                     .await?;
+                    run = back;
+                    follow.append(&mut more);
+                }
+                GraphEffect::WatchJob { node, job_id } => {
+                    // bd-jhz8x.5: the graph model awaits a dispatched job the
+                    // same way the linear model does, so the driver borrows the
+                    // linear arm's shape verbatim.
+                    let (deadline, claimed) = match run.model().node_state.get(&node) {
+                        Some(NodeState::AwaitingJob {
+                            claim_deadline_ms,
+                            result_deadline_ms,
+                            claimed,
+                            ..
+                        }) => {
+                            if *claimed {
+                                (*result_deadline_ms, true)
+                            } else {
+                                (*claim_deadline_ms, false)
+                            }
+                        }
+                        _ => (None, false),
+                    };
+                    let Some(watcher) = &seams.job_watcher else {
+                        anyhow::bail!("run {run_id}: no job watcher: cannot await job {job_id}");
+                    };
+                    let outcome = await_job_watch(
+                        watcher,
+                        JobWatchSpec {
+                            job_id: job_id.clone(),
+                            deadline_ms: deadline,
+                            claimed,
+                        },
+                        deadline,
+                        now_ms(),
+                    )
+                    .await;
+                    let at = now_ms();
+                    let (back, mut more) = match outcome {
+                        JobWatchOutcome::Claimed => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_claimed(&node, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job claim failed: {e}"))?
+                        }
+                        JobWatchOutcome::Settled(value) => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_settled(&node, value, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job settle failed: {e}"))?
+                        }
+                        JobWatchOutcome::Failed(error) => {
+                            let node = node.clone();
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.job_failed(&node, error, at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job fail failed: {e}"))?
+                        }
+                        JobWatchOutcome::TimedOut => {
+                            let at = deadline.unwrap_or_else(now_ms).max(now_ms());
+                            verb(move || {
+                                let mut run = run;
+                                let effects = run.woke(at)?;
+                                Ok::<_, HostError>((run, effects))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("run {run_id}: job timeout failed: {e}"))?
+                        }
+                    };
                     run = back;
                     follow.append(&mut more);
                 }
