@@ -598,7 +598,10 @@ mod tests {
                     no_claim_timeout: 600,
                     result_timeout: None,
                 },
-                &format!("run-cap-flush-{i}"),
+                // One run: the cap-flush property is about ONE key. Distinct
+                // runs and distinct nodes are separate jobs by design
+                // (bd-6setu.2), covered by coalesce.rs.
+                "run-cap-flush",
             )
             .await;
             if out["published"].as_bool() == Some(true) {
@@ -609,9 +612,13 @@ mod tests {
 
         let parent = "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b";
         let batch = toron_workflow::coalesce::Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: "gk".into(),
             mentions: (0..5)
                 .map(|i| InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: "gk".into(),
                     parent: parent.into(),
                     spec: json!({ "text": format!("mention {i}") }),
@@ -705,7 +712,9 @@ mod tests {
                             no_claim_timeout: 600,
                             result_timeout: None,
                         },
-                        &format!("run-burst-{t}-{i}"),
+                        // One key for the whole burst: the bound this test
+                        // names is coalescing WITHIN a step, not across runs.
+                        "run-burst",
                     )
                     .await;
                 }
@@ -3251,14 +3260,20 @@ steps:
         let session = "oc-mp";
 
         let batch1 = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "parent-a".into(),
                     spec: json!({"text": "a"}),
                 },
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "parent-b".into(),
                     spec: json!({"text": "b"}),
@@ -3275,14 +3290,20 @@ steps:
         assert!(store.cursor(session).delivered.contains("parent-b"));
 
         let batch2 = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "parent-a".into(),
                     spec: json!({"text": "a2"}),
                 },
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "parent-c".into(),
                     spec: json!({"text": "c"}),
@@ -3332,8 +3353,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-fn";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "fn-parent-1".into(),
                 spec: json!({"i": 0}),
@@ -3406,8 +3431,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-race";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "race-parent".into(),
                 spec: json!({"t": "race"}),
@@ -3482,8 +3511,12 @@ steps:
         assert_eq!(keep, vec![parent.to_string()]);
 
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: parent.into(),
                 spec: json!({"t": "inflight"}),
@@ -3554,13 +3587,15 @@ steps:
         use toron_workflow::coalesce::InboundMention;
         c.submit(
             InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "p1".into(),
                 spec: json!({"t": 1}),
             },
             0,
         );
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         assert_eq!(c.buffered_for("oc"), 0);
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert!(
@@ -3625,8 +3660,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-fn-acq";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "fn-acq-parent".into(),
                 spec: json!({"i": 0}),
@@ -3889,8 +3928,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-tn-fn";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "tn-fn-parent".into(),
                 spec: json!({"t": "transport"}),
@@ -3942,13 +3985,15 @@ steps:
         use toron_workflow::coalesce::InboundMention;
         c.submit(
             InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "p-tn".into(),
                 spec: json!({"t": 1}),
             },
             0,
         );
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert!(
             matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }),
@@ -3987,14 +4032,20 @@ steps:
         let session = "oc-partial";
         store.mark_delivered(session, ["already"]);
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "already".into(),
                     spec: json!({"n": 1}),
                 },
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "fresh".into(),
                     spec: json!({"n": 2}),
@@ -4075,8 +4126,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-acq-q";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "acq-q-parent".into(),
                 spec: json!({"i": 0}),
@@ -4133,8 +4188,12 @@ steps:
         let store = DeliveryCursorStore::new();
         let session = "oc-ns";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "ns-parent".into(),
                 spec: json!({"t": "nosigner"}),
@@ -4199,8 +4258,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-t1-fn";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "t1-fn-parent".into(),
                 spec: json!({"t": "t1"}),
@@ -4322,8 +4385,12 @@ steps:
         let signer = Keys::generate();
         let session = "oc-t1-ok";
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "t1-ok-parent".into(),
                 spec: json!({"t": "ok"}),
@@ -4377,6 +4444,8 @@ steps:
             let mut g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
             let _ = g.submit(
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: "sibling-live".into(),
                     spec: json!({"sib": true}),
@@ -4388,8 +4457,12 @@ steps:
         }
         for i in 0..REQUEUE_MAX_ATTEMPTS {
             let batch = Coalesced {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 mentions: vec![InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: session.into(),
                     parent: format!("ex-parent-{i}"),
                     spec: json!({"i": i}),
@@ -4412,8 +4485,12 @@ steps:
             );
         }
         let batch = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: session.into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: session.into(),
                 parent: "ex-parent-final".into(),
                 spec: json!({"final": true}),
@@ -4466,6 +4543,8 @@ steps:
         );
         c.submit(
             InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "live".into(),
                 spec: json!({"t": 1}),
@@ -4473,8 +4552,12 @@ steps:
             1_000,
         );
         let failed = Coalesced {
+            run_id: None,
+            node_path: None,
             assignee: "oc".into(),
             mentions: vec![InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "retry".into(),
                 spec: json!({"t": 2}),
@@ -4514,13 +4597,15 @@ steps:
         );
         c.submit(
             InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "tick-p".into(),
                 spec: json!({"t": 1}),
             },
             0,
         );
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         let _ = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
         assert!(c.tick(1_000).is_empty());
         let mut t = 1_000u64;
