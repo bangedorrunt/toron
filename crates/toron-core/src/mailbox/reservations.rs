@@ -6608,25 +6608,19 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("the lease event's own created_at");
+        let measured_ttl_secs = expires_secs - created_at;
         assert_eq!(
-            expires_secs - created_at,
-            DEFAULT_RESERVATION_TTL_SECS as i64,
+            measured_ttl_secs, DEFAULT_RESERVATION_TTL_SECS as i64,
             "default TTL must be {}s from the event's own created_at",
             DEFAULT_RESERVATION_TTL_SECS
         );
         // The test's own name is the other half of the contract: a
         // reservation is a HEARTBEAT (minutes), never the 90-day envelope.
-        // Stated as a value bound so setting the default to the envelope
-        // value fails here instead of merely agreeing with itself.
-        assert_ne!(
-            DEFAULT_RESERVATION_TTL_SECS,
-            crate::bus::DEFAULT_ENVELOPE_TTL_SECS,
-            "the default lease TTL must not be the envelope TTL"
-        );
+        // Bounded on the STAMPED expiry, not on the constant, so a default
+        // set to the envelope value has to fail here.
         assert!(
-            DEFAULT_RESERVATION_TTL_SECS <= 600,
-            "the default lease TTL is the heartbeat, saw {}s",
-            DEFAULT_RESERVATION_TTL_SECS
+            measured_ttl_secs <= 600,
+            "the default lease TTL is the heartbeat, saw {measured_ttl_secs}s"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
