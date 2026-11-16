@@ -112,6 +112,63 @@ pub struct InboundMention {
     /// Free-form spec fragment from this mention.
     #[serde(default)]
     pub spec: serde_json::Value,
+    /// Run this mention belongs to (workflow dispatch, bd-6setu.2). `None` on
+    /// a hand mention: nothing set it, and nothing may invent it.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Node path inside the run (dispatch step). `None` when no run set it.
+    #[serde(default)]
+    pub node_path: Option<String>,
+}
+
+/// The coalesce key: (assignee, run, node). Two nodes of ONE run for one
+/// assignee are two batches, so each becomes its own kind-43001; merging them
+/// would hand a coder two steps' work as one job.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CoalesceKey {
+    pub assignee: String,
+    pub run_id: Option<String>,
+    pub node_path: Option<String>,
+}
+
+impl CoalesceKey {
+    /// The key of a mention that carries no run scope (a hand mention).
+    #[must_use]
+    pub fn assignee_only(assignee: impl Into<String>) -> Self {
+        Self {
+            assignee: assignee.into(),
+            run_id: None,
+            node_path: None,
+        }
+    }
+
+    /// The key a batch was flushed from.
+    #[must_use]
+    pub fn of(coalesced: &Coalesced) -> Self {
+        Self {
+            assignee: coalesced.assignee.clone(),
+            run_id: coalesced.run_id.clone(),
+            node_path: coalesced.node_path.clone(),
+        }
+    }
+}
+
+impl From<&str> for CoalesceKey {
+    fn from(assignee: &str) -> Self {
+        Self::assignee_only(assignee)
+    }
+}
+
+impl From<&String> for CoalesceKey {
+    fn from(assignee: &String) -> Self {
+        Self::assignee_only(assignee.as_str())
+    }
+}
+
+impl From<&Coalesced> for CoalesceKey {
+    fn from(coalesced: &Coalesced) -> Self {
+        Self::of(coalesced)
+    }
 }
 
 /// A coalesced batch ready to become ONE kind-43001. The caller builds the
@@ -126,6 +183,12 @@ pub struct Coalesced {
     /// Arrival time of the FIRST mention in the batch (monotonic clock of the
     /// coalescer; used by the caller for the kind-43001 `created_at`).
     pub first_arrival_ms: u64,
+    /// Run the batch belongs to, copied from its key (bd-6setu.2).
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Node path inside the run, copied from its key.
+    #[serde(default)]
+    pub node_path: Option<String>,
 }
 
 impl Coalesced {
@@ -190,6 +253,8 @@ impl Coalesced {
                 .cloned()
                 .collect(),
             first_arrival_ms: self.first_arrival_ms,
+            run_id: self.run_id.clone(),
+            node_path: self.node_path.clone(),
         }
     }
 }
@@ -342,9 +407,9 @@ pub struct MentionCoalescer {
     window: Duration,
     subwindow: Duration,
     max_buffer: usize,
-    buffers: std::collections::HashMap<String, Buffer>,
+    buffers: std::collections::BTreeMap<CoalesceKey, Buffer>,
     /// Per-assignee Transient requeue attempts (cleared on successful publish).
-    retry_attempts: std::collections::HashMap<String, u32>,
+    retry_attempts: std::collections::BTreeMap<CoalesceKey, u32>,
     /// Durable fail park (Exhausted / NoSigner) — not silent drop (GS-062 T2/T3).
     dlq: Vec<DlqEntry>,
 }
@@ -356,8 +421,8 @@ impl MentionCoalescer {
             window,
             subwindow,
             max_buffer,
-            buffers: std::collections::HashMap::new(),
-            retry_attempts: std::collections::HashMap::new(),
+            buffers: std::collections::BTreeMap::new(),
+            retry_attempts: std::collections::BTreeMap::new(),
             dlq: Vec::new(),
         }
     }
@@ -380,10 +445,14 @@ impl MentionCoalescer {
     /// `now_ms` is a monotonic-millis clock the caller supplies (deterministic
     /// in tests).
     pub fn submit(&mut self, mention: InboundMention, now_ms: u64) -> CoalesceDecision {
-        let assignee = mention.assignee.clone();
+        let key = CoalesceKey {
+            assignee: mention.assignee.clone(),
+            run_id: mention.run_id.clone(),
+            node_path: mention.node_path.clone(),
+        };
         let buf = self
             .buffers
-            .entry(assignee.clone())
+            .entry(key.clone())
             .or_insert_with(|| Buffer::new(now_ms));
         if buf.mentions.is_empty() {
             buf.first_arrival_ms = now_ms;
@@ -392,7 +461,7 @@ impl MentionCoalescer {
         buf.push_dedup(mention);
 
         if buf.mentions.len() >= self.max_buffer {
-            let coalesced = self.take_buffer(&assignee).expect("just-inserted buffer");
+            let coalesced = self.take_buffer(&key).expect("just-inserted buffer");
             return CoalesceDecision::FlushNow(coalesced);
         }
         CoalesceDecision::Buffered {
@@ -406,76 +475,75 @@ impl MentionCoalescer {
     ///
     /// The caller drives this on a timer (e.g. every 100ms) per assignee, or
     /// via [`Self::tick`] to check all assignees at once.
-    pub fn flush_if_ready(&mut self, assignee: &str, now_ms: u64) -> FlushOutcome {
-        let Some(buf) = self.buffers.get(assignee) else {
-            return FlushOutcome::NotReady;
-        };
+    pub fn flush_if_ready(&mut self, assignee: &str, now_ms: u64) -> Vec<Coalesced> {
+        let ready: Vec<CoalesceKey> = self
+            .buffers
+            .iter()
+            .filter(|(key, buf)| key.assignee == assignee && self.ready(buf, now_ms))
+            .map(|(key, _)| key.clone())
+            .collect();
+        ready
+            .into_iter()
+            .filter_map(|key| self.take_buffer(&key))
+            .collect()
+    }
+
+    /// Is this buffer due? A zero-delay requeue (`immediate`), the window, or
+    /// the sub-window fast path, and never before a backoff's `ready_at_ms`.
+    fn ready(&self, buf: &Buffer, now_ms: u64) -> bool {
         if buf.mentions.is_empty() {
-            return FlushOutcome::NotReady;
+            return false;
         }
         let backoff_ready = now_ms >= buf.ready_at_ms;
         let window_elapsed = backoff_ready
             && now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
         let subwindow_elapsed = backoff_ready
             && now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
-        if buf.immediate || window_elapsed || subwindow_elapsed {
-            let coalesced = self
-                .take_buffer(assignee)
-                .expect("non-empty buffer checked above");
-            FlushOutcome::Flushed(coalesced)
-        } else {
-            FlushOutcome::NotReady
-        }
+        buf.immediate || window_elapsed || subwindow_elapsed
     }
 
     /// Check ALL assignees for ready flushes (caller-driven tick). Returns the
     /// flushed batches in assignee-name-sorted order (deterministic).
     pub fn tick(&mut self, now_ms: u64) -> Vec<Coalesced> {
-        let assignees: Vec<String> = self.buffers.keys().cloned().collect();
-        let mut ready: Vec<String> = Vec::new();
-        for a in &assignees {
-            if let Some(buf) = self.buffers.get(a) {
-                if buf.mentions.is_empty() {
-                    continue;
-                }
-                let backoff_ready = now_ms >= buf.ready_at_ms;
-                let window_elapsed = backoff_ready
-                    && now_ms.saturating_sub(buf.first_arrival_ms)
-                        >= self.window.as_millis() as u64;
-                let subwindow_elapsed = backoff_ready
-                    && now_ms.saturating_sub(buf.last_arrival_ms)
-                        >= self.subwindow.as_millis() as u64;
-                if buf.immediate || window_elapsed || subwindow_elapsed {
-                    ready.push(a.clone());
-                }
-            }
-        }
-        ready.sort();
+        let ready: Vec<CoalesceKey> = self
+            .buffers
+            .iter()
+            .filter(|(_, buf)| self.ready(buf, now_ms))
+            .map(|(key, _)| key.clone())
+            .collect();
         ready
             .into_iter()
-            .filter_map(|a| self.take_buffer(&a))
+            .filter_map(|key| self.take_buffer(&key))
             .collect()
     }
 
-    /// Force-flush a specific assignee's buffer now (e.g. on shutdown or an
-    /// operator nudge). Returns `None` if the buffer was empty/absent.
-    pub fn force_flush(&mut self, assignee: &str) -> Option<Coalesced> {
-        self.take_buffer(assignee)
+    /// Force-flush every batch of one assignee now (e.g. on shutdown or an
+    /// operator nudge). Key-sorted; empty when nothing was buffered.
+    pub fn force_flush(&mut self, assignee: &str) -> Vec<Coalesced> {
+        let keys: Vec<CoalesceKey> = self
+            .buffers
+            .keys()
+            .filter(|key| key.assignee == assignee)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.take_buffer(&key))
+            .collect()
     }
 
-    /// Force-flush ALL buffers now (e.g. on shutdown). Assignee-sorted order.
+    /// Force-flush ALL buffers now (e.g. on shutdown). Key-sorted order.
     pub fn force_flush_all(&mut self) -> Vec<Coalesced> {
-        let mut assignees: Vec<String> = self.buffers.keys().cloned().collect();
-        assignees.sort();
-        assignees
-            .into_iter()
-            .filter_map(|a| self.take_buffer(&a))
+        let keys: Vec<CoalesceKey> = self.buffers.keys().cloned().collect();
+        keys.into_iter()
+            .filter_map(|key| self.take_buffer(&key))
             .collect()
     }
 
-    /// Clear Transient retry counter after a successful publish for `assignee`.
-    pub fn clear_retry(&mut self, assignee: &str) {
-        self.retry_attempts.remove(assignee);
+    /// Clear Transient retry counter after a successful publish. Takes the
+    /// batch's key (or a bare assignee for the key-less hand path), so one
+    /// node's success never wipes another node's budget.
+    pub fn clear_retry(&mut self, key: impl Into<CoalesceKey>) {
+        self.retry_attempts.remove(&key.into());
     }
 
     /// Park a coalesced burst on the durable DLQ (timer NoSigner / host
@@ -502,9 +570,9 @@ impl MentionCoalescer {
             .collect()
     }
 
-    /// Current Transient attempt count for `assignee` (0 if none).
-    pub fn retry_attempts(&self, assignee: &str) -> u32 {
-        self.retry_attempts.get(assignee).copied().unwrap_or(0)
+    /// Current Transient attempt count for a key (0 if none).
+    pub fn retry_attempts(&self, key: impl Into<CoalesceKey>) -> u32 {
+        self.retry_attempts.get(&key.into()).copied().unwrap_or(0)
     }
 
     /// Re-insert a previously flushed batch so it is not silently dropped
@@ -524,29 +592,29 @@ impl MentionCoalescer {
         now_ms: u64,
         schedule: RequeueSchedule,
     ) -> RequeueOutcome {
-        let assignee = coalesced.assignee.clone();
+        let key = CoalesceKey::of(&coalesced);
         let (delay_ms, attempt) = match schedule {
             RequeueSchedule::FreshWindow => (None, 0u32),
             RequeueSchedule::Transient => {
-                let attempt = self.retry_attempts(assignee.as_str());
+                let attempt = self.retry_attempts(key.clone());
                 if attempt >= REQUEUE_MAX_ATTEMPTS {
-                    self.retry_attempts.remove(assignee.as_str());
+                    self.retry_attempts.remove(&key);
                     self.dlq.push(DlqEntry {
                         reason: DlqReason::Exhausted,
                         coalesced,
                     });
                     return RequeueOutcome::Exhausted;
                 }
-                let delay = transient_backoff_delay_ms(assignee.as_str(), attempt);
+                let delay = transient_backoff_delay_ms(key.assignee.as_str(), attempt);
                 self.retry_attempts
-                    .insert(assignee.clone(), attempt.saturating_add(1));
+                    .insert(key.clone(), attempt.saturating_add(1));
                 (Some(delay), attempt.saturating_add(1))
             }
         };
 
         let buf = self
             .buffers
-            .entry(assignee)
+            .entry(key.clone())
             .or_insert_with(|| Buffer::new(now_ms));
         match delay_ms {
             Some(delay) => {
@@ -571,15 +639,16 @@ impl MentionCoalescer {
         }
     }
 
-    /// Current buffer depth for an assignee (0 if none). Observable for tests.
+    /// Buffered mentions for an assignee across all of its keys (0 if none).
     pub fn buffered_for(&self, assignee: &str) -> usize {
         self.buffers
-            .get(assignee)
-            .map(|b| b.mentions.len())
-            .unwrap_or(0)
+            .iter()
+            .filter(|(key, _)| key.assignee == assignee)
+            .map(|(_, b)| b.mentions.len())
+            .sum()
     }
 
-    /// Number of assignees with an open (non-empty) buffer.
+    /// Number of open (non-empty) buffers, one per key.
     pub fn open_buffers(&self) -> usize {
         self.buffers
             .values()
@@ -587,9 +656,9 @@ impl MentionCoalescer {
             .count()
     }
 
-    /// Drain + coalesce one assignee's buffer.
-    fn take_buffer(&mut self, assignee: &str) -> Option<Coalesced> {
-        let buf = self.buffers.get_mut(assignee)?;
+    /// Drain + coalesce one key's buffer into a batch that names its scope.
+    fn take_buffer(&mut self, key: &CoalesceKey) -> Option<Coalesced> {
+        let buf = self.buffers.get_mut(key)?;
         if buf.mentions.is_empty() {
             return None;
         }
@@ -600,9 +669,11 @@ impl MentionCoalescer {
         buf.ready_at_ms = 0;
         buf.immediate = false;
         Some(Coalesced {
-            assignee: assignee.to_string(),
+            assignee: key.assignee.clone(),
             mentions,
             first_arrival_ms,
+            run_id: key.run_id.clone(),
+            node_path: key.node_path.clone(),
         })
     }
 }
@@ -622,6 +693,8 @@ mod tests {
             assignee: assignee.into(),
             parent: parent.into(),
             spec: serde_json::json!({ "text": text }),
+            run_id: None,
+            node_path: None,
         }
     }
 
@@ -631,7 +704,7 @@ mod tests {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "hi"), 0);
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         assert_eq!(c.buffered_for("oc"), 0);
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert!(
@@ -653,13 +726,15 @@ mod tests {
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(
             InboundMention {
+                run_id: None,
+                node_path: None,
                 assignee: "oc".into(),
                 parent: "p1".into(),
                 spec: serde_json::json!({"t": 1}),
             },
             0,
         );
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         let q = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
         assert!(matches!(q, RequeueOutcome::Queued { .. }), "{q:?}");
         assert_eq!(c.buffered_for("oc"), 1);
@@ -682,7 +757,7 @@ mod tests {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "hi"), 0);
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         let q0 = c.requeue(batch, 1_000, RequeueSchedule::Transient);
         assert_eq!(
             q0,
@@ -696,7 +771,7 @@ mod tests {
         for i in 1..REQUEUE_MAX_ATTEMPTS {
             let now = 2_000 + u64::from(i) * 10;
             c.submit(m("oc", "e1", "hi"), 0);
-            let batch = c.force_flush("oc").expect("flushed");
+            let batch = c.force_flush("oc").into_iter().next().expect("flushed");
             let q = c.requeue(batch, now, RequeueSchedule::Transient);
             match q {
                 RequeueOutcome::Queued { delay_ms, attempt } => {
@@ -718,7 +793,7 @@ mod tests {
             }
         }
         c.submit(m("oc", "e1", "hi"), 0);
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         assert_eq!(
             c.requeue(batch, 9_000, RequeueSchedule::Transient),
             RequeueOutcome::Exhausted
@@ -740,7 +815,7 @@ mod tests {
             "Exhausted must clear retry map (no poison for later Transient)"
         );
         c.submit(m("oc", "e2", "again"), 10_000);
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         assert!(
             matches!(
                 c.requeue(batch, 10_000, RequeueSchedule::Transient),
@@ -765,6 +840,8 @@ mod tests {
             assignee: "oc".into(),
             mentions: vec![m("oc", "failed", "retry")],
             first_arrival_ms: 0,
+            run_id: None,
+            node_path: None,
         };
         let q = c.requeue(failed, 1_000, RequeueSchedule::Transient);
         assert!(
@@ -790,7 +867,7 @@ mod tests {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(100), 64);
         c.submit(m("oc", "e1", "hi"), 0);
-        let batch = c.force_flush("oc").expect("flushed");
+        let batch = c.force_flush("oc").into_iter().next().expect("flushed");
         assert!(matches!(
             c.requeue(batch, 1_000, RequeueSchedule::Transient),
             RequeueOutcome::Queued { delay_ms: 0, .. }
@@ -838,13 +915,19 @@ mod tests {
     fn retain_parents_filters_merged_spec() {
         let batch = Coalesced {
             assignee: "oc".into(),
+            run_id: None,
+            node_path: None,
             mentions: vec![
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: "oc".into(),
                     parent: "already".into(),
                     spec: serde_json::json!({"n": 1}),
                 },
                 InboundMention {
+                    run_id: None,
+                    node_path: None,
                     assignee: "oc".into(),
                     parent: "keep-me".into(),
                     spec: serde_json::json!({"n": 2}),
@@ -889,12 +972,13 @@ mod tests {
         let mut c =
             MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "hi"), 0);
-        assert_eq!(c.flush_if_ready("oc", 400), FlushOutcome::NotReady);
+        assert!(
+            c.flush_if_ready("oc", 400).is_empty(),
+            "before the sub-window nothing flushes"
+        );
         let out = c.flush_if_ready("oc", 500);
-        assert!(matches!(out, FlushOutcome::Flushed(_)), "sub-window flush");
-        if let FlushOutcome::Flushed(batch) = out {
-            assert_eq!(batch.count(), 1);
-        }
+        assert_eq!(out.len(), 1, "sub-window flush returns the ready batch");
+        assert_eq!(out[0].count(), 1);
     }
 
     /// A burst that KEEPS arriving stays buffered up to the full window (the
@@ -906,12 +990,13 @@ mod tests {
         for i in 0..5 {
             c.submit(m("oc", "e", &format!("m{i}")), i * 300);
         }
-        assert_eq!(c.flush_if_ready("oc", 1_200), FlushOutcome::NotReady);
+        assert!(
+            c.flush_if_ready("oc", 1_200).is_empty(),
+            "a live burst stays buffered"
+        );
         let out = c.flush_if_ready("oc", 1_700);
-        match out {
-            FlushOutcome::Flushed(b) => assert_eq!(b.count(), 5),
-            other => panic!("expected flush at t=1700, got {other:?}"),
-        }
+        assert_eq!(out.len(), 1, "expected one flush at t=1700");
+        assert_eq!(out[0].count(), 5);
     }
 
     /// Hard cap flushes immediately (no infinite coalesce).
@@ -941,7 +1026,7 @@ mod tests {
             CoalesceDecision::Buffered { buffered } => assert_eq!(buffered, 1, "dup not added"),
             other => panic!("dup should buffer (not flush), got {other:?}"),
         }
-        let batch = c.force_flush("oc").expect("flush");
+        let batch = c.force_flush("oc").into_iter().next().expect("flush");
         assert_eq!(batch.count(), 1, "deduped to one");
     }
 
@@ -968,10 +1053,14 @@ mod tests {
     fn mentions_outside_window_are_separate_jobs() {
         let mut c = MentionCoalescer::new(Duration::from_millis(1_000), DEFAULT_SUBWINDOW, 64);
         c.submit(m("oc", "e1", "first batch"), 0);
-        let first = c.force_flush("oc").expect("first flush");
+        let first = c.force_flush("oc").into_iter().next().expect("first flush");
         assert_eq!(first.count(), 1);
         c.submit(m("oc", "e2", "second batch"), 5_000);
-        let second = c.force_flush("oc").expect("second flush");
+        let second = c
+            .force_flush("oc")
+            .into_iter()
+            .next()
+            .expect("second flush");
         assert_eq!(second.count(), 1);
         assert_ne!(first.parent(), second.parent(), "distinct parents");
     }
@@ -995,11 +1084,49 @@ mod tests {
         let mut c = MentionCoalescer::with_defaults();
         c.submit(m("oc", "e1", "a"), 0);
         c.submit(m("oc", "e2", "b"), 10);
-        let batch = c.force_flush("oc").expect("flush");
+        let batch = c.force_flush("oc").into_iter().next().expect("flush");
         let spec = batch.merged_spec();
         assert_eq!(spec["coalesced"], true);
         assert_eq!(spec["count"], 2);
         assert!(spec["mentions"].is_array());
         assert_eq!(spec["mentions"].as_array().unwrap().len(), 2);
+    }
+
+    /// bd-6setu.2: two nodes of ONE run for one assignee are two batches, so
+    /// each becomes its own job. Merging them would hand one seat two steps'
+    /// work as a single ask.
+    #[test]
+    fn two_nodes_of_one_run_flush_as_two_batches() {
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
+        let run = |node: &str, parent: &str, text: &str| {
+            let mut mention = m("coder", parent, text);
+            mention.run_id = Some("run-1".into());
+            mention.node_path = Some(node.into());
+            mention
+        };
+        c.submit(run("plan", "e1", "plot"), 0);
+        c.submit(run("execute", "e2", "build"), 0);
+        assert_eq!(
+            c.open_buffers(),
+            2,
+            "one buffer per (assignee, run, node), not one per assignee"
+        );
+        let batches = c.force_flush("coder");
+        assert_eq!(batches.len(), 2, "two nodes of one run are two jobs");
+        let mut nodes: Vec<&str> = batches
+            .iter()
+            .filter_map(|b| b.node_path.as_deref())
+            .collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec!["execute", "plan"]);
+        assert!(
+            batches.iter().all(|b| b.run_id.as_deref() == Some("run-1")),
+            "both batches keep the run"
+        );
+        assert!(
+            batches.iter().all(|b| b.count() == 1),
+            "no mention leaks into the other node's batch"
+        );
     }
 }

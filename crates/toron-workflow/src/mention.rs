@@ -72,6 +72,10 @@ pub fn wire_mention_dispatch_with_cursor(
                 assignee: m.name.clone(),
                 parent: delivery_id,
                 spec: serde_json::json!({ "text": m.content }),
+                // A hand mention carries no run scope: nothing set one, and
+                // inventing it would tag a human's ask with someone's run.
+                run_id: None,
+                node_path: None,
             },
             now_ms,
         );
@@ -294,7 +298,11 @@ mod tests {
         let jobs = wire_mention_dispatch(&post, &mut coalescer, &requester, Some("toron"), 0);
         assert!(jobs.is_empty(), "single mention buffers until sub-window");
 
-        let batch = coalescer.force_flush("Bob").expect("buffered mention");
+        let batch = coalescer
+            .force_flush("Bob")
+            .into_iter()
+            .next()
+            .expect("buffered mention");
         assert_eq!(batch.count(), 1);
         let job = build_job_from_coalesced(&batch, &requester, Some("toron"), Timestamp::from(TS))
             .expect("build 43001");

@@ -528,10 +528,15 @@ async fn dispatch_host_sink(
             send_via_dispatch(&armor, mailbox, &dispatcher, req, msg, key).await
         }
         Action::DispatchJob { assignee, spec, .. } => {
+            // bd-6setu.2: the dispatch knows its run and node, so a batch is
+            // scoped to them. Without the pair, two nodes of one run to one
+            // assignee collapse into one job and the second step is lost.
             let mention = crate::coalesce::InboundMention {
                 assignee: assignee.clone(),
                 parent: String::new(),
                 spec: serde_json::to_value(&spec).expect("DispatchSpec is JSON-serializable"),
+                run_id: Some(inv.run.run_id.clone()),
+                node_path: Some(inv.run.node_path.clone()),
             };
             let now = now_ms();
             let decision = {
@@ -696,9 +701,19 @@ fn build_coalesced_job_event(signer: Option<&Keys>, coalesced: &Coalesced) -> Op
         spec: coalesced.merged_spec(),
         assignee: Some(coalesced.assignee.clone()),
     };
-    let stamped = stamp_workflow_emitted(vec![]);
-    let event =
-        build_job_request_with_tags(keys, parent, &payload, Timestamp::now(), stamped).ok()?;
+    // bd-6setu.2: a dispatch batch names its run and node on the wire, so a
+    // consumer can join the job to the step. A hand mention sets neither, and
+    // an absent scope adds no tag — never an empty one.
+    let mut tags = stamp_workflow_emitted(vec![]);
+    for (name, value) in [
+        ("run", coalesced.run_id.as_deref()),
+        ("node", coalesced.node_path.as_deref()),
+    ] {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            tags.push(Tag::parse([name, value]).expect("run/node tag parses"));
+        }
+    }
+    let event = build_job_request_with_tags(keys, parent, &payload, Timestamp::now(), tags).ok()?;
     Some(event)
 }
 
@@ -4114,10 +4129,12 @@ mod tests {
                     assignee: "oc-t3".into(),
                     parent: "t3-parent".into(),
                     spec: json!({"t": 3}),
+                    run_id: None,
+                    node_path: None,
                 },
                 0,
             );
-            let batch = c.force_flush("oc-t3").expect("flush");
+            let batch = c.force_flush("oc-t3").into_iter().next().expect("flush");
             let _ = c.requeue(batch, 0, RequeueSchedule::FreshWindow);
         }
         host.flush_coalesced_bursts().await;
@@ -4994,5 +5011,69 @@ mod tests {
             "a corrupt model settles once; the sweep must not retry it forever"
         );
         let _ = std::fs::remove_file(db);
+    }
+
+    /// bd-6setu.2: a dispatched batch names its run and node on the kind-43001,
+    /// so a consumer can join the job to the step that asked for it.
+    #[test]
+    fn a_dispatch_job_carries_run_and_node_tags() {
+        let keys = Keys::generate();
+        let batch = Coalesced {
+            assignee: "coder".into(),
+            mentions: vec![crate::coalesce::InboundMention {
+                assignee: "coder".into(),
+                parent: "e1".into(),
+                spec: json!({"task": "plot"}),
+                run_id: Some("run-1".into()),
+                node_path: Some("plan".into()),
+            }],
+            first_arrival_ms: 0,
+            run_id: Some("run-1".into()),
+            node_path: Some("plan".into()),
+        };
+        let event = build_coalesced_job_event(Some(&keys), &batch).expect("event builds");
+        let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        assert!(
+            tags.iter()
+                .any(|t| t.first().map(String::as_str) == Some("run")
+                    && t.get(1).map(String::as_str) == Some("run-1")),
+            "the run tag rides the job: {tags:?}"
+        );
+        assert!(
+            tags.iter()
+                .any(|t| t.first().map(String::as_str) == Some("node")
+                    && t.get(1).map(String::as_str) == Some("plan")),
+            "the node tag rides the job: {tags:?}"
+        );
+    }
+
+    /// A hand mention sets no run and no node, and an absent scope adds NO tag
+    /// (an empty tag would claim a run that does not exist).
+    #[test]
+    fn a_hand_mention_carries_no_run_or_node_tag() {
+        let keys = Keys::generate();
+        let batch = Coalesced {
+            assignee: "Bob".into(),
+            mentions: vec![crate::coalesce::InboundMention {
+                assignee: "Bob".into(),
+                parent: "e2".into(),
+                spec: json!({"text": "hi"}),
+                run_id: None,
+                node_path: None,
+            }],
+            first_arrival_ms: 0,
+            run_id: None,
+            node_path: None,
+        };
+        let event = build_coalesced_job_event(Some(&keys), &batch).expect("event builds");
+        let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        for name in ["run", "node"] {
+            assert!(
+                !tags
+                    .iter()
+                    .any(|t| t.first().map(String::as_str) == Some(name)),
+                "a hand mention must not carry a {name} tag: {tags:?}"
+            );
+        }
     }
 }
