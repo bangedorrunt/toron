@@ -255,6 +255,112 @@ pub fn first_claimer_by_arrival(
         .map(|e| e.pubkey.to_hex())
 }
 
+/// One V10 author-independence refusal (bd-6setu.6): the claimant already
+/// claimed a node this job READS, in the same run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimAuthorConflict {
+    /// The node the claimant authored.
+    pub node: String,
+    /// The run both jobs belong to.
+    pub run: String,
+}
+
+impl ClaimAuthorConflict {
+    /// The typed refusal an agent sees. The stable token is
+    /// `v10-author-conflict`: a caller may match on it without parsing prose.
+    pub fn refusal(&self, claimant: &str) -> String {
+        format!(
+            "toron job claim refused: v10-author-conflict — {claimant} claimed node {} of run {}, \
+             which this review job reads; a reviewer must not review its own work",
+            self.node, self.run
+        )
+    }
+}
+
+/// A job request's `run` tag (bd-6setu.2). `None` on a hand mention.
+pub fn request_run(event: &Event) -> Option<String> {
+    tag_value(event, "run")
+}
+
+/// A job request's `node` tag (bd-6setu.2). `None` on a hand mention.
+pub fn request_node(event: &Event) -> Option<String> {
+    tag_value(event, "node")
+}
+
+fn tag_value(event: &Event, name: &str) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
+        .and_then(|t| t.as_slice().get(1).cloned())
+        .filter(|v| !v.is_empty())
+}
+
+/// The nodes a job spec EXCLUDES its claimant from authoring
+/// (`exclude_claimants_of`, stamped by flywheel's lowering from the review
+/// step's stage-contract reads). Unknown/absent/non-string entries are ignored:
+/// the guard can only over-refuse with a declared node, never from noise.
+pub fn excluded_claimant_nodes(request: &Event) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&request.content) else {
+        return Vec::new();
+    };
+    value
+        .get("spec")
+        .and_then(|spec| spec.get("exclude_claimants_of"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// bd-6setu.6 (V10 at the CLAIM): did `claimant` (npub hex) already claim any
+/// node this job excludes, in the SAME run?
+///
+/// Plane-S jobs are claimed by the agent in its own pane, so the dispatch-side
+/// binder cannot see them; the refusal belongs where the pin binds. Only jobs
+/// carrying both tags join: a hand mention has no run, so nothing excludes it.
+pub fn claim_author_conflict(
+    job: EventId,
+    request: &Event,
+    events: &[Event],
+    claimant: &str,
+) -> Option<ClaimAuthorConflict> {
+    let run = request_run(request)?;
+    let exclude = excluded_claimant_nodes(request);
+    if exclude.is_empty() {
+        return None;
+    }
+    // job id -> (run, node) for every request in the stream
+    let scope: HashMap<EventId, (String, String)> = events
+        .iter()
+        .filter(|e| e.kind == toron_kind(JOB_REQUEST) && e.id != job)
+        .filter_map(|e| Some((e.id, (request_run(e)?, request_node(e)?))))
+        .collect();
+    let mut authored: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e.kind == toron_kind(JOB_ACCEPTED))
+        .filter(|e| e.pubkey.to_hex() == claimant)
+        .filter_map(|e| {
+            let parent = job_parent(e)?;
+            let (r, node) = scope.get(&parent)?;
+            (r == &run && exclude.iter().any(|x| x == node)).then(|| (node.clone(), r.clone()))
+        })
+        .collect();
+    authored.sort();
+    authored.dedup();
+    authored
+        .into_iter()
+        .next()
+        .map(|(node, run)| ClaimAuthorConflict { node, run })
+}
+
 /// The job's current state given the full event stream (request..result).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
@@ -607,6 +713,97 @@ mod tests {
 
     /// W7 (§3.7 T4): the compose-request spec parses, validates, and
     /// round-trips through the JobRequest.spec value.
+    /// A job request carrying a run/node scope, as a coalesced dispatch does.
+    fn scoped_job(keys: &Keys, run: &str, node: &str, exclude: &[&str]) -> Event {
+        let mut spec = serde_json::json!({"task": "x"});
+        if !exclude.is_empty() {
+            spec["exclude_claimants_of"] = serde_json::json!(exclude);
+        }
+        let payload = JobRequest {
+            title: format!("job {node}"),
+            spec,
+            assignee: Some("CyanCove".into()),
+        };
+        let tags = vec![
+            Tag::parse(["run", run]).unwrap(),
+            Tag::parse(["node", node]).unwrap(),
+        ];
+        build_job_request_with_tags(keys, None, &payload, Timestamp::from(TS), tags).unwrap()
+    }
+
+    /// bd-6setu.6 (V10 at the claim): a review job refuses the pin that claimed
+    /// a node it reads in the same run; another pin, another run, and a job
+    /// with no exclusion are all accepted. Only tagged jobs join at all.
+    #[test]
+    fn a_review_job_refuses_its_own_author_within_the_run() {
+        let signer = keys();
+        let author = keys();
+        let reviewer = keys();
+
+        let execute = scoped_job(&signer, "run-1", "execute", &[]);
+        let review = scoped_job(&signer, "run-1", "review", &["execute"]);
+        let author_claim = build_job_claim(&author, execute.id, Timestamp::from(TS)).unwrap();
+
+        let events = vec![execute.clone(), review.clone(), author_claim.clone()];
+
+        let conflict =
+            claim_author_conflict(review.id, &review, &events, &author.public_key().to_hex())
+                .expect("the author of a read node is refused");
+        assert_eq!(conflict.node, "execute");
+        assert_eq!(conflict.run, "run-1");
+        assert!(
+            conflict.refusal("CyanCove").contains("v10-author-conflict"),
+            "the refusal carries its typed token: {}",
+            conflict.refusal("CyanCove")
+        );
+
+        // Another pin is a legitimate reviewer.
+        assert_eq!(
+            claim_author_conflict(review.id, &review, &events, &reviewer.public_key().to_hex()),
+            None
+        );
+
+        // The SAME pin in a DIFFERENT run authored nothing this job reads.
+        let other_execute = scoped_job(&signer, "run-2", "execute", &[]);
+        let other_claim = build_job_claim(&author, other_execute.id, Timestamp::from(TS)).unwrap();
+        let other_events = vec![other_execute, review.clone(), other_claim];
+        assert_eq!(
+            claim_author_conflict(
+                review.id,
+                &review,
+                &other_events,
+                &author.public_key().to_hex()
+            ),
+            None,
+            "run scope is part of the guard"
+        );
+
+        // A job with no exclusion never refuses.
+        assert_eq!(
+            claim_author_conflict(execute.id, &execute, &events, &author.public_key().to_hex()),
+            None
+        );
+
+        // A hand mention carries no run tag, so it joins nothing and excludes
+        // nothing even if a spec happens to name a node.
+        let hand = build_job_request_with_tags(
+            &signer,
+            None,
+            &JobRequest {
+                title: "hand".into(),
+                spec: serde_json::json!({"exclude_claimants_of": ["execute"]}),
+                assignee: None,
+            },
+            Timestamp::from(TS),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            claim_author_conflict(hand.id, &hand, &events, &author.public_key().to_hex()),
+            None
+        );
+    }
+
     #[test]
     fn compose_request_spec_parses_and_roundtrips() {
         let v = serde_json::json!({

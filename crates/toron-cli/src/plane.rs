@@ -49,8 +49,8 @@ use toron_workflow::channels::{
 use toron_workflow::coalesce::MentionCoalescer;
 use toron_workflow::jobs::{
     ClaimArrivals, JobError, JobRequest, JobResult, JobState, build_job_cancel, build_job_claim,
-    build_job_error, build_job_progress, build_job_result, first_claimer, first_claimer_by_arrival,
-    job_parent, job_state, job_state_by_arrival,
+    build_job_error, build_job_progress, build_job_result, claim_author_conflict, first_claimer,
+    first_claimer_by_arrival, job_parent, job_state, job_state_by_arrival,
 };
 use toron_workflow::mention::{build_job_from_coalesced, wire_mention_dispatch};
 
@@ -892,12 +892,18 @@ async fn collect_jobs(mailbox: &Mailbox, project: &str) -> anyhow::Result<Vec<Ev
 
 /// Find the 43001 request event for a job id.
 async fn find_request(mailbox: &Mailbox, project: &str, job_id: &str) -> anyhow::Result<Event> {
+    let events = collect_jobs(mailbox, project).await?;
+    request_from(&events, project, job_id)
+}
+
+/// The 43001 request event for `job_id` in an already-collected stream.
+fn request_from(events: &[Event], project: &str, job_id: &str) -> anyhow::Result<Event> {
     let job = EventId::from_hex(job_id)
         .map_err(|_| anyhow::anyhow!("bad job id {job_id} (expected a 43001 event id)"))?;
-    let events = collect_jobs(mailbox, project).await?;
     events
-        .into_iter()
+        .iter()
         .find(|ev| ev.id == job && ev.kind.as_u16() == 43001)
+        .cloned()
         .with_context(|| format!("job {job_id} not found in project {project}"))
 }
 
@@ -1114,8 +1120,19 @@ async fn resolve_claim_winner(
 /// `won: false` and exits 1 (never a silent success).
 async fn job_claim(mailbox: &Mailbox, args: &JobClaimArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
-    let _ = find_request(mailbox, &args.project, &args.job_id).await?;
+    let events = collect_jobs(mailbox, &args.project).await?;
+    let request = request_from(&events, &args.project, &args.job_id)?;
     let job = EventId::from_hex(&args.job_id).context("job id parses")?;
+    // bd-6setu.6 (V10 at the claim): a review job REFUSES the pin that authored
+    // one of the nodes it reads in this run — the author guard belongs where
+    // the pin binds, because a plane-S job is claimed in the agent's own pane
+    // where flywheel's dispatch-side binder cannot see it. Refuse BEFORE the
+    // claim is published: a refused claim must leave the job open for a peer.
+    if let Some(conflict) =
+        claim_author_conflict(job, &request, &events, &keys.public_key().to_hex())
+    {
+        anyhow::bail!(conflict.refusal(&args.as_name));
+    }
 
     let claim = build_job_claim(&keys, job, Timestamp::now())?;
     mailbox.bus().publish(claim.clone()).await?;
