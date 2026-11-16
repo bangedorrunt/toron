@@ -65,6 +65,15 @@ pub struct VerifyResult {
     pub stderr_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The command's stdout PARSED as JSON, when it is JSON.
+    ///
+    /// bd-jhz8x.2 (ADR-0021 D4.5): a downstream step must be able to consume a
+    /// verify step's data — `foreach over: "{{steps.gate.json.ready}}"` is how
+    /// wave-dispatch stops being a planner seat. `stdout_path` is a file, and a
+    /// template reference cannot read a file, so the embedding carries the
+    /// parsed value here. `None` means "not JSON" — never an empty object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
 }
 
 /// Embedding-provided VerifySink (ADR-0024 Spec 2). Unique TypeId, same pattern
@@ -617,5 +626,36 @@ mod lifecycle_tests {
         );
         assert!(attribute_parks(&["gate".into()], &["p1".into(), "p2".into()]).is_empty());
         assert!(attribute_parks(&["gate".into()], &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod verify_result_json_tests {
+    use super::VerifyResult;
+
+    /// bd-jhz8x.2: the parsed-JSON carrier is optional and is OMITTED when the
+    /// command printed no JSON — a consumer must be able to tell "not JSON"
+    /// from "an empty object", so a `None` never serializes as `null`.
+    #[test]
+    fn a_verify_result_without_json_omits_the_field() {
+        let plain = VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: Some("/tmp/out".into()),
+            stderr_path: None,
+            error: None,
+            json: None,
+        };
+        let text = serde_json::to_string(&plain).expect("serializes");
+        assert!(!text.contains("json"), "an absent parse is omitted: {text}");
+
+        let parsed = VerifyResult {
+            json: Some(serde_json::json!({ "ready": [] })),
+            ..plain
+        };
+        let text = serde_json::to_string(&parsed).expect("serializes");
+        assert!(text.contains("\"ready\""), "the parsed value rides along: {text}");
+        let back: VerifyResult = serde_json::from_str(&text).expect("round-trips");
+        assert_eq!(back.json, parsed.json);
     }
 }

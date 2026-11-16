@@ -221,6 +221,7 @@ mod tests {
                         stdout_path: Some(format!("target/{}.log", req.command)),
                         stderr_path: None,
                         error: None,
+                        json: None,
                     })
                 },
             ))))),
