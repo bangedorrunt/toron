@@ -380,10 +380,7 @@ async fn wave_swarm_gate_result_timeout_is_a_journaled_typed_failure() {
         );
 
         assert!(
-            matches!(
-                run.woke(7_300_000),
-                Err(HostError::WrongPhase { .. })
-            ),
+            matches!(run.woke(7_300_000), Err(HostError::WrongPhase { .. })),
             "a terminal run refuses every further verb"
         );
         assert!(
@@ -394,7 +391,10 @@ async fn wave_swarm_gate_result_timeout_is_a_journaled_typed_failure() {
             "a late settle cannot land after the terminal"
         );
         assert!(
-            run.model().outputs.get("gate").is_none_or(|v| v["ok"] != json!(true)),
+            run.model()
+                .outputs
+                .get("gate")
+                .is_none_or(|v| v["ok"] != json!(true)),
             "the late value never lands: {:?}",
             run.model().outputs
         );
@@ -482,7 +482,10 @@ async fn beads_lifecycle_polish_stops_on_an_unchanged_digest() {
                 }
                 other => panic!("unexpected step {other}"),
             }
-            if effects.iter().any(|e| matches!(e, RunEffect::Complete { .. })) {
+            if effects
+                .iter()
+                .any(|e| matches!(e, RunEffect::Complete { .. }))
+            {
                 break;
             }
             assert!(rounds <= 2, "the loop must not run a third round");
