@@ -476,7 +476,6 @@ pub struct ReleasedLease {
 /// per-path DM flooded crew inboxes and tripped captain watch's idle page.
 struct ReleasedNotice {
     path: String,
-    holder: String,
     holder_pubkey: String,
 }
 
@@ -1537,7 +1536,6 @@ impl Mailbox {
             if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
                 notices.push(ReleasedNotice {
                     path: lease.path_pattern.clone(),
-                    holder: lease.agent_name.clone(),
                     holder_pubkey: lease.agent_pubkey.clone(),
                 });
             }
@@ -1698,7 +1696,6 @@ impl Mailbox {
             if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
                 notices.push(ReleasedNotice {
                     path: lease.path_pattern.clone(),
-                    holder: lease.agent_name.clone(),
                     holder_pubkey: lease.agent_pubkey.clone(),
                 });
             }
