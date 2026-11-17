@@ -471,6 +471,15 @@ pub struct ReleasedLease {
     pub holder: String,
 }
 
+/// One released lease that needs a notice to its PREVIOUS holder (bd-pyf2i).
+/// Accumulated during a release call and published as ONE digest, because a
+/// per-path DM flooded crew inboxes and tripped captain watch's idle page.
+struct ReleasedNotice {
+    path: String,
+    holder: String,
+    holder_pubkey: String,
+}
+
 /// The live leases a bead-close event for `bead_id` releases
 /// (bd-close-releases-leases-qkbo). Exact reason match, never a prefix:
 /// a close of `bd-1` must not release a lease reasoned `bd-10`. An empty
@@ -1485,6 +1494,7 @@ impl Mailbox {
 
         let mut released = 0usize;
         let mut released_leases = Vec::new();
+        let mut notices: Vec<ReleasedNotice> = Vec::new();
         for lease in leases {
             let d = format!("{project_slug}:{}", lease.path_pattern);
             let target = revocation_target(&lease.id)?;
@@ -1525,33 +1535,11 @@ impl Mailbox {
             released += 1;
 
             if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
-                let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
-                    .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
-                let subject = format!("reservation released: {}", lease.path_pattern);
-                let rumor = crate::nostr::gift_wrap::build_rumor(
-                    operator.public_key(),
-                    Timestamp::now(),
-                    crate::nostr::Kind::PrivateDirectMessage,
-                    vec![
-                        Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
-                        Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
-                        Tag::parse(["reason", reason_tag]).expect("reason"),
-                        Tag::parse(["reservation-id", &lease.id]).expect("res"),
-                        Tag::parse(["subject", &subject]).expect("subject"),
-                    ],
-                    format!(
-                        "reservation {} (holder {}) released by {} (reason {})",
-                        lease.path_pattern, lease.agent_name, requestor_name, reason_tag
-                    ),
-                );
-                let wrap = crate::nostr::gift_wrap::gift_wrap(operator, &holder_npub, rumor)
-                    .expect("wrap notify");
-                if let Err(e) = self.publish_dm(&wrap).await {
-                    tracing::warn!(
-                        d,
-                        "release-by-reason notification DM to {holder_npub} failed: {e}"
-                    );
-                }
+                notices.push(ReleasedNotice {
+                    path: lease.path_pattern.clone(),
+                    holder: lease.agent_name.clone(),
+                    holder_pubkey: lease.agent_pubkey.clone(),
+                });
             }
             released_leases.push(ReleasedLease {
                 path: lease.path_pattern.clone(),
@@ -1564,10 +1552,76 @@ impl Mailbox {
                 holder: lease.agent_name.clone(),
             });
         }
+        self.publish_release_digest(operator, &notices, reason_tag, requestor_name, None)
+            .await;
         Ok(ReleaseResult {
             released,
             leases: released_leases,
         })
+    }
+
+    /// One digest per release CALL, addressed to each previous holder whose
+    /// leases were released (bd-pyf2i). The releaser never receives one: it
+    /// already knows. The subject names every path so a watcher can tell what
+    /// moved without reading the body.
+    async fn publish_release_digest(
+        &self,
+        operator: &Keys,
+        notices: &[ReleasedNotice],
+        reason_tag: &str,
+        requestor_name: &str,
+        reopened_epoch: Option<u64>,
+    ) {
+        use std::collections::BTreeMap;
+        let mut by_holder: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for notice in notices {
+            by_holder
+                .entry(notice.holder_pubkey.as_str())
+                .or_default()
+                .push(notice.path.as_str());
+        }
+        for (npub, paths) in by_holder {
+            let holder_npub = match PublicKey::from_hex(npub) {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!("release digest: bad holder npub: {e}");
+                    continue;
+                }
+            };
+            let names = paths.join(", ");
+            let subject = format!("reservation released: {names}");
+            let body = match reopened_epoch {
+                Some(epoch) => format!(
+                    "{} reservation(s) released by {} because {} reopened with epoch <= {}: {names}",
+                    paths.len(),
+                    requestor_name,
+                    reason_tag,
+                    epoch
+                ),
+                None => format!(
+                    "{} reservation(s) released by {} (reason {}): {names}",
+                    paths.len(),
+                    requestor_name,
+                    reason_tag
+                ),
+            };
+            let rumor = gift_wrap::build_rumor(
+                operator.public_key(),
+                Timestamp::now(),
+                Kind::PrivateDirectMessage,
+                vec![
+                    Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
+                    Tag::parse(["p", npub]).expect("p"),
+                    Tag::parse(["reason", reason_tag]).expect("reason"),
+                    Tag::parse(["subject", &subject]).expect("subject"),
+                ],
+                body,
+            );
+            let wrap = gift_wrap::gift_wrap(operator, &holder_npub, rumor).expect("wrap digest");
+            if let Err(e) = self.publish_dm(&wrap).await {
+                tracing::warn!("release digest DM to {holder_npub} failed: {e}");
+            }
+        }
     }
 
     /// Operator-signed release of all reservations whose reason matches `bead_id`
@@ -1598,6 +1652,7 @@ impl Mailbox {
 
         let mut released = 0usize;
         let mut released_leases = Vec::new();
+        let mut notices: Vec<ReleasedNotice> = Vec::new();
         for lease in leases {
             let d = format!("{project_slug}:{}", lease.path_pattern);
             let target = revocation_target(&lease.id)?;
@@ -1641,33 +1696,11 @@ impl Mailbox {
             released += 1;
 
             if notify_previous && requestor_name.trim() != lease.agent_name.trim() {
-                let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
-                    .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
-                let subject = format!("reservation released: {}", lease.path_pattern);
-                let rumor = crate::nostr::gift_wrap::build_rumor(
-                    operator.public_key(),
-                    Timestamp::now(),
-                    crate::nostr::Kind::PrivateDirectMessage,
-                    vec![
-                        Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
-                        Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
-                        Tag::parse(["reason", bead_id]).expect("reason"),
-                        Tag::parse(["reservation-id", &lease.id]).expect("res"),
-                        Tag::parse(["subject", &subject]).expect("subject"),
-                    ],
-                    format!(
-                        "reservation {} (holder {}) released by {} because {} reopened with epoch <= {}",
-                        lease.path_pattern, lease.agent_name, requestor_name, bead_id, max_epoch
-                    ),
-                );
-                let wrap = crate::nostr::gift_wrap::gift_wrap(operator, &holder_npub, rumor)
-                    .expect("wrap notify");
-                if let Err(e) = self.publish_dm(&wrap).await {
-                    tracing::warn!(
-                        d,
-                        "release-by-reason-up-to-epoch notification DM to {holder_npub} failed: {e}"
-                    );
-                }
+                notices.push(ReleasedNotice {
+                    path: lease.path_pattern.clone(),
+                    holder: lease.agent_name.clone(),
+                    holder_pubkey: lease.agent_pubkey.clone(),
+                });
             }
             released_leases.push(ReleasedLease {
                 path: lease.path_pattern.clone(),
@@ -1680,6 +1713,8 @@ impl Mailbox {
                 holder: lease.agent_name.clone(),
             });
         }
+        self.publish_release_digest(operator, &notices, bead_id, requestor_name, Some(max_epoch))
+            .await;
         Ok(ReleaseResult {
             released,
             leases: released_leases,
@@ -6417,6 +6452,88 @@ mod tests {
             wraps.is_empty(),
             "a self release must not notify the releaser, got {} DM(s)",
             wraps.len()
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-pyf2i: 30 paths released in ONE call make ONE digest notice naming
+    /// every path, and NO notice at all to the pin that released them.
+    #[tokio::test]
+    async fn test_release_by_reason_sends_one_digest_for_many_paths() {
+        let (mailbox, db_path, data_dir) = test_mailbox("pyf2i-digest").await;
+        let _holder = register(&mailbox, "demo", "BlueLake").await;
+        let holder_keys = mailbox
+            .agent_keys_for("demo", "BlueLake")
+            .expect("holder keys");
+        let _releaser = register(&mailbox, "demo", "RoseDune").await;
+        let releaser_keys = mailbox
+            .agent_keys_for("demo", "RoseDune")
+            .expect("releaser keys");
+
+        let paths: Vec<String> = (0..30).map(|i| format!("src/digest-{i}.rs")).collect();
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &paths,
+                Some(3600),
+                true,
+                Some("bd-DIGEST"),
+            )
+            .await
+            .expect("acquire 30 leases");
+        let r = mailbox
+            .release_by_reason("demo", "RoseDune", "bd-DIGEST", true)
+            .await
+            .expect("release 30 leases");
+        assert_eq!(r.released, 30);
+
+        let wraps = collect_replay(
+            mailbox.bus.as_ref(),
+            ToronFilter::new().kinds([Kind::GiftWrap]).build(),
+        )
+        .await
+        .expect("wraps");
+        let notices: Vec<_> = wraps
+            .iter()
+            .filter_map(|w| gift_wrap::unwrap(&holder_keys, w).ok())
+            .filter(|g| {
+                g.rumor.tags.iter().any(|t| {
+                    t.as_slice() == ["toron-kind".to_string(), "reservation-revoked".to_string()]
+                })
+            })
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "one digest per release call, not one DM per path: {} notice(s)",
+            notices.len()
+        );
+        let subject = notices[0]
+            .rumor
+            .tags
+            .iter()
+            .find_map(|t| match t.as_slice() {
+                [k, v] if k == "subject" => Some(v.as_str()),
+                _ => None,
+            })
+            .expect("digest subject");
+        assert!(
+            subject.starts_with("reservation released:")
+                && subject.contains("src/digest-0.rs")
+                && subject.contains("src/digest-29.rs"),
+            "the digest names every released path: {subject}"
+        );
+
+        let to_releaser: Vec<_> = wraps
+            .iter()
+            .filter_map(|w| gift_wrap::unwrap(&releaser_keys, w).ok())
+            .collect();
+        assert!(
+            to_releaser.is_empty(),
+            "the releaser already knows: no notice to RoseDune"
         );
 
         let _ = std::fs::remove_file(&db_path);
