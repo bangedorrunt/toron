@@ -1273,6 +1273,53 @@ async fn warn_acquire_paths(paths: &[String]) {
         }
     }
     warn_zero_file_matches(paths).await;
+    warn_acquire_traps(paths).await;
+}
+
+async fn warn_acquire_traps(paths: &[String]) {
+    if paths.is_empty() || std::env::var_os("TORON_SKIP_TRAP_CHECK").is_some() {
+        return;
+    }
+    let paths_owned: Vec<String> = paths.iter().take(8).cloned().collect();
+    let cwd = std::env::current_dir().ok();
+    let chie = std::env::var("TORON_CHIE_BIN").unwrap_or_else(|_| "chie".to_string());
+    let scan = tokio::task::spawn_blocking(move || {
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &paths_owned {
+            let mut cmd = std::process::Command::new(&chie);
+            cmd.args(["memory", "check-trap", "--path", p, "--query", p, "--json"]);
+            if let Some(dir) = cwd.as_deref() {
+                cmd.args(["--project", &dir.to_string_lossy()]);
+            }
+            let Ok(out) = cmd.output() else {
+                return Vec::new();
+            };
+            if !out.status.success() {
+                continue;
+            }
+            if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+                for row in rows {
+                    if let Some(w) = row.get("warning").and_then(|v| v.as_str()) {
+                        let id = row.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let line = if id.is_empty() {
+                            w.to_string()
+                        } else {
+                            format!("{w} [{id}]")
+                        };
+                        seen.insert(line);
+                    }
+                }
+            }
+        }
+        seen.into_iter().take(5).collect::<Vec<_>>()
+    });
+    if let Ok(Ok(warnings)) =
+        tokio::time::timeout(std::time::Duration::from_millis(1200), scan).await
+    {
+        for w in warnings {
+            eprintln!("⚠️  [trap] {w}");
+        }
+    }
 }
 
 async fn warn_zero_file_matches(paths: &[String]) {
