@@ -103,6 +103,14 @@ pub trait Backend: Send + Sync {
         Err(unsupported(self.name(), "pane_wait_output"))
     }
 
+    /// Is the named agent process actually running in this pane? `None` means
+    /// this backend cannot tell (callers keep their legacy pane-existence
+    /// semantics — never a confident "healthy"). bd-1hkt0: liveness must come
+    /// from the plane that owns the pane, not from some other plane's socket.
+    fn agent_alive(&self, _pane_id: &str, _kind: &str) -> Option<bool> {
+        None
+    }
+
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         Err(unsupported(self.name(), "agent_list"))
     }

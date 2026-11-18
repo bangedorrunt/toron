@@ -350,6 +350,58 @@ impl SuperlogicalBackend {
     }
 }
 
+/// bd-1hkt0: compare the rex block's foreground program with the agent kind.
+/// A shell at the prompt is a dead agent even when the labelled pane still
+/// lists; a different known harness is also not the expected agent. An
+/// unknown foreground stays inconclusive rather than confidently alive.
+fn agent_alive_from_foreground(foreground: &str, kind: &str) -> Option<bool> {
+    use toron_core::harness::Harness;
+    let expected = Harness::from_kind(kind);
+    if expected == Harness::Other {
+        return None;
+    }
+    let actual = Harness::from_kind(foreground);
+    if actual == expected {
+        return Some(true);
+    }
+    if ["sh", "bash", "zsh", "fish", "dash"].contains(&foreground) {
+        return Some(false);
+    }
+    if actual == Harness::Other {
+        return None;
+    }
+    Some(false)
+}
+
+#[cfg(test)]
+mod agent_alive_tests {
+    use super::agent_alive_from_foreground;
+
+    #[test]
+    fn rex_liveness_distinguishes_a_live_agent_from_its_dead_label() {
+        assert_eq!(
+            agent_alive_from_foreground("opencode", "opencode"),
+            Some(true),
+            "the expected binary in front is a live agent"
+        );
+        assert_eq!(
+            agent_alive_from_foreground("zsh", "opencode"),
+            Some(false),
+            "a retired seat's pane returns to a shell even though its label stays"
+        );
+        assert_eq!(
+            agent_alive_from_foreground("pi", "opencode"),
+            Some(false),
+            "a different known harness is not the expected agent"
+        );
+        assert_eq!(
+            agent_alive_from_foreground("mystery", "unknown-kind"),
+            None,
+            "an unknown kind is inconclusive, never confidently alive"
+        );
+    }
+}
+
 impl MultiplexerBackend for SuperlogicalBackend {
     fn name(&self) -> &'static str {
         "superlogical"
@@ -447,6 +499,17 @@ impl MultiplexerBackend for SuperlogicalBackend {
         rex.text(&block_close_args(&session.session_id, &block.block_id))
             .map_err(RexFail::into_backend)?;
         Ok(())
+    }
+
+    /// bd-1hkt0: ask the rex plane that owns the pane, not flywheel's hc
+    /// socket. `terminal.process` reports the foreground program directly.
+    fn agent_alive(&self, pane_id: &str, kind: &str) -> Option<bool> {
+        let rex = Self::rex().ok()?;
+        let (session, block) = Self::locate(&rex, pane_id).ok()?;
+        let process = rex
+            .json(&process_args(&session.session_id, &block.block_id))
+            .ok()?;
+        agent_alive_from_foreground(&parse_process_view(&process).foreground, kind)
     }
 
     fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), crate::backend::BackendError> {

@@ -1477,6 +1477,92 @@ impl HcBackend {
     }
 }
 
+/// bd-1hkt0: byte-identical port of flywheel's hc liveness fold.
+///
+/// `terminal.get` carries the shell pid and the foreground group leader;
+/// a binary match is ground truth, a shell-owned foreground means the agent
+/// exited, and an unknown kind with no other signal stays inconclusive.
+fn agent_alive_from_terminal(res: &Value, kind: &str) -> Option<bool> {
+    let shell_pid = res.get("pid").and_then(Value::as_u64);
+    let (foreground_pgid, foreground): (Option<u64>, Vec<(String, Option<String>)>) =
+        match res.get("foreground") {
+            Some(fg) if !fg.is_null() => {
+                let pid = fg.get("pid").and_then(Value::as_u64);
+                let argv0 = fg
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let procs = match fg.get("name").and_then(Value::as_str) {
+                    Some(name) => vec![(name.to_string(), argv0)],
+                    None => Vec::new(),
+                };
+                (pid, procs)
+            }
+            _ => (None, Vec::new()),
+        };
+    let names = kind_process_names(kind);
+    let binary_hit = names.iter().any(|n| {
+        foreground
+            .iter()
+            .any(|(name, argv0)| process_name_matches(name, n) || argv0.as_deref() == Some(*n))
+    });
+    if binary_hit {
+        return Some(true);
+    }
+    if matches!((foreground_pgid, shell_pid), (Some(fg), Some(sh)) if fg == sh) {
+        return Some(false);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(false)
+}
+
+/// Known agent-kind → executable names (flywheel's `kind_process_names`).
+fn kind_process_names(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "opencode" | "oc" => &["opencode"],
+        "pi" => &["pi", "gemini"],
+        "grok" | "gk" => &["grok", "grok-build"],
+        _ => &[],
+    }
+}
+
+/// Exact match, or the same name with an npm/mise `.exe` suffix.
+fn process_name_matches(candidate: &str, expected: &str) -> bool {
+    candidate == expected
+        || candidate
+            .strip_suffix(".exe")
+            .is_some_and(|stem| stem == expected)
+}
+
+#[cfg(test)]
+mod agent_alive_tests {
+    use super::agent_alive_from_terminal;
+    use serde_json::json;
+
+    #[test]
+    fn hc_liveness_sees_the_agent_binary() {
+        let res =
+            json!({"pid": 10, "foreground": {"pid": 11, "name": "opencode", "argv": ["opencode"]}});
+        assert_eq!(agent_alive_from_terminal(&res, "opencode"), Some(true));
+    }
+
+    #[test]
+    fn hc_liveness_reads_a_shell_owned_foreground_as_dead() {
+        let res = json!({"pid": 10, "foreground": {"pid": 10, "name": "zsh", "argv": ["-zsh"]}});
+        assert_eq!(agent_alive_from_terminal(&res, "opencode"), Some(false));
+    }
+
+    #[test]
+    fn hc_liveness_is_inconclusive_for_an_unknown_kind() {
+        let res = json!({"pid": 10, "foreground": {"pid": 11, "name": "mystery"}});
+        assert_eq!(agent_alive_from_terminal(&res, "mystery-kind"), None);
+    }
+}
+
 impl Backend for HcBackend {
     fn name(&self) -> &'static str {
         "hc"
@@ -1600,6 +1686,18 @@ impl Backend for HcBackend {
         let _ = self.client.terminal_kill(pane_id)?;
         let _ = self.client.terminal_rm(pane_id);
         Ok(())
+    }
+
+    /// bd-1hkt0: hc's liveness is unchanged — port of flywheel's process fold.
+    fn agent_alive(&self, pane_id: &str, kind: &str) -> Option<bool> {
+        let res = self
+            .client
+            .call(
+                "terminal.get",
+                json!({ "terminal": strip_id_prefix(pane_id) }),
+            )
+            .ok()?;
+        agent_alive_from_terminal(&res, kind)
     }
 
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
