@@ -9,6 +9,22 @@ The `Backend` trait abstracts process supervision. Two planes implement it:
 TUI client and the tmux stub are gone. Both clients live in
 `toron-core::backend` and are shared with flywheel.
 
+## Conformance (bd-egvr6)
+
+`toron_plane::backend::conformance` is one generic contract run over every
+`Backend` impl. Every trait method answers a typed result: `Ok`,
+`Err(Unsupported)` for a capability the impl deliberately lacks, or
+`Err(other)` for a real failure. `agent_alive` is
+`Result<Option<bool>, BackendError>` — `Ok(Some)` = alive/dead, `Ok(None)` =
+unknown/inconclusive, `Err(Unsupported)` = no liveness probe on this backend.
+Callers must distinguish the last two; only `Ok(None)` is "inconclusive".
+
+Each impl carries a manifest of expected `Unsupported` methods. The suite fails
+either way: a declared method that answers `Ok`/other error, or an undeclared
+method that answers `Unsupported`. It runs unconditionally over `MockBackend`;
+the read-only hc and rex runners are `#[ignore]`d and fail loudly when `HC_BIN`
+/ `REX_BIN_DIR` are absent, so a gated run never passes vacuously.
+
 ## Plane selection
 
 `toron_plane::backend::plane` is the only place that decides which plane serves:

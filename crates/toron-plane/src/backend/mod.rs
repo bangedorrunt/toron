@@ -4,6 +4,7 @@
 // 1. **Object-safety: YES (dyn-capable).** flywheel's factory returns
 // 6. **Error type: this crate's `BackendError`** (machine-code typed,
 
+pub mod conformance;
 pub mod error;
 pub mod fallback;
 pub mod hc;
@@ -103,12 +104,17 @@ pub trait Backend: Send + Sync {
         Err(unsupported(self.name(), "pane_wait_output"))
     }
 
-    /// Is the named agent process actually running in this pane? `None` means
-    /// this backend cannot tell (callers keep their legacy pane-existence
-    /// semantics — never a confident "healthy"). bd-1hkt0: liveness must come
-    /// from the plane that owns the pane, not from some other plane's socket.
-    fn agent_alive(&self, _pane_id: &str, _kind: &str) -> Option<bool> {
-        None
+    /// Is the named agent process actually running in this pane?
+    /// `Ok(Some(bool))` = the plane answered; `Ok(None)` = inconclusive (never
+    /// a confident "healthy"); `Err(Unsupported)` = this backend has no probe;
+    /// `Err(other)` = the probe failed. bd-1hkt0: liveness must come from the
+    /// plane that owns the pane, not from some other plane's socket.
+    fn agent_alive(
+        &self,
+        _pane_id: &str,
+        _kind: &str,
+    ) -> Result<Option<bool>, BackendError> {
+        Err(unsupported(self.name(), "agent_alive"))
     }
 
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {

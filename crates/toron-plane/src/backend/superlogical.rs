@@ -503,13 +503,16 @@ impl MultiplexerBackend for SuperlogicalBackend {
 
     /// bd-1hkt0: ask the rex plane that owns the pane, not flywheel's hc
     /// socket. `terminal.process` reports the foreground program directly.
-    fn agent_alive(&self, pane_id: &str, kind: &str) -> Option<bool> {
-        let rex = Self::rex().ok()?;
-        let (session, block) = Self::locate(&rex, pane_id).ok()?;
+    fn agent_alive(&self, pane_id: &str, kind: &str) -> Result<Option<bool>, BackendError> {
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
         let process = rex
             .json(&process_args(&session.session_id, &block.block_id))
-            .ok()?;
-        agent_alive_from_foreground(&parse_process_view(&process).foreground, kind)
+            .map_err(RexFail::into_backend)?;
+        Ok(agent_alive_from_foreground(
+            &parse_process_view(&process).foreground,
+            kind,
+        ))
     }
 
     fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), crate::backend::BackendError> {

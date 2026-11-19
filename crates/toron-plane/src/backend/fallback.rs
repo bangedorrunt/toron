@@ -255,6 +255,12 @@ impl Backend for FallbackBackend {
         })
     }
 
+    fn agent_alive(&self, pane_id: &str, kind: &str) -> Result<Option<bool>, BackendError> {
+        self.run_for_id(pane_id, Policy::Read, |backend| {
+            backend.agent_alive(pane_id, kind)
+        })
+    }
+
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         self.run(Policy::Read, |backend| backend.agent_list())
     }

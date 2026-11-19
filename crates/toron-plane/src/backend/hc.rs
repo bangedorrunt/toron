@@ -1689,15 +1689,12 @@ impl Backend for HcBackend {
     }
 
     /// bd-1hkt0: hc's liveness is unchanged — port of flywheel's process fold.
-    fn agent_alive(&self, pane_id: &str, kind: &str) -> Option<bool> {
-        let res = self
-            .client
-            .call(
-                "terminal.get",
-                json!({ "terminal": strip_id_prefix(pane_id) }),
-            )
-            .ok()?;
-        agent_alive_from_terminal(&res, kind)
+    fn agent_alive(&self, pane_id: &str, kind: &str) -> Result<Option<bool>, BackendError> {
+        let res = self.client.call(
+            "terminal.get",
+            json!({ "terminal": strip_id_prefix(pane_id) }),
+        )?;
+        Ok(agent_alive_from_terminal(&res, kind))
     }
 
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
