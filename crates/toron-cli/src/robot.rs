@@ -1276,49 +1276,120 @@ async fn warn_acquire_paths(paths: &[String]) {
     warn_acquire_traps(paths).await;
 }
 
+fn find_git_root_from(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
+}
+
+async fn run_toron_trap_cmd(
+    chie: &str,
+    args: &[&str],
+    project_dir: Option<&std::path::Path>,
+    deadline: tokio::time::Instant,
+) -> Result<std::process::Output, bool> {
+    let mut cmd = tokio::process::Command::new(chie);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(dir) = project_dir {
+        cmd.args(["--project", &dir.to_string_lossy()]);
+    }
+    match tokio::time::timeout_at(deadline, cmd.output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(_)) => Err(false),
+        Err(_) => Err(true),
+    }
+}
+
+async fn collect_acquire_traps_with_bin(
+    chie: &str,
+    project_dir: Option<&std::path::Path>,
+    paths: &[String],
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut seen = std::collections::BTreeSet::new();
+    for p in paths.iter().take(8) {
+        let out = match run_toron_trap_cmd(
+            chie,
+            &["memory", "check-trap", "--path", p, "--query", p, "--json"],
+            project_dir,
+            deadline,
+        )
+        .await
+        {
+            Ok(out) if out.status.success() => out,
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                if err.contains("unexpected argument") && err.contains("--query") {
+                    match run_toron_trap_cmd(
+                        chie,
+                        &["memory", "check-trap", "--path", p, "--json"],
+                        project_dir,
+                        deadline,
+                    )
+                    .await
+                    {
+                        Ok(retry) if retry.status.success() => retry,
+                        Ok(_) => continue,
+                        Err(timed_out) => {
+                            if timed_out {
+                                break;
+                            }
+                            return Vec::new();
+                        }
+                    }
+                } else {
+                    continue;
+                }
+            }
+            Err(timed_out) => {
+                if timed_out {
+                    break;
+                }
+                return Vec::new();
+            }
+        };
+        if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+            for row in rows {
+                if let Some(w) = row.get("warning").and_then(|v| v.as_str()) {
+                    let id = row.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let line = if id.is_empty() {
+                        w.to_string()
+                    } else {
+                        format!("{w} [{id}]")
+                    };
+                    seen.insert(line);
+                }
+            }
+        }
+    }
+    seen.into_iter().take(5).collect()
+}
+
 async fn warn_acquire_traps(paths: &[String]) {
     if paths.is_empty() || std::env::var_os("TORON_SKIP_TRAP_CHECK").is_some() {
         return;
     }
-    let paths_owned: Vec<String> = paths.iter().take(8).cloned().collect();
     let cwd = std::env::current_dir().ok();
+    let project_dir = cwd.as_deref().and_then(find_git_root_from).or(cwd);
     let chie = std::env::var("TORON_CHIE_BIN").unwrap_or_else(|_| "chie".to_string());
-    let scan = tokio::task::spawn_blocking(move || {
-        let mut seen = std::collections::BTreeSet::new();
-        for p in &paths_owned {
-            let mut cmd = std::process::Command::new(&chie);
-            cmd.args(["memory", "check-trap", "--path", p, "--query", p, "--json"]);
-            if let Some(dir) = cwd.as_deref() {
-                cmd.args(["--project", &dir.to_string_lossy()]);
-            }
-            let Ok(out) = cmd.output() else {
-                return Vec::new();
-            };
-            if !out.status.success() {
-                continue;
-            }
-            if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
-                for row in rows {
-                    if let Some(w) = row.get("warning").and_then(|v| v.as_str()) {
-                        let id = row.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let line = if id.is_empty() {
-                            w.to_string()
-                        } else {
-                            format!("{w} [{id}]")
-                        };
-                        seen.insert(line);
-                    }
-                }
-            }
-        }
-        seen.into_iter().take(5).collect::<Vec<_>>()
-    });
-    if let Ok(Ok(warnings)) =
-        tokio::time::timeout(std::time::Duration::from_millis(1200), scan).await
-    {
-        for w in warnings {
-            eprintln!("⚠️  [trap] {w}");
-        }
+    let warnings = collect_acquire_traps_with_bin(
+        &chie,
+        project_dir.as_deref(),
+        paths,
+        std::time::Duration::from_millis(1200),
+    )
+    .await;
+    for w in warnings {
+        eprintln!("⚠️  [trap] {w}");
     }
 }
 
@@ -3398,5 +3469,102 @@ mod guard_projection_tests {
                 "crates/d.rs"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    fn write_test_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write script");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[test]
+    fn find_git_root_walks_ancestors() {
+        let base = std::env::temp_dir().join(format!(
+            "toron-git-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let nested = base.join("crates/toron-cli/src");
+        std::fs::create_dir_all(base.join(".git")).expect("create .git");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        assert_eq!(find_git_root_from(&nested).as_deref(), Some(base.as_path()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_acquire_traps_runs_fake_chie_and_falls_back_from_query() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-trap-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let chie = write_test_script(
+            &dir,
+            "fake-chie",
+            r#"#!/bin/sh
+if echo "$*" | grep -q -- "--query"; then
+  echo "error: unexpected argument '--query' found" >&2
+  exit 2
+fi
+printf '[{"rule_id":"trap-1","warning":"Check lock order"}]'
+"#,
+        );
+        let traps = collect_acquire_traps_with_bin(
+            chie.to_str().expect("utf8"),
+            Some(&dir),
+            &["src/lib.rs".to_string()],
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(traps, vec!["Check lock order [trap-1]".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn collect_acquire_traps_handles_missing_bin() {
+        let traps = collect_acquire_traps_with_bin(
+            "/nonexistent/toron-chie-missing",
+            None,
+            &["src/lib.rs".to_string()],
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(traps.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_acquire_traps_times_out_and_kills_child() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-trap-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let chie = write_test_script(&dir, "slow-chie", "#!/bin/sh\nexec sleep 5\n");
+        let start = std::time::Instant::now();
+        let traps = collect_acquire_traps_with_bin(
+            chie.to_str().expect("utf8"),
+            None,
+            &["a.rs".to_string(), "b.rs".to_string()],
+            std::time::Duration::from_millis(120),
+        )
+        .await;
+        assert!(traps.is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
