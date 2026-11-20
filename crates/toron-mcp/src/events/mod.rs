@@ -242,10 +242,10 @@ pub fn authorize(authorization: Option<&str>) -> Result<Principal, ErrorData> {
 
 /// The same decision over an injected store and clock, so the router can be
 /// tested without touching the operator's durable root.
-pub fn authorize_with_store<S: toron_core::events::principal::TokenStore>(
+pub fn authorize_with_store(
     authorization: Option<&str>,
     now_us: i64,
-    store: &S,
+    store: &dyn toron_core::events::principal::TokenStore,
 ) -> Result<Principal, ErrorData> {
     use toron_core::events::principal::resolve;
 

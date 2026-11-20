@@ -621,6 +621,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let _wake = start_wake_sidecar(&mailbox).await;
     let _events = start_events_dispatcher(&mailbox).await;
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+    let index_pool = mailbox.index_pool().cloned().expect("mailbox index pool");
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
     let res: anyhow::Result<()> = tokio::select! {
@@ -707,6 +708,7 @@ async fn router_with_mailbox(
     extra_hosts: &[String],
 ) -> anyhow::Result<(axum::Router, Vec<WorkflowHost>)> {
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+    let index_pool = mailbox.index_pool().cloned().expect("mailbox index pool");
     let server = ToronServer::new().with_mailbox(mailbox);
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
@@ -721,9 +723,24 @@ async fn router_with_mailbox(
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
     let blossom =
         crate::blob_serve::blossom_router(toron_core::archive::blob::BlobStore::new(blob_root));
+    // ADR-0039 D7: SSE stream is a plain axum route (rmcp custom requests are
+    // single JSON results). It shares the store and cursor with events/poll.
+    let events_store: std::sync::Arc<dyn toron_core::events::store::SubscriptionStore> =
+        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
+            index_pool,
+        ));
+    let stream_router = axum::Router::new()
+        .route("/events/stream", axum::routing::get(crate::events_stream::events_stream))
+        .with_state((
+            events_store,
+            std::sync::Arc::new(toron_core::events::principal::FileTokenStore::at_root(
+                &toron_core::config::ToronPaths::resolve().root,
+            )) as std::sync::Arc<dyn toron_core::events::principal::TokenStore>,
+        ));
     let router = axum::Router::new()
         .nest_service("/mcp", service)
-        .merge(blossom);
+        .merge(blossom)
+        .merge(stream_router);
     Ok((router, hosts))
 }
 

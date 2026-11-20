@@ -56,6 +56,16 @@ pub fn args_hash(args: &Value) -> String {
     hex::encode(Sha256::digest(canonical_json(args).as_bytes()))
 }
 
+/// The one gap/cursor rule shared by poll and stream: if `after` fell off the
+/// pruned end, report a gap and resume from the oldest servable row.
+pub fn gap_floor(after: u64, oldest: Option<i64>) -> (bool, i64) {
+    let truncated = oldest.is_some_and(|oldest| (after as i64) < oldest - 1);
+    let start = oldest
+        .map(|o| (after as i64).max(o - 1))
+        .unwrap_or(after as i64);
+    (truncated, start)
+}
+
 fn subscription_id(principal: &str, delivery: &str, name: &str, hash: &str) -> String {
     hex::encode(Sha256::digest(
         format!("{principal}\0{delivery}\0{name}\0{hash}").as_bytes(),
@@ -274,10 +284,7 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
-        let truncated = oldest.is_some_and(|oldest| (after as i64) < oldest - 1);
-        let start = oldest
-            .map(|o| (after as i64).max(o - 1))
-            .unwrap_or(after as i64);
+        let (truncated, start) = gap_floor(after, oldest);
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT seq, payload FROM event_deliveries \
              WHERE subscription_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",

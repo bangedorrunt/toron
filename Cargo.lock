@@ -3516,6 +3516,7 @@ dependencies = [
  "axum",
  "chrono",
  "evalexpr",
+ "futures-util",
  "hex",
  "http-body-util",
  "nostr",

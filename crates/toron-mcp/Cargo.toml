@@ -17,6 +17,7 @@ toron-core = { path = "../toron-core" }
 toron-plane = { path = "../toron-plane" }
 toron-workflow = { path = "../toron-workflow" }
 axum = "0.7"
+futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
