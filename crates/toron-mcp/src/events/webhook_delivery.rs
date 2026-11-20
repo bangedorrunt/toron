@@ -300,6 +300,187 @@ pub async fn subscribe_webhook<P: EgressPort>(
     Ok((secret.whsec(), activated))
 }
 
+/// The webhook delivery kernel. One journal is the source of truth; effects
+/// are appended BEFORE invoke with a stable key, and a retry REUSES that key.
+/// A restarted daemon re-folds the journal into `pending` and resumes from the
+/// next clock Msg. The clock and HTTP are ports; no timer lives in the kernel.
+#[derive(Debug, Default)]
+pub struct WebhookDispatcher<P: EgressPort> {
+    port: P,
+    policy: EgressPolicy,
+    journal: Vec<String>,
+    pending: std::collections::BTreeMap<String, PendingRetry>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRetry {
+    sub: String,
+    event: String,
+    attempt: u32,
+    due_ms: u64,
+    spec: PostSpecOwned,
+}
+
+#[derive(Clone, Debug)]
+pub struct PostSpecOwned {
+    url: String,
+    body: Vec<u8>,
+    secret_whsec: String,
+    webhook_id: String,
+}
+
+impl<P: EgressPort> WebhookDispatcher<P> {
+    pub fn new(port: P, policy: EgressPolicy) -> Self {
+        Self {
+            port,
+            policy,
+            journal: vec![],
+            pending: Default::default(),
+        }
+    }
+
+    pub fn journal_rows(&self) -> &[String] {
+        &self.journal
+    }
+
+    fn append(&mut self, row: String) {
+        self.journal.push(row);
+    }
+
+    /// Dispatch one event: journal intent, invoke, journal the result.
+    pub async fn on_event(
+        &mut self,
+        sub: &str,
+        event: &str,
+        url: &str,
+        body: Vec<u8>,
+        secret: &Secret,
+        timestamp: u64,
+    ) -> Result<Decision, String> {
+        let key = format!("webhook:{sub}:{event}");
+        self.append(format!(
+            "{{\"kind\":\"deliver-intent\",\"key\":\"{key}\",\"attempt\":1}}"
+        ));
+        let spec = PostSpecOwned {
+            url: url.to_string(),
+            body,
+            secret_whsec: secret.whsec(),
+            webhook_id: format!("msg_{event}"),
+        };
+        let outcome = self.post(&spec, timestamp).await?;
+        Ok(self.finish(&key, sub, event, &spec, 1, outcome))
+    }
+
+    async fn post(&self, spec: &PostSpecOwned, timestamp: u64) -> Result<Outcome, String> {
+        let target = egress::validate_target(&spec.url, &self.policy)?;
+        let secret = Secret::from_whsec(&spec.secret_whsec)?;
+        guarded_post(
+            &self.port,
+            &self.policy,
+            &PostSpec {
+                target: &target,
+                timestamp,
+                body: &spec.body,
+                secret: &secret,
+                webhook_id: &spec.webhook_id,
+                challenge: false,
+            },
+        )
+        .await
+    }
+
+    fn finish(
+        &mut self,
+        key: &str,
+        sub: &str,
+        event: &str,
+        spec: &PostSpecOwned,
+        attempt: u32,
+        outcome: Outcome,
+    ) -> Decision {
+        let decision =
+            toron_core::events::retry::decide(attempt, &outcome, 0.0, &RetryPolicy::default());
+        let (due_ms, kind) = match decision {
+            Decision::Retry { delay_ms } => (delay_ms, "retry"),
+            Decision::Terminated(_) => (0, "terminated"),
+            Decision::Gap => (0, "dead-letter"),
+            Decision::Delivered => (0, "delivered"),
+        };
+        self.append(format!(
+            "{{\"kind\":\"deliver-result\",\"key\":\"{key}\",\"attempt\":{attempt},\"decision\":\"{kind}\",\"due_ms\":{due_ms}}}"
+        ));
+        if let Decision::Retry { .. } = decision {
+            self.pending.insert(
+                key.to_string(),
+                PendingRetry {
+                    sub: sub.to_string(),
+                    event: event.to_string(),
+                    attempt: attempt + 1,
+                    due_ms,
+                    spec: spec.clone(),
+                },
+            );
+        } else {
+            self.pending.remove(key);
+        }
+        decision
+    }
+
+    /// One clock Msg re-posts every due retry with the SAME webhook-id.
+    pub async fn on_clock(&mut self, now_ms: u64, timestamp: u64) -> Result<usize, String> {
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.due_ms <= now_ms)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut delivered = 0;
+        for key in due {
+            let p = self.pending.get(&key).expect("checked above").clone();
+            let outcome = self.post(&p.spec, timestamp).await?;
+            let decision = self.finish(&key, &p.sub, &p.event, &p.spec, p.attempt, outcome);
+            if matches!(decision, Decision::Delivered) {
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Re-fold a restarted daemon's journal. `specs` are rebuilt from the
+    /// subscription store (URL/secret body); only keys with an unanswered
+    /// retry remain pending, so a retry resumes at its persisted attempt.
+    pub fn refold(&mut self, rows: &[String], specs: Vec<(String, PostSpecOwned)>) {
+        self.journal = rows.to_vec();
+        self.pending.clear();
+        for (key, spec) in specs {
+            let mut state = RetryState::default();
+            for row in rows {
+                if !row.contains(&format!("\"key\":\"{key}\"")) {
+                    continue;
+                }
+                state = fold_retry(state, row);
+            }
+            if state.due_ms > 0 && !state.terminated && !state.dead_lettered {
+                let (sub, event) = key
+                    .split_once(':')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .unwrap_or_else(|| ("s".into(), "e".into()));
+                let (sub, event) = (sub.trim_start_matches("webhook_").to_string(), event);
+                self.pending.insert(
+                    key,
+                    PendingRetry {
+                        sub,
+                        event,
+                        attempt: state.attempt + 1,
+                        due_ms: state.due_ms,
+                        spec,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Real egress port: ureq 3 (rustls+ring) with a PinnedResolver that returns
 /// ONLY the checked SocketAddr. No redirect is followed, body/timeouts bounded,
 /// and no secret is ever logged. ureq avoids reqwest's aws-lc/quinn/jni lock.
@@ -489,6 +670,48 @@ mod tests {
         );
         assert_eq!(decision, Decision::Terminated("gone"));
         assert!(effects.iter().any(|e| matches!(e, Effect::Journal { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_pending_retry_resumes_after_a_restart_and_delivers_exactly_once() {
+        let p = EgressPolicy::default();
+        let secret = Secret::from_whsec("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").unwrap();
+        let url = "https://foo.example-tailnet.ts.net/hook";
+        let answers = vec![vec!["100.64.2.3".parse::<IpAddr>().unwrap()]];
+        // First process: 503 on the first POST, leaving a pending retry.
+        let first_port = Fake::new(answers.clone(), vec![Outcome::Status(503, None)]);
+        let mut first = WebhookDispatcher::new(first_port, p.clone());
+        let d = first
+            .on_event(
+                "sub",
+                "evt-7",
+                url,
+                br#"{"n":7}"#.to_vec(),
+                &secret,
+                1_614_265_330,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(d, Decision::Retry { .. }), "{d:?}");
+        let rows = first.journal_rows().to_vec();
+
+        // Restart: re-fold from the journal, rebuild the spec from the store.
+        let second_port = Fake::new(answers, vec![Outcome::Ok]);
+        let mut second = WebhookDispatcher::new(second_port, p);
+        let spec = PostSpecOwned {
+            url: url.to_string(),
+            body: br#"{"n":7}"#.to_vec(),
+            secret_whsec: secret.whsec(),
+            webhook_id: "msg_evt-7".to_string(),
+        };
+        second.refold(&rows, vec![("webhook:sub:evt-7".to_string(), spec)]);
+        let delivered = second.on_clock(1_614_300_000, 1_614_265_330).await.unwrap();
+        assert_eq!(delivered, 1, "the resumed retry delivers exactly once");
+        // A second clock tick with no new due work does not re-deliver.
+        assert_eq!(
+            second.on_clock(1_614_400_000, 1_614_265_330).await.unwrap(),
+            0
+        );
     }
 
     #[test]

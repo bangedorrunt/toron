@@ -156,6 +156,67 @@ pub async fn route_events(
             } else {
                 delivery
             };
+            // bd-uak1x: a webhook subscription carries its callback URL, is
+            // guarded against SSRF, and gets a secret returned ONCE. The
+            // verification challenge must pass before it is handed back.
+            let webhook_secret = if delivery == "webhook" {
+                let url = args
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ErrorData::new(
+                            ErrorCode::INVALID_PARAMS,
+                            "webhook delivery requires arguments.url".to_string(),
+                            None,
+                        )
+                    });
+                let url = match url {
+                    Ok(u) => u,
+                    Err(e) => return Some(Err(e)),
+                };
+                let policy = toron_core::bus::egress::EgressPolicy::default();
+                if let Err(e) = toron_core::bus::egress::validate_target(url, &policy) {
+                    return Some(Err(ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        format!("webhook URL refused: {e}"),
+                        None,
+                    )));
+                }
+                let secret_dir = toron_core::config::ToronPaths::resolve()
+                    .root
+                    .join("webhook-secrets");
+                let key = format!("{}:{}:{}", principal.name(), name, url);
+                let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
+                let path = secret_dir.join(format!("{}.secret", hex::encode(digest)));
+                let egress = match webhook_delivery::UreqEgress::new(policy.clone()) {
+                    Ok(e) => e,
+                    Err(e) => return Some(Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e, None))),
+                };
+                let challenge = format!("challenge_{}", now_us);
+                match webhook_delivery::subscribe_webhook(
+                    &egress, &policy, &path, url, &challenge, true,
+                )
+                .await
+                {
+                    Ok((whsec, true)) => Some(whsec),
+                    Ok((_, false)) => {
+                        return Some(Err(ErrorData::new(
+                            ErrorCode::INVALID_PARAMS,
+                            "webhook verification challenge failed".to_string(),
+                            None,
+                        )));
+                    }
+                    Err(e) => {
+                        return Some(Err(ErrorData::new(
+                            ErrorCode::INVALID_PARAMS,
+                            format!("webhook setup failed: {e}"),
+                            None,
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
             match store
                 .subscribe(&toron_core::events::store::SubscribeSpec {
                     principal: principal.name().to_string(),
@@ -168,11 +229,18 @@ pub async fn route_events(
                 })
                 .await
             {
-                Ok(sub) => Ok(CustomResult(json!({
-                    "id": sub.id,
-                    "expiresAt": sub.expires_us,
-                    "cursor": sub.cursor,
-                }))),
+                Ok(sub) => {
+                    let mut out = json!({
+                        "id": sub.id,
+                        "expiresAt": sub.expires_us,
+                        "cursor": sub.cursor,
+                    });
+                    if let Some(secret) = webhook_secret {
+                        // Returned ONCE — never logged, never stored in the sub.
+                        out["secret"] = json!(secret);
+                    }
+                    Ok(CustomResult(out))
+                }
                 Err(e) => Err(ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
                     e.to_string(),
