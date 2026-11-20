@@ -108,7 +108,7 @@ async fn cursor_poll_returns_events_after_the_cursor_and_persists() {
 
 #[tokio::test]
 async fn a_cursor_that_fell_off_the_bounded_table_reports_truncated() {
-    use toron_core::events::store::{SubscribeSpec, MAX_DELIVERIES_PER_SUB, DELIVERY_TTL_US};
+    use toron_core::events::store::{MAX_DELIVERIES_PER_SUB, DELIVERY_TTL_US};
 
     let (store, _path) = store("gap").await;
     let args = json!({"project": "f"});
