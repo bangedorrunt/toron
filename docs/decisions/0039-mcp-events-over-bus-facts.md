@@ -1,17 +1,17 @@
 <!-- governed-by: ADR-0003, ADR-0027, ADR-0033, ADR-0035, ADR-0036, ADR-0037, ADR-0038 -->
 ---
-status: proposed
+status: accepted  # 2026-11-20: accepted by the decision-maker, amended with D7 (events/stream) and D8 (harness bridges)
 date: 2026-10-08
 decision-makers: bangedorrunt
-consulted: MCP Events extension draft and richardanaya/pi-mcp-events (MIT); rmcp 3.5.1 release notes (#1322, #1308, #1281, #1295, #1274); flywheel ADR-0012 D6; executor.sh v2 MCP endpoint docs
+consulted: MCP Events extension SEP-3415 (final, protocol 2026-07-28) and richardanaya/pi-mcp-events (MIT); opencode 2.3.2 native events client (binary inspection 2026-11-20); Claude Code 2.1.328 channels (`claude/channel`); rmcp 3.5.1 release notes (#1322, #1308, #1281, #1295, #1274); rmcp 3.5.1 release notes (#1322, #1308, #1281, #1295, #1274); flywheel ADR-0012 D6; executor.sh v2 MCP endpoint docs
 informed: flywheel x toron x beads x chiebukuro maintainers
 ---
 
 # ADR-0039: MCP Events as Protocol Methods over Existing Bus Facts
 
-**Status:** Proposed. Awaiting operator word. Plan: `docs/plans/2026-10-08-1854-feat-toron-mcp-events-plan.md`.
+**Status:** Accepted (2026-11-20), amended with D7 and D8. Plan: `docs/plans/2026-10-08-1854-feat-toron-mcp-events-plan.md`.
 
-**Decision in one sentence:** toron serves the MCP Events extension (`events/list`, `events/subscribe`, `events/unsubscribe`, `events/poll`) as protocol methods behind an advertised `extensions` capability, not as tools. Its catalogue is derived only from facts already on the bus, subscriptions are durable and bearer-authorised per D6, and push delivery goes only to operator-allowlisted HTTPS callbacks, Standard Webhooks-signed, through one SSRF-safe egress guard.
+**Decision in one sentence:** toron serves the MCP Events extension (`events/list`, `events/poll`, `events/stream`, `events/subscribe`, `events/unsubscribe`) as protocol methods behind an advertised `extensions` capability, not as tools. Its catalogue is derived only from facts already on the bus, subscriptions are durable and bearer-authorised per D6, and push delivery goes only to operator-allowlisted HTTPS callbacks, Standard Webhooks-signed, through one SSRF-safe egress guard.
 
 **Extends:**
 
@@ -51,6 +51,14 @@ informed: flywheel x toron x beads x chiebukuro maintainers
    The allowlist is a carve-out. The guard is never disabled.
 5. **Trust.** A verification challenge is required before activation. Standard Webhooks HMAC signing uses a per-subscription `whsec_` secret. Retries are capped exponential with jitter. 410 terminates the subscription, 413 is not retried, and exhaustion or overflow emits one `gap` carrying a resume cursor.
 6. **Principals.** Operator-minted, hashed-at-rest per-pin bearer tokens. In this ADR's scope they are required on `events/*` only, so executor's token-less tool calls keep working.
+7. **Push stream (amendment, 2026-11-20).** `events/stream` is served over Streamable HTTP SSE, one long-lived request per subscription, sharing the poll cursor and the D5 `gap` semantics. It sends `notifications/events/active`, `event`, `heartbeat` and `terminated`, routed by `_meta["io.modelcontextprotocol/subscriptionId"]`. The reason is that opencode 2.3.2 ships a native SEP-3415 client that streams, and a Claude channel bridge must push. Poll stays the floor every client can fall back to.
+8. **Harness bridges until native support (amendment, 2026-11-20).** A harness with no native events client gets a thin bridge. The bridge is an SEP-3415 client (poll or stream, cursor persisted, deduped by `eventId`) talking directly to toron with its pin's token, for `events/*` only. Tools keep going through executor. The bridge turns each event into the harness's own inbound door:
+   - Claude Code: a channel MCP server (`notifications/claude/channel`).
+   - pi/omp: the pi-mcp-events extension (`pi.sendMessage`, `deliverAs` follow-up or steer).
+   - opencode: its native client, so no bridge.
+   - Harnesses with no inbound door (gemini, antigravity, grok, codex): the doorbell as subscriber (U8) on the existing typed-wake path.
+
+   The payload is the D2 hint ("mail pending, run `toron next`"), never the body. A bridge is retired when its harness ships native support. The doorbell dedupes by bus event id, so a seat reached by both a bridge and the doorbell rings once.
 
 **D6 mapping:**
 
@@ -77,3 +85,4 @@ informed: flywheel x toron x beads x chiebukuro maintainers
 ## Status log
 
 - 2026-10-08: proposed alongside the plan. Not committed. Pending operator review.
+- 2026-11-20: accepted by the decision-maker with D7 (`events/stream`) and D8 (harness bridges). The executor gap in Context still holds for tools. D8 has bridges reach toron directly for `events/*` only.

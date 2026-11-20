@@ -115,8 +115,8 @@ The only egress primitive in the tree, `call_webhook`, is deliberately `Unsuppor
 
 - No new MCP tools and no new Nostr kinds (ADR-0033 freeze; AGENTS.md "wave 1: no new tools").
 - No change to Tailscale configuration. The allowlist is toron config, and `tailscale serve` for `svc:toron` stays as is.
-- No direct registration of toron in opencode, Grok or pi. Harnesses keep reaching toron only through executor.
-- `events/stream` (long-lived SSE delivery) is not in this plan. Poll and webhook cover the actors.
+- Harnesses keep reaching toron's tools only through executor. Per ADR-0039 D8 (2026-11-20), an events bridge or a native events client reaches toron directly for `events/*` only, with its pin's token.
+- `events/stream` is in scope per ADR-0039 D7 (amendment 2026-11-20) as unit U3b.
 
 ### Deferred to Follow-Up Work
 
@@ -237,7 +237,14 @@ sequenceDiagram
 
 ### Sequencing
 
-P0 (rmcp 3.5.1 PR) → P1 (U1–U3) → P2 (U4–U6) → P3 (U7) → P4 (U8, flywheel) → P5 (follow-up). U9 (docs and catalog) lands with each phase.
+P0 (rmcp 3.5.1; the lockfile already resolves it) → P1 (U1–U3, then U3b `events/stream` and U7 gap) → P1.5 (ADR-0039 D8 harness bridges, U10–U12, plus U8 doorbell as subscriber) → P2 (U4–U6 webhook egress) → P5 (follow-up). U9 (docs and catalog) lands with each phase. Webhook moved after the bridges (2026-11-20) because no current consumer needs it before poll and stream.
+
+Amendment units (2026-11-20):
+
+- **U3b `events/stream`:** SSE over Streamable HTTP. It shares U3's cursor and kernel, sends `active`, `event`, `heartbeat` and `terminated`, and is routed by subscription id. It is witnessed by a client that reconnects with the last cursor after a drop and loses nothing.
+- **U10 Claude channel bridge (flywheel):** a stdio MCP server declaring the `claude/channel` capability. It streams toron events for its pin and emits `notifications/claude/channel` with the hint. It is gated by a live test on a throwaway Claude seat.
+- **U11 pi/omp:** configure the installed pi-mcp-events extension against toron, mint the pin token at spawn, and verify on omp.
+- **U12 opencode native:** register toron's events endpoint in the seat's opencode config at spawn, so its native client streams. The bd-f888z `session.prompt` route stays as the doorbell fallback, deduped by event id.
 
 ---
 
