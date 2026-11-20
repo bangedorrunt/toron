@@ -137,7 +137,10 @@ fn write(path: &Path, records: &[TokenRecord]) -> anyhow::Result<()> {
 /// is released by the kernel when the process dies, so a stale lock file left
 /// by a killed mint never blocks the next one. Concurrent mints/revokes must
 /// not drop a token or resurrect a revoked one.
-struct LockGuard(std::fs::File);
+struct LockGuard {
+    // Held only for its OS advisory lock; the kernel releases it at process exit.
+    _file: std::fs::File,
+}
 
 fn exclusive_lock(path: &Path) -> anyhow::Result<LockGuard> {
     if let Some(dir) = path.parent() {
@@ -147,9 +150,10 @@ fn exclusive_lock(path: &Path) -> anyhow::Result<LockGuard> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock)?;
     file.lock()?;
-    Ok(LockGuard(file))
+    Ok(LockGuard { _file: file })
 }
 
 impl TokenStore for FileTokenStore {
