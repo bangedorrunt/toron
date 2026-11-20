@@ -89,21 +89,23 @@ pub struct Page {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct SubscribeSpec {
+    pub principal: String,
+    pub is_pin: bool,
+    pub delivery: String,
+    pub name: String,
+    pub args: Value,
+    pub ttl_us: Option<i64>,
+    pub now_us: i64,
+}
+
 #[async_trait]
 pub trait SubscriptionStore: Send + Sync {
     /// Upsert on identity. A pin's TTL is capped at 24h; the operator may ask
     /// for no expiry (`None`). Identical re-subscribe keeps the same id and
     /// extends the expiry (AE2).
-    async fn subscribe(
-        &self,
-        principal: &str,
-        is_pin: bool,
-        delivery: &str,
-        name: &str,
-        args: &Value,
-        ttl_us: Option<i64>,
-        now_us: i64,
-    ) -> anyhow::Result<Subscription>;
+    async fn subscribe(&self, spec: &SubscribeSpec) -> anyhow::Result<Subscription>;
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Subscription>>;
     async fn list_active(&self) -> anyhow::Result<Vec<Subscription>>;
@@ -135,17 +137,18 @@ fn effective_ttl(requested: Option<i64>, is_pin: bool) -> anyhow::Result<Option<
 
 #[async_trait]
 impl SubscriptionStore for SqliteSubscriptionStore {
-    async fn subscribe(
-        &self,
-        principal: &str,
-        is_pin: bool,
-        delivery: &str,
-        name: &str,
-        args: &Value,
-        ttl_us: Option<i64>,
-        now_us: i64,
-    ) -> anyhow::Result<Subscription> {
-        let ttl = effective_ttl(ttl_us, is_pin)?;
+    async fn subscribe(&self, spec: &SubscribeSpec) -> anyhow::Result<Subscription> {
+        let SubscribeSpec {
+            principal,
+            is_pin,
+            delivery,
+            name,
+            args,
+            ttl_us,
+            now_us,
+        } = spec;
+        let ttl = effective_ttl(*ttl_us, *is_pin)?;
+        let now_us = *now_us;
         let expires = ttl.map(|t| now_us.saturating_add(t));
         let hash = args_hash(args);
         let id = subscription_id(principal, delivery, name, &hash);
@@ -177,9 +180,9 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         .await?;
         Ok(Subscription {
             id,
-            principal: principal.to_string(),
-            delivery: delivery.to_string(),
-            name: name.to_string(),
+            principal: principal.clone(),
+            delivery: delivery.clone(),
+            name: name.clone(),
             args_hash: hash,
             cursor: 0,
             created_us: now_us,

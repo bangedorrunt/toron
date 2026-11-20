@@ -9,10 +9,14 @@ use serde_json::json;
 use toron_core::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
 use toron_core::bus::Bus;
 use toron_core::events::dispatcher::EventDispatcher;
-use toron_core::events::store::{SqliteSubscriptionStore, SubscriptionStore};
+use toron_core::events::store::{SubscribeSpec, SqliteSubscriptionStore, SubscriptionStore};
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::CHANNEL_MESSAGE;
 use toron_core::nostr::{Keys, Tag};
+
+fn sub_spec(principal: &str, is_pin: bool, name: &str, args: &serde_json::Value, ttl: Option<i64>, now: i64) -> SubscribeSpec {
+    SubscribeSpec { principal: principal.into(), is_pin, delivery: "poll".into(), name: name.into(), args: args.clone(), ttl_us: ttl, now_us: now }
+}
 
 fn now_us() -> i64 {
     std::time::SystemTime::now()
@@ -49,7 +53,7 @@ async fn addressed_mail_on_bus_becomes_one_hint_on_poll() {
         Arc::new(SqliteSubscriptionStore::new(pool.clone()));
 
     let sub = store
-        .subscribe("AmberProbe", true, "poll", "mail.addressed", &json!({"project": "flywheel"}), Some(3_600_000_000), now_us())
+        .subscribe(&sub_spec("AmberProbe", true, "mail.addressed", &json!({"project": "flywheel"}), Some(3_600_000_000), now_us()))
         .await
         .unwrap();
 

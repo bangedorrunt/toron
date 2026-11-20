@@ -3,9 +3,13 @@
 //! bd-kz33f U3: durable subscriptions, AE2 identity, TTL caps, cursor poll.
 
 use serde_json::json;
-use toron_core::events::store::{
+use toron_core::events::store::{SubscribeSpec, 
     MAX_PIN_TTL_US, SqliteSubscriptionStore, SubscriptionStore, args_hash, canonical_json,
 };
+
+fn sub_spec(principal: &str, is_pin: bool, name: &str, args: &serde_json::Value, ttl: Option<i64>, now: i64) -> SubscribeSpec {
+    SubscribeSpec { principal: principal.into(), is_pin, delivery: "poll".into(), name: name.into(), args: args.clone(), ttl_us: ttl, now_us: now }
+}
 
 async fn store(tag: &str) -> (SqliteSubscriptionStore, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!(
@@ -34,17 +38,17 @@ async fn ae2_identical_resubscribe_keeps_id_and_extends_expiry() {
     let (store, _path) = store("ae2").await;
     let args = json!({"project": "flywheel"});
     let first = store
-        .subscribe("P", true, "poll", "mail.addressed", &args, Some(1000), 100)
+        .subscribe(&sub_spec("P", true, "mail.addressed", &args, Some(1000), 100))
         .await
         .unwrap();
     let second = store
-        .subscribe("P", true, "poll", "mail.addressed", &args, Some(1000), 500)
+        .subscribe(&sub_spec("P", true, "mail.addressed", &args, Some(1000), 500))
         .await
         .unwrap();
     assert_eq!(first.id, second.id, "identical identity keeps the same id");
     assert_eq!(second.expires_us, Some(1500), "expiry extends from the new now");
     let different = store
-        .subscribe("P", true, "poll", "mail.addressed", &json!({"project": "other"}), Some(1000), 100)
+        .subscribe(&sub_spec("P", true, "mail.addressed", &json!({"project": "other"}), Some(1000), 100))
         .await
         .unwrap();
     assert_ne!(different.id, first.id, "different args create a distinct subscription");
@@ -55,16 +59,16 @@ async fn a_pin_cannot_request_no_expiry_and_48h_is_capped() {
     let (store, _path) = store("ttl").await;
     let args = json!({"project": "f"});
     assert!(store
-        .subscribe("P", true, "poll", "n", &args, None, 0)
+        .subscribe(&sub_spec("P", true, "n", &args, None, 0))
         .await
         .is_err(), "a pin requesting no expiry is denied");
     let capped = store
-        .subscribe("P", true, "poll", "n", &args, Some(48 * 3600 * 1_000_000), 0)
+        .subscribe(&sub_spec("P", true, "n", &args, Some(48 * 3600 * 1_000_000), 0))
         .await
         .unwrap();
     assert_eq!(capped.expires_us, Some(MAX_PIN_TTL_US));
     let operator = store
-        .subscribe("op", false, "poll", "n", &args, None, 0)
+        .subscribe(&sub_spec("op", false, "n", &args, None, 0))
         .await
         .unwrap();
     assert_eq!(operator.expires_us, None, "the operator may have no expiry");
@@ -75,7 +79,7 @@ async fn cursor_poll_returns_events_after_the_cursor_and_persists() {
     let (store, path) = store("cursor").await;
     let args = json!({"project": "f"});
     let sub = store
-        .subscribe("op", false, "poll", "mail.addressed", &args, None, 0)
+        .subscribe(&sub_spec("op", false, "mail.addressed", &args, None, 0))
         .await
         .unwrap();
     for i in 0..3 {
@@ -104,12 +108,12 @@ async fn cursor_poll_returns_events_after_the_cursor_and_persists() {
 
 #[tokio::test]
 async fn a_cursor_that_fell_off_the_bounded_table_reports_truncated() {
-    use toron_core::events::store::{MAX_DELIVERIES_PER_SUB, DELIVERY_TTL_US};
+    use toron_core::events::store::{SubscribeSpec, MAX_DELIVERIES_PER_SUB, DELIVERY_TTL_US};
 
     let (store, _path) = store("gap").await;
     let args = json!({"project": "f"});
     let sub = store
-        .subscribe("op", false, "poll", "n", &args, None, 0)
+        .subscribe(&sub_spec("op", false, "n", &args, None, 0))
         .await
         .unwrap();
     // Age out the earliest rows so the table's oldest seq advances.
@@ -132,7 +136,7 @@ async fn sweep_terminates_expired_and_unsubscribe_is_owned_and_idempotent() {
     let (store, _path) = store("sweep").await;
     let args = json!({"project": "f"});
     let sub = store
-        .subscribe("P", true, "poll", "n", &args, Some(100), 0)
+        .subscribe(&sub_spec("P", true, "n", &args, Some(100), 0))
         .await
         .unwrap();
     assert_eq!(store.sweep(99).await.unwrap(), 0);

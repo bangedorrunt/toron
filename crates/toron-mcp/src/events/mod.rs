@@ -147,7 +147,15 @@ pub async fn route_events(
             let delivery = id_param("delivery");
             let delivery = if delivery.is_empty() { "poll" } else { delivery };
             match store
-                .subscribe(principal.name(), matches!(principal, Principal::Pin { .. }), delivery, name, &args, ttl_us, now_us)
+                .subscribe(&toron_core::events::store::SubscribeSpec {
+                    principal: principal.name().to_string(),
+                    is_pin: matches!(principal, Principal::Pin { .. }),
+                    delivery: delivery.to_string(),
+                    name: name.to_string(),
+                    args,
+                    ttl_us,
+                    now_us,
+                })
                 .await
             {
                 Ok(sub) => Ok(CustomResult(json!({
