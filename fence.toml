@@ -1,0 +1,10 @@
+# Commit-fence sibling pins (bd-u6o2l).
+#
+# toron-core depends on elm-effect crates by relative path outside this repo.
+# The fence exports each sibling at the revision named here, from that repo's
+# git objects — never from a sibling's dirty working tree. A change to a pin
+# must be committed together with the code that needs it.
+
+[[sibling]]
+path = "../elm-effect-rs"
+rev = "3387c446ee5a0a2729274415272587d98d085fb8"

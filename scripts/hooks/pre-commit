@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# bd-u6o2l: fence the staged tree before HEAD moves. Installed per clone by
+# scripts/hooks/install.sh; flywheel commit --repo ../toron runs this hook with
+# a private GIT_INDEX_FILE, so it fences that private tree automatically.
+exec "$(dirname "$0")/../../scripts/fence.sh" --index

@@ -151,6 +151,26 @@ mbx test --workspace --all-features
 
 `mbx test --exclude-ignored` is invalid.
 
+## Commit fence
+
+`scripts/fence.sh` is the fence. A crew's "fence green" means this script,
+never `verify-gates.sh` alone (that only greps ADR-0003 policy and let a
+`dead_code` warning ship in d27f9c43).
+
+```bash
+bash scripts/hooks/install.sh            # once per clone: core.hooksPath=scripts/hooks
+bash scripts/fence.sh --index            # the pre-commit hook: staged tree in a throwaway export
+bash scripts/fence.sh --sha <rev>        # the same steps on a clean export of a commit
+bash scripts/test-fence.sh               # temp-clone proof: unused field refused, clean commit passes
+```
+
+Both modes run `-D warnings build --workspace --all-targets`,
+`clippy --workspace --all-targets -- -D warnings`, `rustfmt --check` on staged
+`.rs` (`--index`), and `verify-gates.sh` on an exported tree. A red fence leaves
+HEAD and the shared index untouched. `flywheel commit --repo ../toron` runs the
+same hook with a private `GIT_INDEX_FILE`, so it fences that private tree
+automatically.
+
 ## Notes
 
 - Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
