@@ -8,7 +8,9 @@
 //! revocation. Tools stay token-less (R13): resolution is the events router's
 //! job, never the tool-call path's.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,8 +35,10 @@ impl Principal {
     }
 }
 
-/// What a token may reach. `None` on pin/project/ttl means unrestricted —
-/// only an operator token is allowed to carry those (D6 matrix).
+/// What a token may reach. `None` on pin/project means unrestricted — only an
+/// operator token may carry those (D6 matrix). `ttl_us` is the maximum
+/// SUBSCRIPTION lifetime (ADR-0039 D3), not a token expiry: tokens live until
+/// revoked.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub pin: Option<String>,
@@ -116,18 +120,49 @@ fn write(path: &Path, records: &[TokenRecord]) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(records)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(records)?)?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
+/// A create-new lock file held across read-modify-write. Concurrent CLI mints
+/// and revokes must not drop a token or resurrect a revoked one.
+struct LockGuard(PathBuf);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn exclusive_lock(path: &Path) -> anyhow::Result<LockGuard> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock = path.with_extension("lock");
+    for _ in 0..100 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(LockGuard(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("events token store lock timeout at {}", lock.display())
+}
+
 impl TokenStore for FileTokenStore {
     fn insert(&self, record: &TokenRecord) -> anyhow::Result<()> {
+        let _lock = exclusive_lock(&self.path)?;
         let mut records = read(&self.path)?;
         if records.iter().any(|r| r.hash == record.hash) {
             anyhow::bail!("token hash already present");
@@ -145,6 +180,7 @@ impl TokenStore for FileTokenStore {
     }
 
     fn revoke(&self, hash: &str) -> anyhow::Result<()> {
+        let _lock = exclusive_lock(&self.path)?;
         let mut records = read(&self.path)?;
         let Some(record) = records.iter_mut().find(|r| r.hash == hash) else {
             anyhow::bail!("unknown token");
@@ -181,22 +217,26 @@ pub fn mint(
     Ok(plaintext)
 }
 
-/// Resolve an Authorization header to a live principal. Unknown, missing,
-/// revoked and expired tokens are all `None` — the caller turns that into the
-/// events 200-body unauthorized error, never an HTTP 401.
+/// Resolve an Authorization header to a live principal. Missing, unknown and
+/// revoked tokens are all `None` — the caller turns that into the events
+/// 200-body unauthorized error, never an HTTP 401. A store read failure is
+/// logged once and also refuses (fail closed); it is not confused with an
+/// unknown token by the operator watching the logs. Tokens have no expiry:
+/// ADR-0039 D3's 24h cap is for subscriptions, not tokens.
 pub fn resolve(
     authorization: Option<&str>,
-    now_us: i64,
+    _now_us: i64,
     store: &dyn TokenStore,
 ) -> Option<Principal> {
     let raw = authorization?.strip_prefix("Bearer ")?;
-    let record = store.get(&hash_token(raw.trim())).ok()??;
+    let record = match store.get(&hash_token(raw.trim())) {
+        Ok(record) => record?,
+        Err(e) => {
+            tracing::warn!("events token store read failed (refusing): {e}");
+            return None;
+        }
+    };
     if record.revoked {
-        return None;
-    }
-    if let Some(ttl) = record.scope.ttl_us
-        && now_us.saturating_sub(record.created_us) > ttl
-    {
         return None;
     }
     Some(record.principal)
@@ -287,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_unknown_revoked_and_expired_tokens_do_not_resolve() {
+    fn missing_unknown_and_revoked_tokens_do_not_resolve() {
         let store = FakeStore::default();
         let plaintext = mint(
             Principal::Pin {
@@ -302,24 +342,58 @@ mod tests {
         assert_eq!(resolve(None, 1000, &store), None);
         assert_eq!(resolve(Some("Bearer nope"), 1000, &store), None);
         assert_eq!(resolve(Some("Basic abc"), 1000, &store), None);
-        assert_eq!(
-            resolve(Some(&format!("Bearer {plaintext}")), 1000 + MAX_PIN_TTL_US + 1, &store),
-            None,
-            "pin token expires after 24h"
-        );
         let hash = hash_token(&plaintext);
         store.revoke(&hash).unwrap();
         assert_eq!(resolve(Some(&format!("Bearer {plaintext}")), 1000, &store), None);
     }
 
     #[test]
-    fn an_operator_token_never_expires() {
+    fn a_token_does_not_expire_with_its_subscription_ttl() {
+        // D3's 24h cap is for subscriptions (U3), not tokens: a daily-expiring
+        // pin token would break every bridge. Tokens live until revoked.
         let store = FakeStore::default();
-        let plaintext = mint(Principal::Operator, Scope::operator(), 1000, &store).unwrap();
+        let plaintext = mint(
+            Principal::Pin {
+                pin: "P".into(),
+                project: "f".into(),
+            },
+            Scope::for_pin("P", "f"),
+            1000,
+            &store,
+        )
+        .unwrap();
         assert_eq!(
-            resolve(Some(&format!("Bearer {plaintext}")), i64::MAX / 2, &store),
-            Some(Principal::Operator)
+            resolve(Some(&format!("Bearer {plaintext}")), 1000 + MAX_PIN_TTL_US * 400, &store),
+            Some(Principal::Pin {
+                pin: "P".into(),
+                project: "f".into()
+            })
         );
+    }
+
+    #[test]
+    fn concurrent_inserts_both_persist() {
+        let dir = std::env::temp_dir().join(format!("fw-tokens-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("events_tokens.json");
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(FileTokenStore::at(path));
+        let row = |n: u8| TokenRecord {
+            hash: format!("hash-{n}"),
+            principal: Principal::Operator,
+            scope: Scope::operator(),
+            created_us: 1000,
+            revoked: false,
+        };
+        let mut threads = Vec::new();
+        for n in 0..8 {
+            let store = store.clone();
+            threads.push(std::thread::spawn(move || store.insert(&row(n))));
+        }
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), 8, "no token lost to a race");
     }
 
     #[test]

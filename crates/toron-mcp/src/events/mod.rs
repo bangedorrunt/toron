@@ -11,15 +11,28 @@ use rmcp::ErrorData;
 use rmcp::model::{CustomResult, ErrorCode};
 use serde_json::{Value, json};
 use toron_core::events::catalogue;
+use toron_core::events::principal::{EventsVerb, Principal, authorize as d6_authorize};
 
 /// The capability key advertised under `capabilities.extensions`.
 pub const EVENTS_EXTENSION: &str = "io.modelcontextprotocol/events";
 
 /// Route an `events/*` custom request. `None` means "not ours"; the caller
 /// then falls back to the default method-not-found handler.
-pub fn route(method: &str, params: Option<&Value>) -> Option<Result<CustomResult, ErrorData>> {
+pub fn route(
+    method: &str,
+    params: Option<&Value>,
+    principal: &Principal,
+) -> Option<Result<CustomResult, ErrorData>> {
     if !method.starts_with("events/") {
         return None;
+    }
+    let verb = request_verb(method, params);
+    if !d6_authorize(principal, verb) {
+        return Some(Err(ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("{verb:?} requires the operator principal"),
+            None,
+        )));
     }
     Some(match method {
         "events/list" => Ok(CustomResult(json!({
@@ -46,6 +59,31 @@ pub fn route(method: &str, params: Option<&Value>) -> Option<Result<CustomResult
     })
 }
 
+/// Map a request to the D6 verb it asks for. Operator-only flags in the params
+/// (cross-scope or full payload) escalate the verb so the matrix gates them.
+fn request_verb(method: &str, params: Option<&Value>) -> EventsVerb {
+    let flag = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    if flag("cross_scope") || flag("cross_pin") || flag("cross_project") {
+        return EventsVerb::CrossScope;
+    }
+    if flag("full_payload") {
+        return EventsVerb::FullPayload;
+    }
+    match method {
+        "events/list" => EventsVerb::List,
+        "events/subscribe" if flag("webhook") => EventsVerb::SubscribeWebhook,
+        "events/subscribe" | "events/poll" | "events/stream" | "events/unsubscribe" => {
+            EventsVerb::SubscribePoll
+        }
+        _ => EventsVerb::List,
+    }
+}
+
 /// SEP-3415 uses `name` (plus `arguments`), not `event`. An unknown name is
 /// AE1's in-band `-32602`.
 fn valid_name(params: Option<&Value>) -> Result<&str, ErrorData> {
@@ -69,7 +107,7 @@ fn valid_name(params: Option<&Value>) -> Result<&str, ErrorData> {
 /// Resolve one bearer token to a principal (ADR-0039 D6, bd-6bgrd). A missing,
 /// unknown, revoked or expired token is an in-band JSON-RPC error — never an
 /// HTTP 401 — so events methods keep the rmcp error contract.
-pub fn authorize(authorization: Option<&str>) -> Result<(), ErrorData> {
+pub fn authorize(authorization: Option<&str>) -> Result<Principal, ErrorData> {
     let store = toron_core::events::principal::FileTokenStore::at_root(
         &toron_core::config::ToronPaths::resolve().root,
     );
@@ -86,17 +124,16 @@ pub fn authorize_with_store<S: toron_core::events::principal::TokenStore>(
     authorization: Option<&str>,
     now_us: i64,
     store: &S,
-) -> Result<(), ErrorData> {
+) -> Result<Principal, ErrorData> {
     use toron_core::events::principal::resolve;
 
-    if resolve(authorization, now_us, store).is_none() {
-        return Err(ErrorData::new(
+    resolve(authorization, now_us, store).ok_or_else(|| {
+        ErrorData::new(
             ErrorCode::INVALID_PARAMS,
             "unauthorized: a valid bearer token is required for events/*",
             None,
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 #[cfg(test)]
@@ -106,7 +143,7 @@ mod tests {
     #[test]
     fn unknown_event_name_is_in_band_invalid_params() {
         let params = json!({"name": "not.an.event"});
-        let err = route("events/subscribe", Some(&params))
+        let err = route("events/subscribe", Some(&params), &Principal::Operator)
             .expect("routed")
             .expect_err("unknown name");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -118,16 +155,16 @@ mod tests {
     fn known_names_on_unimplemented_methods_are_errors_never_ok() {
         let params = json!({"name": "mail.addressed", "arguments": {}});
         for method in ["events/subscribe", "events/poll", "events/stream"] {
-            let out = route(method, Some(&params)).expect("routed");
+            let out = route(method, Some(&params), &Principal::Operator).expect("routed");
             assert!(out.is_err(), "{method} must not fake success");
         }
     }
 
     #[test]
     fn only_events_methods_route_here() {
-        assert!(route("tools/list", None).is_none());
-        assert!(route("events/nope", None).is_some());
-        assert!(route("events/list", None).is_some());
+        assert!(route("tools/list", None, &Principal::Operator).is_none());
+        assert!(route("events/nope", None, &Principal::Operator).is_some());
+        assert!(route("events/list", None, &Principal::Operator).is_some());
     }
 
     #[test]

@@ -165,8 +165,8 @@ impl ServerHandler for ToronServer {
                 .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            crate::events::authorize(authorization.as_deref()).and_then(|()| {
-                crate::events::route(&method, params).unwrap_or_else(|| {
+            crate::events::authorize(authorization.as_deref()).and_then(|principal| {
+                crate::events::route(&method, params, &principal).unwrap_or_else(|| {
                     Err(rmcp::ErrorData::new(
                         rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                         method,

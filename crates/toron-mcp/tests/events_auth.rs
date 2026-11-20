@@ -42,23 +42,44 @@ fn a_valid_pin_token_authorizes() {
         Scope::for_pin("AmberProbe", "flywheel"),
         false,
     ));
-    assert!(toron_mcp::events::authorize_with_store(
-        Some("Bearer a-valid-token"),
-        1000,
-        &store
-    )
-    .is_ok());
+    assert_eq!(
+        toron_mcp::events::authorize_with_store(Some("Bearer a-valid-token"), 1000, &store)
+            .unwrap(),
+        Principal::Pin { pin: "AmberProbe".into(), project: "flywheel".into() }
+    );
 }
 
 #[test]
 fn an_operator_token_authorizes() {
     let store = store_with(record(Principal::Operator, Scope::operator(), false));
-    assert!(toron_mcp::events::authorize_with_store(
-        Some("Bearer a-valid-token"),
-        1000,
-        &store
-    )
-    .is_ok());
+    assert_eq!(
+        toron_mcp::events::authorize_with_store(Some("Bearer a-valid-token"), 1000, &store)
+            .unwrap(),
+        Principal::Operator
+    );
+}
+
+#[test]
+fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
+    let pin = Principal::Pin {
+        pin: "P".into(),
+        project: "f".into(),
+    };
+    for params in [
+        serde_json::json!({"name": "mail.addressed", "cross_scope": true}),
+        serde_json::json!({"name": "mail.addressed", "full_payload": true}),
+    ] {
+        let err = toron_mcp::events::route("events/subscribe", Some(&params), &pin)
+            .expect("routed")
+            .expect_err("a pin token cannot escalate scope");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("operator"), "{err:?}");
+        // The operator gets the normal not-implemented error, not an auth one.
+        let out = toron_mcp::events::route("events/subscribe", Some(&params), &Principal::Operator)
+            .expect("routed");
+        assert!(out.is_err());
+        assert!(!out.unwrap_err().message.contains("operator"));
+    }
 }
 
 #[test]
@@ -77,6 +98,6 @@ fn missing_unknown_and_revoked_tokens_are_in_band_errors() {
 fn tools_stay_token_less_r13() {
     // The auth seam is events-only: `route` still declines tools/list, and the
     // tool handlers never pass through authorize.
-    assert!(toron_mcp::events::route("tools/list", None).is_none());
-    assert!(toron_mcp::events::route("tools/call", None).is_none());
+    assert!(toron_mcp::events::route("tools/list", None, &Principal::Operator).is_none());
+    assert!(toron_mcp::events::route("tools/call", None, &Principal::Operator).is_none());
 }
