@@ -11,5 +11,5 @@ CAT=crates/toron-core/src/events/catalogue.rs
 mutation "E1  the recipient boundary is ignored" \
     file=$CAT \
     expect=addressed_mail_maps_only_to_its_recipient \
-    find='        && fact.addressed_pin.as_deref() == Some(subscriber_pin)' \
-    replace='        && true'
+    find='fact.addressed_pin.as_deref() == Some(subscriber_pin)' \
+    replace='true'
