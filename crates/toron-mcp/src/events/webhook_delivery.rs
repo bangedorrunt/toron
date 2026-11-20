@@ -52,18 +52,31 @@ pub trait EgressPort: Send + Sync {
     ) -> Result<Outcome, String>;
 }
 
+/// One delivery's inputs, bundled so the planner stays under the arg limit.
+pub struct DeliveryRequest<'a> {
+    pub url: &'a str,
+    pub subscription: &'a str,
+    pub event_id: &'a str,
+    pub body: &'a [u8],
+    pub secret: &'a Secret,
+    pub timestamp: u64,
+    pub attempt: u32,
+}
+
 /// A delivery plan: one effect list for one event, replayable from the journal.
 pub fn plan_delivery(
     policy: &EgressPolicy,
-    url: &str,
-    subscription: &str,
-    event_id: &str,
-    body: &[u8],
-    secret: &Secret,
-    timestamp: u64,
-    attempt: u32,
-    rand_unit: f64,
+    req: &DeliveryRequest<'_>,
 ) -> Result<Vec<Effect>, String> {
+    let DeliveryRequest {
+        url,
+        subscription,
+        event_id,
+        body,
+        secret,
+        timestamp,
+        attempt,
+    } = req;
     let target = egress::validate_target(url, policy)?;
     let key = format!("webhook:{subscription}:{event_id}");
     let mut effects = vec![Effect::Journal {
@@ -74,13 +87,12 @@ pub fn plan_delivery(
         target,
         socket: IpAddr::from([0, 0, 0, 0]), // resolved at execution by the interpreter
         id: event_id.to_string(),
-        timestamp,
+        timestamp: *timestamp,
         body: body.to_vec(),
-        secret: secret.clone(),
+        secret: (*secret).clone(),
         webhook_id: format!("msg_{event_id}"),
         challenge: false,
     });
-    let _ = (rand_unit, RetryPolicy::default()); // retry decided after the result
     Ok(effects)
 }
 
@@ -110,25 +122,37 @@ pub fn after_result(
     (effects, decision)
 }
 
+/// One POST's inputs, bundled for the guarded interpreter.
+pub struct PostSpec<'a> {
+    pub target: &'a Target,
+    pub timestamp: u64,
+    pub body: &'a [u8],
+    pub secret: &'a Secret,
+    pub webhook_id: &'a str,
+    pub challenge: bool,
+}
+
 /// Do the guarded POST. The socket comes from `check_resolved` over the port's
 /// DNS answer, so a rebinding resolver cannot redirect the connect.
 pub async fn guarded_post<P: EgressPort>(
     port: &P,
     policy: &EgressPolicy,
-    target: &Target,
-    _id: &str,
-    timestamp: u64,
-    body: &[u8],
-    secret: &Secret,
-    webhook_id: &str,
-    challenge: bool,
+    spec: &PostSpec<'_>,
 ) -> Result<Outcome, String> {
+    let PostSpec {
+        target,
+        timestamp,
+        body,
+        secret,
+        webhook_id,
+        challenge,
+    } = spec;
     let addrs = port.resolve(&target.host)?;
     let socket = egress::check_resolved(&addrs, policy)?;
-    let signature = if challenge {
+    let signature = if *challenge {
         endpoint_verification_response(secret, webhook_id)
     } else {
-        sign(secret, webhook_id, timestamp, body)
+        sign(secret, webhook_id, *timestamp, body)
     };
     let headers = vec![
         ("webhook-id".to_string(), webhook_id.to_string()),
@@ -194,13 +218,14 @@ pub async fn verify_endpoint<P: EgressPort>(
     let outcome = guarded_post(
         port,
         policy,
-        &target,
-        challenge,
-        now,
-        br#"{"type":"verification"}"#,
-        secret,
-        &expected,
-        true,
+        &PostSpec {
+            target: &target,
+            timestamp: now,
+            body: br#"{"type":"verification"}"#,
+            secret,
+            webhook_id: &expected,
+            challenge: true,
+        },
     )
     .await?;
     Ok(matches!(outcome, Outcome::Ok))
@@ -273,10 +298,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    type Sent = Vec<(Vec<(String, String)>, IpAddr)>;
+
     struct Fake {
         answers: Mutex<Vec<Vec<IpAddr>>>,
         statuses: Mutex<Vec<Outcome>>,
-        sent: Mutex<Vec<(Vec<(String, String)>, IpAddr)>>,
+        sent: Mutex<Sent>,
     }
     impl Fake {
         fn new(answers: Vec<Vec<IpAddr>>, statuses: Vec<Outcome>) -> Self {
@@ -327,13 +354,14 @@ mod tests {
             let out = guarded_post(
                 &fake,
                 &p,
-                &target,
-                "evt-1",
-                1_614_265_330,
-                br#"{"a":1}"#,
-                &secret,
-                "msg_evt-1",
-                false,
+                &PostSpec {
+                    target: &target,
+                    timestamp: 1_614_265_330,
+                    body: br#"{"a":1}"#,
+                    secret: &secret,
+                    webhook_id: "msg_evt-1",
+                    challenge: false,
+                },
             )
             .await
             .unwrap();
