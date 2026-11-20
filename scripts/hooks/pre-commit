@@ -2,4 +2,13 @@
 # bd-u6o2l: fence the staged tree before HEAD moves. Installed per clone by
 # scripts/hooks/install.sh; flywheel commit --repo ../toron runs this hook with
 # a private GIT_INDEX_FILE, so it fences that private tree automatically.
+# bd-j1g64: a plain `git commit` is refused — it sweeps another lane's staged
+# hunks. `flywheel commit <paths> -m <msg> --repo ../toron` sets the nonce.
+# Operator escape (explicit): FLYWHEEL_COMMIT_OPERATOR=1.
+if [ -z "${FLYWHEEL_COMMIT_TOKEN:-}" ] && [ "${FLYWHEEL_COMMIT_OPERATOR:-}" != "1" ]; then
+  echo "toron: plain git commit refused (shared index can sweep other lanes' stages)" >&2
+  echo "toron: use: flywheel commit <paths> -m <msg> --repo ../toron" >&2
+  echo "toron: operator escape: FLYWHEEL_COMMIT_OPERATOR=1 git commit ..." >&2
+  exit 1
+fi
 exec "$(dirname "$0")/../../scripts/fence.sh" --index
