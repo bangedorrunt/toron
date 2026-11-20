@@ -66,7 +66,36 @@ fn valid_name(params: Option<&Value>) -> Result<&str, ErrorData> {
 /// bd-6bgrd U2: the ONE authorization seam for `events/*`. U1 has no tokens;
 /// U2 replaces this body with its principal resolver from the Authorization
 /// header value. No other events handler reads auth.
-pub fn authorize(_authorization: Option<&str>) -> Result<(), ErrorData> {
+/// Resolve one bearer token to a principal (ADR-0039 D6, bd-6bgrd). A missing,
+/// unknown, revoked or expired token is an in-band JSON-RPC error — never an
+/// HTTP 401 — so events methods keep the rmcp error contract.
+pub fn authorize(authorization: Option<&str>) -> Result<(), ErrorData> {
+    let store = toron_core::events::principal::FileTokenStore::at_root(
+        &toron_core::config::ToronPaths::resolve().root,
+    );
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    authorize_with_store(authorization, now_us, &store)
+}
+
+/// The same decision over an injected store and clock, so the router can be
+/// tested without touching the operator's durable root.
+pub fn authorize_with_store<S: toron_core::events::principal::TokenStore>(
+    authorization: Option<&str>,
+    now_us: i64,
+    store: &S,
+) -> Result<(), ErrorData> {
+    use toron_core::events::principal::resolve;
+
+    if resolve(authorization, now_us, store).is_none() {
+        return Err(ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            "unauthorized: a valid bearer token is required for events/*",
+            None,
+        ));
+    }
     Ok(())
 }
 
