@@ -223,7 +223,7 @@ pub async fn route_events(
                     is_pin: matches!(principal, Principal::Pin { .. }),
                     delivery: delivery.to_string(),
                     name: name.to_string(),
-                    args,
+                    args: args.clone(),
                     ttl_us,
                     now_us,
                 })
@@ -236,7 +236,30 @@ pub async fn route_events(
                         "cursor": sub.cursor,
                     });
                     if let Some(secret) = webhook_secret {
-                        // Returned ONCE — never logged, never stored in the sub.
+                        // Returned ONCE in the result. The daemon's delivery
+                        // half persists the spec (id/url/secret) under a 0600
+                        // state file so a restart can re-fold pending retries;
+                        // the secret never enters a log or the subscription row.
+                        if let Some(url) = args.get("url").and_then(serde_json::Value::as_str) {
+                            let spec_path =
+                                toron_core::config::state_dir().join("webhook-specs.jsonl");
+                            use std::io::Write as _;
+                            #[cfg(unix)]
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            let mut opts = std::fs::OpenOptions::new();
+                            opts.create(true).append(true);
+                            #[cfg(unix)]
+                            opts.mode(0o600);
+                            if let Ok(mut f) = opts.open(spec_path) {
+                                let _ = writeln!(
+                                    f,
+                                    "{}",
+                                    json!({
+                                        "id": sub.id, "url": url, "secret": secret,
+                                    })
+                                );
+                            }
+                        }
                         out["secret"] = json!(secret);
                     }
                     Ok(CustomResult(out))

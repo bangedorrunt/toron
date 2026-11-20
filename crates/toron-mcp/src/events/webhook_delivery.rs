@@ -266,6 +266,7 @@ pub fn fold_retry(mut state: RetryState, row: &str) -> RetryState {
             }
             "terminated" => state.terminated = true,
             "dead-letter" => state.dead_lettered = true,
+            "delivered" => state.due_ms = 0,
             _ => {}
         },
         _ => {}
@@ -323,10 +324,10 @@ struct PendingRetry {
 
 #[derive(Clone, Debug)]
 pub struct PostSpecOwned {
-    url: String,
-    body: Vec<u8>,
-    secret_whsec: String,
-    webhook_id: String,
+    pub url: String,
+    pub body: Vec<u8>,
+    pub secret_whsec: String,
+    pub webhook_id: String,
 }
 
 impl<P: EgressPort> WebhookDispatcher<P> {

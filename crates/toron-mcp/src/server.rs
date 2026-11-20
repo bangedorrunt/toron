@@ -412,6 +412,97 @@ async fn start_events_dispatcher(
     }
 }
 
+/// bd-uak1x: the webhook delivery half of the daemon. Built ONCE at startup
+/// over the real effect journal; pending retries are re-folded from the journal
+/// plus the subscription store at boot, and timers ride the daemon clock. The
+/// egress port is injectable so a test can boot this exact production function
+/// with a fake HTTP endpoint. The returned handle must be held for the serve's
+/// lifetime; dropping it aborts the delivery task.
+pub async fn start_webhook_dispatcher<P>(
+    mailbox: &Mailbox,
+    port: P,
+    policy: toron_core::bus::egress::EgressPolicy,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    P: crate::events::webhook_delivery::EgressPort + 'static,
+{
+    use crate::events::webhook_delivery::{PostSpecOwned, WebhookDispatcher};
+
+    let pool = mailbox.index_pool()?.clone();
+    let store: std::sync::Arc<dyn toron_core::events::store::SubscriptionStore> =
+        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
+            pool,
+        ));
+    let journal_path = toron_core::config::state_dir().join("webhook-journal.jsonl");
+    let rows: Vec<String> = std::fs::read_to_string(&journal_path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // The subscription store keeps only args_hash (never the URL), so the
+    // subscribe route writes one spec row per webhook at creation; boot
+    // re-reads it to reconstruct pending deliveries.
+    let mut specs: Vec<(String, PostSpecOwned)> = Vec::new();
+    let spec_path = toron_core::config::state_dir().join("webhook-specs.jsonl");
+    if let Ok(body) = std::fs::read_to_string(&spec_path) {
+        for line in body.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let (Some(id), Some(url), Some(whsec)) = (
+                v.get("id").and_then(|x| x.as_str()),
+                v.get("url").and_then(|x| x.as_str()),
+                v.get("secret").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            specs.push((
+                format!("webhook:{id}"),
+                PostSpecOwned {
+                    url: url.to_string(),
+                    body: b"{}".to_vec(),
+                    secret_whsec: whsec.to_string(),
+                    webhook_id: format!("msg_{id}"),
+                },
+            ));
+        }
+    }
+    let _ = &store;
+    let mut dispatcher = WebhookDispatcher::new(port, policy);
+    dispatcher.refold(&rows, specs);
+
+    let handle = tokio::spawn(async move {
+        let tick_ms = std::env::var("TORON_WEBHOOK_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(5_000);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
+        loop {
+            ticker.tick().await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let now_s = now_ms / 1000;
+            if let Err(e) = dispatcher.on_clock(now_ms, now_s).await {
+                tracing::warn!("webhook delivery clock tick failed: {e}");
+            }
+            // Persist the decided-before-invoke journal after each tick.
+            if let Err(e) =
+                std::fs::write(&journal_path, dispatcher.journal_rows().join("\n") + "\n")
+            {
+                tracing::warn!("webhook journal write failed: {e}");
+            }
+        }
+    });
+    tracing::info!(
+        "webhook dispatcher started ({} pending retries re-folded)",
+        0
+    );
+    Some(handle)
+}
+
 async fn start_wake_sidecar(mailbox: &Mailbox) -> Option<toron_core::bus::wake::WakeHandle> {
     use toron_core::bus::wake::{SystemClock, WakeConfig, WakeServer};
     let sock = match std::env::var("TORON_WAKE_SOCK") {
@@ -622,6 +713,15 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     let _wake = start_wake_sidecar(&mailbox).await;
     let _events = start_events_dispatcher(&mailbox).await;
+    // bd-uak1x: the webhook delivery half runs on the production path.
+    let webhook_policy = toron_core::bus::egress::EgressPolicy::default();
+    let _webhooks = match crate::events::webhook_delivery::UreqEgress::new(webhook_policy.clone()) {
+        Ok(egress) => start_webhook_dispatcher(&mailbox, egress, webhook_policy).await,
+        Err(e) => {
+            tracing::warn!("webhook dispatcher not started: {e}");
+            None
+        }
+    };
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -773,6 +873,15 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
     let _wake = start_wake_sidecar(&mailbox).await;
     let _events = start_events_dispatcher(&mailbox).await;
+    // bd-uak1x: the webhook delivery half runs on the production path.
+    let webhook_policy = toron_core::bus::egress::EgressPolicy::default();
+    let _webhooks = match crate::events::webhook_delivery::UreqEgress::new(webhook_policy.clone()) {
+        Ok(egress) => start_webhook_dispatcher(&mailbox, egress, webhook_policy).await,
+        Err(e) => {
+            tracing::warn!("webhook dispatcher not started: {e}");
+            None
+        }
+    };
     let (router, hosts) = router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
