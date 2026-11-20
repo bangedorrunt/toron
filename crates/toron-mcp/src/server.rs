@@ -39,6 +39,7 @@ pub struct ToronServer {
     bus: Option<Arc<dyn Bus>>,
     tools: Option<ToolServer>,
     presence: Option<PresenceBroker>,
+    events: Option<Arc<dyn toron_core::events::store::SubscriptionStore>>,
 }
 
 impl std::fmt::Debug for ToronServer {
@@ -47,6 +48,7 @@ impl std::fmt::Debug for ToronServer {
             .field("bus", &self.bus.is_some())
             .field("tools", &self.tools.is_some())
             .field("presence", &self.presence.is_some())
+            .field("events", &self.events.is_some())
             .finish()
     }
 }
@@ -94,6 +96,11 @@ impl ToronServer {
     pub fn with_mailbox(mut self, mailbox: Mailbox) -> Self {
         self.presence = Some(start_presence(&mailbox));
         self.bus = Some(mailbox.bus().clone());
+        if let Some(pool) = mailbox.index_pool() {
+            self.events = Some(Arc::new(
+                toron_core::events::store::SqliteSubscriptionStore::new(pool.clone()),
+            ));
+        }
         self.tools = Some(ToolServer::new(Arc::new(mailbox)));
         self
     }
@@ -157,31 +164,43 @@ impl ServerHandler for ToronServer {
     + rmcp::service::MaybeSendFuture
     + '_ {
         let method = request.method.clone();
-        let params = request.params.as_ref();
-        let result = if method.starts_with("events/") {
-            let authorization = request
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            crate::events::authorize(authorization.as_deref()).and_then(|principal| {
-                crate::events::route(&method, params, &principal).unwrap_or_else(|| {
-                    Err(rmcp::ErrorData::new(
-                        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                        method,
-                        None,
-                    ))
-                })
+        let params = request.params.clone();
+        let events = self.events.clone();
+        let authorization = request
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        async move {
+            if !method.starts_with("events/") {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    method,
+                    None,
+                ));
+            }
+            let principal = crate::events::authorize(authorization.as_deref())?;
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            crate::events::route_events(
+                &method,
+                params.as_ref(),
+                &principal,
+                events.as_deref(),
+                now_us,
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    method,
+                    None,
+                ))
             })
-        } else {
-            Err(rmcp::ErrorData::new(
-                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                method,
-                None,
-            ))
-        };
-        std::future::ready(result)
+        }
     }
 
     /// The 38 AM-Rust parity tools (bd-led.7.2), delegated to `ToolServer`.

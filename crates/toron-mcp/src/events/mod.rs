@@ -4,8 +4,7 @@
 //! MCP Events U1 protocol surface (ADR-0039 D1/D2).
 //!
 //! These are JSON-RPC methods, NOT tools: the 41-tool surface stays frozen.
-//! A handler error is an in-band JSON-RPC error; a missing `_meta` is rejected
-//! by the method-scoped check in `server.rs` before this router runs.
+//! A handler error is an in-band JSON-RPC error, never an HTTP 401.
 
 use rmcp::ErrorData;
 use rmcp::model::{CustomResult, ErrorCode};
@@ -26,7 +25,7 @@ pub fn route(
     if !method.starts_with("events/") {
         return None;
     }
-    let verb = request_verb(method, params);
+    let verb = request_verb(method, params, principal);
     if !d6_authorize(principal, verb) {
         return Some(Err(ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -59,29 +58,144 @@ pub fn route(
     })
 }
 
-/// Map a request to the D6 verb it asks for. Operator-only flags in the params
-/// (cross-scope or full payload) escalate the verb so the matrix gates them.
-fn request_verb(method: &str, params: Option<&Value>) -> EventsVerb {
-    let flag = |key: &str| {
-        params
-            .and_then(|p| p.get(key))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    };
-    if flag("cross_scope") || flag("cross_pin") || flag("cross_project") {
-        return EventsVerb::CrossScope;
+/// Map a request to the D6 verb it asks for. Scope comes from the SEP-3415
+/// `arguments` object, not ad-hoc flags: a pin naming another pin or project
+/// in its arguments asks for cross-scope, which is operator-only.
+fn request_verb(method: &str, params: Option<&Value>, principal: &Principal) -> EventsVerb {
+    let args = params.and_then(|p| p.get("arguments"));
+    if let Principal::Pin { pin, project } = principal {
+        let other_pin = args
+            .and_then(|a| a.get("pin"))
+            .and_then(Value::as_str)
+            .is_some_and(|p| p != pin);
+        let other_project = args
+            .and_then(|a| a.get("project"))
+            .and_then(Value::as_str)
+            .is_some_and(|p| p != project);
+        if other_pin || other_project {
+            return EventsVerb::CrossScope;
+        }
     }
-    if flag("full_payload") {
+    if args
+        .and_then(|a| a.get("full_payload"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return EventsVerb::FullPayload;
     }
     match method {
         "events/list" => EventsVerb::List,
-        "events/subscribe" if flag("webhook") => EventsVerb::SubscribeWebhook,
+        "events/subscribe"
+            if args
+                .and_then(|a| a.get("webhook"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            EventsVerb::SubscribeWebhook
+        }
         "events/subscribe" | "events/poll" | "events/stream" | "events/unsubscribe" => {
             EventsVerb::SubscribePoll
         }
         _ => EventsVerb::List,
     }
+}
+
+/// U3 durable path. The U1 router above stays pure; subscription methods get
+/// an injected store and clock so their decisions are testable without a
+/// daemon. A missing store means the method is unavailable in this host.
+pub async fn route_events(
+    method: &str,
+    params: Option<&Value>,
+    principal: &Principal,
+    store: Option<&dyn toron_core::events::store::SubscriptionStore>,
+    now_us: i64,
+) -> Option<Result<CustomResult, ErrorData>> {
+    let store = match store {
+        Some(s) => s,
+        None => return route(method, params, principal),
+    };
+    if !d6_authorize(principal, request_verb(method, params, principal)) {
+        return Some(Err(ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            "operator principal required by the D6 matrix",
+            None,
+        )));
+    }
+    if !matches!(method, "events/subscribe" | "events/poll" | "events/unsubscribe") {
+        return route(method, params, principal);
+    }
+    let id_param = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    };
+    let result = match method {
+        "events/subscribe" => {
+            let name = match valid_name(params) {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e)),
+            };
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let ttl_us = args
+                .get("ttl_us")
+                .and_then(Value::as_i64)
+                .or_else(|| args.get("ttlMs").and_then(Value::as_i64).map(|ms| ms * 1000));
+            let delivery = id_param("delivery");
+            let delivery = if delivery.is_empty() { "poll" } else { delivery };
+            match store
+                .subscribe(principal.name(), matches!(principal, Principal::Pin { .. }), delivery, name, &args, ttl_us, now_us)
+                .await
+            {
+                Ok(sub) => Ok(CustomResult(json!({
+                    "id": sub.id,
+                    "expiresAt": sub.expires_us,
+                    "cursor": sub.cursor,
+                }))),
+                Err(e) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, e.to_string(), None)),
+            }
+        }
+        "events/poll" => {
+            let id = id_param("subscriptionId");
+            match store.get(id).await {
+                Ok(Some(sub)) if sub.state == "terminated" => Ok(CustomResult(json!({
+                    "events": [], "cursor": sub.cursor, "nextPollMs": 0,
+                    "hasMore": false, "truncated": false, "terminated": true,
+                }))),
+                Ok(Some(sub)) => {
+                    let after = id_param("cursor").parse::<u64>().unwrap_or(sub.cursor);
+                    match store.poll(id, after, 32).await {
+                        Ok(page) => Ok(CustomResult(json!({
+                            "events": page.events.iter().map(|d| {
+                                serde_json::from_str::<Value>(&d.payload)
+                                    .unwrap_or_else(|_| json!({ "id": d.seq.to_string() }))
+                            }).collect::<Vec<_>>(),
+                            "cursor": page.cursor.to_string(),
+                            "nextPollMs": 5000,
+                            "hasMore": page.has_more,
+                            "truncated": page.truncated,
+                        }))),
+                        Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+                    }
+                }
+                Ok(None) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, "unknown subscription", None)),
+                Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+            }
+        }
+        "events/unsubscribe" => {
+            let id = id_param("subscriptionId");
+            match store.unsubscribe(id, principal.name()).await {
+                Ok(true) => Ok(CustomResult(json!({"id": id, "terminated": true}))),
+                Ok(false) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, "not your subscription", None)),
+                Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+            }
+        }
+        _ => unreachable!(),
+    };
+    Some(result)
 }
 
 /// SEP-3415 uses `name` (plus `arguments`), not `event`. An unknown name is
@@ -168,8 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn authorization_seam_exists_and_is_tokenless_in_u1() {
-        assert!(authorize(None).is_ok());
-        assert!(authorize(Some("Bearer anything")).is_ok());
+    fn authorization_seam_resolves_a_principal() {
+        // U1 was token-less; U2+ resolve the bearer to a Principal. A missing
+        // or unknown token is refused in-band, and a valid one is accepted.
+        assert!(authorize(None).is_err());
+        assert!(authorize(Some("Bearer unknown")).is_err());
     }
 }

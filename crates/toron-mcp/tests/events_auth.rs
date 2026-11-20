@@ -66,8 +66,8 @@ fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
         project: "f".into(),
     };
     for params in [
-        serde_json::json!({"name": "mail.addressed", "cross_scope": true}),
-        serde_json::json!({"name": "mail.addressed", "full_payload": true}),
+        serde_json::json!({"name": "mail.addressed", "arguments": {"project": "other"}}),
+        serde_json::json!({"name": "mail.addressed", "arguments": {"full_payload": true}}),
     ] {
         let err = toron_mcp::events::route("events/subscribe", Some(&params), &pin)
             .expect("routed")
@@ -92,6 +92,62 @@ fn missing_unknown_and_revoked_tokens_are_in_band_errors() {
         assert_eq!(err.code.0, -32602, "in-band error, never an HTTP 401");
         assert!(err.message.contains("unauthorized"), "{err:?}");
     }
+}
+
+#[tokio::test]
+async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
+    use toron_core::events::store::{SqliteSubscriptionStore, SubscriptionStore};
+    use toron_mcp::events::route_events;
+
+    let path = std::env::temp_dir().join(format!(
+        "toron-events-poll-{}-{}.sqlite",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    let pool = toron_core::index::schema::connect(path.to_str().unwrap())
+        .await
+        .unwrap();
+    toron_core::index::schema::migrate(&pool).await.unwrap();
+    let store = SqliteSubscriptionStore::new(pool);
+    let principal = Principal::Operator;
+    let params = serde_json::json!({
+        "name": "mail.addressed",
+        "arguments": {"project": "flywheel"}
+    });
+
+    let sub = route_events("events/subscribe", Some(&params), &principal, Some(&store), 1000)
+        .await
+        .expect("routed")
+        .expect("subscribed");
+    let id = sub.0["id"].as_str().expect("subscription id").to_string();
+
+    store
+        .append(
+            &id,
+            &serde_json::json!({"event_id": "e1", "name": "mail.addressed", "project": "flywheel"}),
+        )
+        .await
+        .unwrap();
+    let poll_params = serde_json::json!({"subscriptionId": id, "cursor": "0"});
+    let page = route_events("events/poll", Some(&poll_params), &principal, Some(&store), 1001)
+        .await
+        .expect("routed")
+        .expect("poll ok");
+    let events = page.0["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "one hint on poll");
+    assert_eq!(events[0]["name"], "mail.addressed");
+    assert!(events[0].get("body").is_none(), "hint-only payload (R5)");
+    assert_eq!(page.0["nextPollMs"], 5000);
+    assert_eq!(page.0["hasMore"], false);
+    assert_eq!(page.0["truncated"], false);
+
+    let next = serde_json::json!({"subscriptionId": id, "cursor": page.0["cursor"]});
+    let again = route_events("events/poll", Some(&next), &principal, Some(&store), 1002)
+        .await
+        .expect("routed")
+        .expect("poll ok");
+    assert_eq!(again.0["events"].as_array().unwrap().len(), 0, "cursor advanced");
 }
 
 #[test]

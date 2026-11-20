@@ -67,14 +67,15 @@ pub struct CatalogueEvent {
     pub payload_schema: Value,
 }
 
+/// The event's OWN arguments (SEP-3415), not the subscribe envelope: each
+/// catalogue fact is addressed by its project.
 fn input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "name": {"type": "string"},
-            "arguments": {"type": "object"}
+            "project": {"type": "string"}
         },
-        "required": ["name"]
+        "required": ["project"]
     })
 }
 
@@ -178,7 +179,7 @@ mod tests {
             let name = row["name"].as_str().expect("name");
             assert!(seen.insert(name), "duplicate event name {name}");
             assert_eq!(row["delivery"], json!(["poll", "push"]));
-            assert_eq!(row["inputSchema"]["properties"]["name"]["type"], "string");
+            assert_eq!(row["inputSchema"]["properties"]["project"]["type"], "string");
             assert_eq!(row["payloadSchema"]["type"], "object");
             let props = row["payloadSchema"]["properties"].as_object().unwrap();
             assert!(props.contains_key("event_id"));
