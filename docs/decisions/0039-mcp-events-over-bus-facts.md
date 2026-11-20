@@ -86,3 +86,11 @@ informed: flywheel x toron x beads x chiebukuro maintainers
 
 - 2026-10-08: proposed alongside the plan. Not committed. Pending operator review.
 - 2026-11-20: accepted by the decision-maker with D7 (`events/stream`) and D8 (harness bridges). The executor gap in Context still holds for tools. D8 has bridges reach toron directly for `events/*` only.
+- 2026-11-21: U12 deviation (operator ruling, bd-o1z4m). opencode v2.3.2's
+  native client is gated by `experimental.mcp_events`, and remote MCP server
+  config accepts only literal `headers` (its `--env` is local-only). To keep the
+  0600 token path-only, U12 registers a LOCAL stdio MCP proxy (`flywheel
+  mcp-events`) in the seat's merged `OPENCODE_CONFIG_CONTENT` via
+  `FLYWHEEL_TORON_TOKEN_FILE=<path>`; opencode's native client still does the
+  consuming. The bd-f888z `session.prompt` route remains the doorbell fallback,
+  deduped by bus event id. No operator-global opencode config is edited.
