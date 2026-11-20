@@ -8,6 +8,7 @@
 //! not a live-only surprise.
 
 pub mod catalogue;
+pub mod dispatcher;
 pub mod kernel;
 pub mod principal;
 pub mod store;

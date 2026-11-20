@@ -126,6 +126,7 @@ async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
         .append(
             &id,
             &serde_json::json!({"event_id": "e1", "name": "mail.addressed", "project": "flywheel"}),
+            1001,
         )
         .await
         .unwrap();

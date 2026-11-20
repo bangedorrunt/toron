@@ -385,6 +385,31 @@ pub async fn demo_mailbox_with_trigger()
 /// (`tracing::warn`) and serve continues; consumers already degrade loud
 /// on an absent socket. The returned handle must be HELD for the serve's
 /// lifetime — dropping it removes the socket file (RAII).
+/// U3 producer: one trusted bus subscription for every event subscription,
+/// plus the 60s expiry sweep. The returned handle must be held for the serve's
+/// lifetime; dropping it aborts the dispatcher task.
+async fn start_events_dispatcher(
+    mailbox: &Mailbox,
+) -> Option<toron_core::events::dispatcher::DispatcherHandle> {
+    let pool = mailbox.index_pool()?.clone();
+    let store: std::sync::Arc<dyn toron_core::events::store::SubscriptionStore> =
+        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(pool));
+    let dispatcher = std::sync::Arc::new(toron_core::events::dispatcher::EventDispatcher::new(
+        mailbox.bus().clone(),
+        store,
+    ));
+    match dispatcher.start().await {
+        Ok(handle) => {
+            tracing::info!("events dispatcher started (one trusted bus subscription)");
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!("events dispatcher not started: {e}");
+            None
+        }
+    }
+}
+
 async fn start_wake_sidecar(mailbox: &Mailbox) -> Option<toron_core::bus::wake::WakeHandle> {
     use toron_core::bus::wake::{SystemClock, WakeConfig, WakeServer};
     let sock = match std::env::var("TORON_WAKE_SOCK") {
@@ -594,6 +619,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     let _wake = start_wake_sidecar(&mailbox).await;
+    let _events = start_events_dispatcher(&mailbox).await;
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -725,6 +751,7 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
     let _wake = start_wake_sidecar(&mailbox).await;
+    let _events = start_events_dispatcher(&mailbox).await;
     let (router, hosts) = router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

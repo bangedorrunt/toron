@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 pub const MAX_PIN_TTL_US: i64 = 24 * 60 * 60 * 1_000_000;
+/// A delivery row is a hint, not a second bus: keep the table bounded by both
+/// age and count per subscription, pruned on append and by the sweep (ADR-0039).
+pub const MAX_DELIVERIES_PER_SUB: i64 = 1000;
+pub const DELIVERY_TTL_US: i64 = 24 * 60 * 60 * 1_000_000;
 
 /// Deterministic canonical JSON for identity hashing (RFC 8785 shape: sorted
 /// object keys, no insignificant whitespace). Numbers use serde_json's stable
@@ -102,7 +106,8 @@ pub trait SubscriptionStore: Send + Sync {
     ) -> anyhow::Result<Subscription>;
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Subscription>>;
-    async fn append(&self, id: &str, payload: &Value) -> anyhow::Result<()>;
+    async fn list_active(&self) -> anyhow::Result<Vec<Subscription>>;
+    async fn append(&self, id: &str, payload: &Value, now_us: i64) -> anyhow::Result<()>;
     async fn poll(&self, id: &str, after: u64, limit: u32) -> anyhow::Result<Page>;
     async fn unsubscribe(&self, id: &str, principal: &str) -> anyhow::Result<bool>;
     async fn sweep(&self, now_us: i64) -> anyhow::Result<usize>;
@@ -210,22 +215,68 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         ))
     }
 
-    async fn append(&self, id: &str, payload: &Value) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO event_deliveries (subscription_id, payload, created_us) VALUES (?, ?, 0)")
+    async fn list_active(&self) -> anyhow::Result<Vec<Subscription>> {
+        let rows = sqlx::query_as::<_, (
+            String, String, String, String, String, i64, i64, Option<i64>, String,
+        )>(
+            "SELECT id, principal, delivery, name, args_hash, cursor, created_us, expires_us, state \
+             FROM event_subscriptions WHERE state = 'active' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, principal, delivery, name, args_hash, cursor, created_us, expires_us, state)| {
+                Subscription {
+                    id, principal, delivery, name, args_hash, cursor: cursor as u64,
+                    created_us, expires_us, state,
+                }
+            })
+            .collect())
+    }
+
+    async fn append(&self, id: &str, payload: &Value, now_us: i64) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO event_deliveries (subscription_id, payload, created_us) VALUES (?, ?, ?)")
             .bind(id)
             .bind(serde_json::to_string(payload)?)
+            .bind(now_us)
             .execute(&self.pool)
             .await?;
+        // Bound by age, then by count: keep only the newest N rows.
+        sqlx::query(
+            "DELETE FROM event_deliveries WHERE subscription_id = ? \
+             AND (created_us < ? OR seq NOT IN ( \
+                 SELECT seq FROM event_deliveries WHERE subscription_id = ? \
+                 ORDER BY seq DESC LIMIT ?))",
+        )
+        .bind(id)
+        .bind(now_us.saturating_sub(DELIVERY_TTL_US))
+        .bind(id)
+        .bind(MAX_DELIVERIES_PER_SUB)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     async fn poll(&self, id: &str, after: u64, limit: u32) -> anyhow::Result<Page> {
+        // bd-sptj4 gap contract: if the cursor fell off the pruned end, report
+        // truncated and hand back a fresh servable cursor instead of lying.
+        let oldest: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(seq) FROM event_deliveries WHERE subscription_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let truncated = oldest.is_some_and(|oldest| (after as i64) < oldest - 1);
+        let start = oldest
+            .map(|o| (after as i64).max(o - 1))
+            .unwrap_or(after as i64);
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT seq, payload FROM event_deliveries \
              WHERE subscription_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
         )
         .bind(id)
-        .bind(after as i64)
+        .bind(start)
         .bind(limit as i64 + 1)
         .fetch_all(&self.pool)
         .await?;
@@ -243,7 +294,7 @@ impl SubscriptionStore for SqliteSubscriptionStore {
             events,
             cursor,
             has_more,
-            truncated: false,
+            truncated,
         })
     }
 
@@ -262,6 +313,10 @@ impl SubscriptionStore for SqliteSubscriptionStore {
     }
 
     async fn sweep(&self, now_us: i64) -> anyhow::Result<usize> {
+        sqlx::query("DELETE FROM event_deliveries WHERE created_us < ?")
+            .bind(now_us.saturating_sub(DELIVERY_TTL_US))
+            .execute(&self.pool)
+            .await?;
         let out = sqlx::query(
             "UPDATE event_subscriptions SET state = 'terminated' \
              WHERE state = 'active' AND expires_us IS NOT NULL AND expires_us <= ?",

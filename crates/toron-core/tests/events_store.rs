@@ -80,7 +80,7 @@ async fn cursor_poll_returns_events_after_the_cursor_and_persists() {
         .unwrap();
     for i in 0..3 {
         store
-            .append(&sub.id, &json!({"event_id": format!("e{i}"), "name": "mail.addressed"}))
+            .append(&sub.id, &json!({"event_id": format!("e{i}"), "name": "mail.addressed"}), 100)
             .await
             .unwrap();
     }
@@ -100,6 +100,31 @@ async fn cursor_poll_returns_events_after_the_cursor_and_persists() {
     let row = reopened.get(&sub.id).await.unwrap().expect("survives restart");
     assert_eq!(row.id, sub.id);
     assert_eq!(reopened.poll(&sub.id, 0, 10).await.unwrap().events.len(), 3);
+}
+
+#[tokio::test]
+async fn a_cursor_that_fell_off_the_bounded_table_reports_truncated() {
+    use toron_core::events::store::{MAX_DELIVERIES_PER_SUB, DELIVERY_TTL_US};
+
+    let (store, _path) = store("gap").await;
+    let args = json!({"project": "f"});
+    let sub = store
+        .subscribe("op", false, "poll", "n", &args, None, 0)
+        .await
+        .unwrap();
+    // Age out the earliest rows so the table's oldest seq advances.
+    for i in 0..5 {
+        store
+            .append(&sub.id, &json!({"i": i}), i * DELIVERY_TTL_US + 1000)
+            .await
+            .unwrap();
+    }
+    // Only the newest row survives the age prune.
+    let page = store.poll(&sub.id, 0, 10).await.unwrap();
+    assert!(page.truncated, "a pruned cursor is reported, not silently skipped");
+    assert!(!page.events.is_empty(), "the fresh cursor still serves rows");
+    assert!(page.cursor > 0, "a fresh servable cursor comes back");
+    let _ = MAX_DELIVERIES_PER_SUB;
 }
 
 #[tokio::test]
