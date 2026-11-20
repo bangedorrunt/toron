@@ -93,7 +93,7 @@ async fn addressed_mail_on_bus_becomes_one_hint_on_poll() {
         let event = build_event(
             &keys,
             toron_core::nostr::kinds::toron_kind(CHANNEL_MESSAGE),
-            &format!("mail-{i}"),
+            format!("mail-{i}"),
             vec![
                 Tag::parse(["p", pin]).unwrap(),
                 Tag::parse(["t", "flywheel"]).unwrap(),

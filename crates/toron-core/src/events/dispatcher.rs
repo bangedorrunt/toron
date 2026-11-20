@@ -119,59 +119,6 @@ pub async fn dispatch_fact(
     Ok(delivered)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use super::super::store::{Page, SubscribeSpec, Subscription};
-    use serde_json::Value;
-    use std::sync::Mutex;
-
-    struct CountingStore {
-        appends: Mutex<usize>,
-    }
-    #[async_trait]
-    impl SubscriptionStore for CountingStore {
-        async fn subscribe(&self, _spec: &SubscribeSpec) -> anyhow::Result<Subscription> {
-            unreachable!()
-        }
-        async fn get(&self, _id: &str) -> anyhow::Result<Option<Subscription>> {
-            Ok(None)
-        }
-        async fn list_active(&self) -> anyhow::Result<Vec<Subscription>> {
-            Ok(vec![Subscription {
-                id: "s".into(),
-                principal: "AmberProbe".into(),
-                delivery: "poll".into(),
-                name: "mail.addressed".into(),
-                args_hash: "h".into(),
-                cursor: 0,
-                created_us: 0,
-                expires_us: None,
-                state: "active".into(),
-            }])
-        }
-        async fn append(&self, _id: &str, _payload: &Value, _now_us: i64) -> anyhow::Result<()> {
-            *self.appends.lock().unwrap() += 1;
-            Ok(())
-        }
-        async fn poll(&self, _id: &str, _after: u64, _limit: u32) -> anyhow::Result<Page> {
-            Ok(Page { events: vec![], cursor: 0, has_more: false, truncated: false })
-        }
-        async fn unsubscribe(&self, _id: &str, _principal: &str) -> anyhow::Result<bool> { Ok(true) }
-        async fn terminate(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn prune_deliveries(&self, _now_us: i64) -> anyhow::Result<()> { Ok(()) }
-        async fn sweep(&self, _now_us: i64) -> anyhow::Result<usize> { Ok(0) }
-    }
-
-    #[tokio::test]
-    async fn a_lost_fact_appends_one_gap_per_active_subscription() {
-        let store = CountingStore { appends: Mutex::new(0) };
-        append_gap(&store, 1000).await;
-        assert_eq!(*store.appends.lock().unwrap(), 1);
-    }
-}
-
 pub struct EventDispatcher {
     bus: Arc<dyn Bus>,
     store: Arc<dyn SubscriptionStore>,
@@ -228,5 +175,58 @@ pub struct DispatcherHandle(tokio::task::JoinHandle<()>);
 impl Drop for DispatcherHandle {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use super::super::store::{Page, SubscribeSpec, Subscription};
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    struct CountingStore {
+        appends: Mutex<usize>,
+    }
+    #[async_trait]
+    impl SubscriptionStore for CountingStore {
+        async fn subscribe(&self, _spec: &SubscribeSpec) -> anyhow::Result<Subscription> {
+            unreachable!()
+        }
+        async fn get(&self, _id: &str) -> anyhow::Result<Option<Subscription>> {
+            Ok(None)
+        }
+        async fn list_active(&self) -> anyhow::Result<Vec<Subscription>> {
+            Ok(vec![Subscription {
+                id: "s".into(),
+                principal: "AmberProbe".into(),
+                delivery: "poll".into(),
+                name: "mail.addressed".into(),
+                args_hash: "h".into(),
+                cursor: 0,
+                created_us: 0,
+                expires_us: None,
+                state: "active".into(),
+            }])
+        }
+        async fn append(&self, _id: &str, _payload: &Value, _now_us: i64) -> anyhow::Result<()> {
+            *self.appends.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn poll(&self, _id: &str, _after: u64, _limit: u32) -> anyhow::Result<Page> {
+            Ok(Page { events: vec![], cursor: 0, has_more: false, truncated: false })
+        }
+        async fn unsubscribe(&self, _id: &str, _principal: &str) -> anyhow::Result<bool> { Ok(true) }
+        async fn terminate(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn prune_deliveries(&self, _now_us: i64) -> anyhow::Result<()> { Ok(()) }
+        async fn sweep(&self, _now_us: i64) -> anyhow::Result<usize> { Ok(0) }
+    }
+
+    #[tokio::test]
+    async fn a_lost_fact_appends_one_gap_per_active_subscription() {
+        let store = CountingStore { appends: Mutex::new(0) };
+        append_gap(&store, 1000).await;
+        assert_eq!(*store.appends.lock().unwrap(), 1);
     }
 }
