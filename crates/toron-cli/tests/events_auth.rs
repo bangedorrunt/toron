@@ -3,7 +3,7 @@
 //! bd-6bgrd U2: CLI operator-signed token minting (no key material in output).
 //! Each test gets a temp HOME/XDG + data dir and never touches a live daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,7 +18,7 @@ fn sandbox(tag: &str) -> PathBuf {
     dir
 }
 
-fn toron(dir: &PathBuf) -> Command {
+fn toron(dir: &Path) -> Command {
     let mut cmd = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     cmd.env_remove("TORON_MCP_URL")
         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -29,7 +29,7 @@ fn toron(dir: &PathBuf) -> Command {
     cmd
 }
 
-fn run(dir: &PathBuf, args: &[&str]) -> Output {
+fn run(dir: &Path, args: &[&str]) -> Output {
     toron(dir).args(args).output().expect("run toron events")
 }
 
@@ -37,7 +37,7 @@ fn parse(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).expect("stdout must be JSON")
 }
 
-fn write_operator_key(dir: &PathBuf) {
+fn write_operator_key(dir: &Path) {
     let cfg_dir = dir.join("config/toron");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let keys = toron_core::keys::generate();
