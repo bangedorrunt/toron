@@ -307,7 +307,7 @@ mod tests {
             channel_capacity: 1,
             detailed_stage_logging: false,
         }).await.unwrap();
-        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
         let keys = crate::nostr::Keys::generate();
         for i in 0..8 {
             let ev = crate::nostr::event::build_event(
@@ -342,7 +342,7 @@ mod tests {
         ).unwrap();
         bus.publish(old).await.unwrap();
         // Fresh dispatcher: since = now, so the old fact is not replayed.
-        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
         let mut replayed = 0;
         while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_millis(50), sub.next()).await {
             if matches!(item, SubscriptionEvent::Event(_)) { replayed += 1; }
@@ -375,10 +375,8 @@ mod tests {
             "later", vec![crate::nostr::Tag::parse(["p", "AmberProbe"]).unwrap()],
             crate::nostr::Timestamp::now(),
         ).unwrap();
-        bus.txs.lock().unwrap()[1]
-            .send(SubscriptionEvent::Event(event))
-            .await
-            .unwrap();
+        let tx = bus.txs.lock().unwrap()[1].clone();
+        tx.send(SubscriptionEvent::Event(event)).await.unwrap();
         let mut ok = false;
         for _ in 0..40 {
             if store.payloads.lock().unwrap().iter().any(|p| p.contains("mail.addressed")) { ok = true; break; }
