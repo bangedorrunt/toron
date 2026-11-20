@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use crate::nostr::{Event, Filter};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,6 +124,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use super::super::store::{Page, SubscribeSpec, Subscription};
+    use serde_json::Value;
     use std::sync::Mutex;
 
     struct CountingStore {
