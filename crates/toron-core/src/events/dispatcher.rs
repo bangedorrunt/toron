@@ -342,7 +342,7 @@ mod tests {
         ).unwrap();
         bus.publish(old).await.unwrap();
         // Fresh dispatcher: since = now, so the old fact is not replayed.
-        let sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
         let mut replayed = 0;
         while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_millis(50), sub.next()).await {
             if matches!(item, SubscriptionEvent::Event(_)) { replayed += 1; }
