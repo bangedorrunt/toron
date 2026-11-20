@@ -10,9 +10,11 @@ use toron_core::events::retry::Outcome;
 use toron_mcp::events::webhook_delivery::EgressPort;
 use toron_mcp::server::start_webhook_dispatcher;
 
+type Headers = Vec<(String, String)>;
+
 #[derive(Debug, Clone)]
 struct FakeStats {
-    posts: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    posts: Arc<Mutex<Vec<Headers>>>,
     outcomes: Arc<Mutex<Vec<Outcome>>>,
 }
 
@@ -34,7 +36,11 @@ impl EgressPort for Fake {
     ) -> Result<Outcome, String> {
         self.stats.posts.lock().unwrap().push(headers);
         let mut o = self.stats.outcomes.lock().unwrap();
-        Ok(if o.len() > 1 { o.remove(0) } else { o[0].clone() })
+        Ok(if o.len() > 1 {
+            o.remove(0)
+        } else {
+            o[0].clone()
+        })
     }
 }
 
@@ -50,7 +56,7 @@ async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
     let state = toron_core::config::state_dir();
     let _ = std::fs::create_dir_all(&state);
     // A pending retry: journal says attempt 1 got a 503 with a due timer.
-    let rows = vec![
+    let rows = [
         r#"{"kind":"deliver-intent","key":"webhook:sub-1","attempt":1}"#.to_string(),
         r#"{"kind":"deliver-result","key":"webhook:sub-1","attempt":1,"decision":"retry","due_ms":1}"#.to_string(),
     ];
@@ -68,33 +74,51 @@ async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
     let mailbox = toron_mcp::demo_mailbox().await.expect("mailbox");
     let handle = start_webhook_dispatcher(
         &mailbox,
-        Fake { stats: stats.clone() },
+        Fake {
+            stats: stats.clone(),
+        },
         EgressPolicy::default(),
     )
     .await
     .expect("dispatcher starts");
     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-    assert_eq!(stats.posts.lock().unwrap().len(), 1, "exactly one resumed delivery");
+    assert_eq!(
+        stats.posts.lock().unwrap().len(),
+        1,
+        "exactly one resumed delivery"
+    );
     let sig = stats.posts.lock().unwrap()[0]
         .iter()
         .find(|(k, _)| k == "webhook-signature")
         .map(|(_, v)| v.clone())
         .expect("signed");
-    assert!(sig.starts_with("v1,"), "delivery is Standard-Webhooks signed: {sig}");
+    assert!(
+        sig.starts_with("v1,"),
+        "delivery is Standard-Webhooks signed: {sig}"
+    );
     let journal_after = std::fs::read_to_string(state.join("webhook-journal.jsonl")).unwrap();
-    assert!(journal_after.contains("delivered"), "journal records the delivery: {journal_after}");
+    assert!(
+        journal_after.contains("delivered"),
+        "journal records the delivery: {journal_after}"
+    );
     drop(handle); // first daemon gone
 
     // Restart: re-fold the SAME journal (now with the delivered result row).
     let handle2 = start_webhook_dispatcher(
         &mailbox,
-        Fake { stats: stats.clone() },
+        Fake {
+            stats: stats.clone(),
+        },
         EgressPolicy::default(),
     )
     .await
     .expect("dispatcher restarts");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert_eq!(stats.posts.lock().unwrap().len(), 1, "restart sends no duplicate");
+    assert_eq!(
+        stats.posts.lock().unwrap().len(),
+        1,
+        "restart sends no duplicate"
+    );
     drop(handle2);
     let _ = std::fs::remove_dir_all(&dir);
 }
