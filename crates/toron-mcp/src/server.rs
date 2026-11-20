@@ -467,9 +467,26 @@ where
             ));
         }
     }
-    let _ = &store;
+    let specs_by_id: std::collections::BTreeMap<String, PostSpecOwned> =
+        specs.iter().cloned().collect();
     let mut dispatcher = WebhookDispatcher::new(port, policy);
     dispatcher.refold(&rows, specs);
+
+    // ONE trusted bus subscription for the whole daemon (bd-kz33f pattern) —
+    // the live-event half of webhook delivery. Facts are matched with the SAME
+    // catalogue classifier the stream path uses; no second matcher here.
+    let started = toron_core::nostr::Timestamp::now();
+    let mut bus_sub = match mailbox
+        .bus()
+        .subscribe_trusted(toron_core::bus::Filter::new().since(started))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("webhook dispatcher bus subscription failed: {e}");
+            return None;
+        }
+    };
 
     let handle = tokio::spawn(async move {
         let tick_ms = std::env::var("TORON_WEBHOOK_TICK_MS")
@@ -478,21 +495,83 @@ where
             .filter(|v| *v > 0)
             .unwrap_or(5_000);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
+        let mut seen_lag = bus_sub.lag_count();
         loop {
-            ticker.tick().await;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let now_s = now_ms / 1000;
-            if let Err(e) = dispatcher.on_clock(now_ms, now_s).await {
-                tracing::warn!("webhook delivery clock tick failed: {e}");
-            }
-            // Persist the decided-before-invoke journal after each tick.
-            if let Err(e) =
-                std::fs::write(&journal_path, dispatcher.journal_rows().join("\n") + "\n")
-            {
-                tracing::warn!("webhook journal write failed: {e}");
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if let Err(e) = dispatcher.on_clock(now_ms, now_ms / 1000).await {
+                        tracing::warn!("webhook delivery clock tick failed: {e}");
+                    }
+                    let _ = std::fs::write(
+                        &journal_path,
+                        dispatcher.journal_rows().join("\n") + "\n",
+                    );
+                }
+                ev = bus_sub.next() => {
+                    let lag = bus_sub.lag_count();
+                    if lag > seen_lag {
+                        seen_lag = lag;
+                        // A bus lag is a gap: one hint per webhook subscription,
+                        // never silence. Reuses the same on_event/journal path.
+                        if let Ok(active) = store.list_active().await {
+                            for sub in active.into_iter().filter(|s| s.delivery == "webhook") {
+                                let Some(spec) = specs_by_id.get(&format!("webhook:{}", sub.id))
+                                else { continue };
+                                let Ok(secret) = toron_core::events::webhook::Secret::from_whsec(&spec.secret_whsec)
+                                else { continue };
+                                let _ = dispatcher.on_event(
+                                    &sub.id, &format!("gap-{lag}"),
+                                    &spec.url, br#"{"kind":"gap"}"#.to_vec(),
+                                    &secret, 0,
+                                ).await;
+                            }
+                        }
+                        let _ = std::fs::write(
+                            &journal_path,
+                            dispatcher.journal_rows().join("\n") + "\n",
+                        );
+                        continue;
+                    }
+                    let Some(toron_core::bus::SubscriptionEvent::Event(event)) = ev else {
+                        continue;
+                    };
+                    let fact = toron_core::events::dispatcher::fact_from_event(&event);
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    let Ok(active) = store.list_active().await else { continue };
+                    for sub in active.into_iter().filter(|s| s.delivery == "webhook") {
+                        let subscriber = if sub.principal == "operator" {
+                            fact.subject_pin.clone().unwrap_or_default()
+                        } else { sub.principal.clone() };
+                        let Some(name) = toron_core::events::catalogue::classify(&fact, &subscriber)
+                        else { continue };
+                        let Some(spec) = specs_by_id.get(&format!("webhook:{}", sub.id)) else {
+                            continue;
+                        };
+                        let Ok(secret) = toron_core::events::webhook::Secret::from_whsec(&spec.secret_whsec) else { continue };
+                        let hint = serde_json::json!({
+                            "event_id": fact.id, "name": name.as_str(),
+                            "timestamp": now_us,
+                        }).to_string().into_bytes();
+                        let event_id = event.id.to_hex();
+                        if let Err(e) = dispatcher.on_event(
+                            &sub.id, &event_id, &spec.url, hint, &secret,
+                            (now_us / 1_000_000) as u64,
+                        ).await {
+                            tracing::warn!("webhook delivery failed for {}: {e}", sub.id);
+                        }
+                    }
+                    let _ = std::fs::write(
+                        &journal_path,
+                        dispatcher.journal_rows().join("\n") + "\n",
+                    );
+                }
             }
         }
     });
