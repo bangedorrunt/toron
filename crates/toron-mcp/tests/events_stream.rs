@@ -42,9 +42,7 @@ async fn post_stream(app: axum::Router, body: &Value, token: Option<&str>) -> St
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut req = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n"
-    );
+    let mut req = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n".to_string();
     if let Some(t) = token {
         req.push_str(&format!("Authorization: Bearer {t}\r\n"));
     }
