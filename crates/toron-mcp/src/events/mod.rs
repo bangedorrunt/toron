@@ -4,8 +4,8 @@
 //! MCP Events U1 protocol surface (ADR-0039 D1/D2).
 //!
 //! These are JSON-RPC methods, NOT tools: the 41-tool surface stays frozen.
-//! A handler error is an in-band JSON-RPC error (HTTP 200); a missing `_meta`
-//! is rejected by the transport as HTTP 400 before it reaches here.
+//! A handler error is an in-band JSON-RPC error; a missing `_meta` is rejected
+//! by the method-scoped check in `server.rs` before this router runs.
 
 use rmcp::ErrorData;
 use rmcp::model::{CustomResult, ErrorCode};
@@ -25,8 +25,15 @@ pub fn route(method: &str, params: Option<&Value>) -> Option<Result<CustomResult
         "events/list" => Ok(CustomResult(json!({
             "events": catalogue::catalogue(),
         }))),
-        "events/subscribe" => subscribe(params),
-        "events/unsubscribe" | "events/poll" => Err(ErrorData::new(
+        "events/subscribe" | "events/poll" | "events/stream" => match valid_name(params) {
+            Ok(name) => Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("{method} for {name} is not implemented in U1"),
+                None,
+            )),
+            Err(err) => Err(err),
+        },
+        "events/unsubscribe" => Err(ErrorData::new(
             ErrorCode::METHOD_NOT_FOUND,
             format!("{method} is not implemented in U1"),
             None,
@@ -39,15 +46,13 @@ pub fn route(method: &str, params: Option<&Value>) -> Option<Result<CustomResult
     })
 }
 
-fn subscribe(params: Option<&Value>) -> Result<CustomResult, ErrorData> {
-    let params = params.ok_or_else(|| {
-        ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            "events/subscribe requires params with an event name",
-            None,
-        )
-    })?;
-    let name = params.get("event").and_then(Value::as_str).unwrap_or("");
+/// SEP-3415 uses `name` (plus `arguments`), not `event`. An unknown name is
+/// AE1's in-band `-32602`.
+fn valid_name(params: Option<&Value>) -> Result<&str, ErrorData> {
+    let name = params
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if catalogue::catalogue().iter().all(|row| row.name != name) {
         return Err(ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -55,12 +60,14 @@ fn subscribe(params: Option<&Value>) -> Result<CustomResult, ErrorData> {
             None,
         ));
     }
-    // U1 has no delivery backend yet (U2+); a valid name is accepted as a hint
-    // contract, never as an active subscription.
-    Ok(CustomResult(json!({
-        "event": name,
-        "status": "not_implemented",
-    })))
+    Ok(name)
+}
+
+/// bd-6bgrd U2: the ONE authorization seam for `events/*`. U1 has no tokens;
+/// U2 replaces this body with its principal resolver from the Authorization
+/// header value. No other events handler reads auth.
+pub fn authorize(_authorization: Option<&str>) -> Result<(), ErrorData> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -69,17 +76,22 @@ mod tests {
 
     #[test]
     fn unknown_event_name_is_in_band_invalid_params() {
-        let params = json!({"event": "not.an.event"});
-        let err = subscribe(Some(&params)).expect_err("unknown name");
+        let params = json!({"name": "not.an.event"});
+        let err = route("events/subscribe", Some(&params))
+            .expect("routed")
+            .expect_err("unknown name");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(err.code.0, -32602);
         assert!(err.message.contains("unknown event name"), "{err:?}");
     }
 
     #[test]
-    fn a_known_event_passes_the_name_check() {
-        let params = json!({"event": "mail.addressed"});
-        let out = subscribe(Some(&params)).expect("known name");
-        assert_eq!(out.0["event"], "mail.addressed");
+    fn known_names_on_unimplemented_methods_are_errors_never_ok() {
+        let params = json!({"name": "mail.addressed", "arguments": {}});
+        for method in ["events/subscribe", "events/poll", "events/stream"] {
+            let out = route(method, Some(&params)).expect("routed");
+            assert!(out.is_err(), "{method} must not fake success");
+        }
     }
 
     #[test]
@@ -87,5 +99,11 @@ mod tests {
         assert!(route("tools/list", None).is_none());
         assert!(route("events/nope", None).is_some());
         assert!(route("events/list", None).is_some());
+    }
+
+    #[test]
+    fn authorization_seam_exists_and_is_tokenless_in_u1() {
+        assert!(authorize(None).is_ok());
+        assert!(authorize(Some("Bearer anything")).is_ok());
     }
 }

@@ -126,11 +126,10 @@ impl ToronServer {
             .enable_resources_subscribe()
             .enable_tool_list_changed()
             .build();
-        let mut events = serde_json::Map::new();
-        events.insert("version".into(), serde_json::json!("2026-11-20"));
+        let events = serde_json::json!({"listChanged": false});
         caps.extensions = Some(std::collections::BTreeMap::from([(
             crate::events::EVENTS_EXTENSION.to_string(),
-            events,
+            events.as_object().expect("an object").clone(),
         )]));
         caps
     }
@@ -151,15 +150,42 @@ impl ServerHandler for ToronServer {
     ) -> impl std::future::Future<Output = Result<rmcp::model::CustomResult, rmcp::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
+        use rmcp::model::GetMeta;
         let method = request.method.clone();
         let params = request.params.as_ref();
-        let result = crate::events::route(&method, params).unwrap_or_else(|| {
+        let result = if method.starts_with("events/") {
+            let missing = request
+                .get_meta()
+                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
+            if !missing.is_empty() {
+                Err(rmcp::ErrorData::invalid_params(
+                    format!("events/* requires _meta: {}", missing.join(", ")),
+                    None,
+                ))
+            } else {
+                let authorization = request
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                crate::events::authorize(authorization.as_deref()).and_then(|()| {
+                    crate::events::route(&method, params).unwrap_or_else(|| {
+                        Err(rmcp::ErrorData::new(
+                            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                            method,
+                            None,
+                        ))
+                    })
+                })
+            }
+        } else {
             Err(rmcp::ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 method,
                 None,
             ))
-        });
+        };
         std::future::ready(result)
     }
 
@@ -649,7 +675,6 @@ async fn router_with_mailbox(
             StreamableHttpServerConfig::default()
                 .with_json_response(true)
                 .with_legacy_session_mode(false)
-                .with_stateless_protocol_metadata_required(true)
                 .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
@@ -777,7 +802,11 @@ mod tests {
             .extensions
             .as_ref()
             .expect("ADR-0039 events extension advertised");
-        assert!(ext.contains_key(crate::events::EVENTS_EXTENSION));
+        let value = ext
+            .get(crate::events::EVENTS_EXTENSION)
+            .expect("events row");
+        assert_eq!(value["listChanged"], false, "SEP-3415 capability value");
+        assert_eq!(value.len(), 1, "no version key");
     }
 
     #[test]
