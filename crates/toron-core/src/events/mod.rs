@@ -11,7 +11,9 @@ pub mod catalogue;
 pub mod dispatcher;
 pub mod kernel;
 pub mod principal;
+pub mod retry;
 pub mod store;
 pub mod stream;
+pub mod webhook;
 
 pub use catalogue::{CatalogueEvent, EventName, Fact, catalogue, classify};

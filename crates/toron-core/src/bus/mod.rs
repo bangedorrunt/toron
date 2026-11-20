@@ -10,6 +10,7 @@
 pub mod addressable;
 pub mod common;
 pub mod convergence;
+pub mod egress;
 pub mod event_store;
 pub mod federation;
 pub mod filter;
