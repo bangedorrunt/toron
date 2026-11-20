@@ -722,24 +722,24 @@ async fn router_with_mailbox(
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
     let blossom =
         crate::blob_serve::blossom_router(toron_core::archive::blob::BlobStore::new(blob_root));
-    // ADR-0039 D7: SSE stream is a plain axum route (rmcp custom requests are
-    // single JSON results). It shares the store and cursor with events/poll.
-    let events_store: std::sync::Arc<dyn toron_core::events::store::SubscriptionStore> =
-        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
+    // ADR-0039 D7: `events/stream` is a JSON-RPC POST to /mcp answered with
+    // SSE. A layer in front of rmcp recognizes that one method; all other
+    // requests pass through unchanged. It shares the store/cursor with poll.
+    let stream_state = crate::events_stream::StreamDeps {
+        store: std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
             index_pool,
-        ));
-    let stream_router = axum::Router::new()
-        .route("/events/stream", axum::routing::get(crate::events_stream::events_stream))
-        .with_state((
-            events_store,
-            std::sync::Arc::new(toron_core::events::principal::FileTokenStore::at_root(
-                &toron_core::config::ToronPaths::resolve().root,
-            )) as std::sync::Arc<dyn toron_core::events::principal::TokenStore>,
-        ));
-    let router = axum::Router::new()
+        )),
+        tokens: std::sync::Arc::new(toron_core::events::principal::FileTokenStore::at_root(
+            &toron_core::config::ToronPaths::resolve().root,
+        )),
+    };
+    let mcp_router = axum::Router::new()
         .nest_service("/mcp", service)
-        .merge(blossom)
-        .merge(stream_router);
+        .layer(axum::middleware::from_fn_with_state(
+            stream_state,
+            crate::events_stream::stream_intercept,
+        ));
+    let router = axum::Router::new().merge(mcp_router).merge(blossom);
     Ok((router, hosts))
 }
 

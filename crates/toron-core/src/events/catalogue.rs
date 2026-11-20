@@ -54,7 +54,7 @@ const NAMES: [EventName; 6] = [
 ];
 
 /// `events/list` advertises poll and push in U1; webhook lands in P2.
-const DELIVERY: &[&str] = &["poll", "push"];
+const DELIVERY: &[&str] = &["poll", "push", "stream"];
 
 /// One SEP-3415 `events/list` row. The wire keys are camelCase.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -181,7 +181,7 @@ mod tests {
             );
             let name = row["name"].as_str().expect("name");
             assert!(seen.insert(name), "duplicate event name {name}");
-            assert_eq!(row["delivery"], json!(["poll", "push"]));
+            assert_eq!(row["delivery"], json!(["poll", "push", "stream"]));
             assert_eq!(row["inputSchema"]["properties"]["project"]["type"], "string");
             assert_eq!(row["payloadSchema"]["type"], "object");
             let props = row["payloadSchema"]["properties"].as_object().unwrap();

@@ -37,7 +37,7 @@ fn events_list_uses_sep3415_wire_keys() {
             "exact SEP-3415 row keys"
         );
         assert!(row["name"].as_str().is_some_and(|s| !s.is_empty()));
-        assert_eq!(row["delivery"], serde_json::json!(["poll", "push"]));
+        assert_eq!(row["delivery"], serde_json::json!(["poll", "push", "stream"]));
         assert_eq!(row["inputSchema"]["properties"]["project"]["type"], "string");
         assert_eq!(row["payloadSchema"]["type"], "object");
         let props = row["payloadSchema"]["properties"].as_object().unwrap();
