@@ -75,7 +75,7 @@ pub fn decide(attempt: u32, outcome: &Outcome, rand_unit: f64, policy: &RetryPol
             }
             let base = delay_ms(attempt, rand_unit, policy);
             let delay = match retry_after {
-                Some(secs) => (*secs as u64)
+                Some(secs) => secs
                     .saturating_mul(1000)
                     .clamp(base.min(policy.cap_ms), policy.cap_ms),
                 None => base,

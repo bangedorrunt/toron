@@ -78,10 +78,10 @@ fn mask_v4(prefix: u8) -> u32 {
 fn mask_v6(prefix: u8) -> [u8; 16] {
     let mut out = [0u8; 16];
     let whole = (prefix / 8) as usize;
-    for i in 0..whole {
-        out[i] = 0xff;
+    for byte in out.iter_mut().take(whole) {
+        *byte = 0xff;
     }
-    if whole < 16 && prefix % 8 != 0 {
+    if whole < 16 && !prefix.is_multiple_of(8) {
         out[whole] = 0xffu8.wrapping_shl(8 - u32::from(prefix % 8));
     }
     out

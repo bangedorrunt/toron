@@ -53,7 +53,7 @@ impl Secret {
 }
 
 fn b64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i < bytes.len() {
         let b0 = bytes[i];
@@ -184,10 +184,14 @@ pub fn verify(
         };
         // Constant-time compare over the expected length; a wrong length is a
         // mismatch but still walks all 32 bytes.
-        let mut diff = (got.len() ^ 32) as u8;
-        for i in 0..32 {
-            let b = got.get(i).copied().unwrap_or(0);
-            diff |= b ^ expected[i];
+        let mut diff = (got.len() ^ expected.len()) as u8;
+        for (b, e) in got
+            .iter()
+            .chain(std::iter::repeat(&0u8))
+            .zip(expected.iter())
+            .take(32)
+        {
+            diff |= b ^ e;
         }
         if diff == 0 {
             ok = true;
