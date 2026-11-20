@@ -106,6 +106,10 @@ pub enum Command {
     /// tool, ADR-0020 wave 1 freeze).
     AckSla(AckSlaArgs),
 
+    /// Events principals (ADR-0039): operator-only bearer token management.
+    #[command(subcommand)]
+    Events(EventsCommand),
+
     /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release.
     #[command(subcommand)]
     Reserve(ReserveCommand),
@@ -820,6 +824,46 @@ pub struct AckSlaArgs {
     /// ack_required + high/urgent importance and no receipt get a wake).
     #[arg(long)]
     pub sla_secs: Option<u64>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventsCommand {
+    /// Bearer tokens for events/* (CLI-only; no new MCP tool, ADR-0039 D6).
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Mint a token; the plaintext is printed ONCE and never stored.
+    Mint(TokenMintArgs),
+    /// List token hashes and their principals (never plaintext).
+    List,
+    /// Revoke a token by hash; its next resolve fails.
+    Revoke(TokenRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TokenMintArgs {
+    /// Mint an operator token (cross-scope, full payload, no expiry).
+    #[arg(long)]
+    pub operator: bool,
+    /// Pin name for a per-pin token (requires --project).
+    #[arg(long)]
+    pub pin: Option<String>,
+    /// Project slug for a per-pin token (requires --pin).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Token lifetime in seconds (pin tokens only, ≤24h).
+    #[arg(long)]
+    pub ttl_secs: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    /// SHA-256 hash of the token (from mint or list).
+    #[arg(long, required = true)]
+    pub hash: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2049,6 +2093,8 @@ mod flag_conformance_tests {
             "toron presence publish",
             "toron presence list",
             "toron tui",
+            // An operator token is project-less by design (ADR-0039 D6).
+            "toron events token mint",
         ];
         let root = Cli::command();
         walk(&root, String::new(), &waived, &mut banned, &mut bad_project);

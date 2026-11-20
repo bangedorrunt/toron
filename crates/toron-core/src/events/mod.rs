@@ -8,5 +8,6 @@
 //! not a live-only surprise.
 
 pub mod catalogue;
+pub mod principal;
 
 pub use catalogue::{CatalogueEvent, EventName, Fact, catalogue, classify};

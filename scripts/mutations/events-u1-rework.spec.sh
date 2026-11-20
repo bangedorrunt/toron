@@ -4,16 +4,16 @@
 # ADR-0039 U1 rework: prove the three non-classifier guards can fail.
 
 CARGO_ARGS=(-p toron-mcp --test events_list)
-TEST_FILTER=(legacy_2025_client_calls_tools_without_per_request_meta capabilities_advertise_the_events_extension_only_under_extensions known_names_on_unimplemented_methods_are_errors_never_ok)
+TEST_FILTER=(ae1_http_contract capabilities_advertise_the_events_extension_only_under_extensions known_names_on_unimplemented_methods_are_errors_never_ok)
 
 SRV=crates/toron-mcp/src/server.rs
 EVT=crates/toron-mcp/src/events/mod.rs
 
-mutation "U1  global stateless metadata requirement is restored" \
+mutation "U1  global stateless metadata requirement is dropped" \
     file=$SRV \
-    expect=legacy_2025_client_calls_tools_without_per_request_meta \
-    find=$'                .with_legacy_session_mode(false)' \
-    replace=$'                .with_legacy_session_mode(false)\n                .with_stateless_protocol_metadata_required(true)'
+    expect=ae1_http_contract \
+    find='                .with_stateless_protocol_metadata_required(true)' \
+    replace='                .with_legacy_session_mode(false)'
 
 mutation "U2  capability value reverts to a custom version key" \
     file=$SRV \

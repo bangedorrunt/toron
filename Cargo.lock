@@ -3468,6 +3468,7 @@ dependencies = [
  "elm-effect-journal",
  "elm-effect-xstate",
  "futures-util",
+ "getrandom 0.3.4",
  "git2",
  "hex",
  "negentropy",

@@ -136,6 +136,12 @@ impl ToronServer {
 }
 
 impl ServerHandler for ToronServer {
+    /// ADR-0039 U1: every real client speaks 2026-07-28. An older client fails
+    /// version negotiation cleanly instead of getting a 400 on every request.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+    }
+
     fn get_info(&self) -> ServerConfig {
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
@@ -150,35 +156,24 @@ impl ServerHandler for ToronServer {
     ) -> impl std::future::Future<Output = Result<rmcp::model::CustomResult, rmcp::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
-        use rmcp::model::GetMeta;
         let method = request.method.clone();
         let params = request.params.as_ref();
         let result = if method.starts_with("events/") {
-            let missing = request
-                .get_meta()
-                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
-            if !missing.is_empty() {
-                Err(rmcp::ErrorData::invalid_params(
-                    format!("events/* requires _meta: {}", missing.join(", ")),
-                    None,
-                ))
-            } else {
-                let authorization = request
-                    .extensions
-                    .get::<axum::http::request::Parts>()
-                    .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                crate::events::authorize(authorization.as_deref()).and_then(|()| {
-                    crate::events::route(&method, params).unwrap_or_else(|| {
-                        Err(rmcp::ErrorData::new(
-                            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                            method,
-                            None,
-                        ))
-                    })
+            let authorization = request
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            crate::events::authorize(authorization.as_deref()).and_then(|()| {
+                crate::events::route(&method, params).unwrap_or_else(|| {
+                    Err(rmcp::ErrorData::new(
+                        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                        method,
+                        None,
+                    ))
                 })
-            }
+            })
         } else {
             Err(rmcp::ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
@@ -675,6 +670,7 @@ async fn router_with_mailbox(
             StreamableHttpServerConfig::default()
                 .with_json_response(true)
                 .with_legacy_session_mode(false)
+                .with_stateless_protocol_metadata_required(true)
                 .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
@@ -807,6 +803,13 @@ mod tests {
             .expect("events row");
         assert_eq!(value["listChanged"], false, "SEP-3415 capability value");
         assert_eq!(value.len(), 1, "no version key");
+    }
+
+    #[test]
+    fn only_2026_07_28_is_supported() {
+        use rmcp::ServerHandler;
+        let versions = ToronServer::new().supported_protocol_versions();
+        assert_eq!(versions.as_ref(), &[ProtocolVersion::V_2026_07_28]);
     }
 
     #[test]

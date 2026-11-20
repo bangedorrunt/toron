@@ -36,6 +36,11 @@
       "name": "ack-sla"
     },
     {
+      "args": "token",
+      "description": "Events principals (ADR-0039): operator-only bearer token management",
+      "name": "events"
+    },
+    {
       "args": "acquire, conflicts, list, renew, release, release-by-reason, sweep, yield, yields, force-release, request-release, respond, transfer, with-lease",
       "description": "File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release",
       "name": "reserve"
@@ -171,7 +176,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-09T06:05:42Z",
+  "generated_at": "2026-11-20T03:55:58Z",
   "resources": [
     {
       "description": "List projects known to toron.",

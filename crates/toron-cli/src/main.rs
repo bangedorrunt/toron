@@ -6,6 +6,7 @@ mod cli;
 mod comms;
 mod config;
 mod daemon;
+mod events;
 mod mailbox_source;
 mod operator;
 mod output;
@@ -87,6 +88,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Key(cmd) => {
             operator::run_key(&cfg, cmd)?;
+            ExitCode::SUCCESS
+        }
+        Command::Events(cmd) => {
+            events::run_events(cmd)?;
             ExitCode::SUCCESS
         }
         Command::Project(cmd) => {

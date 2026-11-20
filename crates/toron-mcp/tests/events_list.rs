@@ -139,6 +139,7 @@ async fn ae1_http_contract() -> anyhow::Result<()> {
         "params": {}
     });
     let resp = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -156,14 +157,37 @@ async fn ae1_http_contract() -> anyhow::Result<()> {
         StatusCode::BAD_REQUEST,
         "events/* missing _meta is a 400"
     );
+
+    // The stricter stateless contract rejects a request carrying neither the
+    // MCP-Protocol-Version header nor per-request `_meta` (legacy fallback).
+    let no_header = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+        "params": {}
+    });
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::HOST, "localhost")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(no_header.to_string()))?,
+        )
+        .await?;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "stateless 2026-07-28 requires the MCP-Protocol-Version header"
+    );
     Ok(())
 }
 
-/// R13 regression: a client negotiated below 2026-07-28 sends no per-request
-/// `_meta`. Dropping `stateless_protocol_metadata_required` must let its ordinary
-/// tool calls succeed — the whole fleet would otherwise lose toron on install.
+/// R13 regression: 2026-07-28 is the only supported version, and its clients
+/// send per-request `_meta`. A tools/call with that metadata must succeed
+/// through the transport, and tools/list must still be 41 — U1 added no tools.
 #[tokio::test]
-async fn legacy_2025_client_calls_tools_without_per_request_meta() -> anyhow::Result<()> {
+async fn modern_2026_client_calls_tools_with_meta() -> anyhow::Result<()> {
     let router = isolated_router().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -175,16 +199,28 @@ async fn legacy_2025_client_calls_tools_without_per_request_meta() -> anyhow::Re
     let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
-    )
-    .with_protocol_version(ProtocolVersion::V_2025_11_25);
+    );
     let mut client = client_info
-        .serve_with_lifecycle(transport, rmcp::ClientLifecycleMode::Initialize)
+        .serve_with_lifecycle(
+            transport,
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![
+                    ProtocolVersion::V_2026_07_28,
+                    ProtocolVersion::V_2025_11_25,
+                ],
+            },
+        )
         .await?;
     let tools = client.list_all_tools().await?;
-    assert_eq!(
-        tools.len(),
-        41,
-        "legacy client keeps the frozen tool surface (R13)"
+    assert_eq!(tools.len(), 41, "frozen tool surface (R13)");
+    let health = client
+        .call_tool(rmcp::model::CallToolRequestParams::new(
+            "health_check".to_string(),
+        ))
+        .await?;
+    assert!(
+        !health.is_error.unwrap_or(false),
+        "2026-07-28 tools/call with _meta succeeds: {health:?}"
     );
     client.close().await?;
     server.abort();
