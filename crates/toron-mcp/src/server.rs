@@ -621,7 +621,6 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let _wake = start_wake_sidecar(&mailbox).await;
     let _events = start_events_dispatcher(&mailbox).await;
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
-    let index_pool = mailbox.index_pool().cloned().expect("mailbox index pool");
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
     let res: anyhow::Result<()> = tokio::select! {
