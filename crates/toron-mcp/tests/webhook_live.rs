@@ -9,7 +9,7 @@
 //! interpreter tests with a fake HTTP port and the published signing vectors.
 
 use toron_core::bus::egress::{self, EgressPolicy};
-use toron_mcp::events::webhook_delivery::ReqwestEgress;
+use toron_mcp::events::webhook_delivery::UreqEgress;
 
 fn enabled() -> bool {
     std::env::var("FLYWHEEL_LIVE_E2E").ok().as_deref() == Some("1")
@@ -23,7 +23,7 @@ fn the_real_egress_guard_refuses_loopback_and_admits_the_tailnet() {
     }
     let policy = EgressPolicy::default();
     // The real client type builds with the pinned egress policy.
-    let _egress = ReqwestEgress::new(policy.clone()).expect("client builds");
+    let _egress = UreqEgress::new(policy.clone()).expect("client builds");
 
     // A local receiver URL is NOT allowlisted by default — this is the SSRF
     // guard doing its job, not a test setup failure.

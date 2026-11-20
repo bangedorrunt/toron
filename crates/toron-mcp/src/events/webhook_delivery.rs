@@ -231,20 +231,112 @@ pub async fn verify_endpoint<P: EgressPort>(
     Ok(matches!(outcome, Outcome::Ok))
 }
 
-/// Real egress port: reqwest with a pinned resolve, redirects disabled, bounded
-/// body and timeouts. No redirect is ever followed and no secret is logged.
-pub struct ReqwestEgress {
+/// The durable retry state of one delivery, re-folded from journal rows after
+/// a daemon restart. No timer survives a restart; the NEXT clock Msg re-arms
+/// from `due_ms`. This is the only state the interpreter needs to resume.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub due_ms: u64,
+    pub terminated: bool,
+    pub dead_lettered: bool,
+}
+
+/// Re-fold one journal row into the retry state. Rows are `{kind,attempt,...}`;
+/// `deliver-intent` starts an attempt, `deliver-result` with a `retry` decision
+/// arms the next timer, `terminated`/`dead-letter` end it. Pure and idempotent
+/// over a replayed log (bd-uak1x restart requirement).
+pub fn fold_retry(mut state: RetryState, row: &str) -> RetryState {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(row) else {
+        return state;
+    };
+    match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+        "deliver-intent" => {
+            state.attempt = v
+                .get("attempt")
+                .and_then(|a| a.as_u64())
+                .unwrap_or(state.attempt as u64) as u32;
+        }
+        "deliver-result" => match v.get("decision").and_then(|d| d.as_str()).unwrap_or("") {
+            "retry" => {
+                state.due_ms = v
+                    .get("due_ms")
+                    .and_then(|d| d.as_u64())
+                    .unwrap_or(state.due_ms);
+            }
+            "terminated" => state.terminated = true,
+            "dead-letter" => state.dead_lettered = true,
+            _ => {}
+        },
+        _ => {}
+    }
+    state
+}
+
+/// Re-fold a WHOLE journal (one row per line) — a restarted daemon calls this
+/// with the persisted rows, so retries continue with the SAME attempt number.
+pub fn refold_retry(rows: &[String]) -> RetryState {
+    rows.iter()
+        .fold(RetryState::default(), |s, r| fold_retry(s, r))
+}
+
+/// Subscribe a webhook: mint the secret once, persist it, run the verification
+/// challenge through the guarded port, and return the whsec ONCE. A refresh
+/// (same subscription) calls `load_secret` instead and never re-challenges.
+pub async fn subscribe_webhook<P: EgressPort>(
+    port: &P,
+    policy: &EgressPolicy,
+    secret_path: &std::path::Path,
+    url: &str,
+    challenge: &str,
+    fresh: bool,
+) -> Result<(String, bool), String> {
+    let secret = if fresh {
+        persist_secret_once(secret_path, &Secret::generate())?
+    } else {
+        load_secret(secret_path)?
+    };
+    let activated = verify_endpoint(port, policy, url, &secret, challenge).await?;
+    Ok((secret.whsec(), activated))
+}
+
+/// Real egress port: ureq 3 (rustls+ring) with a PinnedResolver that returns
+/// ONLY the checked SocketAddr. No redirect is followed, body/timeouts bounded,
+/// and no secret is ever logged. ureq avoids reqwest's aws-lc/quinn/jni lock.
+pub struct UreqEgress {
     policy: EgressPolicy,
 }
 
-impl ReqwestEgress {
+/// A resolver that ignores the URI host and returns the one vetted socket.
+#[derive(Debug)]
+struct PinnedResolver {
+    socket: std::net::SocketAddr,
+}
+
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let mut addrs: ureq::unversioned::resolver::ResolvedSocketAddrs =
+            ureq::unversioned::resolver::ArrayVec::from_fn(|_| {
+                std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+            });
+        addrs.push(self.socket);
+        Ok(addrs)
+    }
+}
+
+impl UreqEgress {
     pub fn new(policy: EgressPolicy) -> Result<Self, String> {
         Ok(Self { policy })
     }
 }
 
 #[async_trait]
-impl EgressPort for ReqwestEgress {
+impl EgressPort for UreqEgress {
     fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, String> {
         use std::net::ToSocketAddrs as _;
         (host, 443)
@@ -260,30 +352,32 @@ impl EgressPort for ReqwestEgress {
         headers: Vec<(String, String)>,
         body: &[u8],
     ) -> Result<Outcome, String> {
-        // ClientBuilder::resolve pins the checked SocketAddr for this one
-        // request — a rebinding resolver cannot redirect the connect.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_millis(self.policy.connect_timeout_ms))
-            .timeout(Duration::from_millis(
+        let config = ureq::Agent::config_builder()
+            .max_redirects(0) // never follow a redirect (KTD5 step 6)
+            .timeout_connect(Some(Duration::from_millis(self.policy.connect_timeout_ms)))
+            .timeout_global(Some(Duration::from_millis(
                 self.policy.connect_timeout_ms.saturating_mul(2),
-            ))
-            .resolve(&target.host, std::net::SocketAddr::new(socket, target.port))
-            .build()
-            .map_err(|e| format!("webhook client build failed: {e}"))?;
-        let mut req = client.post(format!("https://{}:{}/", target.host, target.port));
+            )))
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            PinnedResolver {
+                socket: std::net::SocketAddr::new(socket, target.port),
+            },
+        );
+        // SNI and Host stay the ORIGINAL name; only the connect is pinned.
+        let mut req = agent.post(format!("https://{}:{}/", target.host, target.port));
         for (k, v) in headers {
             req = req.header(&k, &v);
         }
         let resp = req
-            .body(body.to_vec())
-            .send()
-            .await
+            .send(body.to_vec())
             .map_err(|e| format!("webhook POST failed: {e}"))?;
         let status = resp.status().as_u16();
         let retry_after = resp
             .headers()
-            .get(reqwest::header::RETRY_AFTER)
+            .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         if (200..300).contains(&status) {
@@ -395,6 +489,48 @@ mod tests {
         );
         assert_eq!(decision, Decision::Terminated("gone"));
         assert!(effects.iter().any(|e| matches!(e, Effect::Journal { .. })));
+    }
+
+    #[test]
+    fn a_restart_refolds_retry_state_from_journal_rows() {
+        let rows = vec![
+            r#"{"kind":"deliver-intent","attempt":3}"#.to_string(),
+            r#"{"kind":"deliver-result","attempt":3,"decision":"retry","due_ms":99000}"#
+                .to_string(),
+        ];
+        let state = refold_retry(&rows);
+        assert_eq!(state.attempt, 3);
+        assert_eq!(state.due_ms, 99_000);
+        assert!(!state.terminated && !state.dead_lettered);
+        let ended = refold_retry(&[
+            rows[1].clone(),
+            r#"{"kind":"deliver-result","decision":"dead-letter"}"#.to_string(),
+        ]);
+        assert!(ended.dead_lettered);
+        assert_eq!(refold_retry(&[]), RetryState::default());
+    }
+
+    #[tokio::test]
+    async fn a_webhook_subscribe_returns_the_secret_once_and_refresh_reuses_it() {
+        let dir = std::env::temp_dir().join(format!("fw-sub-secret-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sub-1.secret");
+        let p = EgressPolicy::default();
+        let fake = Fake::new(vec![vec!["100.64.2.3".parse().unwrap()]], vec![Outcome::Ok]);
+        let url = "https://foo.example-tailnet.ts.net/hook";
+        let (first, active) = subscribe_webhook(&fake, &p, &path, url, "challenge_123", true)
+            .await
+            .unwrap();
+        assert!(active);
+        assert!(first.starts_with("whsec_"));
+        let (again, _) = subscribe_webhook(&fake, &p, &path, url, "challenge_123", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            first, again,
+            "a refresh returns the SAME secret, never re-mints"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
