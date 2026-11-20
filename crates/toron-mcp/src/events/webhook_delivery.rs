@@ -246,6 +246,11 @@ pub struct RetryState {
 /// `deliver-intent` starts an attempt, `deliver-result` with a `retry` decision
 /// arms the next timer, `terminated`/`dead-letter` end it. Pure and idempotent
 /// over a replayed log (bd-uak1x restart requirement).
+fn json_field(row: &str, name: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(row).ok()?;
+    v.get(name)?.as_str().map(str::to_string)
+}
+
 pub fn fold_retry(mut state: RetryState, row: &str) -> RetryState {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(row) else {
         return state;
@@ -311,6 +316,10 @@ pub struct WebhookDispatcher<P: EgressPort> {
     policy: EgressPolicy,
     journal: Vec<String>,
     pending: std::collections::BTreeMap<String, PendingRetry>,
+    /// Keys whose journal already records a delivered result. A bus replay on
+    /// restart re-offers the same event id; this set makes delivery idempotent
+    /// so a replay cannot produce a duplicate signed POST.
+    delivered: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +346,7 @@ impl<P: EgressPort> WebhookDispatcher<P> {
             policy,
             journal: vec![],
             pending: Default::default(),
+            delivered: Default::default(),
         }
     }
 
@@ -359,6 +369,9 @@ impl<P: EgressPort> WebhookDispatcher<P> {
         timestamp: u64,
     ) -> Result<Decision, String> {
         let key = format!("webhook:{sub}:{event}");
+        if self.delivered.contains(&key) {
+            return Ok(Decision::Delivered);
+        }
         self.append(format!(
             "{{\"kind\":\"deliver-intent\",\"key\":\"{key}\",\"attempt\":1}}"
         ));
@@ -424,6 +437,9 @@ impl<P: EgressPort> WebhookDispatcher<P> {
         } else {
             self.pending.remove(key);
         }
+        if matches!(decision, Decision::Delivered) {
+            self.delivered.insert(key.to_string());
+        }
         decision
     }
 
@@ -453,6 +469,14 @@ impl<P: EgressPort> WebhookDispatcher<P> {
     pub fn refold(&mut self, rows: &[String], specs: Vec<(String, PostSpecOwned)>) {
         self.journal = rows.to_vec();
         self.pending.clear();
+        self.delivered.clear();
+        for row in rows {
+            if row.contains("\"decision\":\"delivered\"")
+                && let Some(k) = json_field(row, "key")
+            {
+                self.delivered.insert(k);
+            }
+        }
         for (key, spec) in specs {
             let mut state = RetryState::default();
             for row in rows {
@@ -480,6 +504,33 @@ impl<P: EgressPort> WebhookDispatcher<P> {
             }
         }
     }
+}
+
+/// A bus lag produces exactly one gap delivery per webhook subscription —
+/// never silence. Pure apart from the injected port and dispatcher, so the
+/// production path and the test exercise the same code.
+pub async fn deliver_gaps<P: EgressPort>(
+    dispatcher: &mut WebhookDispatcher<P>,
+    specs: &std::collections::BTreeMap<String, PostSpecOwned>,
+    lag: u64,
+) -> Result<usize, String> {
+    let mut sent = 0;
+    for (key, spec) in specs {
+        let secret = Secret::from_whsec(&spec.secret_whsec)?;
+        let sub = key.strip_prefix("webhook:").unwrap_or(key);
+        dispatcher
+            .on_event(
+                sub,
+                &format!("gap-{lag}"),
+                &spec.url,
+                br#"{"kind":"gap"}"#.to_vec(),
+                &secret,
+                0,
+            )
+            .await?;
+        sent += 1;
+    }
+    Ok(sent)
 }
 
 /// Real egress port: ureq 3 (rustls+ring) with a PinnedResolver that returns

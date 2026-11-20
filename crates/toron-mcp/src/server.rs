@@ -515,20 +515,13 @@ where
                     let lag = bus_sub.lag_count();
                     if lag > seen_lag {
                         seen_lag = lag;
-                        // A bus lag is a gap: one hint per webhook subscription,
-                        // never silence. Reuses the same on_event/journal path.
-                        if let Ok(active) = store.list_active().await {
-                            for sub in active.into_iter().filter(|s| s.delivery == "webhook") {
-                                let Some(spec) = specs_by_id.get(&format!("webhook:{}", sub.id))
-                                else { continue };
-                                let Ok(secret) = toron_core::events::webhook::Secret::from_whsec(&spec.secret_whsec)
-                                else { continue };
-                                let _ = dispatcher.on_event(
-                                    &sub.id, &format!("gap-{lag}"),
-                                    &spec.url, br#"{"kind":"gap"}"#.to_vec(),
-                                    &secret, 0,
-                                ).await;
-                            }
+                        // A bus lag is a gap: one signed delivery per webhook
+                        // subscription, never silence. Same helper as the test.
+                        match crate::events::webhook_delivery::deliver_gaps(
+                            &mut dispatcher, &specs_by_id, lag,
+                        ).await {
+                            Ok(n) => tracing::info!("webhook gap lag={lag}: {n} deliveries"),
+                            Err(e) => tracing::warn!("webhook gap delivery failed: {e}"),
                         }
                         let _ = std::fs::write(
                             &journal_path,

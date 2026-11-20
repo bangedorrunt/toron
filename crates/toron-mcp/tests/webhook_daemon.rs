@@ -3,11 +3,11 @@
 //! a pending retry from the journal, and proves a restart sends no duplicate.
 
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-fn state_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn state_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 use toron_core::bus::egress::EgressPolicy;
@@ -19,8 +19,9 @@ type Headers = Vec<(String, String)>;
 
 #[derive(Debug, Clone)]
 struct FakeStats {
-    posts: Arc<Mutex<Vec<Headers>>>,
-    outcomes: Arc<Mutex<Vec<Outcome>>>,
+    posts: Arc<tokio::sync::Mutex<Vec<Headers>>>,
+    bodies: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    outcomes: Arc<tokio::sync::Mutex<Vec<Outcome>>>,
 }
 
 struct Fake {
@@ -37,10 +38,11 @@ impl EgressPort for Fake {
         _t: &toron_core::bus::egress::Target,
         _s: IpAddr,
         headers: Vec<(String, String)>,
-        _b: &[u8],
+        b: &[u8],
     ) -> Result<Outcome, String> {
-        self.stats.posts.lock().unwrap().push(headers);
-        let mut o = self.stats.outcomes.lock().unwrap();
+        self.stats.posts.lock().await.push(headers);
+        self.stats.bodies.lock().await.push(b.to_vec());
+        let mut o = self.stats.outcomes.lock().await;
         Ok(if o.len() > 1 {
             o.remove(0)
         } else {
@@ -51,7 +53,7 @@ impl EgressPort for Fake {
 
 #[tokio::test]
 async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on_restart() {
-    let _g = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = state_lock().lock().await;
     let dir = std::env::temp_dir().join(format!("fw-webhook-mail-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     unsafe {
@@ -64,8 +66,9 @@ async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on
     let _ = std::fs::write(state.join("webhook-specs.jsonl"), "");
 
     let stats = FakeStats {
-        posts: Arc::new(Mutex::new(vec![])),
-        outcomes: Arc::new(Mutex::new(vec![Outcome::Ok])),
+        posts: Arc::new(tokio::sync::Mutex::new(vec![])),
+        bodies: Arc::new(tokio::sync::Mutex::new(vec![])),
+        outcomes: Arc::new(tokio::sync::Mutex::new(vec![Outcome::Ok])),
     };
     let mailbox = toron_mcp::demo_mailbox().await.expect("mailbox");
     let pool = mailbox.index_pool().expect("pool").clone();
@@ -120,7 +123,7 @@ async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on
         .await
         .expect("publish addressed fact");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let posts = stats.posts.lock().unwrap();
+    let posts = stats.posts.lock().await;
     assert_eq!(posts.len(), 1, "exactly one signed POST: {posts:?}");
     let sig = posts[0]
         .iter()
@@ -135,6 +138,7 @@ async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on
         .expect("webhook-id");
     assert!(wid.starts_with("msg_"), "event id carried: {wid}");
     drop(posts);
+
     drop(handle);
 
     let handle2 = start_webhook_dispatcher(
@@ -148,7 +152,7 @@ async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on
     .expect("restart");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
-        stats.posts.lock().unwrap().len(),
+        stats.posts.lock().await.len(),
         1,
         "restart sends no duplicate"
     );
@@ -158,7 +162,7 @@ async fn an_addressed_mail_produces_one_signed_webhook_post_then_no_duplicate_on
 
 #[tokio::test]
 async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
-    let _g = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = state_lock().lock().await;
     let dir = std::env::temp_dir().join(format!("fw-webhook-daemon-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     // Use the SAME state dir the daemon's startup function reads.
@@ -181,8 +185,9 @@ async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
     .unwrap();
 
     let stats = FakeStats {
-        posts: Arc::new(Mutex::new(vec![])),
-        outcomes: Arc::new(Mutex::new(vec![Outcome::Ok])),
+        posts: Arc::new(tokio::sync::Mutex::new(vec![])),
+        bodies: Arc::new(tokio::sync::Mutex::new(vec![])),
+        outcomes: Arc::new(tokio::sync::Mutex::new(vec![Outcome::Ok])),
     };
     let mailbox = toron_mcp::demo_mailbox().await.expect("mailbox");
     let handle = start_webhook_dispatcher(
@@ -196,11 +201,11 @@ async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
     .expect("dispatcher starts");
     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
     assert_eq!(
-        stats.posts.lock().unwrap().len(),
+        stats.posts.lock().await.len(),
         1,
         "exactly one resumed delivery"
     );
-    let sig = stats.posts.lock().unwrap()[0]
+    let sig = stats.posts.lock().await[0]
         .iter()
         .find(|(k, _)| k == "webhook-signature")
         .map(|(_, v)| v.clone())
@@ -228,10 +233,61 @@ async fn a_pending_retry_resumes_on_the_production_path_without_a_duplicate() {
     .expect("dispatcher restarts");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
-        stats.posts.lock().unwrap().len(),
+        stats.posts.lock().await.len(),
         1,
         "restart sends no duplicate"
     );
     drop(handle2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_bus_lag_produces_one_gap_delivery_per_webhook_not_silence() {
+    use std::collections::BTreeMap;
+    use toron_mcp::events::webhook_delivery::{PostSpecOwned, WebhookDispatcher, deliver_gaps};
+
+    let _g = state_lock().lock().await;
+    let stats = FakeStats {
+        posts: Arc::new(tokio::sync::Mutex::new(vec![])),
+        bodies: Arc::new(tokio::sync::Mutex::new(vec![])),
+        outcomes: Arc::new(tokio::sync::Mutex::new(vec![Outcome::Ok])),
+    };
+    let mut dispatcher = WebhookDispatcher::new(
+        Fake {
+            stats: stats.clone(),
+        },
+        EgressPolicy::default(),
+    );
+    let mut specs = BTreeMap::new();
+    for id in ["sub-a", "sub-b"] {
+        specs.insert(
+            format!("webhook:{id}"),
+            PostSpecOwned {
+                url: "https://foo.example-tailnet.ts.net/hook".into(),
+                body: b"{}".to_vec(),
+                secret_whsec: "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw".into(),
+                webhook_id: format!("msg_{id}"),
+            },
+        );
+    }
+    let sent = deliver_gaps(&mut dispatcher, &specs, 7).await.unwrap();
+    assert_eq!(sent, 2, "one gap delivery per webhook subscription");
+    let bodies = stats.bodies.lock().await;
+    assert_eq!(bodies.len(), 2);
+    for body in bodies.iter() {
+        assert_eq!(
+            body.as_slice(),
+            br#"{"kind":"gap"}"#,
+            "gap body, not silence"
+        );
+    }
+    let sigs = stats.posts.lock().await;
+    for headers in sigs.iter() {
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "webhook-signature" && v.starts_with("v1,")),
+            "gap delivery is signed",
+        );
+    }
 }
