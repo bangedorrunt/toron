@@ -153,7 +153,6 @@ impl EventDispatcher {
             let mut since = started;
             let mut backoff = Duration::from_millis(200);
             loop {
-                let mut closed = false;
                 loop {
                     let lag = sub.lag_count();
                     if lag > seen_lag {
@@ -172,10 +171,7 @@ impl EventDispatcher {
                                 }
                             }
                             Some(SubscriptionEvent::Eose) => {}
-                            Some(SubscriptionEvent::Closed(_)) | None => {
-                                closed = true;
-                                break;
-                            }
+                            Some(SubscriptionEvent::Closed(_)) | None => break,
                         },
                         _ = sweep.tick() => {
                             let now = now_us();
@@ -185,19 +181,17 @@ impl EventDispatcher {
                         }
                     }
                 }
-                if closed {
-                    // The replay may not cover the hole: record one gap.
-                    append_gap(self.store.as_ref(), now_us()).await;
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    match self.bus.subscribe_trusted(Filter::new().since(since)).await {
-                        Ok(next) => {
-                            sub = next;
-                            seen_lag = sub.lag_count();
-                            tracing::info!("events dispatcher resubscribed");
-                        }
-                        Err(e) => tracing::warn!("events dispatcher resubscribe failed: {e}"),
+                // The replay may not cover the hole: record one gap.
+                append_gap(self.store.as_ref(), now_us()).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                match self.bus.subscribe_trusted(Filter::new().since(since)).await {
+                    Ok(next) => {
+                        sub = next;
+                        seen_lag = sub.lag_count();
+                        tracing::info!("events dispatcher resubscribed");
                     }
+                    Err(e) => tracing::warn!("events dispatcher resubscribe failed: {e}"),
                 }
             }
         });
