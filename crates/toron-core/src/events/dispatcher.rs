@@ -8,12 +8,59 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use crate::nostr::{Event, Filter};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::catalogue::{Fact, classify};
+use super::kernel::{KernelMsg, SubscriptionModel, journal_then_run};
 use super::store::SubscriptionStore;
 use crate::bus::{Bus, SubscriptionEvent};
+
+static GAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One gap hint per active subscription when facts were shed or a store error
+/// dropped a dispatch. Never silently lose facts (ADR-0039 D5, bd-sptj4).
+pub async fn append_gap(store: &dyn SubscriptionStore, now_us: i64) {
+    let Ok(subs) = store.list_active().await else {
+        return;
+    };
+    let event_id = format!("gap:{}:{}", now_us, GAP_SEQ.fetch_add(1, Ordering::Relaxed));
+    for sub in subs {
+        let hint = json!({
+            "event_id": event_id,
+            "name": "gap",
+            "project": "",
+            "sender_pin": sub.principal,
+            "timestamp": now_us,
+        });
+        let _ = store.append(&sub.id, &hint, now_us).await;
+    }
+}
+
+/// Expiry through the pure kernel: tick each subscription, journal Terminate,
+/// then execute it against the store (effect law). The clock is read once by
+/// the caller and passed in.
+pub async fn sweep_expired(store: &dyn SubscriptionStore, now_us: i64) -> anyhow::Result<usize> {
+    let mut terminated = 0;
+    for sub in store.list_active().await? {
+        let model = SubscriptionModel {
+            id: sub.id.clone(),
+            expires_us: sub.expires_us,
+            state: sub.state.clone(),
+        };
+        let next = journal_then_run(&model, &KernelMsg::Clock { now_us }, |effect| {
+            tracing::info!("events effect journal sub={} {effect:?}", model.id);
+        });
+        if next.state == "terminated" && model.state != "terminated" {
+            store.terminate(&sub.id).await?;
+            terminated += 1;
+        }
+    }
+    store.prune_deliveries(now_us).await?;
+    Ok(terminated)
+}
 
 /// Read the fact a catalogue classifier needs from a bus event. `p` carries
 /// the subject pin (an npub in production; the classifier compares it to the
@@ -30,10 +77,12 @@ pub fn fact_from_event(event: &Event) -> Fact {
         })
     };
     Fact {
+        id: event.id.to_hex(),
         kind: event.kind.as_u16(),
         toron_kind: tag("toron-kind"),
         subject_pin: tag("p"),
-        role_change: tag("role") .is_some(),
+        project: tag("t"),
+        role_change: tag("role").is_some(),
         policy_change: tag("policy").is_some(),
     }
 }
@@ -56,9 +105,9 @@ pub async fn dispatch_fact(
         };
         if let Some(name) = classify(fact, &subscriber) {
             let hint = json!({
-                "event_id": format!("{}", fact.kind),
+                "event_id": fact.id,
                 "name": name.as_str(),
-                "project": fact.subject_pin.clone().unwrap_or_default(),
+                "project": fact.project.clone().unwrap_or_default(),
                 "sender_pin": fact.subject_pin,
                 "correlation_id": null,
                 "timestamp": now_us,
@@ -68,6 +117,58 @@ pub async fn dispatch_fact(
         }
     }
     Ok(delivered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use super::super::store::{Page, SubscribeSpec, Subscription};
+    use std::sync::Mutex;
+
+    struct CountingStore {
+        appends: Mutex<usize>,
+    }
+    #[async_trait]
+    impl SubscriptionStore for CountingStore {
+        async fn subscribe(&self, _spec: &SubscribeSpec) -> anyhow::Result<Subscription> {
+            unreachable!()
+        }
+        async fn get(&self, _id: &str) -> anyhow::Result<Option<Subscription>> {
+            Ok(None)
+        }
+        async fn list_active(&self) -> anyhow::Result<Vec<Subscription>> {
+            Ok(vec![Subscription {
+                id: "s".into(),
+                principal: "AmberProbe".into(),
+                delivery: "poll".into(),
+                name: "mail.addressed".into(),
+                args_hash: "h".into(),
+                cursor: 0,
+                created_us: 0,
+                expires_us: None,
+                state: "active".into(),
+            }])
+        }
+        async fn append(&self, _id: &str, _payload: &Value, _now_us: i64) -> anyhow::Result<()> {
+            *self.appends.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn poll(&self, _id: &str, _after: u64, _limit: u32) -> anyhow::Result<Page> {
+            Ok(Page { events: vec![], cursor: 0, has_more: false, truncated: false })
+        }
+        async fn unsubscribe(&self, _id: &str, _principal: &str) -> anyhow::Result<bool> { Ok(true) }
+        async fn terminate(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn prune_deliveries(&self, _now_us: i64) -> anyhow::Result<()> { Ok(()) }
+        async fn sweep(&self, _now_us: i64) -> anyhow::Result<usize> { Ok(0) }
+    }
+
+    #[tokio::test]
+    async fn a_lost_fact_appends_one_gap_per_active_subscription() {
+        let store = CountingStore { appends: Mutex::new(0) };
+        append_gap(&store, 1000).await;
+        assert_eq!(*store.appends.lock().unwrap(), 1);
+    }
 }
 
 pub struct EventDispatcher {
@@ -86,30 +187,32 @@ impl EventDispatcher {
         let filter = Filter::new();
         let mut sub = self.bus.subscribe_trusted(filter).await?;
         let mut sweep = tokio::time::interval(Duration::from_secs(60));
-        sweep.tick().await; // skip the immediate first tick
+        sweep.tick().await;
         let task = tokio::spawn(async move {
             loop {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
                 tokio::select! {
                     item = sub.next() => match item {
                         Some(SubscriptionEvent::Event(event)) => {
                             let fact = fact_from_event(&event);
-                            let now_us = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros() as i64)
-                                .unwrap_or(0);
                             if let Err(e) = dispatch_fact(&fact, self.store.as_ref(), now_us).await {
                                 tracing::warn!("events dispatcher: {e}");
+                                append_gap(self.store.as_ref(), now_us).await;
                             }
                         }
-                        Some(_) => {}
-                        None => { break; }
+                        // EOSE is normal replay end. A closed/shed stream
+                        // means facts were lost — one gap hint per active sub.
+                        Some(SubscriptionEvent::Eose) => {}
+                        Some(SubscriptionEvent::Closed(_)) => {
+                            append_gap(self.store.as_ref(), now_us).await
+                        }
+                        None => break,
                     },
                     _ = sweep.tick() => {
-                        let now_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as i64)
-                            .unwrap_or(0);
-                        if let Err(e) = self.store.sweep(now_us).await {
+                        if let Err(e) = sweep_expired(self.store.as_ref(), now_us).await {
                             tracing::warn!("events sweep: {e}");
                         }
                     }

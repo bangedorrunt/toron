@@ -26,6 +26,32 @@ fn now_us() -> i64 {
 }
 
 #[tokio::test]
+async fn expiry_is_executed_through_the_kernel() {
+    use toron_core::events::dispatcher::sweep_expired;
+
+    let path = std::env::temp_dir().join(format!(
+        "toron-events-kernel-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let pool = toron_core::index::schema::connect(path.to_str().unwrap())
+        .await
+        .unwrap();
+    toron_core::index::schema::migrate(&pool).await.unwrap();
+    let store = SqliteSubscriptionStore::new(pool);
+    let sub = store
+        .subscribe(&sub_spec("P", true, "mail.addressed", &json!({"project": "f"}), Some(100), 1000))
+        .await
+        .unwrap();
+
+    assert_eq!(sweep_expired(&store, 1099).await.unwrap(), 0, "not yet expired");
+    assert_eq!(sweep_expired(&store, 1100).await.unwrap(), 1, "kernel Terminate at expiry");
+    let row = store.get(&sub.id).await.unwrap().unwrap();
+    assert_eq!(row.state, "terminated");
+    assert_eq!(sweep_expired(&store, 1101).await.unwrap(), 0, "Terminate fires once");
+}
+
+#[tokio::test]
 async fn addressed_mail_on_bus_becomes_one_hint_on_poll() {
     let path = std::env::temp_dir().join(format!(
         "toron-events-dispatch-{}.sqlite",
@@ -60,14 +86,14 @@ async fn addressed_mail_on_bus_becomes_one_hint_on_poll() {
     let dispatcher = Arc::new(EventDispatcher::new(bus.clone(), store.clone()));
     let _handle = dispatcher.start().await.expect("dispatcher starts");
 
-    // One addressed mail for AmberProbe (kind 9 + p tag), plus one addressed
-    // to somebody else — only the first may land in this subscription.
+    // Two addressed mails for AmberProbe (kind 9 + p tag), plus one to
+    // somebody else — only the two own-pin mails may land.
     let keys = Keys::generate();
-    for pin in ["AmberProbe", "OtherPin"] {
+    for (i, pin) in ["AmberProbe", "AmberProbe", "OtherPin"].into_iter().enumerate() {
         let event = build_event(
             &keys,
             toron_core::nostr::kinds::toron_kind(CHANNEL_MESSAGE),
-            "hello",
+            &format!("mail-{i}"),
             vec![
                 Tag::parse(["p", pin]).unwrap(),
                 Tag::parse(["t", "flywheel"]).unwrap(),
@@ -82,15 +108,18 @@ async fn addressed_mail_on_bus_becomes_one_hint_on_poll() {
     let mut page = None;
     for _ in 0..20 {
         let p = store.poll(&sub.id, 0, 10).await.unwrap();
-        if !p.events.is_empty() {
+        if p.events.len() >= 2 {
             page = Some(p);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let page = page.expect("one hint delivered");
-    assert_eq!(page.events.len(), 1, "exactly one addressed mail hint");
-    let hint: serde_json::Value = serde_json::from_str(&page.events[0].payload).unwrap();
-    assert_eq!(hint["name"], "mail.addressed");
-    assert!(hint.get("body").is_none(), "hint-only payload (R5)");
+    assert_eq!(page.events.len(), 2, "two addressed mails -> two hints");
+    let first: serde_json::Value = serde_json::from_str(&page.events[0].payload).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&page.events[1].payload).unwrap();
+    assert_eq!(first["name"], "mail.addressed");
+    assert_ne!(first["event_id"], second["event_id"], "the bus event's unique id (D8 dedupe)");
+    assert_eq!(first["project"], "flywheel", "the mail's project, not its subject pin");
+    assert!(first.get("body").is_none(), "hint-only payload (R5)");
 }

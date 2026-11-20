@@ -112,6 +112,10 @@ pub trait SubscriptionStore: Send + Sync {
     async fn append(&self, id: &str, payload: &Value, now_us: i64) -> anyhow::Result<()>;
     async fn poll(&self, id: &str, after: u64, limit: u32) -> anyhow::Result<Page>;
     async fn unsubscribe(&self, id: &str, principal: &str) -> anyhow::Result<bool>;
+    /// Execute a kernel Terminate effect against one subscription.
+    async fn terminate(&self, id: &str) -> anyhow::Result<()>;
+    /// Prune old delivery rows without touching subscription states.
+    async fn prune_deliveries(&self, now_us: i64) -> anyhow::Result<()>;
     async fn sweep(&self, now_us: i64) -> anyhow::Result<usize>;
 }
 
@@ -315,11 +319,24 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         Ok(true)
     }
 
-    async fn sweep(&self, now_us: i64) -> anyhow::Result<usize> {
+    async fn terminate(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE event_subscriptions SET state = 'terminated' WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_deliveries(&self, now_us: i64) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM event_deliveries WHERE created_us < ?")
             .bind(now_us.saturating_sub(DELIVERY_TTL_US))
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn sweep(&self, now_us: i64) -> anyhow::Result<usize> {
+        self.prune_deliveries(now_us).await?;
         let out = sqlx::query(
             "UPDATE event_subscriptions SET state = 'terminated' \
              WHERE state = 'active' AND expires_us IS NOT NULL AND expires_us <= ?",

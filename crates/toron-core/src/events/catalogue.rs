@@ -112,10 +112,13 @@ pub fn catalogue() -> Vec<CatalogueEvent> {
 /// A bus fact reduced to the fields the classifier needs (no Nostr types).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fact {
+    /// The bus event's OWN unique id — D8 bridges and doorbell dedupe by it.
+    pub id: String,
     pub kind: u16,
     pub toron_kind: Option<String>,
     /// The pin this fact concerns: recipient, lease holder or bound pin.
     pub subject_pin: Option<String>,
+    pub project: Option<String>,
     pub role_change: bool,
     pub policy_change: bool,
 }
