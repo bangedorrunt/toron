@@ -97,6 +97,8 @@ struct Subscriber {
     /// Last channel-full drop report (rate-limits the WARN so a permanently
     /// slow consumer doesn't flood the log; drops stay exactly counted).
     last_full_warn: Arc<Mutex<std::time::Instant>>,
+    /// Per-subscription lag counter, also read by the returned Subscription.
+    lagged: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Subscriber {
@@ -274,6 +276,7 @@ impl InProcessBus {
     fn note_full_drop(&self, sub: &Subscriber, event: &Event) {
         self.full_drops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sub.lagged.fetch_add(1, std::sync::atomic::Ordering::Release);
         if !sub.note_full() {
             return;
         }
@@ -411,6 +414,7 @@ impl InProcessBus {
             }
         });
 
+        let lagged = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sub = Arc::new(Subscriber {
             id: id.clone(),
             filter,
@@ -426,12 +430,13 @@ impl InProcessBus {
                     .checked_sub(Subscriber::FULL_WARN_INTERVAL)
                     .unwrap_or_else(std::time::Instant::now),
             )),
+            lagged: lagged.clone(),
         });
         self.subs.write().insert(id.clone(), sub);
 
         let registry = self.subs.clone();
         let release_id = id.clone();
-        Ok(Subscription::new(id, rx).with_release(Box::new(move || {
+        Ok(Subscription::new(id, rx).with_lag(lagged).with_release(Box::new(move || {
             registry.write().remove(&release_id);
         })))
     }

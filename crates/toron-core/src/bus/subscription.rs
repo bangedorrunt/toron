@@ -68,6 +68,9 @@ pub struct Subscription {
     /// Unregisters this id from the bus when dropped. `None` for transports
     /// that hold no registry (relay, wake sidecar).
     release: Option<ReleaseOnDrop>,
+    /// Publisher-side drops (broadcast lag) for this subscription. A consumer
+    /// can read it and emit a gap instead of silently losing facts.
+    lagged: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Subscription {
@@ -77,7 +80,22 @@ impl Subscription {
             id,
             rx: Some(rx),
             release: None,
+            lagged: None,
         }
+    }
+
+    /// Attach the publisher-side lag counter (in-process bus only).
+    pub(crate) fn with_lag(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.lagged = Some(counter);
+        self
+    }
+
+    /// How many events this subscription's publisher dropped due to lag.
+    pub fn lag_count(&self) -> u64 {
+        self.lagged
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// Attach the bus-side unregistration to run on drop.

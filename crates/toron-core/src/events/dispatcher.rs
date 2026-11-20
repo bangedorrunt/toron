@@ -20,6 +20,13 @@ use crate::bus::{Bus, SubscriptionEvent};
 
 static GAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 /// One gap hint per active subscription when facts were shed or a store error
 /// dropped a dispatch. Never silently lose facts (ADR-0039 D5, bd-sptj4).
 pub async fn append_gap(store: &dyn SubscriptionStore, now_us: i64) {
@@ -132,37 +139,64 @@ impl EventDispatcher {
     /// Hold one trusted subscription for the whole daemon. Its JoinHandle is
     /// aborted when the returned handle drops (serve shutdown).
     pub async fn start(self: Arc<Self>) -> anyhow::Result<DispatcherHandle> {
-        let filter = Filter::new();
-        let mut sub = self.bus.subscribe_trusted(filter).await?;
+        // Since = process start: a restart replays only facts from now on,
+        // never re-dispatching stored history as fresh hints.
+        let started = crate::nostr::Timestamp::now();
+        let mut sub = self
+            .bus
+            .subscribe_trusted(Filter::new().since(started))
+            .await?;
         let mut sweep = tokio::time::interval(Duration::from_secs(60));
         sweep.tick().await;
         let task = tokio::spawn(async move {
+            let mut seen_lag = 0u64;
+            let mut since = started;
+            let mut backoff = Duration::from_millis(200);
             loop {
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
-                tokio::select! {
-                    item = sub.next() => match item {
-                        Some(SubscriptionEvent::Event(event)) => {
-                            let fact = fact_from_event(&event);
-                            if let Err(e) = dispatch_fact(&fact, self.store.as_ref(), now_us).await {
-                                tracing::warn!("events dispatcher: {e}");
-                                append_gap(self.store.as_ref(), now_us).await;
+                let mut closed = false;
+                loop {
+                    let lag = sub.lag_count();
+                    if lag > seen_lag {
+                        append_gap(self.store.as_ref(), now_us()).await;
+                        seen_lag = lag;
+                    }
+                    tokio::select! {
+                        item = sub.next() => match item {
+                            Some(SubscriptionEvent::Event(event)) => {
+                                let now = now_us();
+                                since = since.max(event.created_at);
+                                let fact = fact_from_event(&event);
+                                if let Err(e) = dispatch_fact(&fact, self.store.as_ref(), now).await {
+                                    tracing::warn!("events dispatcher: {e}");
+                                    append_gap(self.store.as_ref(), now).await;
+                                }
+                            }
+                            Some(SubscriptionEvent::Eose) => {}
+                            Some(SubscriptionEvent::Closed(_)) | None => {
+                                closed = true;
+                                break;
+                            }
+                        },
+                        _ = sweep.tick() => {
+                            let now = now_us();
+                            if let Err(e) = sweep_expired(self.store.as_ref(), now).await {
+                                tracing::warn!("events sweep: {e}");
                             }
                         }
-                        // EOSE is normal replay end. A closed/shed stream
-                        // means facts were lost — one gap hint per active sub.
-                        Some(SubscriptionEvent::Eose) => {}
-                        Some(SubscriptionEvent::Closed(_)) => {
-                            append_gap(self.store.as_ref(), now_us).await
+                    }
+                }
+                if closed {
+                    // The replay may not cover the hole: record one gap.
+                    append_gap(self.store.as_ref(), now_us()).await;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    match self.bus.subscribe_trusted(Filter::new().since(since)).await {
+                        Ok(next) => {
+                            sub = next;
+                            seen_lag = sub.lag_count();
+                            tracing::info!("events dispatcher resubscribed");
                         }
-                        None => break,
-                    },
-                    _ = sweep.tick() => {
-                        if let Err(e) = sweep_expired(self.store.as_ref(), now_us).await {
-                            tracing::warn!("events sweep: {e}");
-                        }
+                        Err(e) => tracing::warn!("events dispatcher resubscribe failed: {e}"),
                     }
                 }
             }
@@ -188,6 +222,7 @@ mod tests {
 
     struct CountingStore {
         appends: Mutex<usize>,
+        payloads: Mutex<Vec<String>>,
     }
     #[async_trait]
     impl SubscriptionStore for CountingStore {
@@ -212,6 +247,7 @@ mod tests {
         }
         async fn append(&self, _id: &str, _payload: &Value, _now_us: i64) -> anyhow::Result<()> {
             *self.appends.lock().unwrap() += 1;
+            self.payloads.lock().unwrap().push(_payload.to_string());
             Ok(())
         }
         async fn poll(&self, _id: &str, _after: u64, _limit: u32) -> anyhow::Result<Page> {
@@ -225,8 +261,135 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_fact_appends_one_gap_per_active_subscription() {
-        let store = CountingStore { appends: Mutex::new(0) };
+        let store = CountingStore { appends: Mutex::new(0), payloads: Mutex::new(Vec::new()) };
         append_gap(&store, 1000).await;
         assert_eq!(*store.appends.lock().unwrap(), 1);
+    }
+
+    // A bus whose first trusted subscription closes immediately and whose
+    // second one accepts a published fact later. Proves delivery survives a
+    // closed stream instead of dying until daemon restart.
+    struct ClosingBus {
+        calls: AtomicU64,
+        txs: Mutex<Vec<tokio::sync::mpsc::Sender<SubscriptionEvent>>>,
+    }
+
+    #[async_trait]
+    impl crate::bus::Bus for ClosingBus {
+        async fn publish(&self, _event: Event) -> Result<crate::bus::PublishOk, crate::bus::BusError> {
+            unreachable!()
+        }
+        async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, crate::bus::BusError> {
+            self.subscribe_trusted(filter).await
+        }
+        async fn subscribe_trusted(&self, _filter: Filter) -> Result<crate::bus::Subscription, crate::bus::BusError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            if n == 0 {
+                tx.send(SubscriptionEvent::Closed("shed".into())).await.unwrap();
+            }
+            self.txs.lock().unwrap().push(tx);
+            Ok(crate::bus::Subscription::new(
+                crate::bus::SubscriptionId::new(format!("fake-{n}")), rx,
+            ))
+        }
+        async fn health(&self) -> Result<crate::bus::Health, crate::bus::BusError> {
+            Ok(crate::bus::Health { ok: true, message: String::new() })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lagging_subscription_exposes_its_drops() {
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
+        use crate::bus::Bus;
+
+        let path = std::env::temp_dir().join(format!("toron-disp-lag-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = crate::index::schema::connect(path.to_str().unwrap()).await.unwrap();
+        crate::index::schema::migrate(&pool).await.unwrap();
+        let bus = InProcessBus::open(pool, InProcessBusConfig {
+            auth: AuthPolicy::AcceptAll,
+            allowlist: Vec::new(),
+            channel_capacity: 1,
+            detailed_stage_logging: false,
+        }).await.unwrap();
+        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let keys = crate::nostr::Keys::generate();
+        for i in 0..8 {
+            let ev = crate::nostr::event::build_event(
+                &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+                format!("flood-{i}"), vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
+                crate::nostr::Timestamp::now(),
+            ).unwrap();
+            bus.publish(ev).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(sub.lag_count() > 0, "publisher-side lag is observable on the stream");
+    }
+
+    #[tokio::test]
+    async fn a_since_filter_does_not_replay_stored_history() {
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
+        use crate::bus::Bus;
+
+        let path = std::env::temp_dir().join(format!("toron-disp-replay-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = crate::index::schema::connect(path.to_str().unwrap()).await.unwrap();
+        crate::index::schema::migrate(&pool).await.unwrap();
+        let bus = InProcessBus::open(pool, InProcessBusConfig {
+            auth: AuthPolicy::AcceptAll, allowlist: Vec::new(),
+            channel_capacity: 64, detailed_stage_logging: false,
+        }).await.unwrap();
+        let keys = crate::nostr::Keys::generate();
+        let old = crate::nostr::event::build_event(
+            &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+            "old", vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
+            crate::nostr::Timestamp::from_secs(1),
+        ).unwrap();
+        bus.publish(old).await.unwrap();
+        // Fresh dispatcher: since = now, so the old fact is not replayed.
+        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let mut replayed = 0;
+        while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_millis(50), sub.next()).await {
+            if matches!(item, SubscriptionEvent::Event(_)) { replayed += 1; }
+        }
+        assert_eq!(replayed, 0, "restart must not re-dispatch stored history");
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_resubscribes_and_later_facts_still_arrive() {
+        let bus = Arc::new(ClosingBus {
+            calls: AtomicU64::new(0),
+            txs: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(CountingStore {
+            appends: Mutex::new(0),
+            payloads: Mutex::new(Vec::new()),
+        });
+        let dispatcher = Arc::new(EventDispatcher::new(bus.clone(), store.clone()));
+        let _handle = dispatcher.start().await.expect("start");
+
+        // Wait for the resubscribe, then deliver a fact on the second stream.
+        for _ in 0..40 {
+            if bus.calls.load(Ordering::Relaxed) >= 2 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(bus.calls.load(Ordering::Relaxed) >= 2, "dispatcher resubscribed");
+        let keys = crate::nostr::Keys::generate();
+        let event = crate::nostr::event::build_event(
+            &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+            "later", vec![crate::nostr::Tag::parse(["p", "AmberProbe"]).unwrap()],
+            crate::nostr::Timestamp::now(),
+        ).unwrap();
+        bus.txs.lock().unwrap()[1]
+            .send(SubscriptionEvent::Event(event))
+            .await
+            .unwrap();
+        let mut ok = false;
+        for _ in 0..40 {
+            if store.payloads.lock().unwrap().iter().any(|p| p.contains("mail.addressed")) { ok = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(ok, "the later fact arrived after resubscribe");
     }
 }
