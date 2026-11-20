@@ -121,7 +121,10 @@ pub async fn route_events(
             None,
         )));
     }
-    if !matches!(method, "events/subscribe" | "events/poll" | "events/unsubscribe") {
+    if !matches!(
+        method,
+        "events/subscribe" | "events/poll" | "events/unsubscribe"
+    ) {
         return route(method, params, principal);
     }
     let id_param = |key: &str| {
@@ -140,12 +143,17 @@ pub async fn route_events(
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let ttl_us = args
-                .get("ttl_us")
-                .and_then(Value::as_i64)
-                .or_else(|| args.get("ttlMs").and_then(Value::as_i64).map(|ms| ms * 1000));
+            let ttl_us = args.get("ttl_us").and_then(Value::as_i64).or_else(|| {
+                args.get("ttlMs")
+                    .and_then(Value::as_i64)
+                    .map(|ms| ms * 1000)
+            });
             let delivery = id_param("delivery");
-            let delivery = if delivery.is_empty() { "poll" } else { delivery };
+            let delivery = if delivery.is_empty() {
+                "poll"
+            } else {
+                delivery
+            };
             match store
                 .subscribe(&toron_core::events::store::SubscribeSpec {
                     principal: principal.name().to_string(),
@@ -163,7 +171,11 @@ pub async fn route_events(
                     "expiresAt": sub.expires_us,
                     "cursor": sub.cursor,
                 }))),
-                Err(e) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, e.to_string(), None)),
+                Err(e) => Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    e.to_string(),
+                    None,
+                )),
             }
         }
         "events/poll" => {
@@ -186,19 +198,45 @@ pub async fn route_events(
                             "hasMore": page.has_more,
                             "truncated": page.truncated,
                         }))),
-                        Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+                        // Same gap contract as the stream: a store failure is a
+                        // gap with a fresh servable cursor, never a silent loss.
+                        Err(e) => {
+                            tracing::warn!("events poll store error (gap): {e}");
+                            Ok(CustomResult(json!({
+                                "events": [], "cursor": after.to_string(),
+                                "nextPollMs": 5000, "hasMore": false, "truncated": true,
+                            })))
+                        }
                     }
                 }
-                Ok(None) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, "unknown subscription", None)),
-                Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+                Ok(None) => Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    "unknown subscription",
+                    None,
+                )),
+                Err(e) => {
+                    tracing::warn!("events poll store error (gap): {e}");
+                    Ok(CustomResult(json!({
+                        "events": [], "cursor": "0",
+                        "nextPollMs": 5000, "hasMore": false, "truncated": true,
+                    })))
+                }
             }
         }
         "events/unsubscribe" => {
             let id = id_param("subscriptionId");
             match store.unsubscribe(id, principal.name()).await {
                 Ok(true) => Ok(CustomResult(json!({"id": id, "terminated": true}))),
-                Ok(false) => Err(ErrorData::new(ErrorCode::INVALID_PARAMS, "not your subscription", None)),
-                Err(e) => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)),
+                Ok(false) => Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    "not your subscription",
+                    None,
+                )),
+                Err(e) => Err(ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    e.to_string(),
+                    None,
+                )),
             }
         }
         _ => unreachable!(),

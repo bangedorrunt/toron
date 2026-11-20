@@ -15,14 +15,20 @@ use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response, sse::{Event, Sse}};
+use axum::response::{
+    IntoResponse, Response,
+    sse::{Event, Sse},
+};
 use futures_util::stream::Stream;
 use serde_json::{Value, json};
 use toron_core::events::principal::TokenStore;
 use toron_core::events::store::SubscriptionStore;
-use toron_core::events::stream::{StreamMsg, StreamModel, StreamState, journal_then_run};
+use toron_core::events::stream::{StreamModel, StreamMsg, StreamState, journal_then_run};
 
 pub const SUBSCRIPTION_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+/// Shared with the /mcp router's DefaultBodyLimit: one limit for the layer and
+/// for rmcp, so the layer never rejects a request rmcp would have accepted.
+pub const MCP_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 const POLL_MS: u64 = 200;
 const HEARTBEAT_MS: u64 = 5000;
@@ -69,17 +75,28 @@ impl StreamHost {
     async fn step(&mut self) {
         let now_ms = Self::now_ms();
         let now_us = now_ms as i64 * 1000;
-        let next = journal_then_run(&self.model.clone(), &StreamMsg::Clock { now_us }, |effect| {
-            tracing::info!("events stream effect journal sub={} {effect:?}", self.id);
-        });
+        let next = journal_then_run(
+            &self.model.clone(),
+            &StreamMsg::Clock { now_us },
+            |effect| {
+                tracing::info!("events stream effect journal sub={} {effect:?}", self.id);
+            },
+        );
         self.model = next;
         if self.model.state == StreamState::Terminated {
             self.terminate();
             return;
         }
-        let Ok(Some(sub)) = self.store.get(&self.id).await else {
-            self.terminate();
-            return;
+        let sub = match self.store.get(&self.id).await {
+            Ok(Some(sub)) => sub,
+            Ok(None) => {
+                self.terminate();
+                return;
+            }
+            Err(e) => {
+                self.gap(e);
+                return;
+            }
         };
         self.model.expires_us = sub.expires_us;
         if sub.state == "terminated" {
@@ -87,7 +104,11 @@ impl StreamHost {
             return;
         }
         if now_ms >= self.last_heartbeat_ms + HEARTBEAT_MS {
-            let next = journal_then_run(&self.model.clone(), &StreamMsg::Heartbeat { now_us }, |_| {});
+            let next = journal_then_run(
+                &self.model.clone(),
+                &StreamMsg::Heartbeat { now_us },
+                |_| {},
+            );
             self.model = next;
             self.last_heartbeat_ms = now_ms;
             let mut params = self.meta();
@@ -95,41 +116,50 @@ impl StreamHost {
             self.pending
                 .push_back(self.notification("notifications/events/heartbeat", params));
         }
-        if let Ok(page) = self.store.poll(&self.id, self.cursor, 32).await {
-            for delivery in page.events {
-                let event_id = delivery.seq.to_string();
-                let next = journal_then_run(
-                    &self.model.clone(),
-                    &StreamMsg::Fact {
-                        event_id: event_id.clone(),
-                        payload: delivery.payload.clone(),
-                    },
-                    |_| {},
-                );
-                self.model = next;
-                self.cursor = delivery.seq;
-                let payload: Value = serde_json::from_str(&delivery.payload)
-                    .unwrap_or_else(|_| json!({"event_id": event_id}));
-                let mut params = self.meta();
-                params["event"] = payload;
-                self.pending
-                    .push_back(self.notification("notifications/events/event", params));
-            }
-            if page.truncated {
-                let mut params = self.meta();
-                params["cursor"] = json!(page.cursor.to_string());
-                self.pending
-                    .push_back(self.notification("notifications/events/gap", params));
-                self.cursor = page.cursor;
+        match self.store.poll(&self.id, self.cursor, 32).await {
+            Err(e) => self.gap(e),
+            Ok(page) => {
+                for delivery in page.events {
+                    let event_id = delivery.seq.to_string();
+                    let next = journal_then_run(
+                        &self.model.clone(),
+                        &StreamMsg::Fact {
+                            event_id: event_id.clone(),
+                            payload: delivery.payload.clone(),
+                        },
+                        |_| {},
+                    );
+                    self.model = next;
+                    self.cursor = delivery.seq;
+                    let payload: Value = serde_json::from_str(&delivery.payload)
+                        .unwrap_or_else(|_| json!({"event_id": event_id}));
+                    let mut params = self.meta();
+                    params["event"] = payload;
+                    self.pending
+                        .push_back(self.notification("notifications/events/event", params));
+                }
+                if page.truncated {
+                    let mut params = self.meta();
+                    params["cursor"] = json!(page.cursor.to_string());
+                    self.pending
+                        .push_back(self.notification("notifications/events/gap", params));
+                    self.cursor = page.cursor;
+                }
             }
         }
     }
 
+    fn gap(&mut self, error: anyhow::Error) {
+        tracing::warn!("events stream store error (gap): {error}");
+        let mut params = self.meta();
+        params["cursor"] = json!(self.cursor.to_string());
+        self.pending
+            .push_back(self.notification("notifications/events/gap", params));
+    }
+
     fn terminate(&mut self) {
-        self.pending.push_back(self.notification(
-            "notifications/events/terminated",
-            self.meta(),
-        ));
+        self.pending
+            .push_back(self.notification("notifications/events/terminated", self.meta()));
         let result = json!({
             "jsonrpc": "2.0",
             "id": self.result_id,
@@ -152,7 +182,7 @@ pub async fn stream_intercept(
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, 4 * 1024 * 1024).await {
+    let bytes = match to_bytes(body, MCP_BODY_LIMIT).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -193,7 +223,11 @@ pub async fn stream_intercept(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let cursor = last_event_id
-        .or_else(|| params["cursor"].as_str().and_then(|v| v.parse::<u64>().ok()))
+        .or_else(|| {
+            params["cursor"]
+                .as_str()
+                .and_then(|v| v.parse::<u64>().ok())
+        })
         .or_else(|| params["cursor"].as_u64())
         .unwrap_or(0);
     let result_id = request_value["id"].clone();

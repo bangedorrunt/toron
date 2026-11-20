@@ -393,7 +393,9 @@ async fn start_events_dispatcher(
 ) -> Option<toron_core::events::dispatcher::DispatcherHandle> {
     let pool = mailbox.index_pool()?.clone();
     let store: std::sync::Arc<dyn toron_core::events::store::SubscriptionStore> =
-        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(pool));
+        std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
+            pool,
+        ));
     let dispatcher = std::sync::Arc::new(toron_core::events::dispatcher::EventDispatcher::new(
         mailbox.bus().clone(),
         store,
@@ -735,6 +737,9 @@ async fn router_with_mailbox(
     };
     let mcp_router = axum::Router::new()
         .nest_service("/mcp", service)
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::events_stream::MCP_BODY_LIMIT,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             stream_state,
             crate::events_stream::stream_intercept,

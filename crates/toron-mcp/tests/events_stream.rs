@@ -23,10 +23,19 @@ async fn setup(tag: &str) -> (axum::Router, String, Arc<SqliteSubscriptionStore>
     toron_core::index::schema::migrate(&pool).await.unwrap();
     let store = Arc::new(SqliteSubscriptionStore::new(pool));
     let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::at(dir.join("tokens.json")));
-    let token = mint(Principal::Operator, Scope::operator(), 1000, tokens.as_ref()).unwrap();
+    let token = mint(
+        Principal::Operator,
+        Scope::operator(),
+        1000,
+        tokens.as_ref(),
+    )
+    .unwrap();
 
     let app = axum::Router::new()
-        .route("/mcp", axum::routing::any(|| async { "fallthrough".into_response() }))
+        .route(
+            "/mcp",
+            axum::routing::any(|| async { "fallthrough".into_response() }),
+        )
         .layer(axum::middleware::from_fn_with_state(
             toron_mcp::events_stream::StreamDeps {
                 store: store.clone(),
@@ -46,7 +55,11 @@ async fn post_stream(app: axum::Router, body: &Value, token: Option<&str>) -> St
     if let Some(t) = token {
         req.push_str(&format!("Authorization: Bearer {t}\r\n"));
     }
-    req.push_str(&format!("Content-Length: {}\r\n\r\n{}\r\n", body.to_string().len(), body));
+    req.push_str(&format!(
+        "Content-Length: {}\r\n\r\n{}\r\n",
+        body.to_string().len(),
+        body
+    ));
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let mut reader = BufReader::new(stream);
@@ -96,23 +109,39 @@ async fn a_sep_post_streams_active_then_an_event_with_the_request_id() {
     assert!(out.contains("text/event-stream"), "{out}");
     assert!(out.contains("notifications/events/active"), "{out}");
     assert!(out.contains("notifications/events/event"), "{out}");
-    assert!(out.contains(toron_mcp::events_stream::SUBSCRIPTION_META_KEY), "routed by _meta: {out}");
+    assert!(
+        out.contains(toron_mcp::events_stream::SUBSCRIPTION_META_KEY),
+        "routed by _meta: {out}"
+    );
     assert!(out.contains("bus-e1"), "unique bus event id: {out}");
-    assert!(out.contains("bus-e1") || out.contains("notifications/events/event"), "{out}");
+    assert!(
+        out.contains("bus-e1") || out.contains("notifications/events/event"),
+        "{out}"
+    );
 }
 
 #[tokio::test]
 async fn last_event_id_resumes_without_redelivery() {
     let (app, token, store) = setup("resume").await;
     let id = subscribe(&store, "f").await;
-    store.append(&id, &json!({"event_id": "e1", "name": "mail.addressed"}), 1001).await.unwrap();
+    store
+        .append(
+            &id,
+            &json!({"event_id": "e1", "name": "mail.addressed"}),
+            1001,
+        )
+        .await
+        .unwrap();
     let cursor = store.poll(&id, 0, 32).await.unwrap().cursor;
     let body = json!({
         "jsonrpc": "2.0", "id": 7, "method": "events/stream",
         "params": {"subscriptionId": id, "cursor": cursor}
     });
     let out = post_stream(app, &body, Some(&token)).await;
-    assert!(!out.contains("notifications/events/event"), "no duplicate: {out}");
+    assert!(
+        !out.contains("notifications/events/event"),
+        "no duplicate: {out}"
+    );
     assert!(out.contains("notifications/events/active"), "{out}");
 }
 
@@ -143,9 +172,32 @@ async fn a_missing_bearer_token_is_refused() {
 }
 
 #[tokio::test]
+async fn a_large_non_stream_request_still_falls_through() {
+    let (app, token, _store) = setup("large").await;
+    // 1.5 MiB is under the shared 2 MiB limit: the layer must not 400 it.
+    let big = "x".repeat(1_500_000);
+    let body = json!({
+        "jsonrpc": "2.0", "id": 5, "method": "ping",
+        "params": {"blob": big}
+    });
+    let out = post_stream(app, &body, Some(&token)).await;
+    assert!(
+        !out.contains("400"),
+        "a valid large tool call must not be rejected: {out}"
+    );
+    assert!(
+        out.contains("fallthrough"),
+        "it must reach the downstream handler: {out}"
+    );
+}
+
+#[tokio::test]
 async fn other_methods_fall_through_to_rmcp() {
     let (app, token, _store) = setup("fallthrough").await;
     let body = json!({"jsonrpc": "2.0", "id": 3, "method": "ping"});
     let out = post_stream(app, &body, Some(&token)).await;
-    assert!(out.contains("fallthrough"), "a non-stream method must not be hijacked: {out}");
+    assert!(
+        out.contains("fallthrough"),
+        "a non-stream method must not be hijacked: {out}"
+    );
 }
