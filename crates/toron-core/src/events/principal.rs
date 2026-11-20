@@ -10,7 +10,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -134,30 +133,23 @@ fn write(path: &Path, records: &[TokenRecord]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A create-new lock file held across read-modify-write. Concurrent CLI mints
-/// and revokes must not drop a token or resurrect a revoked one.
-struct LockGuard(PathBuf);
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+/// An OS advisory lock held on an open fd across read-modify-write. The lock
+/// is released by the kernel when the process dies, so a stale lock file left
+/// by a killed mint never blocks the next one. Concurrent mints/revokes must
+/// not drop a token or resurrect a revoked one.
+struct LockGuard(std::fs::File);
 
 fn exclusive_lock(path: &Path) -> anyhow::Result<LockGuard> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let lock = path.with_extension("lock");
-    for _ in 0..100 {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(_) => return Ok(LockGuard(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!("events token store lock timeout at {}", lock.display())
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&lock)?;
+    file.lock()?;
+    Ok(LockGuard(file))
 }
 
 impl TokenStore for FileTokenStore {
@@ -394,6 +386,27 @@ mod tests {
             t.join().unwrap().unwrap();
         }
         assert_eq!(store.list().unwrap().len(), 8, "no token lost to a race");
+    }
+
+    #[test]
+    fn a_stale_lock_file_from_a_dead_process_does_not_block_insert() {
+        let dir = std::env::temp_dir().join(format!("fw-token-stale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("events_tokens.json");
+        let _ = std::fs::remove_file(&path);
+        // A killed mint left this file behind; no fd holds the advisory lock.
+        std::fs::write(path.with_extension("lock"), "dead holder").unwrap();
+        let store = FileTokenStore::at(path);
+        store
+            .insert(&TokenRecord {
+                hash: "h".into(),
+                principal: Principal::Operator,
+                scope: Scope::operator(),
+                created_us: 1,
+                revoked: false,
+            })
+            .expect("a stale lock file must not block a new insert");
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]
