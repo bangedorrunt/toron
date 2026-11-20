@@ -12,6 +12,7 @@
 
 pub mod blob_serve;
 pub mod catalog;
+pub mod events;
 pub mod platform;
 pub mod resources;
 pub mod responses;

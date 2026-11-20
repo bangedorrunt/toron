@@ -120,12 +120,19 @@ impl ToronServer {
     /// Logging is deliberately NOT advertised: SEP-2577 deprecates it and
     /// the server never emits log notifications.
     pub fn capabilities() -> ServerCapabilities {
-        ServerCapabilities::builder()
+        let mut caps = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_resources_subscribe()
             .enable_tool_list_changed()
-            .build()
+            .build();
+        let mut events = serde_json::Map::new();
+        events.insert("version".into(), serde_json::json!("2026-11-20"));
+        caps.extensions = Some(std::collections::BTreeMap::from([(
+            crate::events::EVENTS_EXTENSION.to_string(),
+            events,
+        )]));
+        caps
     }
 }
 
@@ -134,6 +141,26 @@ impl ServerHandler for ToronServer {
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new("toron", env!("CARGO_PKG_VERSION")))
+    }
+
+    /// ADR-0039 U1: `events/*` are protocol methods, never tools.
+    fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CustomResult, rmcp::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let method = request.method.clone();
+        let params = request.params.as_ref();
+        let result = crate::events::route(&method, params).unwrap_or_else(|| {
+            Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                method,
+                None,
+            ))
+        });
+        std::future::ready(result)
     }
 
     /// The 38 AM-Rust parity tools (bd-led.7.2), delegated to `ToolServer`.
@@ -622,6 +649,7 @@ async fn router_with_mailbox(
             StreamableHttpServerConfig::default()
                 .with_json_response(true)
                 .with_legacy_session_mode(false)
+                .with_stateless_protocol_metadata_required(true)
                 .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
@@ -745,6 +773,11 @@ mod tests {
             caps.resources.is_some(),
             "resources capability must be enabled"
         );
+        let ext = caps
+            .extensions
+            .as_ref()
+            .expect("ADR-0039 events extension advertised");
+        assert!(ext.contains_key(crate::events::EVENTS_EXTENSION));
     }
 
     #[test]
