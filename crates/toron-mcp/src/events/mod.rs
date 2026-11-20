@@ -15,6 +15,8 @@ use toron_core::events::principal::{EventsVerb, Principal, authorize as d6_autho
 /// The capability key advertised under `capabilities.extensions`.
 pub const EVENTS_EXTENSION: &str = "io.modelcontextprotocol/events";
 
+pub mod webhook_delivery;
+
 /// Route an `events/*` custom request. `None` means "not ours"; the caller
 /// then falls back to the default method-not-found handler.
 pub fn route(

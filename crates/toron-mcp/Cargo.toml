@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 anyhow = "1"
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -30,6 +31,9 @@ evalexpr = "13.1.0"
 nostr-sdk = "0.45.2"
 nostr = { version = "0.45.3", features = ["nip44", "nip49", "nip59", "os-rng"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+# bd-uak1x: guarded webhook delivery. reqwest 0.13.4 is already in Cargo.lock
+# via rmcp's streamable-http client; same rustls stack, no new crates.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 tower = { version = "0.5", features = ["timeout", "limit", "util"] }
 
 [dev-dependencies]
