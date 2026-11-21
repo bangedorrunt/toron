@@ -150,11 +150,52 @@ impl ToronServer {
     }
 }
 
+/// bd-9te8e: negotiate DOWN instead of refusing older clients. Newest first
+/// so a client that understands 2026-07-28 still lands on it.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2026_07_28,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2024_11_05,
+];
+
+/// Typed fallback for `events/*` and `signal/*` on an older negotiated
+/// session: the seat must know to use the doorbell instead of guessing at a
+/// protocol error.
+pub const EVENTS_NEED_NEW_PROTOCOL: &str =
+    "events require MCP protocol 2026-07-28; use the doorbell fallback";
+
+fn events_version_error(
+    method: &str,
+    version: Option<ProtocolVersion>,
+    missing_meta: &[&'static str],
+) -> Option<rmcp::ErrorData> {
+    if version != Some(ProtocolVersion::V_2026_07_28) {
+        return Some(rmcp::ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            EVENTS_NEED_NEW_PROTOCOL,
+            None,
+        ));
+    }
+    if !missing_meta.is_empty() {
+        return Some(rmcp::ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            format!(
+                "missing required protocol metadata: {}",
+                missing_meta.join(", ")
+            ),
+            None,
+        ));
+    }
+    let _ = method;
+    None
+}
+
 impl ServerHandler for ToronServer {
-    /// ADR-0039 U1: every real client speaks 2026-07-28. An older client fails
-    /// version negotiation cleanly instead of getting a 400 on every request.
+    /// bd-9te8e: advertise every version rmcp knows, newest first.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+        std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -167,11 +208,16 @@ impl ServerHandler for ToronServer {
     fn on_custom_request(
         &self,
         request: rmcp::model::CustomRequest,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<rmcp::model::CustomResult, rmcp::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let method = request.method.clone();
+        let negotiated = context.protocol_version();
+        let missing_meta = negotiated
+            .as_ref()
+            .map(|version| context.meta.missing_required_keys(version))
+            .unwrap_or_default();
         let params = request.params.clone();
         let events = self.events.clone();
         let signal_links = self.signal_links.clone();
@@ -182,6 +228,11 @@ impl ServerHandler for ToronServer {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         async move {
+            if (method.starts_with("events/") || method.starts_with("signal/"))
+                && let Some(err) = events_version_error(&method, negotiated, &missing_meta)
+            {
+                return Err(err);
+            }
             if method.starts_with("signal/") {
                 if !crate::events::client_declares(
                     params.as_ref(),
@@ -862,8 +913,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 
 /// Build the axum router with the Streamable HTTP transport mounted at `/mcp`.
 ///
-/// SEP-2567 stateless mode is enabled (`legacy_session_mode(false)`) so the
-/// daemon/federation path is horizontally scalable with no session affinity.
+/// bd-9te8e: legacy sessions are enabled so clients negotiated below
+/// 2026-07-28 keep their `Mcp-Session-Id`; the 2026-07-28 metadata rule is
+/// enforced in the events/signal handler instead of a global transport flag.
 /// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
 pub async fn router() -> anyhow::Result<axum::Router> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
@@ -943,8 +995,8 @@ async fn router_with_mailbox(
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 .with_json_response(true)
-                .with_legacy_session_mode(false)
-                .with_stateless_protocol_metadata_required(true)
+                .with_legacy_session_mode(true)
+                .with_stateless_protocol_metadata_required(false)
                 .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
@@ -1131,10 +1183,52 @@ mod tests {
     }
 
     #[test]
-    fn only_2026_07_28_is_supported() {
+    fn all_five_protocol_versions_are_advertised_newest_first() {
         use rmcp::ServerHandler;
         let versions = ToronServer::new().supported_protocol_versions();
-        assert_eq!(versions.as_ref(), &[ProtocolVersion::V_2026_07_28]);
+        assert_eq!(
+            versions.as_ref(),
+            &[
+                ProtocolVersion::V_2026_07_28,
+                ProtocolVersion::V_2025_11_25,
+                ProtocolVersion::V_2025_06_18,
+                ProtocolVersion::V_2025_03_26,
+                ProtocolVersion::V_2024_11_05,
+            ]
+        );
+    }
+
+    #[test]
+    fn older_sessions_get_a_typed_events_fallback() {
+        let err = events_version_error("events/list", Some(ProtocolVersion::V_2025_11_25), &[])
+            .expect("an older session must be refused");
+        assert!(err.message.contains(EVENTS_NEED_NEW_PROTOCOL));
+        assert!(events_version_error("events/list", None, &[]).is_some());
+        assert!(
+            events_version_error("events/list", Some(ProtocolVersion::V_2026_07_28), &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn a_2026_07_28_request_still_needs_its_metadata() {
+        let err = events_version_error(
+            "events/list",
+            Some(ProtocolVersion::V_2026_07_28),
+            &["io.modelcontextprotocol/protocolVersion"],
+        )
+        .expect("missing metadata must be refused");
+        assert!(err.message.contains("missing required protocol metadata"));
+        assert!(
+            events_version_error(
+                "events/list",
+                Some(ProtocolVersion::V_2025_11_25),
+                &["io.modelcontextprotocol/protocolVersion"]
+            )
+            .map(|e| e.message)
+            .as_deref()
+                == Some(EVENTS_NEED_NEW_PROTOCOL),
+            "the typed fallback wins over the metadata rule for old clients"
+        );
     }
 
     #[test]
