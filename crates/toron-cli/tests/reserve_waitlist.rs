@@ -44,6 +44,158 @@ async fn test_mailbox(tag: &str) -> (Mailbox, PathBuf, PathBuf) {
     (mailbox, db_path, data_dir)
 }
 
+struct DaemonGuard(Option<std::process::Child>);
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn toron() -> std::process::Command {
+    toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
+}
+
+/// bd-ll7bs residual (3): the `--queue` flag must reach the MCP tool through
+/// the daemon arm, not just the embedded mailbox. Spare port, temp store,
+/// never :18080.
+#[test]
+fn queue_acquire_through_daemon_end_to_end() {
+    const DP: &str = "waitlist-daemon";
+    let data = std::env::temp_dir().join(format!(
+        "toron-waitlist-daemon-data-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&data).expect("data dir");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port");
+    let daemon = toron()
+        .args(["serve", "--mcp-http", &format!("127.0.0.1:{port}")])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|c| DaemonGuard(Some(c)))
+        .expect("spawn daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon did not bind spare port {port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    for pin in ["DuskHolder", "DawnWaiter"] {
+        let out = toron()
+            .args([
+                "agent",
+                "bootstrap",
+                "--project",
+                DP,
+                "--as",
+                pin,
+                "--program",
+                "claude-code",
+                "--model",
+                "opus",
+                "--json",
+            ])
+            .env("TORON_MCP_DATA_DIR", &data)
+            .env("TORON_MCP_URL", &url)
+            .output()
+            .expect("bootstrap");
+        assert!(
+            out.status.success(),
+            "bootstrap {pin}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let acquire = |pin: &str, queue: bool| {
+        let mut args = vec![
+            "reserve".to_string(),
+            "acquire".to_string(),
+            "--project".to_string(),
+            DP.to_string(),
+            "--as".to_string(),
+            pin.to_string(),
+            "--paths".to_string(),
+            PATH.to_string(),
+            "--exclusive".to_string(),
+        ];
+        if queue {
+            args.push("--queue".to_string());
+        }
+        let out = toron()
+            .args(args)
+            .env("TORON_MCP_DATA_DIR", &data)
+            .env("TORON_MCP_URL", &url)
+            .output()
+            .expect("acquire");
+        assert!(
+            out.status.success(),
+            "acquire {pin}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    acquire("DuskHolder", false);
+    acquire("DawnWaiter", true);
+
+    let list = toron()
+        .args(["reserve", "list", "--project", DP, "--json"])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("TORON_MCP_URL", &url)
+        .output()
+        .expect("list");
+    let body: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list json");
+    let queues = body["waitlists"].as_array().expect("waitlists field");
+    assert!(
+        queues.iter().any(|q| q["waiters"][0] == "DawnWaiter"),
+        "the daemon MCP path recorded the waiter: {body}"
+    );
+
+    let release = toron()
+        .args([
+            "reserve",
+            "release",
+            "--project",
+            DP,
+            "--as",
+            "DuskHolder",
+            "--paths",
+            PATH,
+        ])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("TORON_MCP_URL", &url)
+        .output()
+        .expect("release");
+    assert!(
+        release.status.success(),
+        "release: {}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    let list = toron()
+        .args(["reserve", "list", "--project", DP, "--json"])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("TORON_MCP_URL", &url)
+        .output()
+        .expect("list");
+    let body: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list json");
+    assert!(
+        body["reservations"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["holder"] == "DawnWaiter")),
+        "the daemon path handed the lease over: {body}"
+    );
+    drop(daemon);
+}
+
 #[tokio::test]
 async fn expiry_hands_over_without_any_release_call() {
     let (mailbox, _db, _data) = test_mailbox("expiry").await;
