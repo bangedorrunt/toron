@@ -24,6 +24,24 @@ pub const UNSUPPORTED: ErrorCode = ErrorCode(-32026);
 pub const CALLBACK_ENDPOINT_ERROR: ErrorCode = ErrorCode(-32027);
 
 pub mod signal_http;
+
+/// SEP-3415 Final G10: a client that declares extensions must include ours.
+/// Absent `_meta` is tolerated (older/our direct clients); a present but empty
+/// or wrong extension set is refused with -32601.
+pub fn client_declares(params: Option<&Value>, extension: &str) -> bool {
+    let Some(p) = params else { return true };
+    let Some(meta) = p.get("_meta") else {
+        return true;
+    };
+    let Some(caps) = meta.get("io.modelcontextprotocol/clientCapabilities") else {
+        return true;
+    };
+    let Some(ext) = caps.get("extensions") else {
+        return true;
+    };
+    ext.get(extension).is_some()
+}
+
 pub mod webhook_delivery;
 
 /// Route an `events/*` custom request. `None` means "not ours"; the caller

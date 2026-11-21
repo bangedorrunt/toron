@@ -183,6 +183,16 @@ impl ServerHandler for ToronServer {
             .map(str::to_owned);
         async move {
             if method.starts_with("signal/") {
+                if !crate::events::client_declares(
+                    params.as_ref(),
+                    crate::events::signal_http::SIGNAL_EXTENSION,
+                ) {
+                    return Err(rmcp::ErrorData::new(
+                        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                        method,
+                        None,
+                    ));
+                }
                 let links = signal_links.unwrap_or_else(|| {
                     Arc::new(toron_core::events::signal::FileSignalStore::at_root(
                         &toron_core::config::ToronPaths::resolve().root,
@@ -206,6 +216,15 @@ impl ServerHandler for ToronServer {
                         None,
                     ))
                 });
+            }
+            if method.starts_with("events/")
+                && !crate::events::client_declares(params.as_ref(), crate::events::EVENTS_EXTENSION)
+            {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    method,
+                    None,
+                ));
             }
             if !method.starts_with("events/") {
                 return Err(rmcp::ErrorData::new(

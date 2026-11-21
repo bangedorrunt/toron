@@ -207,3 +207,25 @@ fn fixture_webhook_header_and_occurrence_shape() {
     );
     assert!(hdr.is_ok(), "Final secret shape accepted");
 }
+
+#[test]
+fn fixture_client_capability_gating() {
+    let declared = json!({"_meta": {"io.modelcontextprotocol/clientCapabilities": {
+        "extensions": {"io.modelcontextprotocol/events": {}}
+    }}});
+    assert!(toron_mcp::events::client_declares(
+        Some(&declared),
+        "io.modelcontextprotocol/events"
+    ));
+    let wrong = json!({"_meta": {"io.modelcontextprotocol/clientCapabilities": {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }}});
+    assert!(!toron_mcp::events::client_declares(
+        Some(&wrong),
+        "io.modelcontextprotocol/events"
+    ));
+    assert!(
+        toron_mcp::events::client_declares(None, "io.modelcontextprotocol/events"),
+        "absent _meta tolerated"
+    );
+}
