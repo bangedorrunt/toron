@@ -41,6 +41,13 @@ pub fn occurrence(payload: &str, seq: u64, now_us: i64) -> Value {
     if let Some(v) = string(hint.get("correlation_id")) {
         data["correlationId"] = json!(v);
     }
+    // bd-gu288: mail importance is a typed field, never parsed from body text.
+    // Forward it only when the producer supplied it on a mail occurrence.
+    if name == "mail.addressed"
+        && let Some(v) = string(hint.get("importance"))
+    {
+        data["importance"] = json!(v);
+    }
     json!({
         "eventId": event_id,
         "name": name,
@@ -73,6 +80,28 @@ mod tests {
         let s = occ.to_string();
         assert!(!s.contains("event_id") && !s.contains("sender_pin"));
         assert!(!s.contains("correlation_id") && !s.contains("\"timestamp\":17"));
+    }
+
+    #[test]
+    fn mail_importance_is_carried_when_present_only() {
+        let urgent = json!({
+            "event_id": "evt-u", "name": "mail.addressed", "importance": "urgent",
+            "sender_pin": "BoldCliff", "timestamp": 0,
+        })
+        .to_string();
+        assert_eq!(occurrence(&urgent, 1, 0)["data"]["importance"], "urgent");
+
+        let normal = json!({
+            "event_id": "evt-n", "name": "mail.addressed", "timestamp": 0,
+        })
+        .to_string();
+        assert_eq!(occurrence(&normal, 2, 0)["data"], json!({}));
+
+        let other = json!({
+            "event_id": "evt-o", "name": "gap", "importance": "urgent", "timestamp": 0,
+        })
+        .to_string();
+        assert_eq!(occurrence(&other, 3, 0)["data"], json!({}));
     }
 
     #[test]
