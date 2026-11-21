@@ -856,6 +856,15 @@ impl Mailbox {
                     // foreign-occupied: recompute and retry.
                     Err(InboxError::Append(AppendError::SeqGap { .. }))
                     | Err(InboxError::PayloadConflict { .. }) => continue,
+                    // bd-gj5vn: a second seat advanced the producer epoch;
+                    // adopt the current fence instead of degrading the pull.
+                    Err(InboxError::Append(AppendError::StaleEpoch { .. })) => {
+                        let (fresh_epoch, fresh_seq) =
+                            store.resync_ingest_seq(&sender, &reader).await?;
+                        env.msg.epoch = fresh_epoch;
+                        env.msg.seq = fresh_seq;
+                        continue;
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -3696,6 +3705,60 @@ mod tests {
     /// (bd-next-readpath-p0-9k47), so scopes never share a row. Ten readers
     /// on one broadcast exceed the 8-retry budget under the old global
     /// counter; per-scope sequences complete with no contention at all.
+    #[tokio::test]
+    async fn a_stale_producer_epoch_recovers_and_the_pending_mail_is_returned() {
+        // bd-gj5vn: a second seat under the same pin advances the producer
+        // epoch. The live reader must adopt the new fence and still see the
+        // pending mail — never degrade to a manual log read.
+        let (mailbox, _pool, _db, _dir) = test_mailbox_with_pool("stale-epoch-recover").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        let (_recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+        let reader = npub.to_hex();
+        let store = mailbox.inbox_store().expect("store");
+        let sender_hex = mailbox
+            .comms_npub("demo", "GreenCastle")
+            .await
+            .expect("sender npub");
+
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
+            .await
+            .expect("first mail");
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "BlueLake", &store)
+                .await
+                .expect("first ingest"),
+            1
+        );
+
+        // The mistaken second seat claims a higher epoch for the same sender.
+        store
+            .claim_epoch(&sender_hex, "second-seat")
+            .await
+            .expect("second seat claims epoch");
+
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
+            .await
+            .expect("second mail");
+        let added = mailbox
+            .ingest_delivered_mail("demo", "BlueLake", &store)
+            .await
+            .expect("stale epoch recovers, no degradation");
+        assert_eq!(added, 1, "the pending mail is ingested after re-sync");
+        let batch = store.next(&reader, None, false).await.expect("next");
+        assert_eq!(
+            batch.items.len(),
+            2,
+            "both mails are visible to the live pin"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn inbox_concurrent_ingest_one_sender_many_readers_no_bail() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("concurrent-ingest").await;
