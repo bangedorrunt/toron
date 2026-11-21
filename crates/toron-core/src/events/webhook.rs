@@ -40,6 +40,19 @@ impl Secret {
         Ok(Self { key })
     }
 
+    /// SEP-3415 Final client-supplied secret: MUST be `whsec_` plus base64
+    /// decoding to 24-64 bytes. The server never mints one (bd-6zo01 G5).
+    pub fn from_client_whsec(s: &str) -> Result<Self, String> {
+        let raw = s
+            .strip_prefix("whsec_")
+            .ok_or_else(|| "secret must start with whsec_".to_string())?;
+        let key = b64_decode(raw).ok_or_else(|| "webhook secret is not base64".to_string())?;
+        if !(24..=64).contains(&key.len()) {
+            return Err("webhook secret must decode to 24-64 bytes".into());
+        }
+        Ok(Self { key })
+    }
+
     /// Generate a fresh `whsec_<base64(32 random bytes)>` (returned once).
     pub fn generate() -> Self {
         let mut key = [0u8; 32];
@@ -259,5 +272,24 @@ mod tests {
         assert!(whsec.starts_with("whsec_"));
         assert_eq!(Secret::from_whsec(&whsec).unwrap().whsec(), whsec);
         assert!(!format!("{s:?}").contains(&whsec[6..]));
+    }
+}
+
+#[cfg(test)]
+mod client_secret_tests {
+    use super::*;
+
+    #[test]
+    fn a_client_whsec_must_carry_the_prefix_and_decode_to_24_64_bytes() {
+        let good = Secret::generate().whsec();
+        assert!(Secret::from_client_whsec(&good).is_ok());
+        let raw = good.strip_prefix("whsec_").unwrap();
+        assert!(
+            Secret::from_client_whsec(raw).is_err(),
+            "prefix is mandatory"
+        );
+        let short = format!("whsec_{}", b64_encode(&[1u8; 8]));
+        assert!(Secret::from_client_whsec(&short).is_err(), "too short");
+        assert!(Secret::from_client_whsec("whsec_not-base64!").is_err());
     }
 }

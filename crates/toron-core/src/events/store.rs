@@ -89,6 +89,8 @@ pub struct Subscription {
 pub struct Delivery {
     pub seq: u64,
     pub payload: String,
+    /// When the delivery was stored; used for the Final maxAgeMs replay floor.
+    pub created_us: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -346,8 +348,8 @@ impl SubscriptionStore for SqliteSubscriptionStore {
                 .fetch_one(&self.pool)
                 .await?;
         let (truncated, start) = gap_floor(after, oldest);
-        let rows = sqlx::query_as::<_, (i64, String)>(
-            "SELECT seq, payload FROM event_deliveries \
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT seq, payload, created_us FROM event_deliveries \
              WHERE subscription_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
         )
         .bind(id)
@@ -357,12 +359,13 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         .await?;
         let has_more = rows.len() > limit as usize;
         let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
-        let cursor = rows.last().map(|(seq, _)| *seq as u64).unwrap_or(after);
+        let cursor = rows.last().map(|(seq, _, _)| *seq as u64).unwrap_or(after);
         let events = rows
             .into_iter()
-            .map(|(seq, payload)| Delivery {
+            .map(|(seq, payload, created_us)| Delivery {
                 seq: seq as u64,
                 payload,
+                created_us,
             })
             .collect();
         Ok(Page {

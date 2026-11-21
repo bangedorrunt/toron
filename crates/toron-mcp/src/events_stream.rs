@@ -49,6 +49,8 @@ struct StreamHost {
     active_sent: bool,
     done: bool,
     result_id: Value,
+    /// Granted heartbeat interval, suggested by the client in heartbeatMs.
+    heartbeat_ms: u64,
 }
 
 impl StreamHost {
@@ -103,7 +105,7 @@ impl StreamHost {
             self.terminate();
             return;
         }
-        if now_ms >= self.last_heartbeat_ms + HEARTBEAT_MS {
+        if now_ms >= self.last_heartbeat_ms + self.heartbeat_ms {
             let next = journal_then_run(
                 &self.model.clone(),
                 &StreamMsg::Heartbeat { now_us },
@@ -131,18 +133,31 @@ impl StreamHost {
                     );
                     self.model = next;
                     self.cursor = delivery.seq;
-                    let payload: Value = serde_json::from_str(&delivery.payload)
-                        .unwrap_or_else(|_| json!({"event_id": event_id}));
+                    // bd-6zo01 G1: the occurrence's fields are the params
+                    // themselves, not nested under "event" (SEP-3415 Final).
+                    let occ = toron_core::events::occurrence::occurrence(
+                        &delivery.payload,
+                        delivery.seq,
+                        now_us,
+                    );
                     let mut params = self.meta();
-                    params["event"] = payload;
+                    if let Some(obj) = occ.as_object() {
+                        for (k, v) in obj {
+                            params[k.clone()] = v.clone();
+                        }
+                    }
                     self.pending
                         .push_back(self.notification("notifications/events/event", params));
                 }
                 if page.truncated {
+                    // G4: a gap is a fresh active with truncated:true, never a
+                    // a spec-compliant active notification.
                     let mut params = self.meta();
                     params["cursor"] = json!(page.cursor.to_string());
+                    params["truncated"] = json!(true);
+                    params["heartbeatMs"] = json!(self.heartbeat_ms);
                     self.pending
-                        .push_back(self.notification("notifications/events/gap", params));
+                        .push_back(self.notification("notifications/events/active", params));
                     self.cursor = page.cursor;
                 }
             }
@@ -150,11 +165,17 @@ impl StreamHost {
     }
 
     fn gap(&mut self, error: anyhow::Error) {
-        tracing::warn!("events stream store error (gap): {error}");
+        // G4: transient per-occurrence failures are a spec
+        // notifications/events/error; the stream stays open.
+        tracing::warn!("events stream store error: {error}");
         let mut params = self.meta();
-        params["cursor"] = json!(self.cursor.to_string());
+        params["error"] = json!({
+            "code": -32603,
+            "message": "UpstreamError",
+            "data": {"reason": "store_unavailable"},
+        });
         self.pending
-            .push_back(self.notification("notifications/events/gap", params));
+            .push_back(self.notification("notifications/events/error", params));
     }
 
     fn terminate(&mut self) {
@@ -163,7 +184,9 @@ impl StreamHost {
         let result = json!({
             "jsonrpc": "2.0",
             "id": self.result_id,
-            "result": {"terminated": true, "cursor": self.cursor.to_string()},
+            "result": {"resultType": "complete", "_meta": {
+                SUBSCRIPTION_META_KEY: self.result_id,
+            }},
         });
         self.pending
             .push_back(Event::default().event("message").data(result.to_string()));
@@ -231,7 +254,11 @@ pub async fn stream_intercept(
         .or_else(|| params["cursor"].as_u64())
         .unwrap_or(0);
     let result_id = request_value["id"].clone();
-    stream_sse(state, subscription_id, cursor, result_id).into_response()
+    let heartbeat_ms = params["heartbeatMs"]
+        .as_u64()
+        .map(|v| v.clamp(1000, 60_000))
+        .unwrap_or(HEARTBEAT_MS);
+    stream_sse(state, subscription_id, cursor, result_id, heartbeat_ms).into_response()
 }
 
 /// Build the SSE response for an authorized `events/stream` JSON-RPC request.
@@ -240,6 +267,7 @@ pub fn stream_sse(
     subscription_id: String,
     cursor: u64,
     result_id: Value,
+    heartbeat_ms: u64,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let host = StreamHost {
         store: state.store,
@@ -251,6 +279,7 @@ pub fn stream_sse(
         active_sent: false,
         done: false,
         result_id,
+        heartbeat_ms,
     };
     let stream = futures_util::stream::unfold(host, |mut host| async move {
         loop {
@@ -262,8 +291,12 @@ pub fn stream_sse(
             }
             if !host.active_sent {
                 host.active_sent = true;
+                let mut params = host.meta();
+                params["cursor"] = json!(host.cursor.to_string());
+                params["truncated"] = json!(false);
+                params["heartbeatMs"] = json!(host.heartbeat_ms);
                 host.pending
-                    .push_back(host.notification("notifications/events/active", host.meta()));
+                    .push_back(host.notification("notifications/events/active", params));
                 continue;
             }
             tokio::time::sleep(Duration::from_millis(POLL_MS)).await;

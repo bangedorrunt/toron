@@ -97,8 +97,7 @@ async fn stream_gap(store: &Arc<SqliteSubscriptionStore>, id: &str, cursor: u64)
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
                 out.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if out.contains("notifications/events/gap")
-                    || out.contains("notifications/events/event")
+                if out.contains("\"truncated\":true") || out.contains("notifications/events/event")
                 {
                     break;
                 }
@@ -110,7 +109,9 @@ async fn stream_gap(store: &Arc<SqliteSubscriptionStore>, id: &str, cursor: u64)
     out.lines().find_map(|line| {
         let data = line.strip_prefix("data: ")?;
         let v: Value = serde_json::from_str(data).ok()?;
-        if v["method"].as_str() == Some("notifications/events/gap") {
+        if v["method"].as_str() == Some("notifications/events/active")
+            && v["params"]["truncated"].as_bool() == Some(true)
+        {
             v["params"]["cursor"].as_str().map(str::to_string)
         } else {
             None

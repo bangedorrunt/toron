@@ -208,6 +208,7 @@ mod tests {
                 events: vec![Delivery {
                     seq: 1,
                     payload: "secret".into(),
+                    created_us: 1_000,
                 }],
                 cursor: 1,
                 has_more: false,

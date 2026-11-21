@@ -54,7 +54,7 @@ const NAMES: [EventName; 6] = [
 ];
 
 /// `events/list` advertises poll and push in U1; webhook lands in P2.
-const DELIVERY: &[&str] = &["poll", "push", "stream"];
+const DELIVERY: &[&str] = &["poll", "push", "webhook"];
 
 /// One SEP-3415 `events/list` row. The wire keys are camelCase.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -82,17 +82,16 @@ fn input_schema() -> Value {
 /// HINT-ONLY (R5): an id, name, project, sender pin, correlation id and
 /// timestamp — never a body or a subject.
 fn hint_payload() -> Value {
+    // SEP-3415 Final: `data` is an object of server-defined fields; the wire
+    // keys are eventId/name/timestamp/data, never the old draft hint names.
     json!({
         "type": "object",
         "properties": {
-            "event_id": {"type": "string"},
-            "name": {"type": "string"},
             "project": {"type": "string"},
-            "sender_pin": {"type": "string"},
-            "correlation_id": {"type": "string"},
-            "timestamp": {"type": "string", "format": "date-time"}
+            "senderPin": {"type": "string"},
+            "correlationId": {"type": "string"}
         },
-        "additionalProperties": false
+        "additionalProperties": true
     })
 }
 
@@ -181,11 +180,14 @@ mod tests {
             );
             let name = row["name"].as_str().expect("name");
             assert!(seen.insert(name), "duplicate event name {name}");
-            assert_eq!(row["delivery"], json!(["poll", "push", "stream"]));
-            assert_eq!(row["inputSchema"]["properties"]["project"]["type"], "string");
+            assert_eq!(row["delivery"], json!(["poll", "push", "webhook"]));
+            assert_eq!(
+                row["inputSchema"]["properties"]["project"]["type"],
+                "string"
+            );
             assert_eq!(row["payloadSchema"]["type"], "object");
             let props = row["payloadSchema"]["properties"].as_object().unwrap();
-            assert!(props.contains_key("event_id"));
+            assert!(props.contains_key("senderPin"));
             assert!(!props.contains_key("body"), "hint-only payload (R5)");
             assert!(!props.contains_key("subject"));
         }

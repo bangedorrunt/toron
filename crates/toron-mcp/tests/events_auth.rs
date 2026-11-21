@@ -45,7 +45,10 @@ fn a_valid_pin_token_authorizes() {
     assert_eq!(
         toron_mcp::events::authorize_with_store(Some("Bearer a-valid-token"), 1000, &store)
             .unwrap(),
-        Principal::Pin { pin: "AmberProbe".into(), project: "flywheel".into() }
+        Principal::Pin {
+            pin: "AmberProbe".into(),
+            project: "flywheel".into()
+        }
     );
 }
 
@@ -72,7 +75,7 @@ fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
         let err = toron_mcp::events::route("events/subscribe", Some(&params), &pin)
             .expect("routed")
             .expect_err("a pin token cannot escalate scope");
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(err.code, rmcp::model::ErrorCode(-32024));
         assert!(err.message.contains("operator"), "{err:?}");
         // The operator gets the normal not-implemented error, not an auth one.
         let out = toron_mcp::events::route("events/subscribe", Some(&params), &Principal::Operator)
@@ -85,7 +88,12 @@ fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
 #[test]
 fn missing_unknown_and_revoked_tokens_are_in_band_errors() {
     let store = store_with(record(Principal::Operator, Scope::operator(), true));
-    for header in [None, Some("Bearer nope"), Some("Basic xyz"), Some("Bearer a-valid-token")] {
+    for header in [
+        None,
+        Some("Bearer nope"),
+        Some("Basic xyz"),
+        Some("Bearer a-valid-token"),
+    ] {
         let err = toron_mcp::events::authorize_with_store(header, 1000, &store)
             .expect_err("must refuse a missing/unknown/revoked token");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -116,10 +124,16 @@ async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
         "arguments": {"project": "flywheel"}
     });
 
-    let sub = route_events("events/subscribe", Some(&params), &principal, Some(&store), 1000)
-        .await
-        .expect("routed")
-        .expect("subscribed");
+    let sub = route_events(
+        "events/subscribe",
+        Some(&params),
+        &principal,
+        Some(&store),
+        1000,
+    )
+    .await
+    .expect("routed")
+    .expect("subscribed");
     let id = sub.0["id"].as_str().expect("subscription id").to_string();
 
     store
@@ -131,10 +145,16 @@ async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
         .await
         .unwrap();
     let poll_params = serde_json::json!({"subscriptionId": id, "cursor": "0"});
-    let page = route_events("events/poll", Some(&poll_params), &principal, Some(&store), 1001)
-        .await
-        .expect("routed")
-        .expect("poll ok");
+    let page = route_events(
+        "events/poll",
+        Some(&poll_params),
+        &principal,
+        Some(&store),
+        1001,
+    )
+    .await
+    .expect("routed")
+    .expect("poll ok");
     let events = page.0["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1, "one hint on poll");
     assert_eq!(events[0]["name"], "mail.addressed");
@@ -148,7 +168,11 @@ async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
         .await
         .expect("routed")
         .expect("poll ok");
-    assert_eq!(again.0["events"].as_array().unwrap().len(), 0, "cursor advanced");
+    assert_eq!(
+        again.0["events"].as_array().unwrap().len(),
+        0,
+        "cursor advanced"
+    );
 }
 
 #[test]

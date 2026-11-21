@@ -41,7 +41,7 @@ fn events_list_uses_sep3415_wire_keys() {
         assert!(row["name"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(
             row["delivery"],
-            serde_json::json!(["poll", "push", "stream"])
+            serde_json::json!(["poll", "push", "webhook"])
         );
         assert_eq!(
             row["inputSchema"]["properties"]["project"]["type"],
@@ -49,7 +49,7 @@ fn events_list_uses_sep3415_wire_keys() {
         );
         assert_eq!(row["payloadSchema"]["type"], "object");
         let props = row["payloadSchema"]["properties"].as_object().unwrap();
-        assert!(props.contains_key("event_id"));
+        assert!(props.contains_key("senderPin"));
         assert!(!props.contains_key("body"), "hint-only payload (R5)");
     }
 }

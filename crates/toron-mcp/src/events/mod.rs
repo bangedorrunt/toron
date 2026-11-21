@@ -15,6 +15,14 @@ use toron_core::events::principal::{EventsVerb, Principal, authorize as d6_autho
 /// The capability key advertised under `capabilities.extensions`.
 pub const EVENTS_EXTENSION: &str = "io.modelcontextprotocol/events";
 
+/// SEP-3415 Final named error codes (bd-6zo01 G9). General-purpose codes with
+/// typed `data`, not per-condition numbers.
+pub const NOT_FOUND: ErrorCode = ErrorCode(-32023);
+pub const FORBIDDEN: ErrorCode = ErrorCode(-32024);
+pub const RESOURCE_EXHAUSTED: ErrorCode = ErrorCode(-32025);
+pub const UNSUPPORTED: ErrorCode = ErrorCode(-32026);
+pub const CALLBACK_ENDPOINT_ERROR: ErrorCode = ErrorCode(-32027);
+
 pub mod signal_http;
 pub mod webhook_delivery;
 
@@ -31,13 +39,14 @@ pub fn route(
     let verb = request_verb(method, params, principal);
     if !d6_authorize(principal, verb) {
         return Some(Err(ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
+            FORBIDDEN,
             format!("{verb:?} requires the operator principal"),
-            None,
+            Some(json!({"reason": "access_denied"})),
         )));
     }
     Some(match method {
         "events/list" => Ok(CustomResult(json!({
+            "resultType": "complete",
             "events": catalogue::catalogue(),
         }))),
         "events/subscribe" | "events/poll" | "events/stream" => match valid_name(params) {
@@ -119,9 +128,9 @@ pub async fn route_events(
     };
     if !d6_authorize(principal, request_verb(method, params, principal)) {
         return Some(Err(ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
+            FORBIDDEN,
             "operator principal required by the D6 matrix",
-            None,
+            Some(json!({"reason": "access_denied"})),
         )));
     }
     if !matches!(
@@ -151,29 +160,35 @@ pub async fn route_events(
                     .and_then(Value::as_i64)
                     .map(|ms| ms * 1000)
             });
-            let delivery = id_param("delivery");
-            let delivery = if delivery.is_empty() {
-                "poll"
-            } else {
-                delivery
-            };
-            // bd-uak1x: a webhook subscription carries its callback URL, is
-            // guarded against SSRF, and gets a secret returned ONCE. The
-            // verification challenge must pass before it is handed back.
-            let webhook_secret = if delivery == "webhook" {
-                let url = args
-                    .get("url")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        ErrorData::new(
+            let delivery_obj = params.and_then(|p| p.get("delivery"));
+            let mode = delivery_obj
+                .and_then(|d| d.get("mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("poll");
+            // SEP-3415 Final G5: webhook secret is CLIENT-supplied and never
+            // minted here; validate whsec_ + 24-64 decoded bytes, then verify
+            // the endpoint before the subscription activates.
+            let mut webhook: Option<(String, String)> = None;
+            if mode == "webhook" {
+                let d = match delivery_obj {
+                    Some(d) => d,
+                    None => {
+                        return Some(Err(ErrorData::new(
                             ErrorCode::INVALID_PARAMS,
-                            "webhook delivery requires arguments.url".to_string(),
+                            "webhook delivery requires params.delivery",
                             None,
-                        )
-                    });
-                let url = match url {
-                    Ok(u) => u,
-                    Err(e) => return Some(Err(e)),
+                        )));
+                    }
+                };
+                let url = match d.get("url").and_then(Value::as_str) {
+                    Some(u) => u,
+                    None => {
+                        return Some(Err(ErrorData::new(
+                            ErrorCode::INVALID_PARAMS,
+                            "delivery.url is required",
+                            None,
+                        )));
+                    }
                 };
                 let policy = toron_core::bus::egress::EgressPolicy::default();
                 if let Err(e) = toron_core::bus::egress::validate_target(url, &policy) {
@@ -183,46 +198,69 @@ pub async fn route_events(
                         None,
                     )));
                 }
-                let secret_dir = toron_core::config::ToronPaths::resolve()
-                    .root
-                    .join("webhook-secrets");
-                let key = format!("{}:{}:{}", principal.name(), name, url);
-                let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
-                let path = secret_dir.join(format!("{}.secret", hex::encode(digest)));
+                let secret_str = match d.get("secret").and_then(Value::as_str) {
+                    Some(s) => s,
+                    None => {
+                        return Some(Err(ErrorData::new(
+                            ErrorCode::INVALID_PARAMS,
+                            "delivery.secret is required",
+                            None,
+                        )));
+                    }
+                };
+                let secret =
+                    match toron_core::events::webhook::Secret::from_client_whsec(secret_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(Err(ErrorData::new(
+                                ErrorCode::INVALID_PARAMS,
+                                format!("invalid delivery.secret: {e}"),
+                                None,
+                            )));
+                        }
+                    };
                 let egress = match webhook_delivery::UreqEgress::new(policy.clone()) {
                     Ok(e) => e,
                     Err(e) => return Some(Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e, None))),
                 };
                 let challenge = format!("challenge_{}", now_us);
-                match webhook_delivery::subscribe_webhook(
-                    &egress, &policy, &path, url, &challenge, true,
+                // Deterministic sub id: stable across restarts and refreshes,
+                // and the X-MCP-Subscription-Id on the verification POST.
+                let sub_id = {
+                    let canonical = toron_core::events::store::canonical_json(&args);
+                    let digest = <sha2::Sha256 as sha2::Digest>::digest(
+                        format!("{}:{}:{}:{}", principal.name(), url, name, canonical).as_bytes(),
+                    );
+                    hex::encode(digest)[..16].to_string()
+                };
+                match webhook_delivery::verify_endpoint(
+                    &egress, &policy, url, &secret, &challenge, &sub_id,
                 )
                 .await
                 {
-                    Ok((whsec, true)) => Some(whsec),
-                    Ok((_, false)) => {
+                    Ok(true) => {}
+                    Ok(false) => {
                         return Some(Err(ErrorData::new(
-                            ErrorCode::INVALID_PARAMS,
-                            "webhook verification challenge failed".to_string(),
-                            None,
+                            CALLBACK_ENDPOINT_ERROR,
+                            "callback endpoint verification failed",
+                            Some(json!({"reason": "challenge_failed"})),
                         )));
                     }
                     Err(e) => {
                         return Some(Err(ErrorData::new(
-                            ErrorCode::INVALID_PARAMS,
-                            format!("webhook setup failed: {e}"),
-                            None,
+                            CALLBACK_ENDPOINT_ERROR,
+                            "callback endpoint unreachable",
+                            Some(json!({"reason": "connection_refused", "detail": e})),
                         )));
                     }
                 }
-            } else {
-                None
-            };
+                webhook = Some((url.to_string(), secret_str.to_string()));
+            }
             match store
                 .subscribe(&toron_core::events::store::SubscribeSpec {
                     principal: principal.name().to_string(),
                     is_pin: matches!(principal, Principal::Pin { .. }),
-                    delivery: delivery.to_string(),
+                    delivery: mode.to_string(),
                     name: name.to_string(),
                     args: args.clone(),
                     ttl_us,
@@ -231,37 +269,40 @@ pub async fn route_events(
                 .await
             {
                 Ok(sub) => {
-                    let mut out = json!({
-                        "id": sub.id,
-                        "expiresAt": sub.expires_us,
-                        "cursor": sub.cursor,
-                    });
-                    if let Some(secret) = webhook_secret {
-                        // Returned ONCE in the result. The daemon's delivery
-                        // half persists the spec (id/url/secret) under a 0600
-                        // state file so a restart can re-fold pending retries;
-                        // the secret never enters a log or the subscription row.
-                        if let Some(url) = args.get("url").and_then(serde_json::Value::as_str) {
-                            let spec_path =
-                                toron_core::config::state_dir().join("webhook-specs.jsonl");
-                            use std::io::Write as _;
-                            #[cfg(unix)]
-                            use std::os::unix::fs::OpenOptionsExt as _;
-                            let mut opts = std::fs::OpenOptions::new();
-                            opts.create(true).append(true);
-                            #[cfg(unix)]
-                            opts.mode(0o600);
-                            if let Ok(mut f) = opts.open(spec_path) {
-                                let _ = writeln!(
-                                    f,
-                                    "{}",
-                                    json!({
-                                        "id": sub.id, "url": url, "secret": secret,
-                                    })
-                                );
-                            }
+                    if let Some((url, secret)) = webhook {
+                        // Persist the spec for the daemon's delivery half; the
+                        // secret is client-supplied and never echoed back.
+                        let spec_path = toron_core::config::state_dir().join("webhook-specs.jsonl");
+                        use std::io::Write as _;
+                        #[cfg(unix)]
+                        use std::os::unix::fs::OpenOptionsExt as _;
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.create(true).append(true);
+                        #[cfg(unix)]
+                        opts.mode(0o600);
+                        if let Ok(mut f) = opts.open(spec_path) {
+                            let _ = writeln!(
+                                f,
+                                "{}",
+                                json!({
+                                    "id": sub.id, "url": url, "secret": secret,
+                                })
+                            );
                         }
-                        out["secret"] = json!(secret);
+                    }
+                    let mut out = json!({
+                        "resultType": "complete",
+                        "id": sub.id,
+                        "refreshBefore": sub.expires_us.map(|us|
+                            json!(toron_core::events::occurrence::iso8601(us))
+                        ).unwrap_or(Value::Null),
+                        "cursor": sub.cursor.to_string(),
+                        "truncated": false,
+                    });
+                    if mode == "webhook" {
+                        out["deliveryStatus"] = json!({
+                            "active": true, "lastError": Value::Null,
+                        });
                     }
                     Ok(CustomResult(out))
                 }
@@ -280,13 +321,37 @@ pub async fn route_events(
                     "hasMore": false, "truncated": false, "terminated": true,
                 }))),
                 Ok(Some(sub)) => {
-                    let after = id_param("cursor").parse::<u64>().unwrap_or(sub.cursor);
-                    match store.poll(id, after, 32).await {
+                    let cursor_param = params.as_ref().and_then(|p| p.get("cursor"));
+                    let after = cursor_param
+                        .and_then(Value::as_str)
+                        .and_then(|c| c.parse::<u64>().ok())
+                        .unwrap_or(sub.cursor);
+                    // G3: maxAgeMs is a replay floor; ignored on a null cursor.
+                    let max_age_us = if cursor_param.is_some() && !cursor_param.is_none() {
+                        params
+                            .as_ref()
+                            .and_then(|p| p.get("maxAgeMs"))
+                            .and_then(Value::as_u64)
+                            .map(|ms| now_us.saturating_sub((ms as i64).saturating_mul(1000)))
+                    } else {
+                        None
+                    };
+                    let limit = params
+                        .as_ref()
+                        .and_then(|p| p.get("maxEvents"))
+                        .and_then(Value::as_u64)
+                        .map(|n| n.clamp(1, 1000) as u32)
+                        .unwrap_or(32);
+                    match store.poll(id, after, limit).await {
                         Ok(page) => Ok(CustomResult(json!({
-                            "events": page.events.iter().map(|d| {
-                                serde_json::from_str::<Value>(&d.payload)
-                                    .unwrap_or_else(|_| json!({ "id": d.seq.to_string() }))
-                            }).collect::<Vec<_>>(),
+                            "resultType": "complete",
+                            "events": page.events.iter()
+                                .filter(|d| max_age_us.is_none_or(|floor| d.created_us >= floor))
+                                .map(|d| {
+                                    toron_core::events::occurrence::occurrence(
+                                        &d.payload, d.seq, now_us,
+                                    )
+                                }).collect::<Vec<_>>(),
                             "cursor": page.cursor.to_string(),
                             "nextPollMs": 5000,
                             "hasMore": page.has_more,
@@ -297,6 +362,7 @@ pub async fn route_events(
                         Err(e) => {
                             tracing::warn!("events poll store error (gap): {e}");
                             Ok(CustomResult(json!({
+                                "resultType": "complete",
                                 "events": [], "cursor": after.to_string(),
                                 "nextPollMs": 5000, "hasMore": false, "truncated": true,
                             })))
@@ -304,13 +370,14 @@ pub async fn route_events(
                     }
                 }
                 Ok(None) => Err(ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
+                    NOT_FOUND,
                     "unknown subscription",
-                    None,
+                    Some(json!({"kind": "subscription"})),
                 )),
                 Err(e) => {
                     tracing::warn!("events poll store error (gap): {e}");
                     Ok(CustomResult(json!({
+                        "resultType": "complete",
                         "events": [], "cursor": "0",
                         "nextPollMs": 5000, "hasMore": false, "truncated": true,
                     })))
@@ -320,11 +387,13 @@ pub async fn route_events(
         "events/unsubscribe" => {
             let id = id_param("subscriptionId");
             match store.unsubscribe(id, principal.name()).await {
-                Ok(true) => Ok(CustomResult(json!({"id": id, "terminated": true}))),
+                Ok(true) => Ok(CustomResult(json!({
+                    "resultType": "complete", "id": id, "terminated": true,
+                }))),
                 Ok(false) => Err(ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
+                    FORBIDDEN,
                     "not your subscription",
-                    None,
+                    Some(json!({"reason": "access_denied"})),
                 )),
                 Err(e) => Err(ErrorData::new(
                     ErrorCode::INTERNAL_ERROR,

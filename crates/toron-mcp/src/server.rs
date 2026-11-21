@@ -497,6 +497,7 @@ where
                     body: b"{}".to_vec(),
                     secret_whsec: whsec.to_string(),
                     webhook_id: format!("msg_{id}"),
+                    subscription_id: id.to_string(),
                 },
             ));
         }

@@ -267,6 +267,7 @@ async fn a_bus_lag_produces_one_gap_delivery_per_webhook_not_silence() {
                 body: b"{}".to_vec(),
                 secret_whsec: "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw".into(),
                 webhook_id: format!("msg_{id}"),
+                subscription_id: id.to_string(),
             },
         );
     }

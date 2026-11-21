@@ -129,6 +129,8 @@ pub struct PostSpec<'a> {
     pub body: &'a [u8],
     pub secret: &'a Secret,
     pub webhook_id: &'a str,
+    /// SEP-3415 Final: X-MCP-Subscription-Id on every POST (G7).
+    pub subscription_id: &'a str,
     pub challenge: bool,
 }
 
@@ -145,6 +147,7 @@ pub async fn guarded_post<P: EgressPort>(
         body,
         secret,
         webhook_id,
+        subscription_id,
         challenge,
     } = spec;
     let addrs = port.resolve(&target.host)?;
@@ -158,6 +161,10 @@ pub async fn guarded_post<P: EgressPort>(
         ("webhook-id".to_string(), webhook_id.to_string()),
         ("webhook-timestamp".to_string(), timestamp.to_string()),
         ("webhook-signature".to_string(), signature),
+        (
+            "x-mcp-subscription-id".to_string(),
+            subscription_id.to_string(),
+        ),
         ("content-type".to_string(), "application/json".to_string()),
     ];
     port.post(target, socket, headers, body).await
@@ -208,6 +215,7 @@ pub async fn verify_endpoint<P: EgressPort>(
     url: &str,
     secret: &Secret,
     challenge: &str,
+    subscription_id: &str,
 ) -> Result<bool, String> {
     let target = egress::validate_target(url, policy)?;
     let expected = endpoint_verification_response(secret, challenge);
@@ -224,6 +232,7 @@ pub async fn verify_endpoint<P: EgressPort>(
             body: br#"{"type":"verification"}"#,
             secret,
             webhook_id: &expected,
+            subscription_id,
             challenge: true,
         },
     )
@@ -296,13 +305,14 @@ pub async fn subscribe_webhook<P: EgressPort>(
     url: &str,
     challenge: &str,
     fresh: bool,
+    subscription_id: &str,
 ) -> Result<(String, bool), String> {
     let secret = if fresh {
         persist_secret_once(secret_path, &Secret::generate())?
     } else {
         load_secret(secret_path)?
     };
-    let activated = verify_endpoint(port, policy, url, &secret, challenge).await?;
+    let activated = verify_endpoint(port, policy, url, &secret, challenge, subscription_id).await?;
     Ok((secret.whsec(), activated))
 }
 
@@ -337,6 +347,7 @@ pub struct PostSpecOwned {
     pub body: Vec<u8>,
     pub secret_whsec: String,
     pub webhook_id: String,
+    pub subscription_id: String,
 }
 
 impl<P: EgressPort> WebhookDispatcher<P> {
@@ -380,6 +391,7 @@ impl<P: EgressPort> WebhookDispatcher<P> {
             body,
             secret_whsec: secret.whsec(),
             webhook_id: format!("msg_{event}"),
+            subscription_id: sub.to_string(),
         };
         let outcome = self.post(&spec, timestamp).await?;
         Ok(self.finish(&key, sub, event, &spec, 1, outcome))
@@ -397,6 +409,7 @@ impl<P: EgressPort> WebhookDispatcher<P> {
                 body: &spec.body,
                 secret: &secret,
                 webhook_id: &spec.webhook_id,
+                subscription_id: &spec.subscription_id,
                 challenge: false,
             },
         )
@@ -687,6 +700,7 @@ mod tests {
                     body: br#"{"a":1}"#,
                     secret: &secret,
                     webhook_id: "msg_evt-1",
+                    subscription_id: "sub-1",
                     challenge: false,
                 },
             )
@@ -755,6 +769,7 @@ mod tests {
             body: br#"{"n":7}"#.to_vec(),
             secret_whsec: secret.whsec(),
             webhook_id: "msg_evt-7".to_string(),
+            subscription_id: "sub".to_string(),
         };
         second.refold(&rows, vec![("webhook:sub:evt-7".to_string(), spec)]);
         let delivered = second.on_clock(1_614_300_000, 1_614_265_330).await.unwrap();
@@ -793,12 +808,13 @@ mod tests {
         let p = EgressPolicy::default();
         let fake = Fake::new(vec![vec!["100.64.2.3".parse().unwrap()]], vec![Outcome::Ok]);
         let url = "https://foo.example-tailnet.ts.net/hook";
-        let (first, active) = subscribe_webhook(&fake, &p, &path, url, "challenge_123", true)
-            .await
-            .unwrap();
+        let (first, active) =
+            subscribe_webhook(&fake, &p, &path, url, "challenge_123", true, "sub-1")
+                .await
+                .unwrap();
         assert!(active);
         assert!(first.starts_with("whsec_"));
-        let (again, _) = subscribe_webhook(&fake, &p, &path, url, "challenge_123", false)
+        let (again, _) = subscribe_webhook(&fake, &p, &path, url, "challenge_123", false, "sub-1")
             .await
             .unwrap();
         assert_eq!(
@@ -840,7 +856,8 @@ mod tests {
                 &p,
                 "https://foo.example-tailnet.ts.net/h",
                 &secret,
-                "challenge_123"
+                "challenge_123",
+                "sub-1"
             )
             .await
             .unwrap()
@@ -859,5 +876,45 @@ mod tests {
         );
         let text = format!("{effects:?}");
         assert!(!text.contains("MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn every_signed_post_carries_the_mcp_subscription_id_header() {
+        use toron_core::events::webhook::Secret;
+        let policy = EgressPolicy::default();
+        let target =
+            egress::validate_target("https://foo.example-tailnet.ts.net/h", &policy).unwrap();
+        let fake = Fake::new(
+            vec![vec!["100.64.2.3".parse::<IpAddr>().unwrap()]],
+            vec![Outcome::Ok],
+        );
+        let secret = Secret::from_whsec("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").unwrap();
+        guarded_post(
+            &fake,
+            &policy,
+            &PostSpec {
+                target: &target,
+                timestamp: 1_700_000_000,
+                body: br#"{"eventId":"e"}"#,
+                secret: &secret,
+                webhook_id: "msg_e",
+                subscription_id: "sub-42",
+                challenge: false,
+            },
+        )
+        .await
+        .unwrap();
+        let sent = fake.sent.lock().unwrap();
+        let headers = &sent[0].0;
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "x-mcp-subscription-id" && v == "sub-42")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "webhook-signature" && v.starts_with("v1,"))
+        );
     }
 }

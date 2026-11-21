@@ -10,6 +10,7 @@
 pub mod catalogue;
 pub mod dispatcher;
 pub mod kernel;
+pub mod occurrence;
 pub mod principal;
 pub mod retry;
 pub mod signal;
