@@ -128,6 +128,41 @@ async fn every_advertised_version_can_initialize_and_list_tools() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn bare_server_discover_needs_no_metadata() -> anyhow::Result<()> {
+    let router = isolated_router().await?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 9, "method": "server/discover", "params": {}
+    });
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::HOST, "localhost")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let text = String::from_utf8(resp.into_body().collect().await?.to_bytes().to_vec())?;
+    assert_eq!(status, StatusCode::OK, "discover must answer: {text}");
+    assert!(
+        text.contains("supportedVersions"),
+        "discover lists versions: {text}"
+    );
+    assert!(
+        text.contains("2026-07-28"),
+        "discover advertises the draft: {text}"
+    );
+    assert!(
+        text.contains("2024-11-05"),
+        "discover advertises old versions: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn events_answer_a_typed_fallback_on_old_sessions() -> anyhow::Result<()> {
     let old_router = isolated_router().await?;
     let old_session = initialize_session(old_router.clone(), "2025-11-25").await?;

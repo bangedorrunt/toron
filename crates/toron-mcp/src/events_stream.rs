@@ -217,6 +217,31 @@ pub async fn stream_intercept(
                 .await;
         }
     };
+    if request_value["method"].as_str() == Some("server/discover") {
+        // bd-958by: pi's auto probe sends server/discover with no _meta. rmcp
+        // requires metadata on every discover request, so answer it here with
+        // the same version list the server advertises.
+        let result = json!({
+            "resultType": "complete",
+            "supportedVersions": crate::server::SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            "capabilities": serde_json::to_value(crate::server::ToronServer::capabilities())
+                .unwrap_or_default(),
+            "ttlMs": 60_000,
+            "cacheScope": "public",
+        });
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "jsonrpc": "2.0",
+                "id": request_value["id"].clone(),
+                "result": result,
+            })),
+        )
+            .into_response();
+    }
     if request_value["method"].as_str() != Some("events/stream") {
         return next
             .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
