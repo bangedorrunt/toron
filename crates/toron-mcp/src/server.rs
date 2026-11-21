@@ -136,10 +136,16 @@ impl ToronServer {
             .enable_tool_list_changed()
             .build();
         let events = serde_json::json!({"listChanged": false});
-        caps.extensions = Some(std::collections::BTreeMap::from([(
-            crate::events::EVENTS_EXTENSION.to_string(),
-            events.as_object().expect("an object").clone(),
-        )]));
+        caps.extensions = Some(std::collections::BTreeMap::from([
+            (
+                crate::events::EVENTS_EXTENSION.to_string(),
+                events.as_object().expect("an object").clone(),
+            ),
+            (
+                crate::events::signal_http::SIGNAL_EXTENSION.to_string(),
+                serde_json::Map::new(),
+            ),
+        ]));
         caps
     }
 }
@@ -1096,6 +1102,12 @@ mod tests {
             .expect("events row");
         assert_eq!(value["listChanged"], false, "SEP-3415 capability value");
         assert_eq!(value.len(), 1, "no version key");
+        assert!(
+            ext.get(crate::events::signal_http::SIGNAL_EXTENSION)
+                .is_some(),
+            "signal/* is advertised under toron's own key (#1446)"
+        );
+        assert_eq!(ext.len(), 2, "events + signal, no third extension");
     }
 
     #[test]

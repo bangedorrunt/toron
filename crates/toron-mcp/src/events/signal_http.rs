@@ -17,6 +17,11 @@ use toron_core::events::signal::{
 };
 use toron_core::events::store::SubscriptionStore;
 
+/// toron's own extension key for the count-only signal methods (bd-2ghz8,
+/// bd-6zo01 G12/#1446). Deliberately NOT under the MCP Events key — signal/*
+/// is not part of that extension and rmcp 3.11 rejects unadvertised methods.
+pub const SIGNAL_EXTENSION: &str = "dev.toron/signal";
+
 #[derive(Clone)]
 pub struct SignalDeps {
     pub links: Arc<dyn SignalStore>,

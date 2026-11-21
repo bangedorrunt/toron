@@ -5,7 +5,7 @@ version = "1.7.2"
 edition = "2024"
 
 [dependencies]
-rmcp = { version = "3.5.1", features = [
+rmcp = { workspace = true, features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
@@ -13,6 +13,7 @@ rmcp = { version = "3.5.1", features = [
     "transport-streamable-http-client-reqwest",
     "client",
 ] }
+rmcp-macros = { workspace = true }
 toron-core = { path = "../toron-core" }
 toron-plane = { path = "../toron-plane" }
 toron-workflow = { path = "../toron-workflow" }

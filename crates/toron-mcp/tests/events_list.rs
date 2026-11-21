@@ -8,13 +8,15 @@ use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVers
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use toron_mcp::events::{EVENTS_EXTENSION, route};
 use toron_core::events::principal::Principal;
+use toron_mcp::events::{EVENTS_EXTENSION, route};
 use toron_mcp::server::ToronServer;
 
 #[test]
 fn events_list_uses_sep3415_wire_keys() {
-    let result = route("events/list", None, &Principal::Operator).expect("routed").expect("ok");
+    let result = route("events/list", None, &Principal::Operator)
+        .expect("routed")
+        .expect("ok");
     let rows = result.0["events"].as_array().expect("events array");
     assert_eq!(rows.len(), 6);
     for row in rows {
@@ -37,8 +39,14 @@ fn events_list_uses_sep3415_wire_keys() {
             "exact SEP-3415 row keys"
         );
         assert!(row["name"].as_str().is_some_and(|s| !s.is_empty()));
-        assert_eq!(row["delivery"], serde_json::json!(["poll", "push", "stream"]));
-        assert_eq!(row["inputSchema"]["properties"]["project"]["type"], "string");
+        assert_eq!(
+            row["delivery"],
+            serde_json::json!(["poll", "push", "stream"])
+        );
+        assert_eq!(
+            row["inputSchema"]["properties"]["project"]["type"],
+            "string"
+        );
         assert_eq!(row["payloadSchema"]["type"], "object");
         let props = row["payloadSchema"]["properties"].as_object().unwrap();
         assert!(props.contains_key("event_id"));
@@ -50,10 +58,14 @@ fn events_list_uses_sep3415_wire_keys() {
 fn capabilities_advertise_the_events_extension_only_under_extensions() {
     let caps = ToronServer::capabilities();
     let ext = caps.extensions.as_ref().expect("extensions");
-    assert_eq!(ext.len(), 1, "U1 advertises only the events extension");
+    assert_eq!(ext.len(), 2, "events + signal extensions (#1446)");
     let value = &ext[EVENTS_EXTENSION];
     assert_eq!(value["listChanged"], false, "SEP-3415 capability value");
     assert_eq!(value.len(), 1, "no version key");
+    assert!(
+        ext.get("dev.toron/signal").is_some(),
+        "signal extension advertised"
+    );
     assert!(caps.tools.is_some(), "tools capability unchanged");
 }
 
@@ -72,7 +84,9 @@ fn known_names_on_unimplemented_methods_are_errors_never_ok() {
     let params = serde_json::json!({"name": "mail.addressed", "arguments": {}});
     for method in ["events/subscribe", "events/poll", "events/stream"] {
         assert!(
-            route(method, Some(&params), &Principal::Operator).expect("routed").is_err(),
+            route(method, Some(&params), &Principal::Operator)
+                .expect("routed")
+                .is_err(),
             "{method} must not fake success"
         );
     }

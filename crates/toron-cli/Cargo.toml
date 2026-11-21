@@ -18,7 +18,7 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-rmcp = { version = "3.4.0", features = [
+rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }

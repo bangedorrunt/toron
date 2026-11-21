@@ -19,6 +19,10 @@ members = [
 # relink, and none of it is read: a panic in a dependency still resolves to a
 # line table, which is all a backtrace needs. Full debuginfo for deps was the
 # default here because no repo set a `[profile.dev.package]` override.
+[workspace.dependencies]
+rmcp = "3.11.0"
+rmcp-macros = "3.11.0"
+
 [profile.dev.package."*"]
 debug = "line-tables-only"
 
