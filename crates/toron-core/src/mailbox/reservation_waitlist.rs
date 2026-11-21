@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{AcquireResult, Mailbox, ReleaseAsk, RequestRelease};
+use super::{AcquireResult, Mailbox, ReleaseAsk, RequestRelease, Reservation, ReservationStatus};
 
 /// One queued waiter, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +161,69 @@ impl Mailbox {
                 },
             )
             .collect())
+    }
+
+    /// Hand waitlisted paths to their head waiter when no live holder remains.
+    /// Called from the lease-board read that discovers an expired lease; the
+    /// caller's inflight guard keeps this from recursing through that read.
+    pub async fn sweep_expired_waitlists(&self, project_slug: &str) -> anyhow::Result<usize> {
+        use std::collections::HashSet;
+
+        let waiters = self.list_project_waiters(project_slug).await?;
+        if waiters.is_empty() {
+            return Ok(0);
+        }
+        let leases = self.resolved_leases(project_slug).await?;
+        let mut seen = HashSet::new();
+        let mut handed = 0;
+        for w in waiters {
+            if !seen.insert(w.path_pattern.clone()) {
+                continue;
+            }
+            let on_path: Vec<_> = leases
+                .iter()
+                .filter(|l| l.path_pattern == w.path_pattern && l.status == ReservationStatus::Held)
+                .collect();
+            if on_path.iter().any(|l| !l.expired) {
+                continue; // a live holder still owns the path
+            }
+            if let Some(expired) = on_path.first() {
+                let mut lease = Reservation {
+                    id: expired.id.clone(),
+                    agent_name: String::new(),
+                    agent_pubkey: expired.agent_pubkey.clone(),
+                    path_pattern: expired.path_pattern.clone(),
+                    exclusive: expired.exclusive,
+                    reason: expired.reason.clone(),
+                    expires_ts_us: expired.expires_ts_us,
+                    status: ReservationStatus::Held,
+                    epoch: expired.epoch,
+                };
+                self.fill_agent_names(project_slug, std::slice::from_mut(&mut lease))
+                    .await;
+                if self.handoff_waiter(project_slug, &lease).await {
+                    handed += 1;
+                }
+            } else {
+                // The expired lease has left the board entirely: grant the
+                // head waiter through the ordinary acquire path.
+                let out = self
+                    .file_reservation_paths(
+                        project_slug,
+                        &w.agent_name,
+                        std::slice::from_ref(&w.path_pattern),
+                        Some(super::reservations::DEFAULT_RESERVATION_TTL_SECS),
+                        true,
+                        w.reason.as_deref(),
+                    )
+                    .await?;
+                if !out.granted.is_empty() {
+                    self.remove_waiter(w.seq).await?;
+                    handed += 1;
+                }
+            }
+        }
+        Ok(handed)
     }
 
     /// The next agent to receive a freed path, or None when the queue is empty.

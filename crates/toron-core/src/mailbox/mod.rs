@@ -184,6 +184,9 @@ pub struct Mailbox {
     alt_key_paths: Arc<papaya::HashMap<(String, String), AltKeyMemo>>,
     /// Test/metrics observable: alternate-root walks performed.
     alt_key_walks: Arc<AtomicU64>,
+    /// bd-ll7bs: per-project guard so an expiry-triggered handoff cannot
+    /// recurse through the lease board read that triggered it.
+    pub(crate) handoff_inflight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A memoized alternate-root resolution (see `Mailbox::alt_key_paths`).
@@ -248,6 +251,7 @@ impl Mailbox {
             unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
             alt_key_paths: Arc::new(papaya::HashMap::new()),
             alt_key_walks: Arc::new(AtomicU64::new(0)),
+            handoff_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         }
     }
 

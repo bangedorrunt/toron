@@ -45,6 +45,44 @@ async fn test_mailbox(tag: &str) -> (Mailbox, PathBuf, PathBuf) {
 }
 
 #[tokio::test]
+async fn expiry_hands_over_without_any_release_call() {
+    let (mailbox, _db, _data) = test_mailbox("expiry").await;
+    for name in ["ShortHolder", "ExpiryWaiter"] {
+        mailbox
+            .register_agent(PROJECT, &AgentProfile::new(name))
+            .await
+            .expect("register");
+    }
+    let paths = vec![PATH.to_string()];
+    mailbox
+        .file_reservation_paths(PROJECT, "ShortHolder", &paths, Some(1), true, Some("ttl"))
+        .await
+        .expect("short lease");
+    let queued = mailbox
+        .file_reservation_paths_queued(PROJECT, "ExpiryWaiter", &paths, Some(3600), true, None)
+        .await
+        .expect("queue");
+    assert!(!queued.conflicts.is_empty());
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // No release is called: the lease-board read that sees the expired lease
+    // must run the handoff itself.
+    let _ = mailbox.active_reservations(PROJECT).await.expect("read");
+    let holders = mailbox
+        .list_file_reservations(PROJECT, Some("ExpiryWaiter"), None)
+        .await
+        .expect("board");
+    assert_eq!(holders.len(), 1, "expiry handed the path to the waiter");
+    assert!(
+        mailbox
+            .list_waiters(PROJECT, PATH)
+            .await
+            .expect("queue")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn queued_acquires_hand_off_fifo_on_every_release() {
     let (mailbox, _db, _data) = test_mailbox("fifo").await;
     for name in ["Holder", "WaiterA", "WaiterB"] {

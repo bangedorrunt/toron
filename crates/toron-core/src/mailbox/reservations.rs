@@ -1865,6 +1865,21 @@ impl Mailbox {
                 });
             }
         }
+        // bd-ll7bs: an expired lease with waiters must hand over on the READ,
+        // not on some unrelated later release. The inflight guard stops the
+        // sweep's own board read from recursing into another sweep.
+        if self
+            .list_project_waiters(project_slug)
+            .await
+            .is_ok_and(|w| !w.is_empty())
+            && self
+                .handoff_inflight
+                .lock()
+                .insert(project_slug.to_string())
+        {
+            let _ = Box::pin(self.sweep_expired_waitlists(project_slug)).await;
+            self.handoff_inflight.lock().remove(project_slug);
+        }
         Ok(out)
     }
 
@@ -2414,7 +2429,11 @@ impl Mailbox {
     /// Best-effort: fill `agent_name` from kind-30013 profiles. A roster
     /// miss leaves the name EMPTY — never an invented pubkey prefix, which
     /// later compared as a peer pin and made a lane starve on its own lease.
-    async fn fill_agent_names(&self, project_slug: &str, reservations: &mut [Reservation]) {
+    pub(crate) async fn fill_agent_names(
+        &self,
+        project_slug: &str,
+        reservations: &mut [Reservation],
+    ) {
         let name_by_pubkey = self.agent_name_map(project_slug).await;
         for r in reservations.iter_mut() {
             if let Some(name) = name_by_pubkey.get(&r.agent_pubkey) {
@@ -3004,7 +3023,7 @@ impl Mailbox {
     /// bd-ll7bs: one handoff choke point. A freed path with a waiter moves to
     /// it through the existing epoch-safe transfer — never a second grant path.
     /// A failed transfer leaves the lease alone so an ordinary release can run.
-    async fn handoff_waiter(&self, project_slug: &str, lease: &Reservation) -> bool {
+    pub(crate) async fn handoff_waiter(&self, project_slug: &str, lease: &Reservation) -> bool {
         let mut releasing = lease.clone();
         self.fill_agent_names(project_slug, std::slice::from_mut(&mut releasing))
             .await;
