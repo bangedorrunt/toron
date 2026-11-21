@@ -40,6 +40,8 @@ pub struct ToronServer {
     tools: Option<ToolServer>,
     presence: Option<PresenceBroker>,
     events: Option<Arc<dyn toron_core::events::store::SubscriptionStore>>,
+    /// bd-2ghz8: hashed signal links for count-only hooks.
+    signal_links: Option<Arc<dyn toron_core::events::signal::SignalStore>>,
 }
 
 impl std::fmt::Debug for ToronServer {
@@ -166,6 +168,7 @@ impl ServerHandler for ToronServer {
         let method = request.method.clone();
         let params = request.params.clone();
         let events = self.events.clone();
+        let signal_links = self.signal_links.clone();
         let authorization = request
             .extensions
             .get::<axum::http::request::Parts>()
@@ -173,6 +176,31 @@ impl ServerHandler for ToronServer {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         async move {
+            if method.starts_with("signal/") {
+                let links = signal_links.unwrap_or_else(|| {
+                    Arc::new(toron_core::events::signal::FileSignalStore::at_root(
+                        &toron_core::config::ToronPaths::resolve().root,
+                    )) as Arc<dyn toron_core::events::signal::SignalStore>
+                });
+                let principal = crate::events::authorize(authorization.as_deref())?;
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
+                return crate::events::signal_http::route_signal(
+                    &method,
+                    principal.name(),
+                    links.as_ref(),
+                    now_us,
+                )
+                .unwrap_or_else(|| {
+                    Err(rmcp::ErrorData::new(
+                        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                        method,
+                        None,
+                    ))
+                });
+            }
             if !method.starts_with("events/") {
                 return Err(rmcp::ErrorData::new(
                     rmcp::model::ErrorCode::METHOD_NOT_FOUND,
@@ -901,7 +929,7 @@ async fn router_with_mailbox(
     // requests pass through unchanged. It shares the store/cursor with poll.
     let stream_state = crate::events_stream::StreamDeps {
         store: std::sync::Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
-            index_pool,
+            index_pool.clone(),
         )),
         tokens: std::sync::Arc::new(toron_core::events::principal::FileTokenStore::at_root(
             &toron_core::config::ToronPaths::resolve().root,
@@ -916,7 +944,24 @@ async fn router_with_mailbox(
             stream_state,
             crate::events_stream::stream_intercept,
         ));
-    let router = axum::Router::new().merge(mcp_router).merge(blossom);
+    let signal_state = crate::events::signal_http::SignalDeps {
+        links: Arc::new(toron_core::events::signal::FileSignalStore::at_root(
+            &toron_core::config::ToronPaths::resolve().root,
+        )),
+        events: Arc::new(toron_core::events::store::SqliteSubscriptionStore::new(
+            index_pool,
+        )),
+    };
+    let signal_router = axum::Router::new()
+        .route(
+            "/signal",
+            axum::routing::get(crate::events::signal_http::signal_get),
+        )
+        .with_state(signal_state);
+    let router = axum::Router::new()
+        .merge(mcp_router)
+        .merge(blossom)
+        .merge(signal_router);
     Ok((router, hosts))
 }
 

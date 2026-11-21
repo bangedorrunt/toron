@@ -99,6 +99,22 @@ pub struct Page {
     pub truncated: bool,
 }
 
+/// Count-only view for one participant. Deliberately carries no ids, no
+/// payloads and no hints — a signal link learns how busy a seat is, never what
+/// the messages say (bd-2ghz8 least-privilege).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrincipalCounts {
+    pub pending: u64,
+    pub urgent: u64,
+    pub waking: u64,
+    pub cursor: u64,
+}
+
+/// Subscription names whose undelivered events count as urgent.
+fn urgent_name(name: &str) -> bool {
+    matches!(name, "reservation.conflict" | "ack_sla_expired")
+}
+
 #[derive(Clone, Debug)]
 pub struct SubscribeSpec {
     pub principal: String,
@@ -127,6 +143,29 @@ pub trait SubscriptionStore: Send + Sync {
     /// Prune old delivery rows without touching subscription states.
     async fn prune_deliveries(&self, now_us: i64) -> anyhow::Result<()>;
     async fn sweep(&self, now_us: i64) -> anyhow::Result<usize>;
+
+    /// Counts for one participant across its live subscriptions. Polls are
+    /// used internally but only the integers escape — no payload, id or hint
+    /// is returned to the caller (bd-2ghz8).
+    async fn counts_for(&self, principal: &str, now_us: i64) -> anyhow::Result<PrincipalCounts> {
+        let mut out = PrincipalCounts::default();
+        for sub in self.list_active().await? {
+            if sub.principal != principal || sub.expires_us.is_some_and(|e| e <= now_us) {
+                continue;
+            }
+            out.cursor = out.cursor.max(sub.cursor);
+            out.waking = out.waking.saturating_add(1);
+            let page = self
+                .poll(&sub.id, sub.cursor, MAX_DELIVERIES_PER_SUB as u32)
+                .await?;
+            let n = page.events.len() as u64;
+            out.pending = out.pending.saturating_add(n);
+            if urgent_name(&sub.name) {
+                out.urgent = out.urgent.saturating_add(n);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Clone)]
@@ -168,11 +207,13 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         let id = subscription_id(principal, delivery, name, &hash);
         if let Some(row) = self.get(&id).await? {
             let expires = ttl.map(|t| now_us.saturating_add(t));
-            sqlx::query("UPDATE event_subscriptions SET expires_us = ?, state = 'active' WHERE id = ?")
-                .bind(expires)
-                .bind(&id)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE event_subscriptions SET expires_us = ?, state = 'active' WHERE id = ?",
+            )
+            .bind(expires)
+            .bind(&id)
+            .execute(&self.pool)
+            .await?;
             return Ok(Subscription {
                 expires_us: expires,
                 ..row
@@ -243,22 +284,43 @@ impl SubscriptionStore for SqliteSubscriptionStore {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, principal, delivery, name, args_hash, cursor, created_us, expires_us, state)| {
-                Subscription {
-                    id, principal, delivery, name, args_hash, cursor: cursor as u64,
-                    created_us, expires_us, state,
-                }
-            })
+            .map(
+                |(
+                    id,
+                    principal,
+                    delivery,
+                    name,
+                    args_hash,
+                    cursor,
+                    created_us,
+                    expires_us,
+                    state,
+                )| {
+                    Subscription {
+                        id,
+                        principal,
+                        delivery,
+                        name,
+                        args_hash,
+                        cursor: cursor as u64,
+                        created_us,
+                        expires_us,
+                        state,
+                    }
+                },
+            )
             .collect())
     }
 
     async fn append(&self, id: &str, payload: &Value, now_us: i64) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO event_deliveries (subscription_id, payload, created_us) VALUES (?, ?, ?)")
-            .bind(id)
-            .bind(serde_json::to_string(payload)?)
-            .bind(now_us)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO event_deliveries (subscription_id, payload, created_us) VALUES (?, ?, ?)",
+        )
+        .bind(id)
+        .bind(serde_json::to_string(payload)?)
+        .bind(now_us)
+        .execute(&self.pool)
+        .await?;
         // Bound by age, then by count: keep only the newest N rows.
         sqlx::query(
             "DELETE FROM event_deliveries WHERE subscription_id = ? \
@@ -278,12 +340,11 @@ impl SubscriptionStore for SqliteSubscriptionStore {
     async fn poll(&self, id: &str, after: u64, limit: u32) -> anyhow::Result<Page> {
         // bd-sptj4 gap contract: if the cursor fell off the pruned end, report
         // truncated and hand back a fresh servable cursor instead of lying.
-        let oldest: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(seq) FROM event_deliveries WHERE subscription_id = ?",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
+        let oldest: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(seq) FROM event_deliveries WHERE subscription_id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
         let (truncated, start) = gap_floor(after, oldest);
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT seq, payload FROM event_deliveries \

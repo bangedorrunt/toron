@@ -12,6 +12,7 @@ pub mod dispatcher;
 pub mod kernel;
 pub mod principal;
 pub mod retry;
+pub mod signal;
 pub mod store;
 pub mod stream;
 pub mod webhook;
