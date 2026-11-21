@@ -4,6 +4,11 @@ Nostr-native agent mailbox: one `toron` binary (daemon, MCP server and robot
 CLI). Flywheel embeds toron, never the reverse. Dependencies run one way only:
 **flywheel → toron-workflow → toron-core**.
 
+MCP surface: **41 tools** (38 AM-Rust parity + 3 toron additive:
+`release_file_reservations_by_reason`, `list_file_reservations`,
+`ask_judgment`) and **25 resources**. `catalog::agents_doc_counts_match_the_catalog`
+checks these counts against the catalog constants.
+
 Ops crib: `~/.agents/skills/toron/SKILL.md`. ADRs: `docs/decisions/` (they are
 history; `0001-*` is superseded). One root `AGENTS.md` only, enforced by
 `scripts/verify-gates.sh`.
@@ -62,7 +67,8 @@ workflows/              product YAML
 
 - Edition 2024. `#![forbid(unsafe_code)]` crate roots and ADR markers are
   enforced by `scripts/verify-gates.sh`.
-- No new kinds or MCP tools without an ADR, a catalog regen and tests.
+- Frozen: 41 tool names (38 AM-Rust parity + 3 additive) and 25 resources.
+  No new kinds or MCP tools without an ADR, a catalog regen and tests.
 - CLI flags: the acting agent is always `--as`; project-scoped commands require
   `--project`. Channel posts are kind 9.
 - `MessageId` is hex `String`, never `u64`. The `t` tag is the project slug only.
