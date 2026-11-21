@@ -53,7 +53,7 @@ const NAMES: [EventName; 6] = [
     EventName::Gap,
 ];
 
-/// `events/list` advertises poll and push in U1; webhook lands in P2.
+/// `events/list` advertises poll, push and webhook; webhook delivery is live.
 const DELIVERY: &[&str] = &["poll", "push", "webhook"];
 
 /// One SEP-3415 `events/list` row. The wire keys are camelCase.

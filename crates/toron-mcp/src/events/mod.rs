@@ -44,50 +44,6 @@ pub fn client_declares(params: Option<&Value>, extension: &str) -> bool {
 
 pub mod webhook_delivery;
 
-/// Route an `events/*` custom request. `None` means "not ours"; the caller
-/// then falls back to the default method-not-found handler.
-pub fn route(
-    method: &str,
-    params: Option<&Value>,
-    principal: &Principal,
-) -> Option<Result<CustomResult, ErrorData>> {
-    if !method.starts_with("events/") {
-        return None;
-    }
-    let verb = request_verb(method, params, principal);
-    if !d6_authorize(principal, verb) {
-        return Some(Err(ErrorData::new(
-            FORBIDDEN,
-            format!("{verb:?} requires the operator principal"),
-            Some(json!({"reason": "access_denied"})),
-        )));
-    }
-    Some(match method {
-        "events/list" => Ok(CustomResult(json!({
-            "resultType": "complete",
-            "events": catalogue::catalogue(),
-        }))),
-        "events/subscribe" | "events/poll" | "events/stream" => match valid_name(params) {
-            Ok(name) => Err(ErrorData::new(
-                ErrorCode::METHOD_NOT_FOUND,
-                format!("{method} for {name} is not implemented in U1"),
-                None,
-            )),
-            Err(err) => Err(err),
-        },
-        "events/unsubscribe" => Err(ErrorData::new(
-            ErrorCode::METHOD_NOT_FOUND,
-            format!("{method} is not implemented in U1"),
-            None,
-        )),
-        other => Err(ErrorData::new(
-            ErrorCode::METHOD_NOT_FOUND,
-            format!("unknown method {other}"),
-            None,
-        )),
-    })
-}
-
 /// Map a request to the D6 verb it asks for. Scope comes from the SEP-3415
 /// `arguments` object, not ad-hoc flags: a pin naming another pin or project
 /// in its arguments asks for cross-scope, which is operator-only.
@@ -140,10 +96,9 @@ pub async fn route_events(
     store: Option<&dyn toron_core::events::store::SubscriptionStore>,
     now_us: i64,
 ) -> Option<Result<CustomResult, ErrorData>> {
-    let store = match store {
-        Some(s) => s,
-        None => return route(method, params, principal),
-    };
+    if !method.starts_with("events/") {
+        return None;
+    }
     if !d6_authorize(principal, request_verb(method, params, principal)) {
         return Some(Err(ErrorData::new(
             FORBIDDEN,
@@ -151,12 +106,43 @@ pub async fn route_events(
             Some(json!({"reason": "access_denied"})),
         )));
     }
-    if !matches!(
-        method,
-        "events/subscribe" | "events/poll" | "events/unsubscribe"
-    ) {
-        return route(method, params, principal);
+    match method {
+        "events/list" => {
+            return Some(Ok(CustomResult(json!({
+                "resultType": "complete",
+                "events": catalogue::catalogue(),
+            }))));
+        }
+        "events/stream" => {
+            return Some(Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "events/stream is not available in this host",
+                None,
+            )));
+        }
+        "events/subscribe" | "events/poll" | "events/unsubscribe" => {}
+        other => {
+            return Some(Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("unknown method {other}"),
+                None,
+            )));
+        }
     }
+    // A known verb with an unknown event name is an in-band error, before any
+    // store is consulted (bd-w32ho).
+    if method == "events/subscribe"
+        && let Err(err) = valid_name(params)
+    {
+        return Some(Err(err));
+    }
+    let Some(store) = store else {
+        return Some(Err(ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            "events: no subscription store in this host",
+            None,
+        )));
+    };
     let id_param = |key: &str| {
         params
             .and_then(|p| p.get(key))
@@ -488,31 +474,52 @@ pub fn authorize_with_store(
 mod tests {
     use super::*;
 
-    #[test]
-    fn unknown_event_name_is_in_band_invalid_params() {
+    #[tokio::test]
+    async fn unknown_event_name_is_in_band_invalid_params() {
         let params = json!({"name": "not.an.event"});
-        let err = route("events/subscribe", Some(&params), &Principal::Operator)
-            .expect("routed")
-            .expect_err("unknown name");
+        let err = route_events(
+            "events/subscribe",
+            Some(&params),
+            &Principal::Operator,
+            None,
+            0,
+        )
+        .await
+        .expect("routed")
+        .expect_err("unknown name");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(err.code.0, -32602);
         assert!(err.message.contains("unknown event name"), "{err:?}");
     }
 
-    #[test]
-    fn known_names_on_unimplemented_methods_are_errors_never_ok() {
+    #[tokio::test]
+    async fn known_names_on_unimplemented_methods_are_errors_never_ok() {
         let params = json!({"name": "mail.addressed", "arguments": {}});
         for method in ["events/subscribe", "events/poll", "events/stream"] {
-            let out = route(method, Some(&params), &Principal::Operator).expect("routed");
+            let out = route_events(method, Some(&params), &Principal::Operator, None, 0)
+                .await
+                .expect("routed");
             assert!(out.is_err(), "{method} must not fake success");
         }
     }
 
-    #[test]
-    fn only_events_methods_route_here() {
-        assert!(route("tools/list", None, &Principal::Operator).is_none());
-        assert!(route("events/nope", None, &Principal::Operator).is_some());
-        assert!(route("events/list", None, &Principal::Operator).is_some());
+    #[tokio::test]
+    async fn only_events_methods_route_here() {
+        assert!(
+            route_events("tools/list", None, &Principal::Operator, None, 0)
+                .await
+                .is_none()
+        );
+        assert!(
+            route_events("events/nope", None, &Principal::Operator, None, 0)
+                .await
+                .is_some()
+        );
+        assert!(
+            route_events("events/list", None, &Principal::Operator, None, 0)
+                .await
+                .is_some()
+        );
     }
 
     #[test]

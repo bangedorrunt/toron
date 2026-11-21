@@ -62,8 +62,8 @@ fn an_operator_token_authorizes() {
     );
 }
 
-#[test]
-fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
+#[tokio::test]
+async fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
     let pin = Principal::Pin {
         pin: "P".into(),
         project: "f".into(),
@@ -72,14 +72,22 @@ fn a_pin_token_cannot_reach_operator_only_verbs_but_operator_can() {
         serde_json::json!({"name": "mail.addressed", "arguments": {"project": "other"}}),
         serde_json::json!({"name": "mail.addressed", "arguments": {"full_payload": true}}),
     ] {
-        let err = toron_mcp::events::route("events/subscribe", Some(&params), &pin)
+        let err = toron_mcp::events::route_events("events/subscribe", Some(&params), &pin, None, 0)
+            .await
             .expect("routed")
             .expect_err("a pin token cannot escalate scope");
         assert_eq!(err.code, rmcp::model::ErrorCode(-32024));
         assert!(err.message.contains("operator"), "{err:?}");
         // The operator gets the normal not-implemented error, not an auth one.
-        let out = toron_mcp::events::route("events/subscribe", Some(&params), &Principal::Operator)
-            .expect("routed");
+        let out = toron_mcp::events::route_events(
+            "events/subscribe",
+            Some(&params),
+            &Principal::Operator,
+            None,
+            0,
+        )
+        .await
+        .expect("routed");
         assert!(out.is_err());
         assert!(!out.unwrap_err().message.contains("operator"));
     }
@@ -175,10 +183,18 @@ async fn subscribe_append_then_poll_returns_the_hint_after_the_cursor() {
     );
 }
 
-#[test]
-fn tools_stay_token_less_r13() {
-    // The auth seam is events-only: `route` still declines tools/list, and the
+#[tokio::test]
+async fn tools_stay_token_less_r13() {
+    // The auth seam is events-only: route_events declines tools/list, and the
     // tool handlers never pass through authorize.
-    assert!(toron_mcp::events::route("tools/list", None, &Principal::Operator).is_none());
-    assert!(toron_mcp::events::route("tools/call", None, &Principal::Operator).is_none());
+    assert!(
+        toron_mcp::events::route_events("tools/list", None, &Principal::Operator, None, 0)
+            .await
+            .is_none()
+    );
+    assert!(
+        toron_mcp::events::route_events("tools/call", None, &Principal::Operator, None, 0)
+            .await
+            .is_none()
+    );
 }

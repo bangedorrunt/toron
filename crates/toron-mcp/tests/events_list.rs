@@ -9,12 +9,13 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use toron_core::events::principal::Principal;
-use toron_mcp::events::{EVENTS_EXTENSION, route};
+use toron_mcp::events::{EVENTS_EXTENSION, route_events};
 use toron_mcp::server::ToronServer;
 
-#[test]
-fn events_list_uses_sep3415_wire_keys() {
-    let result = route("events/list", None, &Principal::Operator)
+#[tokio::test]
+async fn events_list_uses_sep3415_wire_keys() {
+    let result = route_events("events/list", None, &Principal::Operator, None, 0)
+        .await
         .expect("routed")
         .expect("ok");
     let rows = result.0["events"].as_array().expect("events array");
@@ -69,22 +70,30 @@ fn capabilities_advertise_the_events_extension_only_under_extensions() {
     assert!(caps.tools.is_some(), "tools capability unchanged");
 }
 
-#[test]
-fn ae1_unknown_event_name_is_in_band_invalid_params() {
+#[tokio::test]
+async fn ae1_unknown_event_name_is_in_band_invalid_params() {
     let params = serde_json::json!({"name": "not.an.event"});
-    let err = route("events/subscribe", Some(&params), &Principal::Operator)
-        .expect("routed")
-        .expect_err("unknown name");
+    let err = route_events(
+        "events/subscribe",
+        Some(&params),
+        &Principal::Operator,
+        None,
+        0,
+    )
+    .await
+    .expect("routed")
+    .expect_err("unknown name");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     assert_eq!(err.code.0, -32602);
 }
 
-#[test]
-fn known_names_on_unimplemented_methods_are_errors_never_ok() {
+#[tokio::test]
+async fn known_names_on_unimplemented_methods_are_errors_never_ok() {
     let params = serde_json::json!({"name": "mail.addressed", "arguments": {}});
     for method in ["events/subscribe", "events/poll", "events/stream"] {
         assert!(
-            route(method, Some(&params), &Principal::Operator)
+            route_events(method, Some(&params), &Principal::Operator, None, 0)
+                .await
                 .expect("routed")
                 .is_err(),
             "{method} must not fake success"
