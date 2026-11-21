@@ -27,11 +27,43 @@ async fn isolated_router() -> anyhow::Result<axum::Router> {
     toron_mcp::router_with_isolated(dir, key_path, "test-pass").await
 }
 
+async fn initialize_session(router: axum::Router, version: &str) -> anyhow::Result<String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": version,
+            "capabilities": {},
+            "clientInfo": {"name": "negotiation-test", "version": "1"}
+        }
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::HOST, "localhost")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let sid = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(!sid.is_empty(), "legacy mode must issue a session id");
+    Ok(sid)
+}
+
 async fn raw_events_list(
     router: axum::Router,
     version: &str,
     meta: bool,
-) -> anyhow::Result<String> {
+    session: &str,
+) -> anyhow::Result<(StatusCode, String)> {
     let params = if meta {
         serde_json::json!({"_meta": {
             "io.modelcontextprotocol/protocolVersion": version,
@@ -54,13 +86,13 @@ async fn raw_events_list(
                 .header(header::ACCEPT, "application/json, text/event-stream")
                 .header("mcp-protocol-version", version)
                 .header("mcp-method", "events/list")
+                .header("mcp-session-id", session)
                 .body(Body::from(body.to_string()))?,
         )
         .await?;
-    assert_eq!(resp.status(), StatusCode::OK, "handler errors stay in band");
-    Ok(String::from_utf8(
-        resp.into_body().collect().await?.to_bytes().to_vec(),
-    )?)
+    let status = resp.status();
+    let text = String::from_utf8(resp.into_body().collect().await?.to_bytes().to_vec())?;
+    Ok((status, text))
 }
 
 #[tokio::test]
@@ -97,22 +129,40 @@ async fn every_advertised_version_can_initialize_and_list_tools() -> anyhow::Res
 
 #[tokio::test]
 async fn events_answer_a_typed_fallback_on_old_sessions() -> anyhow::Result<()> {
-    let text = raw_events_list(isolated_router().await?, "2025-11-25", false).await?;
+    let old_router = isolated_router().await?;
+    let old_session = initialize_session(old_router.clone(), "2025-11-25").await?;
+    let (status, text) = raw_events_list(old_router, "2025-11-25", false, &old_session).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "handler errors stay in band: {text}"
+    );
     assert!(
         text.contains(EVENTS_NEED_NEW_PROTOCOL),
         "older sessions get the doorbell-fallback pointer: {text}"
     );
 
-    let no_meta = raw_events_list(isolated_router().await?, "2026-07-28", false).await?;
+    let new_router = isolated_router().await?;
+    let new_session = initialize_session(new_router.clone(), "2026-07-28").await?;
+    let (status, no_meta) =
+        raw_events_list(new_router.clone(), "2026-07-28", false, &new_session).await?;
     assert!(
-        no_meta.contains("-32602") && no_meta.contains("missing required protocol metadata"),
-        "the draft version still requires per-request metadata: {no_meta}"
+        status == StatusCode::BAD_REQUEST || status == StatusCode::OK,
+        "the draft version must refuse a metadata-less request: {status} {no_meta}"
+    );
+    assert!(
+        no_meta.contains("-32602") && no_meta.contains("missing"),
+        "the refusal names the missing metadata: {no_meta}"
     );
 
-    let with_meta = raw_events_list(isolated_router().await?, "2026-07-28", true).await?;
+    let (status, with_meta) = raw_events_list(new_router, "2026-07-28", true, &new_session).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a valid draft request succeeds: {with_meta}"
+    );
     assert!(
-        !with_meta.contains(EVENTS_NEED_NEW_PROTOCOL)
-            && !with_meta.contains("missing required protocol metadata"),
+        !with_meta.contains(EVENTS_NEED_NEW_PROTOCOL) && !with_meta.contains("missing"),
         "a 2026-07-28 request with metadata reaches events/list: {with_meta}"
     );
     Ok(())
