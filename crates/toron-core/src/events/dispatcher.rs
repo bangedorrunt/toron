@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
 use crate::nostr::{Event, Filter};
+use serde_json::json;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -91,6 +91,7 @@ pub fn fact_from_event(event: &Event) -> Fact {
         project: tag("t"),
         role_change: tag("role").is_some(),
         policy_change: tag("policy").is_some(),
+        importance: tag("importance"),
     }
 }
 
@@ -111,7 +112,7 @@ pub async fn dispatch_fact(
             sub.principal.clone()
         };
         if let Some(name) = classify(fact, &subscriber) {
-            let hint = json!({
+            let mut hint = json!({
                 "event_id": fact.id,
                 "name": name.as_str(),
                 "project": fact.project.clone().unwrap_or_default(),
@@ -119,6 +120,11 @@ pub async fn dispatch_fact(
                 "correlation_id": null,
                 "timestamp": now_us,
             });
+            // bd-cdite: forward the typed urgency so occurrence.rs can carry it
+            // into data.importance for the bridges. Absent = normal.
+            if let Some(importance) = &fact.importance {
+                hint["importance"] = json!(importance);
+            }
             store.append(&sub.id, &hint, now_us).await?;
             delivered += 1;
         }
@@ -208,9 +214,9 @@ impl Drop for DispatcherHandle {
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::{Page, SubscribeSpec, Subscription};
     use super::*;
     use async_trait::async_trait;
-    use super::super::store::{Page, SubscribeSpec, Subscription};
     use serde_json::Value;
     use std::sync::Mutex;
 
@@ -245,17 +251,78 @@ mod tests {
             Ok(())
         }
         async fn poll(&self, _id: &str, _after: u64, _limit: u32) -> anyhow::Result<Page> {
-            Ok(Page { events: vec![], cursor: 0, has_more: false, truncated: false })
+            Ok(Page {
+                events: vec![],
+                cursor: 0,
+                has_more: false,
+                truncated: false,
+            })
         }
-        async fn unsubscribe(&self, _id: &str, _principal: &str) -> anyhow::Result<bool> { Ok(true) }
-        async fn terminate(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn prune_deliveries(&self, _now_us: i64) -> anyhow::Result<()> { Ok(()) }
-        async fn sweep(&self, _now_us: i64) -> anyhow::Result<usize> { Ok(0) }
+        async fn unsubscribe(&self, _id: &str, _principal: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn terminate(&self, _id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn prune_deliveries(&self, _now_us: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn sweep(&self, _now_us: i64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// bd-cdite: an urgent mail's typed importance reaches the hint row; absent
+    /// importance stays absent (normal). This is the producer half of the chain.
+    #[tokio::test]
+    async fn a_fact_carries_its_typed_importance_into_the_hint() {
+        let store = CountingStore {
+            appends: Mutex::new(0),
+            payloads: Mutex::new(Vec::new()),
+        };
+        let urgent = Fact {
+            id: "e-urgent".into(),
+            kind: 1059,
+            subject_pin: Some("AmberProbe".into()),
+            importance: Some("urgent".into()),
+            ..Fact::default()
+        };
+        dispatch_fact(&urgent, &store, 1000)
+            .await
+            .expect("dispatch urgent");
+        {
+            let rows = store.payloads.lock().unwrap();
+            let hint: Value = serde_json::from_str(&rows[0]).expect("hint json");
+            assert_eq!(hint["importance"], "urgent", "typed urgency on the hint");
+        }
+
+        let store = CountingStore {
+            appends: Mutex::new(0),
+            payloads: Mutex::new(Vec::new()),
+        };
+        let normal = Fact {
+            id: "e-normal".into(),
+            kind: 1059,
+            subject_pin: Some("AmberProbe".into()),
+            ..Fact::default()
+        };
+        dispatch_fact(&normal, &store, 1000)
+            .await
+            .expect("dispatch normal");
+        let rows = store.payloads.lock().unwrap();
+        let hint: Value = serde_json::from_str(&rows[0]).expect("hint json");
+        assert!(
+            hint.get("importance").is_none(),
+            "normal mail has no urgency bit"
+        );
     }
 
     #[tokio::test]
     async fn a_lost_fact_appends_one_gap_per_active_subscription() {
-        let store = CountingStore { appends: Mutex::new(0), payloads: Mutex::new(Vec::new()) };
+        let store = CountingStore {
+            appends: Mutex::new(0),
+            payloads: Mutex::new(Vec::new()),
+        };
         append_gap(&store, 1000).await;
         assert_eq!(*store.appends.lock().unwrap(), 1);
     }
@@ -270,82 +337,134 @@ mod tests {
 
     #[async_trait]
     impl crate::bus::Bus for ClosingBus {
-        async fn publish(&self, _event: Event) -> Result<crate::bus::PublishOk, crate::bus::BusError> {
+        async fn publish(
+            &self,
+            _event: Event,
+        ) -> Result<crate::bus::PublishOk, crate::bus::BusError> {
             unreachable!()
         }
-        async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, crate::bus::BusError> {
+        async fn subscribe(
+            &self,
+            filter: Filter,
+        ) -> Result<crate::bus::Subscription, crate::bus::BusError> {
             self.subscribe_trusted(filter).await
         }
-        async fn subscribe_trusted(&self, _filter: Filter) -> Result<crate::bus::Subscription, crate::bus::BusError> {
+        async fn subscribe_trusted(
+            &self,
+            _filter: Filter,
+        ) -> Result<crate::bus::Subscription, crate::bus::BusError> {
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = tokio::sync::mpsc::channel(8);
             if n == 0 {
-                tx.send(SubscriptionEvent::Closed("shed".into())).await.unwrap();
+                tx.send(SubscriptionEvent::Closed("shed".into()))
+                    .await
+                    .unwrap();
             }
             self.txs.lock().unwrap().push(tx);
             Ok(crate::bus::Subscription::new(
-                crate::bus::SubscriptionId::new(format!("fake-{n}")), rx,
+                crate::bus::SubscriptionId::new(format!("fake-{n}")),
+                rx,
             ))
         }
         async fn health(&self) -> Result<crate::bus::Health, crate::bus::BusError> {
-            Ok(crate::bus::Health { ok: true, message: String::new() })
+            Ok(crate::bus::Health {
+                ok: true,
+                message: String::new(),
+            })
         }
     }
 
     #[tokio::test]
     async fn a_lagging_subscription_exposes_its_drops() {
-        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
         use crate::bus::Bus;
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
 
-        let path = std::env::temp_dir().join(format!("toron-disp-lag-{}.sqlite", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("toron-disp-lag-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let pool = crate::index::schema::connect(path.to_str().unwrap()).await.unwrap();
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .unwrap();
         crate::index::schema::migrate(&pool).await.unwrap();
-        let bus = InProcessBus::open(pool, InProcessBusConfig {
-            auth: AuthPolicy::AcceptAll,
-            allowlist: Vec::new(),
-            channel_capacity: 1,
-            detailed_stage_logging: false,
-        }).await.unwrap();
-        let sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let bus = InProcessBus::open(
+            pool,
+            InProcessBusConfig {
+                auth: AuthPolicy::AcceptAll,
+                allowlist: Vec::new(),
+                channel_capacity: 1,
+                detailed_stage_logging: false,
+            },
+        )
+        .await
+        .unwrap();
+        let sub = bus
+            .subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now()))
+            .await
+            .unwrap();
         let keys = crate::nostr::Keys::generate();
         for i in 0..8 {
             let ev = crate::nostr::event::build_event(
-                &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
-                format!("flood-{i}"), vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
+                &keys,
+                crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+                format!("flood-{i}"),
+                vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
                 crate::nostr::Timestamp::now(),
-            ).unwrap();
+            )
+            .unwrap();
             bus.publish(ev).await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(sub.lag_count() > 0, "publisher-side lag is observable on the stream");
+        assert!(
+            sub.lag_count() > 0,
+            "publisher-side lag is observable on the stream"
+        );
     }
 
     #[tokio::test]
     async fn a_since_filter_does_not_replay_stored_history() {
-        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
         use crate::bus::Bus;
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
 
-        let path = std::env::temp_dir().join(format!("toron-disp-replay-{}.sqlite", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("toron-disp-replay-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let pool = crate::index::schema::connect(path.to_str().unwrap()).await.unwrap();
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .unwrap();
         crate::index::schema::migrate(&pool).await.unwrap();
-        let bus = InProcessBus::open(pool, InProcessBusConfig {
-            auth: AuthPolicy::AcceptAll, allowlist: Vec::new(),
-            channel_capacity: 64, detailed_stage_logging: false,
-        }).await.unwrap();
+        let bus = InProcessBus::open(
+            pool,
+            InProcessBusConfig {
+                auth: AuthPolicy::AcceptAll,
+                allowlist: Vec::new(),
+                channel_capacity: 64,
+                detailed_stage_logging: false,
+            },
+        )
+        .await
+        .unwrap();
         let keys = crate::nostr::Keys::generate();
         let old = crate::nostr::event::build_event(
-            &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
-            "old", vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
+            &keys,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+            "old",
+            vec![crate::nostr::Tag::parse(["p", "P"]).unwrap()],
             crate::nostr::Timestamp::from_secs(1),
-        ).unwrap();
+        )
+        .unwrap();
         bus.publish(old).await.unwrap();
         // Fresh dispatcher: since = now, so the old fact is not replayed.
-        let mut sub = bus.subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now())).await.unwrap();
+        let mut sub = bus
+            .subscribe_trusted(Filter::new().since(crate::nostr::Timestamp::now()))
+            .await
+            .unwrap();
         let mut replayed = 0;
-        while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_millis(50), sub.next()).await {
-            if matches!(item, SubscriptionEvent::Event(_)) { replayed += 1; }
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sub.next()).await
+        {
+            if matches!(item, SubscriptionEvent::Event(_)) {
+                replayed += 1;
+            }
         }
         assert_eq!(replayed, 0, "restart must not re-dispatch stored history");
     }
@@ -365,21 +484,38 @@ mod tests {
 
         // Wait for the resubscribe, then deliver a fact on the second stream.
         for _ in 0..40 {
-            if bus.calls.load(Ordering::Relaxed) >= 2 { break; }
+            if bus.calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(bus.calls.load(Ordering::Relaxed) >= 2, "dispatcher resubscribed");
+        assert!(
+            bus.calls.load(Ordering::Relaxed) >= 2,
+            "dispatcher resubscribed"
+        );
         let keys = crate::nostr::Keys::generate();
         let event = crate::nostr::event::build_event(
-            &keys, crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
-            "later", vec![crate::nostr::Tag::parse(["p", "AmberProbe"]).unwrap()],
+            &keys,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::CHANNEL_MESSAGE),
+            "later",
+            vec![crate::nostr::Tag::parse(["p", "AmberProbe"]).unwrap()],
             crate::nostr::Timestamp::now(),
-        ).unwrap();
+        )
+        .unwrap();
         let tx = bus.txs.lock().unwrap()[1].clone();
         tx.send(SubscriptionEvent::Event(event)).await.unwrap();
         let mut ok = false;
         for _ in 0..40 {
-            if store.payloads.lock().unwrap().iter().any(|p| p.contains("mail.addressed")) { ok = true; break; }
+            if store
+                .payloads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("mail.addressed"))
+            {
+                ok = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(ok, "the later fact arrived after resubscribe");

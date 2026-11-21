@@ -120,6 +120,9 @@ pub struct Fact {
     pub project: Option<String>,
     pub role_change: bool,
     pub policy_change: bool,
+    /// bd-cdite: the outer urgency tag on a mail wrap (`importance=urgent`).
+    /// Typed data, never parsed out of the sealed body.
+    pub importance: Option<String>,
 }
 
 /// Pure classifier. D6: every event is own-pin only — a fact about somebody
