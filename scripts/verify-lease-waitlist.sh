@@ -45,5 +45,22 @@ run ToronLeaseResolution.waitlist.broken-lifo invariant FifoHandoff
 run ToronLeaseResolution.waitlist.broken-drop-waiter invariant NoLostWaiter
 run ToronLeaseResolution.waitlist.broken-no-ttl invariant HandoffOnEveryRelease
 
+conform() { # trace expected-rc step
+  local trace="$1" expected="$2" step="$3" out rc
+  out="$(cd "$WORK" && "$CHECKER" conform -trace "$trace" \
+    -config ToronLeaseResolution.waitlist.cfg ToronLeaseResolution.tla 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  if [ "$rc" = "$expected" ] && { [ -z "$step" ] || printf '%s' "$out" | grep -q "$step"; }; then
+    echo "PASS conform $trace (exit $rc${step:+ $step})"
+  else
+    echo "FAIL conform $trace: expected $expected $step, got $rc: $out" >&2
+    fail=$((fail + 1))
+  fi
+}
+TRACES="$REPO/.agents/skills/verify-lease-resolution/traces"
+cp "$TRACES"/ToronLeaseResolution.*.jsonl "$WORK/"
+conform ToronLeaseResolution.recorded.jsonl 0 ""
+conform ToronLeaseResolution.no-holder-release.jsonl 20 "HandoffRelease"
+
 [ "$fail" -eq 0 ] || { echo "verify-lease-waitlist: $fail failed" >&2; exit 1; }
 echo "verify-lease-waitlist: all checks passed"

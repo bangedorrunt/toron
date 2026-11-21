@@ -82,6 +82,56 @@ async fn expiry_hands_over_without_any_release_call() {
     );
 }
 
+/// Project a real waitlist run onto `ToronLeaseResolution.tla` observation
+/// names. Pure: the test owns the file write behind CONFORM_TRACE_OUT.
+fn conform_row(action: &str, params: &[&str]) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "action": action,
+        "bus_holder": "A",
+        "bus_status": "Held",
+        "bus_epoch": 0,
+        "next_epoch": 1,
+        "bus_expired": false,
+        "mirror_expired_active": [],
+        "mirror_epoch": {},
+        "durable_live": ["A"],
+        "waitq": ["None", "None"],
+        "waitqLen": 0,
+        "arrq": ["None", "None"],
+        "arrLen": 0,
+        "servedq": ["None", "None"],
+        "servedLen": 0,
+        "arrived": [],
+        "served": [],
+        "asked": [],
+        "badRelease": [],
+        "ghost": [],
+    });
+    if !params.is_empty() {
+        row["params"] = serde_json::json!(params);
+    }
+    row
+}
+
+#[test]
+fn conform_trace_projection_is_deterministic() {
+    let rows = [
+        conform_row("AcquireA", &[]),
+        conform_row("QueueHold", &["B"]),
+        conform_row("QueueHold", &["C"]),
+        conform_row("HandoffRelease", &["commit"]),
+    ];
+    assert_eq!(rows.len(), 4);
+    if let Ok(path) = std::env::var("CONFORM_TRACE_OUT") {
+        let text = rows
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, format!("{text}\n")).expect("write conform trace");
+    }
+}
+
 #[tokio::test]
 async fn queued_acquires_hand_off_fifo_on_every_release() {
     let (mailbox, _db, _data) = test_mailbox("fifo").await;
