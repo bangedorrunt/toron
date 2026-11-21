@@ -75,6 +75,7 @@ pub mod pin_reuse;
 pub mod product;
 pub mod receipts;
 pub mod receipts_core;
+pub mod reservation_waitlist;
 pub mod reservations;
 pub mod reservations_core;
 pub mod search;
