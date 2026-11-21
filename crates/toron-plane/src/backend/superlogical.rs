@@ -28,7 +28,7 @@ use crate::backend::{AgentStatus, BackendError, BackendErrorCode, EventStream, P
 use serde_json::{Value, json};
 use toron_core::pane_types::TOKEN_PIN;
 
-use crate::backend::rex_cli;
+use crate::backend::rex_cli::{self, paste_event_args};
 
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
@@ -341,8 +341,10 @@ impl SuperlogicalBackend {
         text: &str,
     ) -> Result<Value, crate::backend::BackendError> {
         let rex = Self::rex()?;
+        // bd-sfxu1: a paste event respects the terminal's bracketed-paste mode;
+        // rex handles that server-side. Enter is sent separately below.
         let receipt = rex
-            .json(&write_args(session, block, text))
+            .json(&paste_event_args(session, block, text))
             .map_err(RexFail::into_backend)?;
         rex.text(&send_key_args(session, block, &["enter"]))
             .map_err(RexFail::into_backend)?;

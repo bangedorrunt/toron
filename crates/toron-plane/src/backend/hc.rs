@@ -1816,6 +1816,7 @@ fn event_pane(ev: &BackendEvent) -> Option<&str> {
     match ev {
         BackendEvent::AgentStatusChanged { pane, .. } => Some(pane.as_str()),
         BackendEvent::AgentDetected { pane, .. } => Some(pane.as_str()),
+        BackendEvent::ProgramStatusChanged { pane, .. } => Some(pane.as_str()),
         BackendEvent::PaneExited { pane } => Some(pane.as_str()),
         BackendEvent::EventsLost | BackendEvent::Raw(_) => None,
     }

@@ -359,6 +359,7 @@ fn pane_wanted(event: &BackendEvent, panes: &[String]) -> bool {
     let pane = match event {
         BackendEvent::AgentStatusChanged { pane, .. }
         | BackendEvent::AgentDetected { pane, .. }
+        | BackendEvent::ProgramStatusChanged { pane, .. }
         | BackendEvent::PaneExited { pane } => pane.as_str(),
         BackendEvent::EventsLost | BackendEvent::Raw(_) => return true,
     };
@@ -424,6 +425,25 @@ pub fn write_args(session: &str, block: &str, text: &str) -> Vec<String> {
         block.into(),
         "write".into(),
         serde_json::json!({ "data": text }).to_string(),
+    ]
+}
+
+/// bd-sfxu1: send a typed wake as a `block.event` paste, so rex applies the
+/// terminal's bracketed-paste mode; Enter is a SEPARATE key event. The session
+/// id is required by `block.event` (unlike the legacy `block call write`).
+pub fn paste_event_args(session: &str, block: &str, text: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "call".into(),
+        "-s".into(),
+        session.into(),
+        "block.event".into(),
+        serde_json::json!({
+            "session_id": session,
+            "block_id": block,
+            "event": {"type": "paste", "payload": {"text": text}},
+        })
+        .to_string(),
     ]
 }
 
@@ -1598,13 +1618,25 @@ pub mod rex_map {
         if kind.ends_with("program_status_changed") {
             let record = payload.get("record").cloned().unwrap_or(Value::Null);
             let status = status_from_program_status(&json_records(&record));
-            return BackendEvent::AgentStatusChanged {
+            let state = record
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let kind = record
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let id = record.get("id").and_then(Value::as_str).map(str::to_string);
+            return BackendEvent::ProgramStatusChanged {
                 pane: PaneId::new(pane),
                 agent: payload
                     .get("label")
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 status,
+                state,
+                kind,
+                id,
             };
         }
         if kind.ends_with("block_closed") {
@@ -1669,8 +1701,8 @@ pub mod rex_map {
 #[cfg(test)]
 mod wire_contract_tests {
     use super::rex_map::{
-        PROMPT_STABLE_SECS, STALE_WORKING_SECS, newest_record_age_secs, screen_shows_a_prompt,
-        status_from_program_status, status_with_stable_screen,
+        PROMPT_STABLE_SECS, STALE_WORKING_SECS, event_from_line, newest_record_age_secs,
+        screen_shows_a_prompt, status_from_program_status, status_with_stable_screen,
     };
     use super::*;
     use crate::backend::AgentStatus;
@@ -2257,5 +2289,45 @@ mod wire_contract_tests {
         let records: Value = serde_json::from_str(IDLE_RECORDS).unwrap();
         assert_eq!(status_from_program_status(&records), AgentStatus::Idle);
         assert!(screen_shows_a_prompt(IDLE_SCREEN_NARROW));
+    }
+
+    #[test]
+    fn a_typed_wake_is_a_paste_event_with_a_separate_enter() {
+        let args = paste_event_args("session:abc", "block:def", "hello");
+        assert_eq!(args[0], "api");
+        assert_eq!(args[1], "call");
+        assert_eq!(args[4], "block.event");
+        let payload: serde_json::Value = serde_json::from_str(args.last().unwrap()).unwrap();
+        assert_eq!(payload["session_id"], "session:abc");
+        assert_eq!(payload["block_id"], "block:def");
+        assert_eq!(payload["event"]["type"], "paste");
+        assert_eq!(payload["event"]["payload"]["text"], "hello");
+        // Enter is a separate key event, never part of the paste payload.
+        let enter = send_key_args("session:abc", "block:def", &["enter"]);
+        assert!(enter.iter().any(|a| a == "enter"));
+        assert!(!args.iter().any(|a| a == "enter"));
+    }
+
+    #[test]
+    fn a_program_status_changed_fixture_carries_state_and_kind_without_a_poll() {
+        let line = r#"{"type":"session_event","payload":{"event":{"type":"program_status_changed","payload":{"block_id":"block:seat","label":"BoldCliff","record":{"state":"blocked","kind":"permission","id":"opencode-1"}}}}}"#;
+        let ev = event_from_line(line);
+        match ev {
+            BackendEvent::ProgramStatusChanged {
+                pane,
+                state,
+                kind,
+                id,
+                status,
+                ..
+            } => {
+                assert_eq!(pane.as_str(), "block:seat");
+                assert_eq!(state.as_deref(), Some("blocked"));
+                assert_eq!(kind.as_deref(), Some("permission"));
+                assert_eq!(id.as_deref(), Some("opencode-1"));
+                assert_eq!(status, AgentStatus::Blocked);
+            }
+            other => panic!("expected a structured program status event, got {other:?}"),
+        }
     }
 }

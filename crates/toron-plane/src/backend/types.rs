@@ -88,6 +88,17 @@ pub enum BackendEvent {
         agent: Option<String>,
         status: AgentStatus,
     },
+    /// bd-sfxu1: a rex `program_status_changed` block event. Carries the raw
+    /// OSC state/kind so a blocked+kind record gates typing and an `error`
+    /// record is never mistaken for done or idle.
+    ProgramStatusChanged {
+        pane: PaneId,
+        agent: Option<String>,
+        status: AgentStatus,
+        state: Option<String>,
+        kind: Option<String>,
+        id: Option<String>,
+    },
     PaneExited {
         pane: PaneId,
     },
