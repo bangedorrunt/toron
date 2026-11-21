@@ -171,12 +171,12 @@
       "name": "done"
     },
     {
-      "args": "append, send, task, msg",
+      "args": "append, send, task, msg, cursor",
       "description": "Inbox plumbing: `append` (fixture door, one envelope straight to the log), `send` (journal first through the outbox loop, with recovery) and `task` (every envelope of a task you sent or received)",
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-20T03:55:58Z",
+  "generated_at": "2026-11-21T06:31:38Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -634,8 +634,15 @@
         "required": [
           "name",
           "npub",
+          "program",
+          "model",
+          "task_description",
           "last_active_ts_us",
           "stale",
+          "pane_id",
+          "workspace_id",
+          "tab_id",
+          "pane_npub",
           "identity_divergent"
         ],
         "type": "object"
@@ -688,7 +695,9 @@
           }
         },
         "required": [
-          "pane_id"
+          "agent_name",
+          "pane_id",
+          "note"
         ],
         "type": "object"
       },
@@ -763,6 +772,11 @@
             ]
           }
         },
+        "required": [
+          "removed",
+          "released",
+          "note"
+        ],
         "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
@@ -869,8 +883,15 @@
             "required": [
               "name",
               "npub",
+              "program",
+              "model",
+              "task_description",
               "last_active_ts_us",
               "stale",
+              "pane_id",
+              "workspace_id",
+              "tab_id",
+              "pane_npub",
               "identity_divergent"
             ],
             "type": "object"
@@ -1583,7 +1604,16 @@
               "body_md",
               "importance",
               "ack_required",
-              "created_ts_us"
+              "thread_id",
+              "created_ts_us",
+              "read_ts_us",
+              "duplicate_of",
+              "corr",
+              "wake",
+              "priority",
+              "audience",
+              "result_path",
+              "verdict"
             ],
             "type": "object"
           }
@@ -1657,6 +1687,7 @@
         "required": [
           "message_id",
           "acknowledged",
+          "acknowledged_at_us",
           "read"
         ],
         "type": "object"
@@ -1716,6 +1747,7 @@
         "required": [
           "message_id",
           "acknowledged",
+          "acknowledged_at_us",
           "read"
         ],
         "type": "object"
@@ -1840,6 +1872,7 @@
           "from_pubkey",
           "to_name",
           "to_pubkey",
+          "to_project",
           "status",
           "created_ts_us"
         ],
@@ -1935,6 +1968,7 @@
           "from_pubkey",
           "to_name",
           "to_pubkey",
+          "to_project",
           "status",
           "created_ts_us"
         ],
@@ -2007,6 +2041,7 @@
               "from_pubkey",
               "to_name",
               "to_pubkey",
+              "to_project",
               "status",
               "created_ts_us"
             ],
@@ -2158,7 +2193,8 @@
             "required": [
               "slot",
               "agent_name",
-              "exclusive"
+              "exclusive",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -2313,7 +2349,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           },
@@ -2447,7 +2484,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -2763,7 +2801,9 @@
               "from",
               "created_ts_us",
               "importance",
-              "ack_required"
+              "ack_required",
+              "thread_id",
+              "body_md"
             ],
             "type": "object"
           }
@@ -2784,7 +2824,8 @@
           }
         },
         "required": [
-          "result"
+          "result",
+          "next_cursor"
         ],
         "type": "object"
       },
@@ -3009,7 +3050,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -3386,6 +3428,7 @@
               "from_pubkey",
               "to_name",
               "to_pubkey",
+              "to_project",
               "status",
               "created_ts_us"
             ],
@@ -3417,6 +3460,7 @@
         "required": [
           "requester",
           "target",
+          "link",
           "welcome_sent"
         ],
         "type": "object"
@@ -3515,7 +3559,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -3785,7 +3830,9 @@
               "from",
               "created_ts_us",
               "importance",
-              "ack_required"
+              "ack_required",
+              "thread_id",
+              "body_md"
             ],
             "type": "object"
           }
@@ -3941,7 +3988,14 @@
               "body_md",
               "importance",
               "ack_required",
-              "created_ts_us"
+              "thread_id",
+              "created_ts_us",
+              "corr",
+              "wake",
+              "priority",
+              "audience",
+              "result_path",
+              "verdict"
             ],
             "type": "object"
           }
@@ -4120,7 +4174,8 @@
             },
             "required": [
               "slot",
-              "exclusive"
+              "exclusive",
+              "expires_ts_us"
             ],
             "type": "object"
           },
@@ -4236,7 +4291,8 @@
               "agent_name",
               "agent_pubkey",
               "exclusive",
-              "status"
+              "status",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -4254,6 +4310,9 @@
             ]
           }
         },
+        "required": [
+          "slot"
+        ],
         "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"

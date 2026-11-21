@@ -293,6 +293,11 @@ pub enum InboxCommand {
     /// One stored envelope by its `producer:epoch:seq` key, even after its
     /// epoch has been fenced (read-only).
     Msg(InboxMsgArgs),
+    /// The pin's committed pull cursor as rumor-time micros (read-only):
+    /// the high-water every `next` and `since last` read advances, which the
+    /// doorbell ring guard takes as the one notion of consumed (bd-yc6jf).
+    /// Missing row = 0.
+    Cursor(InboxCursorArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -304,6 +309,17 @@ pub struct InboxMsgArgs {
     pub project: String,
     /// Viewer: agent name or 64-hex npub. Only a message it sent or
     /// received is shown.
+    #[arg(long = "as", required = true)]
+    pub who: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxCursorArgs {
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reader: agent name whose committed cursor is served. A single
+    /// rumor-time timestamp, not mail content.
     #[arg(long = "as", required = true)]
     pub who: String,
 }

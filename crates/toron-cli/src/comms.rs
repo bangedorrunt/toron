@@ -59,6 +59,14 @@ pub async fn run_comms(
                 let now_us = toron_core::mailbox::lease_liveness::host_now_us();
                 mailbox.record_inbox_poll(&a.project, &a.who, now_us).await;
             }
+            if batch.is_ok() && !a.peek {
+                // bd-yc6jf: a committed read advances the same high-water a
+                // `mail inbox --since last` read advances, so a CLI pull at
+                // or after a mail's created_at suppresses the next ring.
+                // Best-effort and fail-open: a lost bump re-rings (the old
+                // behavior) instead of skipping a wake.
+                let _ = mailbox.note_committed_read(&a.project, &a.who).await;
+            }
             match batch {
                 Ok(b) if a.urgent => {
                     if let Some(err) = next_degraded.as_deref() {
@@ -155,6 +163,22 @@ pub async fn run_comms(
             store.read_triple(&msg, &viewer).await.map(|found| {
                 json!({"key": a.key, "viewer": viewer, "found": found.is_some(), "message": found})
             })
+        }
+        Command::Inbox(InboxCommand::Cursor(a)) => {
+            match mailbox.cursor_us(&a.project, &a.who).await {
+                Ok(cursor) => Ok(json!({
+                    "project": a.project,
+                    "agent": a.who,
+                    "cursor_us": cursor,
+                })),
+                Err(e) => {
+                    render_json(
+                        &json!({"refused": "cursor", "error": e.to_string()}),
+                        format,
+                    );
+                    return Ok(ExitCode::from(3));
+                }
+            }
         }
         _ => unreachable!("run_comms only handles the comms verbs"),
     };

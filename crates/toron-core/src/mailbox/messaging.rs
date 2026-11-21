@@ -721,6 +721,35 @@ impl Mailbox {
         Ok(())
     }
 
+    /// bd-yc6jf: the pin's committed pull cursor as rumor-time micros — the
+    /// one notion of consumed the doorbell ring guard reads. Missing row = 0
+    /// (everything is new on a cold start). Read-only: never bumps.
+    pub async fn cursor_us(&self, project: &str, agent: &str) -> anyhow::Result<i64> {
+        let project_slug = self.canonical_project(project).await;
+        self.read_inbox_cursor(&project_slug, agent).await
+    }
+
+    /// bd-yc6jf: stamp a committed `toron next` read onto the same
+    /// high-water a `mail inbox --since last` read advances, so a CLI pull
+    /// at or after a mail's created_at suppresses the next ring for that
+    /// mail. Same visibility as `fetch_inbox` (no filters); empty inbox
+    /// leaves the cursor untouched via the MAX in `bump_inbox_cursor`.
+    pub async fn note_committed_read(&self, project: &str, agent: &str) -> anyhow::Result<i64> {
+        let project_slug = self.canonical_project(project).await;
+        let current = self.read_inbox_cursor(&project_slug, agent).await?;
+        let messages = self
+            .fetch_inbox(&FetchInbox {
+                project_slug: project_slug.clone(),
+                agent_name: agent.into(),
+                ..Default::default()
+            })
+            .await?;
+        let high_water_us = messages.iter().map(|m| m.created_ts_us).max().unwrap_or(0);
+        self.bump_inbox_cursor(&project_slug, agent, high_water_us.max(current))
+            .await?;
+        self.read_inbox_cursor(&project_slug, agent).await
+    }
+
     /// The reader's delivered kind-1059 mail, unwrapped (shared collection
     /// behind `fetch_inbox` and the `next` ingest: contact handshakes are
     /// protocol, not mail, in both views).
@@ -2785,6 +2814,68 @@ mod tests {
         };
         assert!(mailbox.fetch_inbox(&bad).await.is_err(), "malformed errors");
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-yc6jf: a committed CLI-style read advances the same pull cursor a
+    /// `since last` read advances, so a `toron next` pull suppresses the
+    /// next ring for the pulled mail. Reducer-first: fails until `next`
+    /// stamps the high-water it committed.
+    #[tokio::test]
+    async fn a_committed_read_advances_the_pull_cursor() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("cursornext").await;
+        let (_s, _) = register(&mailbox, "demo", "SenderCR").await;
+        let (_r, _) = register(&mailbox, "demo", "ReaderCR").await;
+        assert_eq!(
+            mailbox.cursor_us("demo", "ReaderCR").await.expect("cursor"),
+            0,
+            "cold start reads zero"
+        );
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "SenderCR".into(),
+                to: vec!["ReaderCR".into()],
+                subject: "ring me".into(),
+                body_md: "cursor probe".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        let rows = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "ReaderCR".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(rows.len(), 1, "one visible message");
+        let ts = rows[0].created_ts_us;
+        assert_eq!(
+            mailbox.cursor_us("demo", "ReaderCR").await.expect("cursor"),
+            0,
+            "a plain read moves nothing"
+        );
+        let after = mailbox
+            .note_committed_read("demo", "ReaderCR")
+            .await
+            .expect("commit");
+        assert!(
+            after >= ts,
+            "cursor covers the pulled mail: {after} >= {ts}"
+        );
+        assert_eq!(
+            mailbox.cursor_us("demo", "ReaderCR").await.expect("cursor"),
+            after,
+            "the verb serves the committed cursor"
+        );
+        let again = mailbox
+            .note_committed_read("demo", "ReaderCR")
+            .await
+            .expect("re-commit");
+        assert_eq!(again, after, "no new mail: monotone, never backward");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
