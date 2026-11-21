@@ -1,183 +1,142 @@
 # toron
 
-Nostr-native agent mailbox. One `toron` binary (daemon + MCP + robot CLI).
-Flywheel embeds this; never the reverse. Deps one-way:
-**flywheel → toron-workflow → toron-core**. Never reverse.
+Nostr-native agent mailbox: one `toron` binary (daemon, MCP server and robot
+CLI). Flywheel embeds toron, never the reverse. Dependencies run one way only:
+**flywheel → toron-workflow → toron-core**.
 
-MCP surface: **41 tools** (38 AM-Rust parity + 3 toron additive:
-`release_file_reservations_by_reason`, `list_file_reservations`,
-`ask_judgment`) and **25 resources**. The committed catalog
-(`docs/catalog/toron-mcp.json`) is the 38-parity subset by contract.
-Ops crib: `~/.agents/skills/toron/SKILL.md`. ADRs: `docs/decisions/`.
+Ops crib: `~/.agents/skills/toron/SKILL.md`. ADRs: `docs/decisions/` (they are
+history; `0001-*` is superseded). One root `AGENTS.md` only, enforced by
+`scripts/verify-gates.sh`.
 
 ## Structure
 
 ```
-crates/toron-core/      mailbox, bus, nostr, archive, index, pane types + port, keys
-crates/toron-plane/     pane plane: backend adapters (rex/hc), osc7501, live port
-crates/toron-workflow/ YAML engine, cron, channels/jobs
-crates/toron-mcp/      rmcp server (stdio + HTTP /mcp)
-crates/toron-cli/      bin `toron` (+ TUI)
-crates/toron-e2e/      SC-* scenarios (feature-gated)
-docs/decisions/        ADRs
-docs/catalog/          generated surface (toron.dev)
-workflows/             product YAML
-scripts/verify-gates.sh
+crates/toron-core/      mailbox, bus, nostr, archive, index, events, pane types + port, keys
+crates/toron-plane/     pane plane: rex/hc backends, OSC 7501 board
+crates/toron-workflow/  YAML engine, cron, channels/jobs
+crates/toron-mcp/       rmcp server (stdio + HTTP /mcp), MCP Events
+crates/toron-cli/       bin `toron` (+ TUI)
+crates/toron-e2e/       SC-* scenarios (feature-gated)
+docs/catalog/           generated MCP surface (toron.dev)
+workflows/              product YAML
 ```
-
-One root `AGENTS.md` only — enforced by `scripts/verify-gates.sh`.
 
 ## Where to look
 
 | Task | Location |
 |------|----------|
 | Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) |
-| Reservations / lease board | `crates/toron-core/src/mailbox/reservations.rs`; CLI `toron reserve …` |
-| Wait / receipts / roles | `crates/toron-core/src/mailbox/{receipts,send_tags,identity}.rs` |
-| Gift-wrap / kinds / identity | `crates/toron-core/src/nostr/` |
+| Reservations | `crates/toron-core/src/mailbox/reservations.rs`; CLI `toron reserve …` |
+| Receipts / send tags / identity | `crates/toron-core/src/mailbox/{receipts,send_tags,identity}.rs` |
+| Gift wrap / kinds / identity | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
-| OSC 7501 board | `crates/toron-plane/src/osc7501.rs` (`fold` + `FoldPolicy`; shared by hc + rex) |
-| Multiplexer backends | `crates/toron-plane/src/backend/` (`plane.rs` resolves rex-first with hc fallback; `hc` OpenRPC client; rex roster bounded, subscribe session-resolved) — kernel takes them through the injected `toron-core::plane_port::PanePlane` port |
-| Workflow engine | `crates/toron-workflow/src/{schema,engine}/` — guide `docs/guides/workflow-engine.mdx` |
-| Effect journal / run-state | core index migrations + `RunStateStore`; CLI `toron run-state …` |
-| Durable engine store | `crates/toron-core/src/index/durable_engine.rs` (`EngineStorage` over additive `durable_engine_*` tables; sync bridge like `journal.rs`; `commit_run`/`commit_park` are one transaction each). Kernel re-export: `toron_core::kernel` |
-| Cron (distinct type) | `crates/toron-workflow/src/cron.rs` |
-| MCP tools / resources | `crates/toron-mcp/src/{tools,resources}.rs` |
-| TUI (Elm core) | `crates/toron-cli/src/tui/` — pure `tick`; theme at `src/theme.rs` |
-| Daemon / CLI | `crates/toron-cli/src/{cli,daemon,main}.rs` |
-| Daemon build identity | `crates/toron-core/src/serve_build.rs` + mcp `serve_lock.rs` |
+| OSC 7501 board | `crates/toron-plane/src/osc7501.rs` (`fold` + `FoldPolicy`) |
+| Multiplexer backends | `crates/toron-plane/src/backend/` (`plane.rs` resolves rex first, hc fallback), injected through `toron_core::plane_port::PanePlane` |
+| Workflow engine | `crates/toron-workflow/src/{schema,engine}/`; guide `docs/guides/workflow-engine.mdx` |
+| Cron | `crates/toron-workflow/src/cron.rs` (not `trigger: schedule`) |
+| Effect journal / durable engine | core index migrations, `RunStateStore`, `crates/toron-core/src/index/durable_engine.rs` |
+| MCP tools / resources | `crates/toron-mcp/src/{tools,resources}.rs`, `catalog.rs` |
+| MCP Events (SEP-3415) | `crates/toron-core/src/events/`, `crates/toron-mcp/src/events/`, `events_stream.rs` |
+| TUI (Elm core) | `crates/toron-cli/src/tui/` (pure `tick`) |
+| Daemon / CLI / build identity | `crates/toron-cli/src/{cli,daemon,main}.rs`, `crates/toron-core/src/serve_build.rs` |
 
-### Crate essentials
+## Crate rules
 
-- **toron-core:** `Mailbox` concrete, `MailSurface` embedder trait. One SQLite
-  write connection, WAL, i64-µs. Gift wraps: no project tags; unwrap verifies
-  Schnorr before NIP-44. Presence (20001) ephemeral — never persist. Never
-  write the live libgit2 index in `GitArchive::commit`. Force-release =
-  operator revocation. Never `{:#?}` a `SecretKey`.
-- **toron-workflow:** never imports flywheel. Embedder injects
-  `ProfileResolver` / `WorkflowResolver` (default `None` → fail-closed).
-  Cron ≠ `trigger: schedule`. DAG `edges:` forbidden — derive from `needs`.
-  `Enforced` refuses a live effect with no runner; `Recording` is dry-arm.
-- **toron-mcp:** `#[tool]`/`#[resource]` + schemars only. Frozen names unless
-  ADR. Blossom at `/.blossom`, never collide `/mcp`. No passphrase/nsec in
-  responses. Intentional AM-Rust shape diffs: `docs/parity/known-divergences.md`.
-
-## Proof for a change
-
-A green suite over a dirty tree is not a green tree. Proof =
-`git archive HEAD` → build in scratch. `git add` only paths you edited —
-never `git add -A`.
+- **toron-core:** one SQLite write connection, WAL, i64-µs. Gift wraps carry no
+  project tags; unwrap verifies Schnorr before NIP-44. Presence (20001) is
+  ephemeral and never persisted. Never write the live libgit2 index in
+  `GitArchive::commit`. Force-release is operator revocation. Never `{:#?}` a
+  `SecretKey`.
+- **toron-workflow:** never imports flywheel. The embedder injects
+  `ProfileResolver` / `WorkflowResolver` (default `None`, which fails closed).
+  DAG `edges:` are forbidden; derive them from `needs`. `Enforced` refuses a
+  live effect with no runner; `Recording` is the dry arm.
+- **toron-mcp:** `rmcp` + Tokio, `#[tool]`/`#[resource]` + schemars only. Tool
+  and resource names are frozen unless an ADR says otherwise; the published
+  catalog is the AM-Rust parity subset (`catalog.rs`, `catalog_freshness`).
+  MCP Events follows the Final spec (`io.modelcontextprotocol/events`). Blossom
+  lives at `/.blossom` and never collides with `/mcp`. No passphrase or nsec in
+  any response. Intentional shape diffs: `docs/parity/known-divergences.md`.
 
 ## Conventions
 
-- Edition 2024.
-- New/changed ADR markers and `#![forbid(unsafe_code)]` crate roots:
-  enforced by `scripts/verify-gates.sh` (ADR-0003).
-- Frozen: 41 tool names (38 AM-Rust parity + 3 additive), 25 resources,
-  kind registry. No new kinds/tools
-  without an ADR. Additive tools need ADR + catalog regen + tests.
-- CLI nouns: `channel` `job` `react` `presence` `watch`. Channel posts = kind
-  **9**. Flag vocabulary: acting agent is always `--as`; project-scoped
-  commands require `--project`.
-- `MessageId` is String/hex — never `u64` in shared types. `t` tag = project
-  slug only.
-- Agent pins: CamelCase Adjective+Noun, enforced
-  (`nostr::identity::validate_agent_pin`). One key per pin (ADR-0037).
-  Address legacy split pins as `pin@project` or npub until re-keyed.
-- Captain alias: `toron contact captain --project <slug> --pin <AdjNoun>`;
-  mail `--to captain`.
-- Corr authority: sender mints non-empty `corr`; sqlite owns
-  `owed→acked→resulted` (monotonic).
-- Catalog: `PATH="$PWD/target/debug:$PATH" toron catalog --json` then
-  `mbx test catalog_freshness`. Bare `toron` may be a stale install.
-- Bead close ceremony: br skill. Published MCP strings stay `bd-*`-free
-  (`catalog_no_internal_ids`).
-- Beads: agents use `br --json` / `--robot-*`; bare `br` is the human TUI.
-- TDD for new features and bug fixes. No benches in this repo.
-- Engineering principles: `flywheel principles list`.
+- Edition 2024. `#![forbid(unsafe_code)]` crate roots and ADR markers are
+  enforced by `scripts/verify-gates.sh`.
+- No new kinds or MCP tools without an ADR, a catalog regen and tests.
+- CLI flags: the acting agent is always `--as`; project-scoped commands require
+  `--project`. Channel posts are kind 9.
+- `MessageId` is hex `String`, never `u64`. The `t` tag is the project slug only.
+- Agent pins are CamelCase AdjectiveNoun (`nostr::identity::validate_agent_pin`),
+  one key per pin.
+- `corr` is minted by the sender; sqlite owns `owed → acked → resulted`.
+- Published MCP strings stay free of `bd-*` ids (`catalog_no_internal_ids`).
+- Beads: `br --json` / `--robot-*`; close through the br skill ceremony.
+- TDD. No benches. Cite a principle with `flywheel principles list`.
+
+## Working in the shared tree
+
+Flywheel builds toron-core from this tree, so a broken file here breaks every
+flywheel build. Crews follow the rules in `../flywheel/AGENTS.md`:
+
+- Reserve the files you edit (`toron reserve acquire --project flywheel --paths
+  ../toron/<path>`), keep the tree compiling between steps, and commit only with
+  `flywheel commit <paths> --repo ../toron`.
+- Never stage by hand, and never `git add -A`, `stash`, `checkout --`,
+  `restore`, `reset`, `rebase` or `--amend`.
+- Run cargo through `mbx` with no `CARGO_TARGET_DIR`.
+- Before you mail a sha: `bash scripts/fence.sh --sha <sha>` plus the targeted
+  tests for what you touched. A toron API change also needs a `proof.toml` bump
+  in flywheel; the captain's flywheel proof covers it.
+
+## Commands
+
+```bash
+mbx test -p <crate> <filter>
+bash scripts/fence.sh --sha <rev>     # -Dwarnings build, clippy, rustfmt, verify-gates on a clean export
+bash scripts/fence.sh --index         # the pre-commit hook (scripts/hooks/install.sh once per clone)
+bash scripts/verify-gates.sh
+bash scripts/e2e-behavior.sh          # daemon-free channel/job/mail/supervisor matrix
+PATH="$PWD/target/debug:$PATH" toron catalog --json && mbx test catalog_freshness
+mbx test -p toron-e2e --features p1   # also p2, p4
+toron daemon status --json
+```
+
+"Fence green" means `scripts/fence.sh`, never `verify-gates.sh` alone.
+`mbx test --exclude-ignored` is invalid.
 
 ## Effect law
 
-Binding: `~/.agents/skills/effect-oriented/SKILL.md`. A core is
-`tick(&Model, &Msg) -> (Model, Vec<Effect>)` — no clock/env/network in the
-file. Live effects journal before the provider. Settled defects (do not
-re-open): ReleaseIgnored, receipt tombstone, ask_judgment Prepared-before-call,
-send_armor half-open probe, MarkDegraded — each has a witness test; see the
-effect-law ADR acceptance record.
+Binding skill: `~/.agents/skills/effect-oriented/SKILL.md`. A core is
+`tick(&Model, &Msg) -> (Model, Vec<Effect>)` with no clock, env or network.
+Live effects journal before the provider runs. Prove each test can fail.
 
 ## Test sandbox (hard)
 
-1. Deny-shims for `launchctl` and `systemctl` first on `PATH`; logs empty after.
-2. Temp `HOME` + temp XDG; set explicit `TORON_DATA_DIR` / config dir for
-   mailbox tests (mbx builds may lack `CACHEDIR.TAG`).
-3. Spare ports only — never live **`:18080`** / **`:18980`**, never the live
-   store `~/.local/share/toron/`, never a live hc session or
-   `~/.config/herdr-core`. Never rewrite the operator passphrase/nsec.
-4. Never print `operator_nsec` contents.
+1. `launchctl`/`systemctl` deny-shims first on `PATH`; their logs stay empty.
+2. Temp `HOME` and XDG dirs, with an explicit `TORON_DATA_DIR` for mailbox tests.
+3. Spare ports only: never live `:18080` / `:18980`, the live store
+   `~/.local/share/toron/`, a live hc session or `~/.config/herdr-core`. Never
+   rewrite the operator passphrase or nsec.
+4. Never print `operator_nsec`.
 
 ## Skill sync
 
 CLI/MCP change → `Command` enum + tool attrs + this file +
-`~/.agents/skills/toron/SKILL.md` + tool-count constants +
-`toron catalog --json` / `catalog_freshness` when the catalog grows.
-Wave-1: no new MCP tools; CLI-only nouns still sync steps 1/3/4.
+`~/.agents/skills/toron/SKILL.md` + the catalog (`toron catalog --json`,
+`catalog_freshness`) when the surface grows.
 
 ## Anti-patterns
 
-- `asupersync` / `fastmcp` (CI fails). MCP is `rmcp` + Tokio.
-- Cross-key NIP-09 delete. Nested `block_on`. Silent-success stubs.
-- Per-pid temp mailbox roots. Removing the atomic reservation conflict-check.
-- Headless faking pane lifecycle kinds.
-- Editing `docs/decisions/0001-*` as live policy (superseded).
-
-## Commands
-
-Prefix cargo with `mbx` (bare `cargo` misparses under the mbx shim).
-
-```bash
-bash scripts/verify-gates.sh
-bash scripts/e2e-behavior.sh        # daemon-free channel/job/mail/supervisor matrix
-toron daemon status --json
-mbx test --workspace
-mbx test catalog_freshness
-PATH="$PWD/target/debug:$PATH" toron catalog --json
-mbx test -p toron-e2e --features p1   # SC-1..8
-mbx test -p toron-e2e --features p2   # no server needed; durable runs over local sqlite
-mbx test -p toron-e2e --features p4   # SC-18..25
-mbx clippy --workspace --all-targets -- -D warnings
-mbx fmt --check
-mbx test --workspace --all-features
-```
-
-`mbx test --exclude-ignored` is invalid.
-
-## Commit fence
-
-`scripts/fence.sh` is the fence. A crew's "fence green" means this script,
-never `verify-gates.sh` alone (that only greps ADR-0003 policy and let a
-`dead_code` warning ship in d27f9c43).
-
-```bash
-bash scripts/hooks/install.sh            # once per clone: core.hooksPath=scripts/hooks
-bash scripts/fence.sh --index            # the pre-commit hook: staged tree in a throwaway export
-bash scripts/fence.sh --sha <rev>        # the same steps on a clean export of a commit
-bash scripts/test-fence.sh               # temp-clone proof: unused field refused, clean commit passes
-```
-
-Both modes run `-D warnings build --workspace --all-targets`,
-`clippy --workspace --all-targets -- -D warnings`, `rustfmt --check` on staged
-`.rs` (`--index`), and `verify-gates.sh` on an exported tree. A red fence leaves
-HEAD and the shared index untouched. `flywheel commit --repo ../toron` runs the
-same hook with a private `GIT_INDEX_FILE`, so it fences that private tree
-automatically.
+- `asupersync` / `fastmcp`. Nested `block_on`. Silent-success stubs.
+- Cross-key NIP-09 delete. Per-pid temp mailbox roots.
+- Removing the atomic reservation conflict check.
+- Headless code faking pane lifecycle kinds.
 
 ## Notes
 
-- Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
-  `~/.config/toron/passphrase` (0600). Operator key
-  `~/.config/toron/operator_nsec` (0600) — one canonical path.
-- `toron serve` requires `--mcp-stdio` or `--mcp-http`.
-- Sibling orchestrator: `../flywheel` (default pane plane: **rex** /
-  Superlogical; `hc` / herdr-core is the transport fallback). Map:
-  `../flywheel/AGENTS.md`. Rex docs: https://www.superlogical.com/rex/docs .
-  hc docs: https://herdr.dev/core/
+- Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. `toron serve` needs
+  `--mcp-stdio` or `--mcp-http`. Passphrase `~/.config/toron/passphrase` and
+  operator key `~/.config/toron/operator_nsec` (both 0600).
+- Bare `toron` may be a stale install; use `target/debug` for catalog work.
+- Sibling orchestrator: `../flywheel` (pane plane rex, hc fallback). Rex docs:
+  https://www.superlogical.com/rex/docs. hc docs: https://herdr.dev/core/
