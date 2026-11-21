@@ -176,7 +176,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-21T06:31:38Z",
+  "generated_at": "2026-11-21T22:48:37Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -2265,6 +2265,7 @@
           "<string>"
         ],
         "project_key": "<string>",
+        "queue": true,
         "reason": null,
         "transfer_from": null,
         "ttl_seconds": null
@@ -2290,6 +2291,11 @@
           },
           "project_key": {
             "type": "string"
+          },
+          "queue": {
+            "default": false,
+            "description": "On a hard conflict, join the FIFO waitlist and ask the holder once.",
+            "type": "boolean"
           },
           "reason": {
             "type": [

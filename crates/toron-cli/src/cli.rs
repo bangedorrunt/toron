@@ -945,6 +945,9 @@ pub struct ReserveAcquireArgs {
     /// Lease reason.
     #[arg(long)]
     pub reason: Option<String>,
+    /// On a hard conflict, join the FIFO waitlist and ask the holder once.
+    #[arg(long)]
+    pub queue: bool,
 }
 
 #[derive(Debug, Args)]

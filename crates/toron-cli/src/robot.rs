@@ -1168,7 +1168,18 @@ pub async fn run_reserve(
             let paths = normalize_reserve_paths(&args.paths);
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             warn_acquire_paths(&paths).await;
-            emit(
+            let out = if args.queue {
+                mailbox
+                    .file_reservation_paths_queued(
+                        &args.project,
+                        &args.agent,
+                        &paths,
+                        args.ttl_secs,
+                        args.exclusive,
+                        args.reason.as_deref(),
+                    )
+                    .await?
+            } else {
                 mailbox
                     .file_reservation_paths(
                         &args.project,
@@ -1178,8 +1189,9 @@ pub async fn run_reserve(
                         args.exclusive,
                         args.reason.as_deref(),
                     )
-                    .await?,
-            )
+                    .await?
+            };
+            emit(out)
         }
         ReserveCommand::Conflicts(args) => {
             let paths = normalize_reserve_paths(&args.paths);
@@ -1751,6 +1763,7 @@ pub async fn run_reserve_daemon(
                     "ttl_seconds": args.ttl_secs,
                     "exclusive": args.exclusive,
                     "reason": args.reason,
+                    "queue": args.queue,
                 }),
             )
             .await

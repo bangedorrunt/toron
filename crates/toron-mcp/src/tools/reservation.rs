@@ -64,7 +64,18 @@ impl ToolServer {
                     .await,
             );
         }
-        ToolOutput::result(
+        ToolOutput::result(if args.queue {
+            self.mailbox
+                .file_reservation_paths_queued(
+                    &args.project_key,
+                    &args.agent_name,
+                    &args.paths,
+                    nonneg_secs(args.ttl_seconds),
+                    args.exclusive.unwrap_or(false),
+                    args.reason.as_deref(),
+                )
+                .await
+        } else {
             self.mailbox
                 .file_reservation_paths(
                     &args.project_key,
@@ -74,8 +85,8 @@ impl ToolServer {
                     args.exclusive.unwrap_or(false),
                     args.reason.as_deref(),
                 )
-                .await,
-        )
+                .await
+        })
     }
 
     /// `renew_file_reservations`: extend the holder's active lease TTLs.
@@ -241,6 +252,9 @@ pub struct FileReservationPathsArgs {
     pub reason: Option<String>,
     /// When set, this call is a `transfer_reservation` (`agent_name` = to).
     pub transfer_from: Option<String>,
+    /// On a hard conflict, join the FIFO waitlist and ask the holder once.
+    #[serde(default)]
+    pub queue: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]

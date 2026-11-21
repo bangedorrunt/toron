@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::Mailbox;
+use super::{AcquireResult, Mailbox, ReleaseAsk, RequestRelease};
 
 /// One queued waiter, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +32,51 @@ pub fn head_of_line<'a>(waiters: &'a [Waiter], served: &[String]) -> Option<&'a 
 }
 
 impl Mailbox {
+    /// Acquire with `--queue`: a hard conflict leaves the lease board alone,
+    /// records ONE waiter per path, and sends each holder one typed
+    /// request-release. The lease is granted later by the release handoff.
+    pub async fn file_reservation_paths_queued(
+        &self,
+        project_slug: &str,
+        agent_name: &str,
+        paths: &[String],
+        ttl_seconds: Option<u64>,
+        exclusive: bool,
+        reason: Option<&str>,
+    ) -> anyhow::Result<AcquireResult> {
+        let out = self
+            .file_reservation_paths(
+                project_slug,
+                agent_name,
+                paths,
+                ttl_seconds,
+                exclusive,
+                reason,
+            )
+            .await?;
+        for conflict in &out.conflicts {
+            if !self
+                .enqueue_waiter(project_slug, &conflict.path, agent_name, reason)
+                .await?
+            {
+                continue; // one row and one ask per (path, agent)
+            }
+            for (holder, id) in conflict.holders.iter().zip(conflict.reservation_ids.iter()) {
+                let _ = self
+                    .request_release(&RequestRelease {
+                        project_slug: project_slug.to_string(),
+                        sender_name: agent_name.to_string(),
+                        target_agent: holder.clone(),
+                        reservation_id: id.clone(),
+                        ask: ReleaseAsk::Release,
+                        note: reason.map(str::to_string),
+                    })
+                    .await;
+            }
+        }
+        Ok(out)
+    }
+
     /// Enqueue one waiter. Idempotent per `(project, path, agent)`: a repeat
     /// acquire does not stack a second row or send a second request-release.
     /// Returns true when this call created the row.
