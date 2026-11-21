@@ -28,6 +28,7 @@ pub mod pane_types;
 pub mod plane_port;
 pub mod policy;
 pub mod proc;
+pub mod queued_send;
 pub mod serve_build;
 pub mod testkit;
 pub mod time_spec;

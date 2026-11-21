@@ -29,9 +29,10 @@ use toron_core::index::run_state::{ForkIntent, RunStateStore, plan_fork};
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, MailCommand};
 use crate::config::Config;
 use crate::output::{ColorChoice, OutputFormat, render_json, stdout_is_tty};
+use toron_core::queued_send;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -304,10 +305,43 @@ async fn run_serve(
 /// success, an error counter on failure.
 #[tokio::main]
 async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
-    let source = crate::mailbox_source::MailboxSource::resolve().await?;
+    // bd-ys3jp: flush first, before a dead daemon can make `resolve` fail.
+    robot::flush_queued_sends().await?;
+    let mut mail_override: Option<Command> = None;
+    let mut queued_corr: Option<String> = None;
+    if let Command::Mail(cmd) = command {
+        match cmd {
+            MailCommand::Send(args) => {
+                let corr = robot::send_corr(args.corr.clone());
+                let mut stamped = args.clone();
+                stamped.corr = Some(corr.clone());
+                queued_send::enqueue(&robot::queued_from_send(&stamped, &corr))?;
+                queued_corr = Some(corr);
+                mail_override = Some(Command::Mail(MailCommand::Send(stamped)));
+            }
+            MailCommand::Reply(args) => {
+                let corr = robot::send_corr(args.corr.clone());
+                let mut stamped = args.clone();
+                stamped.corr = Some(corr.clone());
+                queued_send::enqueue(&robot::queued_from_reply(&stamped, &corr))?;
+                queued_corr = Some(corr);
+                mail_override = Some(Command::Mail(MailCommand::Reply(stamped)));
+            }
+            _ => {}
+        }
+    }
+    let dispatch = mail_override.as_ref().unwrap_or(command);
+    let source = match crate::mailbox_source::MailboxSource::resolve().await {
+        Ok(source) => source,
+        Err(e) if queued_corr.is_some() && outage(&e) => {
+            report_queued(queued_corr.as_deref().unwrap_or_default());
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let tool_name = operator::robot_tool_name(command);
     let start = std::time::Instant::now();
-    let result = match (&source, command) {
+    let result = match (&source, dispatch) {
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Mail(cmd)) => {
             robot::run_mail_daemon(dc, cmd).await
         }
@@ -354,7 +388,16 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     };
     match result {
         Ok(()) => {
+            if let Some(corr) = &queued_corr {
+                queued_send::remove(corr)?;
+                println!("{{\"delivery\":\"delivered\",\"corr\":\"{corr}\"}}");
+            }
             operator::record_tool_call(tool_name, start.elapsed());
+            Ok(())
+        }
+        Err(e) if queued_corr.is_some() && outage(&e) => {
+            report_queued(queued_corr.as_deref().unwrap_or_default());
+            operator::record_tool_error(tool_name, start.elapsed());
             Ok(())
         }
         Err(e) => {
@@ -362,6 +405,20 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             Err(e)
         }
     }
+}
+
+fn report_queued(corr: &str) {
+    println!("{{\"delivery\":\"queued\",\"corr\":\"{corr}\"}}");
+}
+
+/// bd-ys3jp: only transport outages queue. A malformed recipient, a refusal
+/// or a bad tag must still fail loud instead of being hidden as "queued".
+fn outage(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::mailbox_source::DaemonUnreachable>()
+        .is_some()
+        || e.to_string().contains("daemon unreachable")
+        || e.to_string().contains("daemon connect timed out")
+        || e.to_string().contains("daemon unresponsive")
 }
 
 /// `toron catalog` — the MCP surface catalog (ADR-0002 D3): frozen 38 parity

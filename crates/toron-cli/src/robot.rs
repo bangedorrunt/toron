@@ -19,12 +19,13 @@ use toron_core::mailbox::{
     ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse,
     RequestContact, RequestRelease, RespondContact, SearchMessages, SendMessage,
 };
+use toron_core::queued_send::{self, QueuedSend};
 use toron_mcp::ToJson;
 use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 
 use crate::cli::{
-    AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand,
-    SlotCommand,
+    AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, MailCommand, MailReplyArgs,
+    MailSendArgs, PolicyArg, ReserveCommand, SlotCommand,
 };
 use crate::mailbox_source::DaemonClient;
 
@@ -244,6 +245,108 @@ pub(crate) fn build_send_tags(
     )
     .map_err(|e| anyhow::anyhow!(e.message))?;
     Ok(tags.to_tags())
+}
+
+/// bd-ys3jp: the corr a send will be journaled under. A caller that did not
+/// pass --corr still gets one now, so the queue and the eventual send share it.
+pub(crate) fn send_corr(explicit: Option<String>) -> String {
+    explicit.unwrap_or_else(queued_send::mint_corr)
+}
+
+pub(crate) fn queued_from_send(args: &MailSendArgs, corr: &str) -> QueuedSend {
+    QueuedSend {
+        corr: corr.to_string(),
+        project: args.project.clone(),
+        sender: args.from.clone(),
+        to: args.to.clone(),
+        cc: args.cc.clone(),
+        bcc: args.bcc.clone(),
+        subject: args.subject.clone(),
+        body: args.body.clone(),
+        importance: args.importance.clone(),
+        thread: args.thread.clone(),
+        wake: args.wake.clone(),
+        priority: args.priority.clone(),
+        audience: args.audience.clone(),
+        result_path: args.result_path.clone(),
+        verdict: args.verdict.clone(),
+        created_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    }
+}
+
+pub(crate) fn queued_from_reply(args: &MailReplyArgs, corr: &str) -> QueuedSend {
+    QueuedSend {
+        corr: corr.to_string(),
+        project: args.project.clone(),
+        sender: args.from.clone(),
+        to: args.to.clone(),
+        cc: args.cc.clone(),
+        bcc: args.bcc.clone(),
+        subject: args.subject.clone(),
+        body: args.body.clone(),
+        importance: args.importance.clone(),
+        thread: Some(args.thread.clone()),
+        wake: args.wake.clone(),
+        priority: args.priority.clone(),
+        audience: args.audience.clone(),
+        result_path: args.result_path.clone(),
+        verdict: None,
+        created_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    }
+}
+
+fn send_message_from_queued(q: &QueuedSend) -> anyhow::Result<SendMessage> {
+    let extra_tags = build_send_tags(
+        Some(q.corr.clone()),
+        q.wake.clone(),
+        q.priority.clone(),
+        q.audience.clone(),
+        q.result_path.clone(),
+        q.verdict.clone(),
+    )?;
+    Ok(SendMessage {
+        project_slug: q.project.clone(),
+        sender_name: q.sender.clone(),
+        to: q.to.clone(),
+        subject: q.subject.clone(),
+        body_md: q.body.clone(),
+        cc: q.cc.clone(),
+        bcc: q.bcc.clone(),
+        importance: q.importance.clone(),
+        ack_required: false,
+        thread_id: q.thread.clone(),
+        sender_token: None,
+        overseer: false,
+        extra_tags,
+    })
+}
+
+/// Re-send every queued row against the local store, under its ORIGINAL corr.
+/// The idempotent-send claim makes a replay a duplicate, never a second mail.
+pub async fn flush_queued_sends() -> anyhow::Result<usize> {
+    let pending = queued_send::pending()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mailbox = toron_mcp::demo_mailbox().await?;
+    let mut flushed = 0;
+    for q in pending {
+        let msg = match send_message_from_queued(&q) {
+            Ok(msg) => msg,
+            Err(e) => {
+                eprintln!("toron: queued send {} has invalid tags: {e}", q.corr);
+                continue;
+            }
+        };
+        match mailbox.send_message(&msg).await {
+            Ok(_) => {
+                queued_send::remove(&q.corr)?;
+                flushed += 1;
+            }
+            Err(e) => eprintln!("toron: queued send {} still pending: {e}", q.corr),
+        }
+    }
+    Ok(flushed)
 }
 
 /// Resolve an inbox `--since` argument to the daemon-facing string via the

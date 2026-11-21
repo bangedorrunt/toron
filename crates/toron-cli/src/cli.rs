@@ -605,7 +605,7 @@ pub struct MailWhoisArgs {
     pub name: String,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct MailSendArgs {
     /// Sender agent name (must have a local key in the project).
     #[arg(long = "as", default_value = "agent")]
@@ -682,7 +682,7 @@ pub struct MailOverseerArgs {
     pub project: String,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct MailReplyArgs {
     /// Sender agent name (must have a local key in the project).
     #[arg(long = "as", default_value = "agent")]
