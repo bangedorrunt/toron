@@ -127,6 +127,18 @@ pub struct Target {
     pub port: u16,
 }
 
+/// U4 body cap: refuse an oversized response before reading it into memory.
+pub fn check_body_len(len: usize, policy: &EgressPolicy) -> Result<(), String> {
+    if len > policy.max_body_bytes {
+        Err(format!(
+            "response body over cap: {len} > {}",
+            policy.max_body_bytes
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn host_allowed(host: &str, policy: &EgressPolicy) -> bool {
     let host = host.to_ascii_lowercase();
     policy.allow_hosts.iter().any(|suffix| {
@@ -238,5 +250,12 @@ mod tests {
         let mut p = EgressPolicy::default();
         p.allow_cidrs.clear();
         assert!(check_resolved(&[ip("100.64.2.3")], &p).is_err());
+    }
+
+    #[test]
+    fn a_body_over_the_cap_is_refused() {
+        let policy = EgressPolicy::default();
+        assert!(check_body_len(policy.max_body_bytes, &policy).is_ok());
+        assert!(check_body_len(policy.max_body_bytes + 1, &policy).is_err());
     }
 }

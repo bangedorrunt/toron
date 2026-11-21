@@ -680,6 +680,10 @@ impl EgressPort for UreqEgress {
             .map_err(|e| format!("well-known fetch failed: {e}"))?
             .body_mut()
             .read_to_string()
+            .and_then(|body| {
+                egress::check_body_len(body.len(), &self.policy).map_err(std::io::Error::other)?;
+                Ok(body)
+            })
             .map_err(|e| format!("well-known body unreadable: {e}"))
     }
 

@@ -82,7 +82,10 @@ pub fn decide(attempt: u32, outcome: &Outcome, rand_unit: f64, policy: &RetryPol
             };
             Decision::Retry { delay_ms: delay }
         }
-        Outcome::Status(code, _) if (200..=399).contains(code) => Decision::Delivered,
+        // SEP-3415 / U4: redirects are never followed; a 3xx is a failure,
+        // never a successful delivery (bd-uak1x AE3).
+        Outcome::Status(code, _) if (300..=399).contains(code) => Decision::Terminated("redirect"),
+        Outcome::Status(code, _) if (200..=299).contains(code) => Decision::Delivered,
         Outcome::Timeout | Outcome::Transport | Outcome::Status(_, _) => {
             if attempt >= policy.max_attempts {
                 return Decision::Gap;
@@ -158,5 +161,18 @@ mod tests {
         assert_eq!(delay_ms(3, 0.0, &p), 20_000);
         assert_eq!(delay_ms(4, 0.0, &p), 40_000);
         assert_eq!(delay_ms(30, 0.0, &p), p.cap_ms);
+    }
+
+    #[test]
+    fn a_30x_redirect_is_a_failure_not_a_delivery() {
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            decide(1, &Outcome::Status(302, None), 0.0, &policy),
+            Decision::Terminated("redirect")
+        );
+        assert_eq!(
+            decide(1, &Outcome::Status(200, None), 0.0, &policy),
+            Decision::Delivered
+        );
     }
 }
