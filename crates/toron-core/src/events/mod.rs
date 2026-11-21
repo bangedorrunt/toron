@@ -17,5 +17,6 @@ pub mod signal;
 pub mod store;
 pub mod stream;
 pub mod webhook;
+pub mod webhook_verify;
 
 pub use catalogue::{CatalogueEvent, EventName, Fact, catalogue, classify};

@@ -43,6 +43,11 @@ pub enum Effect {
 #[async_trait]
 pub trait EgressPort: Send + Sync {
     fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, String>;
+    /// Guarded GET for the receiver-published well-known document. Default
+    /// refuses so existing test ports need no change.
+    async fn get(&self, _target: &Target, _socket: IpAddr) -> Result<String, String> {
+        Err("guarded GET unsupported".into())
+    }
     async fn post(
         &self,
         target: &Target,
@@ -238,6 +243,66 @@ pub async fn verify_endpoint<P: EgressPort>(
     )
     .await?;
     Ok(matches!(outcome, Outcome::Ok))
+}
+
+/// Per-(principal,url) verification cache. A successful handshake or a
+/// well-known match covers all of that principal's subscriptions to the URL
+/// across refreshes and `arguments` (SEP-3415 Final G8).
+static VERIFY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<toron_core::events::webhook_verify::VerificationCache>,
+> = std::sync::OnceLock::new();
+
+fn verify_cache() -> &'static std::sync::Mutex<toron_core::events::webhook_verify::VerificationCache>
+{
+    VERIFY_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(
+            toron_core::events::webhook_verify::VerificationCache::with_ttl(
+                24 * 60 * 60 * 1_000_000,
+            ),
+        )
+    })
+}
+
+/// Verify for delivery: cached result, then receiver-published well-known
+/// consent over the SSRF guard, then the signed challenge. Keyed by
+/// (principal, url), never by subscription.
+#[allow(clippy::too_many_arguments)] // one verify call carries port, guard, url, secret, nonce, id, principal, clock
+pub async fn verify_endpoint_cached<P: EgressPort>(
+    port: &P,
+    policy: &EgressPolicy,
+    url: &str,
+    secret: &Secret,
+    challenge: &str,
+    subscription_id: &str,
+    principal: &str,
+    now_us: i64,
+) -> Result<bool, String> {
+    if verify_cache()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_verified(principal, url, now_us)
+    {
+        return Ok(true);
+    }
+    let target = egress::validate_target(url, policy)?;
+    let socket = egress::check_resolved(&port.resolve(&target.host)?, policy)?;
+    if let Ok(document) = port.get(&target, socket).await
+        && toron_core::events::webhook_verify::well_known_covers(&document, url)
+    {
+        verify_cache()
+            .lock()
+            .map_err(|e| e.to_string())?
+            .mark(principal, url, now_us);
+        return Ok(true);
+    }
+    if verify_endpoint(port, policy, url, secret, challenge, subscription_id).await? {
+        verify_cache()
+            .lock()
+            .map_err(|e| e.to_string())?
+            .mark(principal, url, now_us);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The durable retry state of one delivery, re-folded from journal rows after
@@ -591,6 +656,33 @@ impl EgressPort for UreqEgress {
             .map_err(|e| format!("webhook DNS resolution failed: {e}"))
     }
 
+    async fn get(&self, target: &Target, socket: IpAddr) -> Result<String, String> {
+        // Pin the connect to the checked socket; Host/SNI stay the original
+        // name; redirects are never followed (same SSRF guard as POST).
+        let config = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .timeout_global(Some(Duration::from_millis(self.policy.connect_timeout_ms)))
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            PinnedResolver {
+                socket: std::net::SocketAddr::new(socket, target.port),
+            },
+        );
+        let url = format!(
+            "https://{}:{}/.well-known/mcp-webhook-receiver.json",
+            target.host, target.port
+        );
+        agent
+            .get(&url)
+            .call()
+            .map_err(|e| format!("well-known fetch failed: {e}"))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("well-known body unreadable: {e}"))
+    }
+
     async fn post(
         &self,
         target: &Target,
@@ -916,5 +1008,49 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "webhook-signature" && v.starts_with("v1,"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_well_known_receiver_document_verifies_without_a_challenge_post() {
+        struct Wk;
+        #[async_trait]
+        impl EgressPort for Wk {
+            fn resolve(&self, _host: &str) -> Result<Vec<IpAddr>, String> {
+                Ok(vec!["100.64.2.3".parse().unwrap()])
+            }
+            async fn get(&self, _t: &Target, _s: IpAddr) -> Result<String, String> {
+                Ok(r#"{"receivers":["/hooks/"]}"#.into())
+            }
+            async fn post(
+                &self,
+                _t: &Target,
+                _s: IpAddr,
+                _h: Vec<(String, String)>,
+                _b: &[u8],
+            ) -> Result<Outcome, String> {
+                panic!("a well-known match must not POST a challenge")
+            }
+        }
+        let policy = EgressPolicy::default();
+        let secret = Secret::from_client_whsec("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").unwrap();
+        let ok = verify_endpoint_cached(
+            &Wk,
+            &policy,
+            "https://foo.example-tailnet.ts.net/hooks/client1",
+            &secret,
+            "challenge",
+            "sub-1",
+            "BoldCliff",
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "well-known consent activates delivery");
+        // Cached: a second call for the same (principal,url) needs no fetch.
+        assert!(verify_cache().lock().unwrap().is_verified(
+            "BoldCliff",
+            "https://foo.example-tailnet.ts.net/hooks/client1",
+            1_001
+        ));
     }
 }

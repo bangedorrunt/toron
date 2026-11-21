@@ -251,8 +251,15 @@ pub async fn route_events(
                     );
                     hex::encode(digest)[..16].to_string()
                 };
-                match webhook_delivery::verify_endpoint(
-                    &egress, &policy, url, &secret, &challenge, &sub_id,
+                match webhook_delivery::verify_endpoint_cached(
+                    &egress,
+                    &policy,
+                    url,
+                    &secret,
+                    &challenge,
+                    &sub_id,
+                    principal.name(),
+                    now_us,
                 )
                 .await
                 {
