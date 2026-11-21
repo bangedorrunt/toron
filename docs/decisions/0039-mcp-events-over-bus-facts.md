@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0027, ADR-0033, ADR-0035, ADR-0036, ADR-0037, ADR-0038 -->
 ---
-status: accepted  # 2026-11-20: accepted by the decision-maker, amended with D7 (events/stream) and D8 (harness bridges)
+status: accepted  # 2026-11-20 accepted with D7/D8; 2026-11-22 status corrected (bd-g5cp6): bridge and token code committed, live end-to-end turn not passed (bd-znczi)
 date: 2026-10-08
 decision-makers: bangedorrunt
 consulted: MCP Events extension SEP-3415 (final, protocol 2026-07-28) and richardanaya/pi-mcp-events (MIT); opencode 2.3.2 native events client (binary inspection 2026-11-20); Claude Code 2.1.328 channels (`claude/channel`); rmcp 3.5.1 release notes (#1322, #1308, #1281, #1295, #1274); rmcp 3.5.1 release notes (#1322, #1308, #1281, #1295, #1274); flywheel ADR-0012 D6; executor.sh v2 MCP endpoint docs
@@ -9,7 +9,7 @@ informed: flywheel x toron x beads x chiebukuro maintainers
 
 # ADR-0039: MCP Events as Protocol Methods over Existing Bus Facts
 
-**Status:** Accepted (2026-11-20), amended with D7 and D8. Plan: `docs/plans/2026-10-08-1854-feat-toron-mcp-events-plan.md`.
+**Status:** Accepted (2026-11-20), amended with D7 and D8. 2026-11-22 correction (bd-g5cp6): the per-pin token mint (flywheel `src/cmd/spawn.rs:2192`, `src/events_tokens.rs`; bd-rrlo2, bd-u7m1y) and the Claude `--follow` plus urgency wire (`plugins/claude-flywheel/hooks/register.ts:120`, `plugins/claude-flywheel/src/decode.ts:53`; bd-krzqu, bd-cdite) are committed, but the live end-to-end turn (`tests/live_events_delivery.rs`, bd-znczi) has not passed. Plan: `docs/plans/2026-10-08-1854-feat-toron-mcp-events-plan.md`.
 
 **Decision in one sentence:** toron serves the MCP Events extension (`events/list`, `events/poll`, `events/stream`, `events/subscribe`, `events/unsubscribe`) as protocol methods behind an advertised `extensions` capability, not as tools. Its catalogue is derived only from facts already on the bus, subscriptions are durable and bearer-authorised per D6, and push delivery goes only to operator-allowlisted HTTPS callbacks, Standard Webhooks-signed, through one SSRF-safe egress guard.
 
@@ -75,6 +75,7 @@ informed: flywheel x toron x beads x chiebukuro maintainers
 - **Positive:** Off-host consumers get authenticated, resumable push without new tools or kinds. bd-i6kc gains a reusable guard. Loss becomes explicit (`gap`). The doorbell keeps a single budgeted path.
 - **Negative:** It adds a third public surface (protocol methods) that the catalog and skill sync must track. The webhook egress is new attack surface, bounded by the allowlist and signing. The draft spec may still rename things, and versioning under the capability key absorbs that.
 - **Neutral:** Executor users see no change. Harness-side MCP Events clients cannot reach toron through executor. If wanted, that is executor's feature to add.
+- **2026-11-22 status (bd-g5cp6):** events-primary is committed but not proven end to end. The per-pin mint (bd-rrlo2, bd-u7m1y) and Claude bridge wire (bd-krzqu, bd-cdite) are in the tree and their beads remain open until landed; `tests/live_events_delivery.rs` (bd-znczi) has not passed. The doorbell fallback is still the proven wake path.
 
 ## Alternatives rejected
 
@@ -94,3 +95,4 @@ informed: flywheel x toron x beads x chiebukuro maintainers
   `FLYWHEEL_TORON_TOKEN_FILE=<path>`; opencode's native client still does the
   consuming. The bd-f888z `session.prompt` route remains the doorbell fallback,
   deduped by bus event id. No operator-global opencode config is edited.
+- 2026-11-22: status corrected (bd-g5cp6) against code and bead state: mint and bridge code is committed, the live end-to-end turn is not (bd-znczi). Decision text in §Decision was not edited; only Status lines, one Consequences line and this dated note changed.
