@@ -137,6 +137,32 @@ impl Mailbox {
             .collect())
     }
 
+    /// Every queued waiter in a project, oldest first.
+    pub async fn list_project_waiters(&self, project_slug: &str) -> anyhow::Result<Vec<Waiter>> {
+        let pool = self.index_pool_required()?;
+        let project_slug = self.canonical_project(project_slug).await;
+        let rows: Vec<(i64, String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT seq, project_slug, path_pattern, agent_name, reason, created_us \
+             FROM reservation_waitlist WHERE project_slug = ? ORDER BY seq",
+        )
+        .bind(&project_slug)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(seq, project_slug, path_pattern, agent_name, reason, created_us)| Waiter {
+                    seq,
+                    project_slug,
+                    path_pattern,
+                    agent_name,
+                    reason,
+                    created_us,
+                },
+            )
+            .collect())
+    }
+
     /// The next agent to receive a freed path, or None when the queue is empty.
     pub async fn next_waiter(
         &self,

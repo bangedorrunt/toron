@@ -1149,6 +1149,12 @@ impl Mailbox {
         let mut released = 0usize;
         let mut leases = Vec::new();
         for res in mine {
+            // bd-ll7bs: a waiter gets the path through the same atomic transfer
+            // every other release uses; the transfer publishes its own events.
+            if self.handoff_waiter(project_slug, &res).await {
+                released += 1;
+                continue;
+            }
             let (_, effects) = self
                 .kernel_tick(project_slug, &KernelMsg::Release { id: res.id.clone() })
                 .await;
@@ -2995,7 +3001,45 @@ impl Mailbox {
         (next, effects)
     }
 
+    /// bd-ll7bs: one handoff choke point. A freed path with a waiter moves to
+    /// it through the existing epoch-safe transfer — never a second grant path.
+    /// A failed transfer leaves the lease alone so an ordinary release can run.
+    async fn handoff_waiter(&self, project_slug: &str, lease: &Reservation) -> bool {
+        let mut releasing = lease.clone();
+        self.fill_agent_names(project_slug, std::slice::from_mut(&mut releasing))
+            .await;
+        if releasing.agent_name.is_empty() {
+            return false;
+        }
+        let Ok(Some(next)) = self
+            .next_waiter(project_slug, &releasing.path_pattern)
+            .await
+        else {
+            return false;
+        };
+        if next.agent_name == releasing.agent_name {
+            return false;
+        }
+        let moved = self
+            .transfer_reservation(
+                project_slug,
+                &releasing.agent_name,
+                &next.agent_name,
+                &releasing.path_pattern,
+                next.reason.as_deref(),
+            )
+            .await
+            .is_ok();
+        if moved {
+            let _ = self.remove_waiter(next.seq).await;
+        }
+        moved
+    }
+
     async fn kernel_release_lease(&self, project_slug: &str, lease: &Reservation) -> bool {
+        if self.handoff_waiter(project_slug, lease).await {
+            return true;
+        }
         let (_, effects) = self
             .kernel_tick(
                 project_slug,

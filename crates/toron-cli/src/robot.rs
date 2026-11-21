@@ -1219,6 +1219,9 @@ pub async fn run_reserve(
                         expires_ts_us: r.expires_ts_us,
                     })
                     .collect(),
+                waitlists: toron_mcp::tools::reservation::waitlist_rows(
+                    &mailbox.list_project_waiters(&args.project).await?,
+                ),
             }
             .to_json();
             let closed =

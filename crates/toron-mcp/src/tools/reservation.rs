@@ -227,10 +227,16 @@ impl ToolServer {
                 expires_ts_us: r.expires_ts_us,
             })
             .collect();
+        let waiters = self
+            .mailbox
+            .list_project_waiters(&args.project_key)
+            .await
+            .unwrap_or_default();
         ToolOutput::result(Ok(LeaseBoardOut {
             project_key: args.project_key,
             count: reservations.len() as i64,
             reservations,
+            waitlists: waitlist_rows(&waiters),
         }))
     }
 }
@@ -324,6 +330,36 @@ pub struct LeaseBoardOut {
     pub project_key: String,
     pub count: i64,
     pub reservations: Vec<LeaseRowOut>,
+    /// bd-ll7bs: FIFO waiters by path, shown by `reserve list`.
+    #[serde(default)]
+    pub waitlists: Vec<ReservationWaitlistOut>,
+}
+
+/// One path's FIFO waiters.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct ReservationWaitlistOut {
+    pub path: String,
+    pub waiters: Vec<String>,
+}
+
+/// Group the project's waiters by path, preserving arrival order within each.
+#[must_use]
+pub fn waitlist_rows(
+    waiters: &[toron_core::mailbox::reservation_waitlist::Waiter],
+) -> Vec<ReservationWaitlistOut> {
+    use std::collections::BTreeMap;
+    let mut rows: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for w in waiters {
+        rows.entry(&w.path_pattern)
+            .or_default()
+            .push(w.agent_name.clone());
+    }
+    rows.into_iter()
+        .map(|(path, waiters)| ReservationWaitlistOut {
+            path: path.to_string(),
+            waiters,
+        })
+        .collect()
 }
 
 impl crate::tools::ToJson for LeaseBoardOut {
@@ -338,6 +374,10 @@ impl crate::tools::ToJson for LeaseBoardOut {
                 "exclusive": r.exclusive,
                 "reason": r.reason,
                 "expires_ts_us": r.expires_ts_us,
+            })).collect::<Vec<_>>(),
+            "waitlists": self.waitlists.iter().map(|w| json!({
+                "path": w.path,
+                "waiters": w.waiters,
             })).collect::<Vec<_>>(),
         })
     }
