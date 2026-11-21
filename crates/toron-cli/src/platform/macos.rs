@@ -7,11 +7,26 @@ use crate::cli::DaemonArgs;
 
 use super::{DaemonState, InstallCtx};
 
+/// Test-binary pins backing the launchctl and LaunchAgents seams. Prod reads
+/// them unconditionally (always `None` outside tests); setters are cfg(test).
+#[cfg(test)]
+static LAUNCHCTL_TEST_PIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+#[cfg(test)]
+static LAUNCH_AGENTS_TEST_PIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn launchctl_cmd() -> Command {
+    #[cfg(test)]
+    if let Some(p) = LAUNCHCTL_TEST_PIN.get() {
+        return Command::new(p);
+    }
+    Command::new("launchctl")
+}
+
 /// Probe the launchd job; `Some(RunningLaunchd)` when loaded, else `None`
 /// so `daemon.rs` falls through to pidfile + addr probes.
 pub(crate) fn detect_supervised(label: &str) -> Option<DaemonState> {
     let uid = current_uid();
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["print", &format!("gui/{uid}/{label}")])
         .output();
     if let Ok(o) = out
@@ -40,12 +55,11 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
     let plist_path = dir.join(format!("{label}.plist"));
     std::fs::write(&plist_path, plist)?;
     let uid = current_uid();
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
     let _ = out;
-    install_logrotate_agent(&dir, &uid)?;
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args([
             "bootstrap",
             &format!("gui/{uid}"),
@@ -58,7 +72,7 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
             anyhow::bail!("launchctl bootstrap failed: {stderr}");
         }
     }
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["enable", &format!("gui/{uid}/{label}")])
         .output()?;
     if !out.status.success() {
@@ -67,7 +81,7 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
         .output()?;
     if !out.status.success() {
@@ -80,6 +94,9 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
         "installed + started {label} (plist {})",
         plist_path.display()
     );
+    if let Err(e) = install_logrotate_agent(&dir, &uid) {
+        eprintln!("warning: com.toron.logrotate install failed (serve is already running): {e}");
+    }
     Ok(())
 }
 
@@ -87,7 +104,7 @@ pub(crate) fn install_supervised(ctx: &InstallCtx<'_>) -> anyhow::Result<()> {
 pub(crate) fn uninstall_supervised(args: &DaemonArgs) -> anyhow::Result<()> {
     let label = args.label.clone();
     let uid = current_uid();
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output()?;
     if !out.status.success() {
@@ -120,7 +137,7 @@ pub(crate) fn stop_supervised(args: &DaemonArgs, pidfile: &Path) -> anyhow::Resu
     use crate::daemon::{addr_alive, port_holder_pid, process_alive, read_pidfile};
     let label = args.label.clone();
     let uid = current_uid();
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
     if let Ok(o) = out
@@ -267,6 +284,7 @@ pub fn plist_xml(
 /// golden-tested.
 pub fn logrotate_plist_xml() -> String {
     let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
+    let script = script.replace('&', "&amp;");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -293,10 +311,10 @@ fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
     let label = "com.toron.logrotate";
     let path = dir.join(format!("{label}.plist"));
     std::fs::write(&path, logrotate_plist_xml())?;
-    let _ = Command::new("launchctl")
+    let _ = launchctl_cmd()
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
-    let out = Command::new("launchctl")
+    let out = launchctl_cmd()
         .args([
             "bootstrap",
             &format!("gui/{uid}"),
@@ -313,6 +331,10 @@ fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
 }
 
 fn home_launch_agents() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = LAUNCH_AGENTS_TEST_PIN.get() {
+        return Ok(p.clone());
+    }
     let home = toron_core::config::home_env("HOME")
         .ok_or_else(|| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
     Ok(home.join("Library").join("LaunchAgents"))
@@ -383,5 +405,91 @@ mod tests {
         assert!(!xml.contains("StartCalendarInterval"));
         assert!(xml.contains("serve.out.log"));
         assert!(xml.contains("1048576"), "1 MiB copy-truncate threshold");
+    }
+
+    #[test]
+    fn logrotate_plist_is_valid_xml() {
+        let xml = logrotate_plist_xml();
+        let root = std::env::temp_dir().join(format!("toron-bd3pbzc-xml-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("com.toron.logrotate.plist");
+        std::fs::write(&path, &xml).unwrap();
+        let out = plutil_lint(&path);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            out.status.success(),
+            "plutil -lint must accept the generated plist: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn plutil_lint(path: &Path) -> std::process::Output {
+        Command::new("plutil")
+            .args(["-lint", path.to_str().unwrap()])
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn logrotate_failure_cannot_take_serve_down() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("toron-bd3pbzc-install-{}", std::process::id()));
+        let bin = root.join("bin");
+        let agents = root.join("agents");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&agents).unwrap();
+        let log = root.join("launchctl.log");
+        let fake = bin.join("launchctl");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  \
+                 *com.toron.logrotate.plist*) echo 'Bootstrap failed: 5' >&2; exit 5 ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = LAUNCHCTL_TEST_PIN.set(fake);
+        let _ = LAUNCH_AGENTS_TEST_PIN.set(agents.clone());
+
+        let binary = Path::new("/usr/local/bin/toron");
+        let key_path = Path::new("/Users/x/.config/toron/operator_nsec");
+        let pass = Path::new("/Users/x/.config/toron/passphrase");
+        let out_log = Path::new("/Users/x/.local/state/toron/serve.out.log");
+        let err_log = Path::new("/Users/x/.local/state/toron/serve.err.log");
+        let ctx = InstallCtx {
+            label: "com.toron.serve",
+            binary,
+            addr: "127.0.0.1:18080",
+            key_path,
+            pass,
+            out_log,
+            err_log,
+            state: Path::new("/Users/x/.local/state/toron"),
+        };
+        let result = install_supervised(&ctx);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+
+        assert!(
+            result.is_ok(),
+            "a side agent must never take serve down: {result:?}"
+        );
+        let serve = calls.find("com.toron.serve.plist").unwrap_or(usize::MAX);
+        let rotate = calls
+            .find("com.toron.logrotate.plist")
+            .unwrap_or(usize::MAX);
+        assert!(serve < rotate, "serve must be bootstrapped first: {calls}");
+        assert!(
+            calls.contains("kickstart"),
+            "serve must be running before the side agent is touched: {calls}"
+        );
+        assert!(
+            agents.join("com.toron.serve.plist").is_file(),
+            "the serve plist must be installed even when logrotate fails: {calls}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
