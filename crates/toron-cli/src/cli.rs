@@ -1295,7 +1295,7 @@ pub struct ProductInboxArgs {
     /// Product key.
     pub key: String,
     /// Agent whose inbox to fan out.
-    #[arg(long, default_value = "agent")]
+    #[arg(long = "as", default_value = "agent")]
     pub agent: String,
 }
 
@@ -1369,7 +1369,7 @@ pub struct MailPrepareThreadArgs {
     #[arg(long, required = true)]
     pub thread: String,
     /// Agent name (registered if missing with --register-if-missing).
-    #[arg(long)]
+    #[arg(long = "as")]
     pub agent: Option<String>,
     /// Agent program.
     #[arg(long, required = true)]
@@ -1410,7 +1410,7 @@ pub struct ReserveCycleArgs {
     #[arg(long, required = true)]
     pub project: String,
     /// Agent holding the reservation.
-    #[arg(long, default_value = "agent")]
+    #[arg(long = "as", default_value = "agent")]
     pub agent: String,
     /// Path globs, comma-separated.
     #[arg(long, value_delimiter = ',', required = true)]
