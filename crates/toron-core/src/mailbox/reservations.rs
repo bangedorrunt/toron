@@ -295,6 +295,8 @@ pub struct Reservation {
     /// genesis). Mutating ops present the epoch they claimed with; a stale
     /// epoch fails loud via [`Mailbox::check_claim_epoch`].
     pub epoch: u64,
+    /// bd-nmilo: canonical git toplevel of the repo this path was reserved in.
+    pub repo_root: Option<String>,
 }
 
 /// Result of `file_reservation_paths` (parity shape).
@@ -379,6 +381,7 @@ struct LeaseUpsert<'a> {
     /// The fencing epoch of the lease event (persisted so an expired mirror
     /// keeps its epoch after the bus prunes the event).
     epoch: u64,
+    repo_root: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -546,7 +549,16 @@ struct AcquireProbe {
 
 /// Expired-lease mirror row, in SELECT order: agent pubkey, path pattern,
 /// reason, exclusive, expires_ts_us, event id, epoch.
-type ExpiredMirror = (String, String, String, i64, i64, Option<String>, i64);
+type ExpiredMirror = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    i64,
+    Option<String>,
+);
 
 /// Per-lease metadata the kernel needs beside the model: holder NAME, status,
 /// and the lease reason (bead id for `release-by-reason`).
@@ -591,6 +603,31 @@ impl Mailbox {
         ttl_secs: Option<u64>,
         exclusive: bool,
         reason: Option<&str>,
+    ) -> anyhow::Result<AcquireResult> {
+        self.file_reservation_paths_with_root(
+            project_slug,
+            agent_name,
+            paths,
+            ttl_secs,
+            exclusive,
+            reason,
+            None,
+        )
+        .await
+    }
+
+    /// bd-nmilo: same acquire, carrying the canonical git toplevel on the
+    /// lease so dirty evidence is checked against the right repo.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn file_reservation_paths_with_root(
+        &self,
+        project_slug: &str,
+        agent_name: &str,
+        paths: &[String],
+        ttl_secs: Option<u64>,
+        exclusive: bool,
+        reason: Option<&str>,
+        repo_root: Option<&str>,
     ) -> anyhow::Result<AcquireResult> {
         let project_slug = &self.canonical_project(project_slug).await;
         // Take every coordinate lock BEFORE any snapshot, transaction, pooled
@@ -692,6 +729,9 @@ impl Mailbox {
             ];
             let mut tags =
                 with_project_scoping(toron_kind(FILE_RESERVATION), base, Some(project_slug));
+            if let Some(root) = repo_root.filter(|r| !r.is_empty()) {
+                tags.push(Tag::parse(["repo_root", root]).expect("repo_root tag"));
+            }
             let ttl = EnvelopeTtl {
                 secs: Some(ttl_secs),
             };
@@ -767,6 +807,7 @@ impl Mailbox {
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
                 epoch,
+                repo_root,
             })
             .await;
             result.granted.push(GrantedReservation {
@@ -1123,6 +1164,7 @@ impl Mailbox {
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
                 epoch: res.epoch,
+                repo_root: res.repo_root.as_deref(),
             })
             .await;
             result.reservations.push(GrantedReservation {
@@ -1815,7 +1857,7 @@ impl Mailbox {
             // holder's fencing check). The row's own stamp is the authority.
             let expired_mirrors: Vec<ExpiredMirror> = sqlx::query_as(
                 "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
-                     expires_ts_us, event_id, epoch \
+                     expires_ts_us, event_id, epoch, repo_root \
                      FROM file_reservations \
                      WHERE project_slug = ?1 AND status = 'active' \
                        AND expires_ts_us IS NOT NULL AND expires_ts_us <= ?2",
@@ -1825,16 +1867,28 @@ impl Mailbox {
             .fetch_all(pool)
             .await
             .unwrap_or_default();
-            let paths = expired_mirrors
-                .iter()
-                .map(|m| m.1.clone())
-                .collect::<Vec<_>>();
-            let evidences = match self.repo_roots.get(project_slug) {
-                Some(root) => self.evidence_batch_cached(root, &paths, now_us),
-                None => vec![super::dirty_path::PathEvidence::Unknown; paths.len()],
-            };
-            for ((pubkey, path, reason, excl, exp_us, event_id, row_epoch), evidence) in
-                expired_mirrors.into_iter().zip(evidences)
+            let mut groups: std::collections::HashMap<Option<String>, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, m) in expired_mirrors.iter().enumerate() {
+                groups.entry(m.7.clone()).or_default().push(i);
+            }
+            let mut evidences =
+                vec![super::dirty_path::PathEvidence::Unknown; expired_mirrors.len()];
+            for (root, indices) in groups {
+                let Some(root) = root else { continue };
+                let paths = indices
+                    .iter()
+                    .map(|&i| expired_mirrors[i].1.clone())
+                    .collect::<Vec<_>>();
+                let batch = self.evidence_batch_cached(std::path::Path::new(&root), &paths, now_us);
+                for (i, ev) in indices.into_iter().zip(batch) {
+                    evidences[i] = ev;
+                }
+            }
+            for (
+                (pubkey, path, reason, excl, exp_us, event_id, row_epoch, mirror_root),
+                evidence,
+            ) in expired_mirrors.into_iter().zip(evidences)
             {
                 let dup_self = out
                     .iter()
@@ -1904,6 +1958,7 @@ impl Mailbox {
                     epoch,
                     expired: true,
                     liveness_extended: true,
+                    repo_root: mirror_root,
                 });
             }
         }
@@ -1970,7 +2025,16 @@ impl Mailbox {
                 })
                 .flatten()
                 .unwrap_or_default();
+            let repo_root = winning
+                .tags
+                .iter()
+                .find_map(|t| {
+                    (t.as_slice().first().map(String::as_str) == Some("repo_root"))
+                        .then(|| t.as_slice().get(1).map(ToString::to_string))
+                })
+                .flatten();
             out.push(ResolvedLease {
+                repo_root,
                 id: winning.id.to_hex(),
                 agent_pubkey: winning.pubkey.to_hex(),
                 path_pattern: path.to_string(),
@@ -2075,6 +2139,7 @@ impl Mailbox {
                 expires_ts_us: l.expires_ts_us,
                 status: ReservationStatus::Held,
                 epoch: l.epoch,
+                repo_root: l.repo_root,
             })
             .collect();
         self.fill_agent_names(project_slug, &mut out).await;
@@ -2619,6 +2684,7 @@ impl Mailbox {
         }
         self.bus.publish(release_event.clone()).await?;
         self.project_lease_upsert(LeaseUpsert {
+            repo_root: holder.repo_root.as_deref(),
             project_slug,
             agent_name: to_agent,
             agent_pubkey: &to_keys.public_key().to_hex(),
@@ -3178,13 +3244,13 @@ impl Mailbox {
         let r = sqlx::query(
             "INSERT INTO file_reservations \
              (project_slug, agent_name, agent_pubkey, path_pattern, exclusive, reason, \
-              status, event_id, expires_ts_us, created_ts_us, epoch) \
-             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) \
+              status, event_id, expires_ts_us, created_ts_us, epoch, repo_root) \
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) \
              ON CONFLICT(project_slug, path_pattern, agent_pubkey) DO UPDATE SET \
                agent_name=excluded.agent_name, exclusive=excluded.exclusive, \
                reason=excluded.reason, status='active', event_id=excluded.event_id, \
                expires_ts_us=excluded.expires_ts_us, created_ts_us=excluded.created_ts_us, \
-               epoch=excluded.epoch",
+               epoch=excluded.epoch, repo_root=excluded.repo_root",
         )
         .bind(u.project_slug)
         .bind(u.agent_name)
@@ -3198,6 +3264,7 @@ impl Mailbox {
             &crate::index::writer::SystemClock,
         ))
         .bind(u.epoch as i64)
+        .bind(u.repo_root)
         .execute(pool)
         .await;
         if let Err(e) = r {
@@ -3345,6 +3412,8 @@ pub(crate) struct ResolvedLease {
     /// This lease blocks ONLY because of the liveness oracle
     /// (bd-lease-liveness-bo0g); surfaces may report the reason.
     pub liveness_extended: bool,
+    /// bd-nmilo: canonical git toplevel carried on the lease, not the project.
+    pub repo_root: Option<String>,
 }
 
 /// One ghost lease released by the pane-prune cascade (bd-gc7k).
@@ -7070,6 +7139,7 @@ mod tests {
             expires_ts_us: None,
             status: ReservationStatus::Held,
             epoch: 1,
+            repo_root: None,
         }
     }
 
@@ -7527,18 +7597,16 @@ mod tests {
             .expect("file")
             .set_modified(old)
             .expect("old mtime");
-        let mut roots = std::collections::HashMap::new();
-        roots.insert("demo".to_string(), repo.clone());
-        let mailbox = mailbox.with_repo_roots(roots);
         let holder = register(&mailbox, "demo", "BlueLake").await;
         mailbox
-            .file_reservation_paths(
+            .file_reservation_paths_with_root(
                 "demo",
                 "BlueLake",
                 &["tracked.txt".to_string()],
                 Some(1),
                 true,
                 None,
+                Some(repo.to_str().expect("utf8 root")),
             )
             .await
             .expect("acquire");

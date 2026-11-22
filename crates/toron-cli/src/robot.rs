@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -1471,6 +1472,16 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
     }))
 }
 
+fn acquire_repo_root() -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub async fn run_reserve(
     mailbox: &Mailbox,
     cmd: &ReserveCommand,
@@ -1484,6 +1495,7 @@ pub async fn run_reserve(
             let paths = normalize_reserve_paths(&args.paths);
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             warn_acquire_paths(&paths).await;
+            let root = acquire_repo_root();
             let out = if args.queue {
                 mailbox
                     .file_reservation_paths_queued(
@@ -1493,17 +1505,19 @@ pub async fn run_reserve(
                         args.ttl_secs,
                         args.exclusive,
                         args.reason.as_deref(),
+                        root.as_deref(),
                     )
                     .await?
             } else {
                 mailbox
-                    .file_reservation_paths(
+                    .file_reservation_paths_with_root(
                         &args.project,
                         &args.agent,
                         &paths,
                         args.ttl_secs,
                         args.exclusive,
                         args.reason.as_deref(),
+                        root.as_deref(),
                     )
                     .await?
             };
@@ -2099,6 +2113,7 @@ pub async fn run_reserve_daemon(
                     "exclusive": args.exclusive,
                     "reason": args.reason,
                     "queue": args.queue,
+                    "repo_root": acquire_repo_root(),
                 }),
             )
             .await

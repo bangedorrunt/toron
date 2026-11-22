@@ -253,7 +253,15 @@ async fn expiry_hands_over_without_any_release_call() {
         .await
         .expect("short lease");
     let queued = mailbox
-        .file_reservation_paths_queued(PROJECT, "ExpiryWaiter", &paths, Some(3600), true, None)
+        .file_reservation_paths_queued(
+            PROJECT,
+            "ExpiryWaiter",
+            &paths,
+            Some(3600),
+            true,
+            None,
+            None,
+        )
         .await
         .expect("queue");
     assert!(!queued.conflicts.is_empty());
@@ -344,7 +352,15 @@ async fn queued_acquires_hand_off_fifo_on_every_release() {
 
     for waiter in ["WaiterA", "WaiterB"] {
         let out = mailbox
-            .file_reservation_paths_queued(PROJECT, waiter, &paths, Some(3600), true, Some("lane"))
+            .file_reservation_paths_queued(
+                PROJECT,
+                waiter,
+                &paths,
+                Some(3600),
+                true,
+                Some("lane"),
+                None,
+            )
             .await
             .expect("queued acquire");
         assert_eq!(out.granted.len(), 0, "{waiter} cannot take a held path");

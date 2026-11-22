@@ -73,17 +73,19 @@ impl ToolServer {
                     nonneg_secs(args.ttl_seconds),
                     args.exclusive.unwrap_or(false),
                     args.reason.as_deref(),
+                    args.repo_root.as_deref(),
                 )
                 .await
         } else {
             self.mailbox
-                .file_reservation_paths(
+                .file_reservation_paths_with_root(
                     &args.project_key,
                     &args.agent_name,
                     &args.paths,
                     nonneg_secs(args.ttl_seconds),
                     args.exclusive.unwrap_or(false),
                     args.reason.as_deref(),
+                    args.repo_root.as_deref(),
                 )
                 .await
         })
@@ -266,6 +268,8 @@ pub struct FileReservationPathsArgs {
     /// On a hard conflict, join the FIFO waitlist and ask the holder once.
     #[serde(default)]
     pub queue: bool,
+    /// Canonical git toplevel of the repo these paths belong to.
+    pub repo_root: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]

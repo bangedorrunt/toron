@@ -65,11 +65,18 @@ pub struct AdditiveColumn {
 }
 
 /// Every additive column, in apply order.
-pub static ADDITIVE_COLUMNS: &[AdditiveColumn] = &[AdditiveColumn {
-    table: "file_reservations",
-    column: "epoch",
-    ddl: "ALTER TABLE file_reservations ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
-}];
+pub static ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
+    AdditiveColumn {
+        table: "file_reservations",
+        column: "epoch",
+        ddl: "ALTER TABLE file_reservations ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
+    },
+    AdditiveColumn {
+        table: "file_reservations",
+        column: "repo_root",
+        ddl: "ALTER TABLE file_reservations ADD COLUMN repo_root TEXT",
+    },
+];
 
 /// Every additive table, in apply order.
 pub static ADDITIVE_TABLES: &[AdditiveTable] = &[

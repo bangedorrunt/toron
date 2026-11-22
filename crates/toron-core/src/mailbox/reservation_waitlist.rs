@@ -35,6 +35,7 @@ impl Mailbox {
     /// Acquire with `--queue`: a hard conflict leaves the lease board alone,
     /// records ONE waiter per path, and sends each holder one typed
     /// request-release. The lease is granted later by the release handoff.
+    #[allow(clippy::too_many_arguments)]
     pub async fn file_reservation_paths_queued(
         &self,
         project_slug: &str,
@@ -43,15 +44,17 @@ impl Mailbox {
         ttl_seconds: Option<u64>,
         exclusive: bool,
         reason: Option<&str>,
+        repo_root: Option<&str>,
     ) -> anyhow::Result<AcquireResult> {
         let out = self
-            .file_reservation_paths(
+            .file_reservation_paths_with_root(
                 project_slug,
                 agent_name,
                 paths,
                 ttl_seconds,
                 exclusive,
                 reason,
+                repo_root,
             )
             .await?;
         for conflict in &out.conflicts {
@@ -198,6 +201,7 @@ impl Mailbox {
                     expires_ts_us: expired.expires_ts_us,
                     status: ReservationStatus::Held,
                     epoch: expired.epoch,
+                    repo_root: expired.repo_root.clone(),
                 };
                 self.fill_agent_names(project_slug, std::slice::from_mut(&mut lease))
                     .await;

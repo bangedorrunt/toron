@@ -194,7 +194,6 @@ pub struct Mailbox {
     pub(crate) unknown_logged: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub(crate) dirty_cache:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, (i64, dirty_path::PathEvidence)>>>,
-    pub(crate) repo_roots: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
 }
 
 /// A memoized alternate-root resolution (see `Mailbox::alt_key_paths`).
@@ -263,7 +262,6 @@ impl Mailbox {
             dirty_source: Arc::new(dirty_path::GitDirtyPathSource::default()),
             unknown_logged: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             dirty_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            repo_roots: Arc::new(std::collections::HashMap::new()),
         }
     }
 
@@ -319,17 +317,6 @@ impl Mailbox {
         out.into_iter()
             .map(|ev| ev.unwrap_or(dirty_path::PathEvidence::Unknown))
             .collect()
-    }
-
-    /// Register a project's git repo root. Until toron persists one, the
-    /// embedder supplies it; without one the evidence source reports Unknown.
-    #[must_use]
-    pub fn with_repo_roots(
-        mut self,
-        roots: std::collections::HashMap<String, std::path::PathBuf>,
-    ) -> Self {
-        self.repo_roots = Arc::new(roots);
-        self
     }
 
     /// Override the pane-plane port (tests, embedders holding their own

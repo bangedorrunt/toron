@@ -517,7 +517,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-22T03:49:03Z",
+  "generated_at": "2026-11-22T20:42:21Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -2608,6 +2608,7 @@
         "project_key": "<string>",
         "queue": true,
         "reason": null,
+        "repo_root": null,
         "transfer_from": null,
         "ttl_seconds": null
       },
@@ -2639,6 +2640,13 @@
             "type": "boolean"
           },
           "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_root": {
+            "description": "Canonical git toplevel of the repo these paths belong to.",
             "type": [
               "string",
               "null"
