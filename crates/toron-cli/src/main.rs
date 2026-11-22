@@ -151,7 +151,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Product(_)
         | Command::Judgment(_)
         | Command::Guard(_) => {
-            run_robot(command, cli.globals.dry_run)?;
+            run_robot(command, cli.globals.dry_run, format)?;
             ExitCode::SUCCESS
         }
         Command::Channel(_)
@@ -307,7 +307,7 @@ async fn run_serve(
 /// instrumented into the operator metrics (bd-led.8.2): tool name + duration on
 /// success, an error counter on failure.
 #[tokio::main]
-async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
+async fn run_robot(command: &Command, dry_run: bool, format: OutputFormat) -> anyhow::Result<()> {
     // bd-ys3jp: flush first, before a dead daemon can make `resolve` fail.
     robot::flush_queued_sends().await?;
     let mut mail_override: Option<Command> = None;
@@ -337,7 +337,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     let source = match crate::mailbox_source::MailboxSource::resolve().await {
         Ok(source) => source,
         Err(e) if queued_corr.is_some() && outage(&e) => {
-            report_queued(queued_corr.as_deref().unwrap_or_default());
+            report_queued(queued_corr.as_deref().unwrap_or_default(), format);
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -346,7 +346,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let result = match (&source, dispatch) {
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Mail(cmd)) => {
-            robot::run_mail_daemon(dc, cmd).await
+            robot::run_mail_daemon(dc, cmd, queued_corr.as_deref()).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Reserve(cmd)) => {
             robot::run_reserve_daemon(dc, cmd, dry_run).await
@@ -376,7 +376,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             robot::run_ack_sla_daemon(dc, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Mail(cmd)) => {
-            robot::run_mail(mb, cmd).await
+            robot::run_mail(mb, cmd, queued_corr.as_deref()).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Reserve(cmd)) => {
             robot::run_reserve(mb, cmd, dry_run).await
@@ -411,13 +411,12 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
         Ok(()) => {
             if let Some(corr) = &queued_corr {
                 queued_send::remove(corr)?;
-                println!("{{\"delivery\":\"delivered\",\"corr\":\"{corr}\"}}");
             }
             operator::record_tool_call(tool_name, start.elapsed());
             Ok(())
         }
         Err(e) if queued_corr.is_some() && outage(&e) => {
-            report_queued(queued_corr.as_deref().unwrap_or_default());
+            report_queued(queued_corr.as_deref().unwrap_or_default(), format);
             operator::record_tool_error(tool_name, start.elapsed());
             Ok(())
         }
@@ -428,8 +427,12 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     }
 }
 
-fn report_queued(corr: &str) {
-    println!("{{\"delivery\":\"queued\",\"corr\":\"{corr}\"}}");
+fn report_queued(corr: &str, format: OutputFormat) {
+    if format == OutputFormat::Json {
+        println!("{{\"delivery\":\"queued\",\"corr\":\"{corr}\"}}");
+    } else {
+        eprintln!("queued (corr {corr}); the next toron command will flush it");
+    }
 }
 
 /// bd-ys3jp: only transport outages queue. A malformed recipient, a refusal

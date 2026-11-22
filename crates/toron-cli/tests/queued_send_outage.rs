@@ -3,7 +3,6 @@
 //! its corr and reported as `queued`, instead of vanishing with an error.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 #[test]
 fn a_daemon_outage_queues_the_send_with_its_corr() {
@@ -20,7 +19,7 @@ fn a_daemon_outage_queues_the_send_with_its_corr() {
         std::fs::create_dir_all(root.join(rel)).unwrap();
     }
 
-    let out = Command::new(env!("CARGO_BIN_EXE_toron"))
+    let out = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("xdg/config"))
         .env("XDG_DATA_HOME", root.join("xdg/data"))
@@ -29,6 +28,7 @@ fn a_daemon_outage_queues_the_send_with_its_corr() {
         .env("TORON_DATA_DIR", root.join("data"))
         .env("TORON_MCP_URL", "http://127.0.0.1:18999/mcp")
         .args([
+            "--json",
             "mail",
             "send",
             "--project",

@@ -32,7 +32,21 @@ use crate::mailbox_source::DaemonClient;
 
 /// Call a daemon MCP tool and print its text content (the parity JSON).
 async fn daemon_tool(dc: &DaemonClient, tool: &str, args: serde_json::Value) -> anyhow::Result<()> {
-    let out = dc.call_tool(tool, args).await?;
+    daemon_tool_with_extra(dc, tool, args, None).await
+}
+
+async fn daemon_tool_with_extra(
+    dc: &DaemonClient,
+    tool: &str,
+    args: serde_json::Value,
+    extra: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let mut out = dc.call_tool(tool, args).await?;
+    if let (Some(obj), Some(extra)) = (out.as_object_mut(), extra) {
+        for (key, field) in extra.as_object().cloned().unwrap_or_default() {
+            obj.insert(key, field);
+        }
+    }
     print_json(&out)
 }
 
@@ -64,7 +78,41 @@ async fn embedded_mailbox() -> anyhow::Result<Mailbox> {
 
 /// Print a result's MCP-parity JSON shape to stdout (always pretty JSON).
 fn emit<T: ToJson>(result: T) -> anyhow::Result<()> {
-    print_json(&result.to_json())
+    emit_with(result, None)
+}
+
+/// One JSON document on stdout, with the delivery fields folded INTO it. A
+/// second print after this would break `--json` consumers (bd-ys3jp).
+fn emit_with<T: ToJson>(result: T, extra: Option<serde_json::Value>) -> anyhow::Result<()> {
+    let mut value = result.to_json();
+    if let (Some(obj), Some(extra)) = (value.as_object_mut(), extra) {
+        for (key, field) in extra.as_object().cloned().unwrap_or_default() {
+            obj.insert(key, field);
+        }
+    }
+    print_json(&value)
+}
+
+fn delivery_fields(corr: Option<&str>) -> Option<serde_json::Value> {
+    corr.map(|corr| {
+        json!({
+            "delivery": "delivered",
+            "corr": corr,
+        })
+    })
+}
+
+#[cfg(test)]
+mod delivery_shape_tests {
+    use super::delivery_fields;
+
+    #[test]
+    fn delivered_status_is_one_object_in_the_result() {
+        let extra = delivery_fields(Some("c-1")).expect("a stamped send has a corr");
+        assert_eq!(extra["delivery"], "delivered");
+        assert_eq!(extra["corr"], "c-1");
+        assert!(delivery_fields(None).is_none());
+    }
 }
 
 /// Pretty-print a raw JSON value (hand-built parity shapes).
@@ -329,7 +377,7 @@ pub async fn flush_queued_sends() -> anyhow::Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let mailbox = toron_mcp::demo_mailbox().await?;
+    let mailbox = embedded_mailbox().await?;
     let mut flushed = 0;
     for q in pending {
         let msg = match send_message_from_queued(&q) {
@@ -361,7 +409,11 @@ fn resolve_inbox_since(since: &Option<String>) -> anyhow::Result<Option<String>>
         .map_err(|e| anyhow::anyhow!("--since {e}"))
 }
 
-pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()> {
+pub async fn run_mail(
+    mailbox: &Mailbox,
+    cmd: &MailCommand,
+    delivery_corr: Option<&str>,
+) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
             let mut extra_tags = build_send_tags(
@@ -393,7 +445,10 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 overseer: false,
                 extra_tags,
             };
-            emit(mailbox.send_message(&msg).await?)
+            emit_with(
+                mailbox.send_message(&msg).await?,
+                delivery_fields(delivery_corr),
+            )
         }
         MailCommand::Overseer(args) => {
             let msg = SendMessage {
@@ -443,7 +498,10 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 overseer: false,
                 extra_tags,
             };
-            emit(mailbox.reply_message(&msg).await?)
+            emit_with(
+                mailbox.reply_message(&msg).await?,
+                delivery_fields(delivery_corr),
+            )
         }
         MailCommand::Inbox(args) => {
             let fi = FetchInbox {
@@ -522,10 +580,14 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
 /// (overseer) fail loud rather than silently using a second mailbox.
 /// `reserve request-release`/`respond`/`transfer` compose existing tools
 /// (`send_message` / `reply_message` / `file_reservation_paths`).
-pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Result<()> {
+pub async fn run_mail_daemon(
+    dc: &DaemonClient,
+    cmd: &MailCommand,
+    delivery_corr: Option<&str>,
+) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
-            daemon_tool(
+            daemon_tool_with_extra(
                 dc,
                 "send_message",
                 json!({
@@ -546,6 +608,7 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "audience": args.audience,
                     "result_path": args.result_path,
                 }),
+                delivery_fields(delivery_corr),
             )
             .await
         }
@@ -554,7 +617,7 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
              overseer tool; run it with the daemon URL unset (embedded mode)"
         ),
         MailCommand::Reply(args) => {
-            daemon_tool(
+            daemon_tool_with_extra(
                 dc,
                 "reply_message",
                 json!({
@@ -575,6 +638,7 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "audience": args.audience,
                     "result_path": args.result_path,
                 }),
+                delivery_fields(delivery_corr),
             )
             .await
         }
