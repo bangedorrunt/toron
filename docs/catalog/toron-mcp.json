@@ -138,7 +138,7 @@
                 "type": "string"
               },
               "holder_live": {
-                "description": "bd-kyute: false when the holder has no live signed presence.",
+                "description": "False when the holder has no live signed presence.",
                 "type": "boolean"
               },
               "id": {
@@ -199,7 +199,7 @@
           },
           "waitlists": {
             "default": [],
-            "description": "bd-ll7bs: FIFO waiters by path, shown by `reserve list`.",
+            "description": "FIFO waiters by path, shown by `reserve list`.",
             "items": {
               "$ref": "#/$defs/ReservationWaitlistOut"
             },
@@ -517,7 +517,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-22T01:12:06Z",
+  "generated_at": "2026-11-22T03:49:03Z",
   "resources": [
     {
       "description": "List projects known to toron.",

@@ -327,7 +327,7 @@ pub struct LeaseRowOut {
     pub exclusive: bool,
     pub reason: String,
     pub expires_ts_us: Option<i64>,
-    /// bd-kyute: false when the holder has no live signed presence.
+    /// False when the holder has no live signed presence.
     pub holder_live: bool,
 }
 
@@ -337,7 +337,7 @@ pub struct LeaseBoardOut {
     pub project_key: String,
     pub count: i64,
     pub reservations: Vec<LeaseRowOut>,
-    /// bd-ll7bs: FIFO waiters by path, shown by `reserve list`.
+    /// FIFO waiters by path, shown by `reserve list`.
     #[serde(default)]
     pub waitlists: Vec<ReservationWaitlistOut>,
 }
