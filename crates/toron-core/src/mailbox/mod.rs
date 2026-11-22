@@ -57,6 +57,7 @@ pub mod aliases;
 pub mod build_slots;
 pub mod comms;
 pub mod contacts;
+pub mod dirty_path;
 pub mod envelope;
 pub mod error;
 pub mod guard;
@@ -187,6 +188,10 @@ pub struct Mailbox {
     /// bd-ll7bs: per-project guard so an expiry-triggered handoff cannot
     /// recurse through the lease board read that triggered it.
     pub(crate) handoff_inflight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// bd-nmilo: dirty-path evidence for liveness extension. Injectable so
+    /// tests use a fake; production reads git status plus file mtime.
+    pub(crate) dirty_source: Arc<dyn dirty_path::DirtyPathSource>,
+    pub(crate) unknown_logged: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A memoized alternate-root resolution (see `Mailbox::alt_key_paths`).
@@ -252,7 +257,16 @@ impl Mailbox {
             alt_key_paths: Arc::new(papaya::HashMap::new()),
             alt_key_walks: Arc::new(AtomicU64::new(0)),
             handoff_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            dirty_source: Arc::new(dirty_path::GitDirtyPathSource::default()),
+            unknown_logged: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// bd-nmilo: inject dirty-path evidence (tests) instead of the git source.
+    #[must_use]
+    pub fn with_dirty_source(mut self, source: Arc<dyn dirty_path::DirtyPathSource>) -> Self {
+        self.dirty_source = source;
+        self
     }
 
     /// Override the pane-plane port (tests, embedders holding their own

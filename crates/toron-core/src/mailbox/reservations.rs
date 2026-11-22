@@ -1832,9 +1832,29 @@ impl Mailbox {
                 let conflict = out
                     .iter()
                     .any(|l| (l.exclusive || excl != 0) && overlaps(&l.path_pattern, &path));
-                let live = durable_live
+                let live_presence = durable_live
                     .as_ref()
                     .is_some_and(|m| m.contains_key(&pubkey));
+                // bd-nmilo: liveness extends only while the path is dirty or
+                // recently edited. Unknown evidence falls back to the old
+                // liveness rule; a missing git repo never steals a lease.
+                let repo_root = self.data_dir.join(project_slug);
+                let evidence = self.dirty_source.evidence(&repo_root, &path);
+                if evidence == super::dirty_path::PathEvidence::Unknown {
+                    let key = format!("{project_slug}:{path}");
+                    if self.unknown_logged.lock().insert(key) {
+                        eprintln!(
+                            "toron: dirty-path evidence unavailable for {project_slug}:{path}; using liveness fallback"
+                        );
+                    }
+                }
+                let live = live_presence
+                    && super::dirty_path::should_extend(
+                        &evidence,
+                        now_us,
+                        super::dirty_path::DIRTY_GRACE_SECS,
+                        live_presence,
+                    );
                 if dup_self || conflict || !live {
                     continue;
                 }
@@ -7471,9 +7491,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    struct FixedEvidence(super::super::dirty_path::PathEvidence);
+    impl super::super::dirty_path::DirtyPathSource for FixedEvidence {
+        fn evidence(
+            &self,
+            _repo_root: &std::path::Path,
+            _path: &str,
+        ) -> super::super::dirty_path::PathEvidence {
+            self.0.clone()
+        }
+    }
+
     #[tokio::test]
     async fn liveness_extended_lease_preserves_fencing_epoch() {
         let (mailbox, db_path, data_dir) = test_mailbox("liveness_epoch").await;
+        // bd-nmilo: a clean path past the grace would now expire; this test
+        // pins the epoch of a DIRTY live holder.
+        let mailbox = mailbox.with_dirty_source(std::sync::Arc::new(FixedEvidence(
+            super::super::dirty_path::PathEvidence::Dirty { last_edit_ts_us: 0 },
+        )));
         register(&mailbox, "demo", "BlueLake").await;
 
         mailbox
