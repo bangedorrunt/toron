@@ -24,8 +24,9 @@ use toron_mcp::ToJson;
 use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 
 use crate::cli::{
-    AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, MailCommand, MailReplyArgs,
-    MailSendArgs, PolicyArg, ReserveCommand, SlotCommand,
+    AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, JudgmentCommand, MailCommand,
+    MailReplyArgs, MailSendArgs, PaneCommand, PolicyArg, ProductCommand, ReserveCommand,
+    SlotCommand,
 };
 use crate::mailbox_source::DaemonClient;
 
@@ -495,6 +496,24 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 .await?,
         ),
         MailCommand::Whois(args) => emit(mailbox.whois(&args.project, &args.name).await?),
+        MailCommand::PrepareThread(args) => {
+            let agent = args.agent.clone().unwrap_or_else(|| "agent".into());
+            emit(
+                mailbox
+                    .macro_prepare_thread(
+                        &args.project,
+                        &args.thread,
+                        &agent,
+                        &args.program,
+                        &args.model,
+                        None,
+                        args.register_if_missing,
+                        false,
+                        args.inbox_limit,
+                    )
+                    .await?,
+            )
+        }
     }
 }
 
@@ -641,6 +660,22 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                 json!({
                     "project_key": args.project,
                     "agent_name": args.name,
+                }),
+            )
+            .await
+        }
+        MailCommand::PrepareThread(args) => {
+            daemon_tool(
+                dc,
+                "macro_prepare_thread",
+                json!({
+                    "project_key": args.project,
+                    "thread_id": args.thread,
+                    "agent_name": args.agent,
+                    "program": args.program,
+                    "model": args.model,
+                    "register_if_missing": args.register_if_missing,
+                    "inbox_limit": args.inbox_limit,
                 }),
             )
             .await
@@ -808,6 +843,36 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                           routable, and the old name's leases now answer to the new one",
             }))
         }
+        AgentCommand::List(args) => {
+            use toron_core::mailbox::identity::ListAgentsOptions;
+            emit(
+                mailbox
+                    .list_agents(
+                        &args.project,
+                        ListAgentsOptions {
+                            active_within_days: args.active_within_days,
+                        },
+                    )
+                    .await?,
+            )
+        }
+        AgentCommand::Mint(args) => {
+            use toron_core::nostr::identity::AgentProfile;
+            emit(
+                mailbox
+                    .create_agent_identity(
+                        &args.project,
+                        &AgentProfile {
+                            name: args.name.clone(),
+                            program: args.program.clone(),
+                            model: args.model.clone(),
+                            task_description: None,
+                            persona: None,
+                        },
+                    )
+                    .await?,
+            )
+        }
     }
 }
 
@@ -927,6 +992,180 @@ pub async fn run_agent_daemon(
             );
             let mb = embedded_mailbox().await?;
             run_agent(&mb, cmd, dry_run).await
+        }
+        AgentCommand::List(args) => {
+            daemon_tool(
+                dc,
+                "list_agents",
+                json!({
+                    "project_key": args.project,
+                    "active_within_days": args.active_within_days,
+                }),
+            )
+            .await
+        }
+        AgentCommand::Mint(args) => {
+            daemon_tool(
+                dc,
+                "create_agent_identity",
+                json!({
+                    "project_key": args.project,
+                    "name_hint": args.name,
+                    "program": args.program,
+                    "model": args.model,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+/// Pane identity verbs: thin wrappers over the same mailbox calls the
+/// resolve/cleanup MCP tools use (bd-5jeyj CLI parity).
+pub async fn run_pane(mailbox: &Mailbox, cmd: &PaneCommand) -> anyhow::Result<()> {
+    let plane = toron_plane::LivePanePlane::connect_default()?;
+    match cmd {
+        PaneCommand::Resolve(args) => match mailbox.resolve_pane_identity(&plane, &args.pane) {
+            Ok(name) => print_json(&json!({"pane_id": args.pane, "agent_name": name})),
+            Err(e) => print_json(&json!({"pane_id": args.pane, "note": format!("{e:#}")})),
+        },
+        PaneCommand::Cleanup(args) => match mailbox.cleanup_pane_identities(&plane) {
+            Ok(names) => print_json(&json!({"project": args.project, "removed": names})),
+            Err(e) => print_json(&json!({"project": args.project, "note": format!("{e:#}")})),
+        },
+    }
+}
+
+/// Daemon arm of `run_pane`: same tools through the daemon.
+pub async fn run_pane_daemon(dc: &DaemonClient, cmd: &PaneCommand) -> anyhow::Result<()> {
+    match cmd {
+        PaneCommand::Resolve(args) => {
+            daemon_tool(
+                dc,
+                "resolve_pane_identity",
+                json!({"project_key": args.project, "pane_id": args.pane}),
+            )
+            .await
+        }
+        PaneCommand::Cleanup(args) => {
+            daemon_tool(
+                dc,
+                "cleanup_pane_identities",
+                json!({"project_key": args.project}),
+            )
+            .await
+        }
+    }
+}
+
+/// Product bus verbs: thin wrappers over the same mailbox calls the
+/// product MCP tools use (bd-5jeyj CLI parity).
+pub async fn run_product(mailbox: &Mailbox, cmd: &ProductCommand) -> anyhow::Result<()> {
+    match cmd {
+        ProductCommand::Ensure(args) => emit(mailbox.ensure_product(&args.key, &args.name).await?),
+        ProductCommand::Link(args) => emit(mailbox.products_link(&args.key, &args.project).await?),
+        ProductCommand::Search(args) => emit(
+            mailbox
+                .search_messages_product(&args.key, &args.query, args.limit, false)
+                .await?,
+        ),
+        ProductCommand::Inbox(args) => {
+            emit(mailbox.fetch_inbox_product(&args.key, &args.agent).await?)
+        }
+        ProductCommand::Summarize(args) => emit(
+            mailbox
+                .summarize_thread_product(&args.key, &args.thread, false)
+                .await?,
+        ),
+    }
+}
+
+/// Daemon arm of `run_product`: same tools through the daemon.
+pub async fn run_product_daemon(dc: &DaemonClient, cmd: &ProductCommand) -> anyhow::Result<()> {
+    match cmd {
+        ProductCommand::Ensure(args) => {
+            daemon_tool(
+                dc,
+                "ensure_product",
+                json!({"product_key": args.key, "name": args.name}),
+            )
+            .await
+        }
+        ProductCommand::Link(args) => {
+            daemon_tool(
+                dc,
+                "products_link",
+                json!({"product_key": args.key, "project_key": args.project}),
+            )
+            .await
+        }
+        ProductCommand::Search(args) => {
+            daemon_tool(
+                dc,
+                "search_messages_product",
+                json!({"product_key": args.key, "query": args.query, "limit": args.limit}),
+            )
+            .await
+        }
+        ProductCommand::Inbox(args) => {
+            daemon_tool(
+                dc,
+                "fetch_inbox_product",
+                json!({"product_key": args.key, "agent_name": args.agent}),
+            )
+            .await
+        }
+        ProductCommand::Summarize(args) => {
+            daemon_tool(
+                dc,
+                "summarize_thread_product",
+                json!({"product_key": args.key, "thread_id": args.thread}),
+            )
+            .await
+        }
+    }
+}
+
+/// Judgment verbs: thin wrappers over the same mailbox calls the
+/// ask_judgment MCP tool uses (bd-5jeyj CLI parity).
+pub async fn run_judgment(mailbox: &Mailbox, cmd: &JudgmentCommand) -> anyhow::Result<()> {
+    match cmd {
+        JudgmentCommand::Ask(args) => {
+            let state: Value = serde_json::from_str(&args.state)?;
+            emit(
+                mailbox
+                    .ask_judgment(
+                        &args.project,
+                        &args.effect_key,
+                        &args.pack,
+                        &state,
+                        &args.transport,
+                        args.timeout_secs,
+                    )
+                    .await?,
+            )
+        }
+    }
+}
+
+/// Daemon arm of `run_judgment`: same tool through the daemon.
+pub async fn run_judgment_daemon(dc: &DaemonClient, cmd: &JudgmentCommand) -> anyhow::Result<()> {
+    match cmd {
+        JudgmentCommand::Ask(args) => {
+            let state: Value = serde_json::from_str(&args.state)?;
+            daemon_tool(
+                dc,
+                "ask_judgment",
+                json!({
+                    "project_key": args.project,
+                    "effect_key": args.effect_key,
+                    "pack_id": args.pack,
+                    "state": state,
+                    "transport": args.transport,
+                    "timeout_seconds": args.timeout_secs,
+                }),
+            )
+            .await
         }
     }
 }
@@ -1063,6 +1302,19 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
                 "notify_previous": !a.no_notify,
             }),
             "nothing was released",
+        ),
+        ReserveCommand::Cycle(a) => (
+            "macro_file_reservation_cycle",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "paths": a.paths,
+                "ttl_seconds": a.ttl_seconds,
+                "exclusive": a.exclusive,
+                "reason": a.reason,
+                "auto_release": a.auto_release,
+            }),
+            "nothing was leased",
         ),
         ReserveCommand::Sweep(a) => (
             "release_file_reservations_by_reason",
@@ -1205,20 +1457,23 @@ pub async fn run_reserve(
             let rows = mailbox
                 .list_file_reservations(&args.project, args.holder.as_deref(), args.path.as_deref())
                 .await?;
+            let mut reservations = Vec::with_capacity(rows.len());
+            for r in rows {
+                let holder_live = mailbox.holder_live(&args.project, &r.agent_pubkey).await;
+                reservations.push(toron_mcp::tools::reservation::LeaseRowOut {
+                    id: r.id,
+                    path: r.path_pattern,
+                    holder: r.agent_name,
+                    exclusive: r.exclusive,
+                    reason: r.reason,
+                    expires_ts_us: r.expires_ts_us,
+                    holder_live,
+                });
+            }
             let mut board = toron_mcp::tools::reservation::LeaseBoardOut {
                 project_key: args.project.clone(),
-                count: rows.len() as i64,
-                reservations: rows
-                    .into_iter()
-                    .map(|r| toron_mcp::tools::reservation::LeaseRowOut {
-                        id: r.id,
-                        path: r.path_pattern,
-                        holder: r.agent_name,
-                        exclusive: r.exclusive,
-                        reason: r.reason,
-                        expires_ts_us: r.expires_ts_us,
-                    })
-                    .collect(),
+                count: reservations.len() as i64,
+                reservations,
                 waitlists: toron_mcp::tools::reservation::waitlist_rows(
                     &mailbox.list_project_waiters(&args.project).await?,
                 ),
@@ -1248,6 +1503,19 @@ pub async fn run_reserve(
         ReserveCommand::ReleaseByReason(args) => emit(
             mailbox
                 .release_by_reason(&args.project, &args.agent, &args.bead_id, !args.no_notify)
+                .await?,
+        ),
+        ReserveCommand::Cycle(args) => emit(
+            mailbox
+                .macro_file_reservation_cycle(
+                    &args.project,
+                    &args.agent,
+                    &args.paths,
+                    args.ttl_seconds.map(|t| t as u64),
+                    args.exclusive,
+                    args.reason.as_deref(),
+                    args.auto_release,
+                )
                 .await?,
         ),
         ReserveCommand::Sweep(args) => {
@@ -1840,6 +2108,22 @@ pub async fn run_reserve_daemon(
             )
             .await
         }
+        ReserveCommand::Cycle(args) => {
+            daemon_tool(
+                dc,
+                "macro_file_reservation_cycle",
+                json!({
+                    "project_key": args.project,
+                    "agent_name": args.agent,
+                    "paths": args.paths,
+                    "ttl_seconds": args.ttl_seconds,
+                    "exclusive": args.exclusive,
+                    "reason": args.reason,
+                    "auto_release": args.auto_release,
+                }),
+            )
+            .await
+        }
         ReserveCommand::Sweep(args) => {
             let (repo, closed) = sweep_closed_set(args)?;
             let board = dc
@@ -2077,6 +2361,20 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             )
             .await
         }
+        ContactCommand::Handshake(args) => {
+            daemon_tool(
+                dc,
+                "macro_contact_handshake",
+                json!({
+                    "project_key": args.project,
+                    "requester": args.requester,
+                    "target": args.target,
+                    "reason": args.reason,
+                    "auto_accept": args.auto_accept,
+                }),
+            )
+            .await
+        }
         ContactCommand::Captain(args) => {
             if args.clear {
                 let previous = toron_core::mailbox::identity::clear_captain_alias_in_db(
@@ -2207,6 +2505,23 @@ pub async fn run_contact(mailbox: &Mailbox, cmd: &ContactCommand) -> anyhow::Res
             emit(
                 mailbox
                     .set_contact_policy(&args.project, &args.agent, policy)
+                    .await?,
+            )
+        }
+        ContactCommand::Handshake(args) => {
+            let requester = args.requester.clone().unwrap_or_else(|| "agent".into());
+            let target = args.target.clone().unwrap_or_else(|| "Peer".into());
+            emit(
+                mailbox
+                    .macro_contact_handshake(
+                        &args.project,
+                        &requester,
+                        &target,
+                        args.reason.as_deref(),
+                        args.auto_accept,
+                        None,
+                        None,
+                    )
                     .await?,
             )
         }

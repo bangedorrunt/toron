@@ -130,6 +130,18 @@ pub enum Command {
     #[command(subcommand)]
     Agent(AgentCommand),
 
+    /// Pane identities (plane N): resolve a pane to its pin, prune stale names.
+    #[command(subcommand)]
+    Pane(PaneCommand),
+
+    /// Product bus: cross-project manifests and fan-out reads.
+    #[command(subcommand)]
+    Product(ProductCommand),
+
+    /// Judgment calls (effect sandbox): ask a judgment pack for a verdict.
+    #[command(subcommand)]
+    Judgment(JudgmentCommand),
+
     /// NIP-29 channels: create/join/leave/close/purge/list/members/post/read (39000/39002 + kind 9)
     /// (plane S; lifecycle open -> closed -> purged).
     #[command(subcommand)]
@@ -590,6 +602,8 @@ pub enum MailCommand {
     Search(MailSearchArgs),
     /// Deterministic digest of a thread.
     ThreadSummarize(MailThreadSummarizeArgs),
+    /// Batch: ensure registration + thread summary + recent inbox context.
+    PrepareThread(MailPrepareThreadArgs),
     /// Resolve a name/alias/pin to its identity (npub + profile fields).
     /// bd-captain-alias-0g8a: `mail whois <project> captain` hits the
     /// orchestrator pin once the alias is set.
@@ -897,6 +911,8 @@ pub enum ReserveCommand {
     /// Release every reservation whose reason is the given bead id
     /// (release-on-bead-close; operator-signed, no staleness heuristic).
     ReleaseByReason(ReserveReleaseByReasonArgs),
+    /// Batch: reserve a set of path globs, optionally releasing them at the end.
+    Cycle(ReserveCycleArgs),
     /// Release every lease whose reason bead is CLOSED (batch of
     /// release-by-reason; the closed set is read from the repo tracker).
     Sweep(ReserveSweepArgs),
@@ -1201,6 +1217,216 @@ pub enum AgentCommand {
     /// moves the identity onto a registered adjective+noun pin without
     /// minting a second key for the same words.
     Rename(AgentRenameArgs),
+    /// List a project's registered agents (npub + last-active from the registry,
+    /// not the presence plane).
+    List(AgentListArgs),
+    /// Mint a fresh keypair for a new identity (fails closed on collision).
+    Mint(AgentMintArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaneCommand {
+    /// Resolve a live pane id to its agent pin (token stamp first, then the
+    /// agent-list name match).
+    Resolve(PaneResolveArgs),
+    /// Report identities whose panes are absent from the live pane list.
+    Cleanup(PaneCleanupArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PaneResolveArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Pane id to resolve.
+    pub pane: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PaneCleanupArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProductCommand {
+    /// Ensure a product manifest exists (idempotent).
+    Ensure(ProductEnsureArgs),
+    /// Link a project into a product (idempotent).
+    Link(ProductLinkArgs),
+    /// FTS5 search across a product's member projects.
+    Search(ProductSearchArgs),
+    /// Fan `fetch_inbox` across a product's member projects.
+    Inbox(ProductInboxArgs),
+    /// Summarize a thread across a product's member projects.
+    Summarize(ProductSummarizeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProductEnsureArgs {
+    /// Product key.
+    pub key: String,
+    /// Product display name.
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProductLinkArgs {
+    /// Product key.
+    pub key: String,
+    /// Project slug to link in.
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProductSearchArgs {
+    /// Product key.
+    pub key: String,
+    /// Search query.
+    pub query: String,
+    /// Maximum hits.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProductInboxArgs {
+    /// Product key.
+    pub key: String,
+    /// Agent whose inbox to fan out.
+    #[arg(long, default_value = "agent")]
+    pub agent: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProductSummarizeArgs {
+    /// Product key.
+    pub key: String,
+    /// Thread id to summarize.
+    pub thread: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JudgmentCommand {
+    /// Ask a judgment pack for a verdict on an effect state.
+    Ask(JudgmentAskArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct JudgmentAskArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Effect key the verdict is journaled under.
+    #[arg(long, required = true)]
+    pub effect_key: String,
+    /// Judgment pack id.
+    #[arg(long, required = true)]
+    pub pack: String,
+    /// Effect state JSON.
+    #[arg(long, required = true)]
+    pub state: String,
+    /// Effect transport name.
+    #[arg(long, required = true)]
+    pub transport: String,
+    /// Timeout in seconds.
+    #[arg(long)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Only agents active within this many days.
+    #[arg(long)]
+    pub active_within_days: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentMintArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Display name (project-scoped).
+    pub name: String,
+    /// Agent program (pi / opencode / grok).
+    #[arg(long)]
+    pub program: Option<String>,
+    /// Model id.
+    #[arg(long)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct MailPrepareThreadArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Thread id to prepare.
+    #[arg(long, required = true)]
+    pub thread: String,
+    /// Agent name (registered if missing with --register-if-missing).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Agent program.
+    #[arg(long, required = true)]
+    pub program: String,
+    /// Model id.
+    #[arg(long, required = true)]
+    pub model: String,
+    /// Register the agent if missing.
+    #[arg(long)]
+    pub register_if_missing: bool,
+    /// Max inbox messages for context.
+    #[arg(long)]
+    pub inbox_limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct ContactHandshakeArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Requesting agent.
+    #[arg(long)]
+    pub requester: Option<String>,
+    /// Target agent.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Reason for the link.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Auto-accept the request.
+    #[arg(long)]
+    pub auto_accept: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveCycleArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent holding the reservation.
+    #[arg(long, default_value = "agent")]
+    pub agent: String,
+    /// Path globs, comma-separated.
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub paths: Vec<String>,
+    /// TTL in seconds.
+    #[arg(long)]
+    pub ttl_seconds: Option<i64>,
+    /// Exclusive (default) or shared lease.
+    #[arg(long)]
+    pub exclusive: bool,
+    /// Reservation reason (usually a bead id).
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Release the paths at the end.
+    #[arg(long)]
+    pub auto_release: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1333,6 +1559,8 @@ pub enum ContactCommand {
     List(ContactListArgs),
     /// Set the agent's inbound contact policy.
     Policy(ContactPolicyArgs),
+    /// Batch: request contact + optional auto-accept + welcome message.
+    Handshake(ContactHandshakeArgs),
     /// Show or set the project's captain alias (bd-captain-alias-0g8a).
     /// With `--pin`, validates the pin is REGISTERED and folds `captain`
     /// onto it; without, prints the current fold.

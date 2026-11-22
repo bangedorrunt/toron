@@ -1,4 +1,325 @@
 {
+  "additive_tools": [
+    {
+      "cli": "reserve release-by-reason",
+      "description": "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close). REQUIRED: project_key, agent_name, bead_id. Operator/loop after-close hook; crews release their own locks via release_file_reservations (by agent_name) or CLI: toron reserve release --project <p> --as <pin>. Operator CLI door: toron reserve release-by-reason <bead> --project <p> --as <operator>.",
+      "example": {
+        "agent_name": "<string>",
+        "bead_id": "<string>",
+        "notify_previous": null,
+        "project_key": "<string>"
+      },
+      "group": "Additive",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "description": "Requestor (operator-facing name; used in the holder notification DM).",
+            "type": "string"
+          },
+          "bead_id": {
+            "description": "Bead id whose matching (reason == bead id) leases get revoked.",
+            "type": "string"
+          },
+          "notify_previous": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "bead_id"
+        ],
+        "type": "object"
+      },
+      "name": "release_file_reservations_by_reason",
+      "output_schema": {
+        "$defs": {
+          "ReleasedLeaseOut": {
+            "description": "`release_file_reservations` per-lease breakdown (S6).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "mode",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "leases": {
+            "items": {
+              "$ref": "#/$defs/ReleasedLeaseOut"
+            },
+            "type": "array"
+          },
+          "released": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "released",
+          "leases"
+        ],
+        "type": "object"
+      },
+      "parity": "AM-Rust 38-tool surface"
+    },
+    {
+      "cli": "reserve list",
+      "description": "List every active (held) file reservation in the project — the lock board the strict guard evaluates: id, path glob, holder, exclusive, reason, expiry. Optional filters: holder (exact agent name), path (glob overlap). REQUIRED: project_key.",
+      "example": {
+        "holder": null,
+        "path": null,
+        "project_key": "<string>"
+      },
+      "group": "Additive",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "holder": {
+            "description": "exact holder filter (agent name)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "glob-overlap filter (show holders of one path)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "name": "list_file_reservations",
+      "output_schema": {
+        "$defs": {
+          "LeaseRowOut": {
+            "description": "One lease row (`list_file_reservations`).",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "holder": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "holder",
+              "exclusive",
+              "reason",
+              "expires_ts_us"
+            ],
+            "type": "object"
+          },
+          "ReservationWaitlistOut": {
+            "description": "One path's FIFO waiters.",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "waiters": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "path",
+              "waiters"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reservations": {
+            "items": {
+              "$ref": "#/$defs/LeaseRowOut"
+            },
+            "type": "array"
+          },
+          "waitlists": {
+            "default": [],
+            "description": "bd-ll7bs: FIFO waiters by path, shown by `reserve list`.",
+            "items": {
+              "$ref": "#/$defs/ReservationWaitlistOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_key",
+          "count",
+          "reservations",
+          "waitlists"
+        ],
+        "type": "object"
+      },
+      "parity": "AM-Rust 38-tool surface"
+    },
+    {
+      "cli": "judgment ask",
+      "description": "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key). Offline transport is pure; system-one reaches a live model API.",
+      "example": {
+        "effect_key": "<string>",
+        "pack_id": "<string>",
+        "project_key": "<string>",
+        "state": null,
+        "timeout_seconds": null,
+        "transport": null
+      },
+      "group": "Additive",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "effect_key": {
+            "description": "Idempotency key: a recorded key replays the stored row, no re-invoke.",
+            "type": "string"
+          },
+          "pack_id": {
+            "description": "Flywheel resolves the question pack (unknown pack = typed error).",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "state": {
+            "description": "State fields (object); capped at 64KiB serialized."
+          },
+          "timeout_seconds": {
+            "description": "Child budget, default 30, max 300.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "transport": {
+            "description": "offline (pure, default) or system-one (live model).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "effect_key",
+          "pack_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "name": "ask_judgment",
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "answers": true,
+          "confidence": {
+            "format": "double",
+            "type": "number"
+          },
+          "effect_key": {
+            "type": "string"
+          },
+          "escalated": {
+            "type": "boolean"
+          },
+          "fallback_flag": {
+            "type": "boolean"
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "pack_id": {
+            "type": "string"
+          },
+          "pack_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "usage": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect_key",
+          "pack_id",
+          "pack_version",
+          "model_id",
+          "confidence",
+          "usage",
+          "fallback_flag",
+          "escalated",
+          "note",
+          "answers",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "parity": "AM-Rust 38-tool surface"
+    }
+  ],
   "cli_commands": [
     {
       "args": "--mcp-stdio, --mcp-http <MCP_HTTP>",
@@ -26,7 +347,7 @@
       "name": "config"
     },
     {
-      "args": "send, overseer, reply, inbox, ack, read, search, thread-summarize, whois",
+      "args": "send, overseer, reply, inbox, ack, read, search, thread-summarize, prepare-thread, whois",
       "description": "Mail: send/reply/inbox/ack/read/search/thread-summarize (MCP parity JSON)",
       "name": "mail"
     },
@@ -41,7 +362,7 @@
       "name": "events"
     },
     {
-      "args": "acquire, conflicts, list, renew, release, release-by-reason, sweep, yield, yields, force-release, request-release, respond, transfer, with-lease",
+      "args": "acquire, conflicts, list, renew, release, release-by-reason, cycle, sweep, yield, yields, force-release, request-release, respond, transfer, with-lease",
       "description": "File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release",
       "name": "reserve"
     },
@@ -51,7 +372,7 @@
       "name": "slot"
     },
     {
-      "args": "request, respond, list, policy, captain",
+      "args": "request, respond, list, policy, handshake, captain",
       "description": "Contacts: request/respond/list/policy",
       "name": "contact"
     },
@@ -61,9 +382,24 @@
       "name": "guard"
     },
     {
-      "args": "bootstrap, prune, rename",
+      "args": "bootstrap, prune, rename, list, mint",
       "description": "Agent identity: one-step session bootstrap (register/upsert + reserve)",
       "name": "agent"
+    },
+    {
+      "args": "resolve, cleanup",
+      "description": "Pane identities (plane N): resolve a pane to its pin, prune stale names",
+      "name": "pane"
+    },
+    {
+      "args": "ensure, link, search, inbox, summarize",
+      "description": "Product bus: cross-project manifests and fan-out reads",
+      "name": "product"
+    },
+    {
+      "args": "ask",
+      "description": "Judgment calls (effect sandbox): ask a judgment pack for a verdict",
+      "name": "judgment"
     },
     {
       "args": "create, join, leave, list, members, post, read, close, purge",
@@ -176,7 +512,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-21T23:05:10Z",
+  "generated_at": "2026-11-22T00:08:30Z",
   "resources": [
     {
       "description": "List projects known to toron.",

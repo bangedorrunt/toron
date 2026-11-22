@@ -147,6 +147,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Slot(_)
         | Command::Contact(_)
         | Command::Agent(_)
+        | Command::Pane(_)
+        | Command::Product(_)
+        | Command::Judgment(_)
         | Command::Guard(_) => {
             run_robot(command, cli.globals.dry_run)?;
             ExitCode::SUCCESS
@@ -360,6 +363,15 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Agent(cmd)) => {
             robot::run_agent_daemon(dc, cmd, dry_run).await
         }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Pane(cmd)) => {
+            robot::run_pane_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Product(cmd)) => {
+            robot::run_product_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Judgment(cmd)) => {
+            robot::run_judgment_daemon(dc, cmd).await
+        }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::AckSla(cmd)) => {
             robot::run_ack_sla_daemon(dc, cmd).await
         }
@@ -380,6 +392,15 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Agent(cmd)) => {
             robot::run_agent(mb, cmd, dry_run).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Pane(cmd)) => {
+            robot::run_pane(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Product(cmd)) => {
+            robot::run_product(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Judgment(cmd)) => {
+            robot::run_judgment(mb, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::AckSla(cmd)) => {
             robot::run_ack_sla(mb, cmd).await
@@ -437,6 +458,27 @@ fn run_catalog(output: Option<PathBuf>) -> anyhow::Result<()> {
     }
 }
 
+/// Bus + archive liveness in the health_check tool's shape, or an error
+/// note when no store is reachable. Status never fails on health.
+fn status_health() -> serde_json::Value {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return serde_json::json!({"error": format!("{e:#}")}),
+    };
+    rt.block_on(async {
+        match toron_mcp::demo_mailbox().await {
+            Ok(mb) => match serde_json::to_value(mb.health_check().await) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": format!("{e:#}")}),
+            },
+            Err(e) => serde_json::json!({"error": format!("{e:#}")}),
+        }
+    })
+}
+
 fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
     let value = serde_json::json!({
         "data_dir": cfg.data_dir.as_ref().map(|p| p.display().to_string()),
@@ -446,6 +488,9 @@ fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
         "envelope_ttl_days": cfg.envelope_ttl_days(None),
         "proof_gate_enabled": cfg.proof_gate_enabled(),
         "proof_scheme": cfg.effective_proof_scheme(),
+        // bd-5jeyj: the health_check tool's shape, reachable without MCP.
+        // Degraded, never fatal: status reports config even with no store.
+        "health": status_health(),
     });
     match format {
         OutputFormat::Json => render_json(&value, format),

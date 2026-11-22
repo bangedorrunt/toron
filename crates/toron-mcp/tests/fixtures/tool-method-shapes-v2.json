@@ -1655,6 +1655,10 @@
               "holder": {
                 "type": "string"
               },
+              "holder_live": {
+                "description": "bd-kyute: false when the holder has no live signed presence.",
+                "type": "boolean"
+              },
               "id": {
                 "type": "string"
               },
@@ -1671,7 +1675,8 @@
               "holder",
               "exclusive",
               "reason",
-              "expires_ts_us"
+              "expires_ts_us",
+              "holder_live"
             ],
             "type": "object"
           },

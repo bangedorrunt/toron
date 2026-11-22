@@ -216,17 +216,22 @@ impl ToolServer {
             Ok(rows) => rows,
             Err(e) => return ToolOutput::result::<()>(Err(e)),
         };
-        let reservations: Vec<LeaseRowOut> = rows
-            .into_iter()
-            .map(|r| LeaseRowOut {
+        let mut reservations: Vec<LeaseRowOut> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let holder_live = self
+                .mailbox
+                .holder_live(&args.project_key, &r.agent_pubkey)
+                .await;
+            reservations.push(LeaseRowOut {
                 id: r.id,
                 path: r.path_pattern,
                 holder: r.agent_name,
                 exclusive: r.exclusive,
                 reason: r.reason,
                 expires_ts_us: r.expires_ts_us,
-            })
-            .collect();
+                holder_live,
+            });
+        }
         let waiters = self
             .mailbox
             .list_project_waiters(&args.project_key)
@@ -322,6 +327,8 @@ pub struct LeaseRowOut {
     pub exclusive: bool,
     pub reason: String,
     pub expires_ts_us: Option<i64>,
+    /// bd-kyute: false when the holder has no live signed presence.
+    pub holder_live: bool,
 }
 
 /// `list_file_reservations`.
@@ -374,6 +381,7 @@ impl crate::tools::ToJson for LeaseBoardOut {
                 "exclusive": r.exclusive,
                 "reason": r.reason,
                 "expires_ts_us": r.expires_ts_us,
+                "holder_live": r.holder_live,
             })).collect::<Vec<_>>(),
             "waitlists": self.waitlists.iter().map(|w| json!({
                 "path": w.path,

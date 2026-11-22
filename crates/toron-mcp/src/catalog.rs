@@ -161,6 +161,87 @@ pub fn resource_catalog() -> Vec<Value> {
         .collect()
 }
 
+/// Every live MCP tool and the CLI command that covers it (bd-5jeyj).
+/// The parity test reads the live router and fails naming any tool with no
+/// row here, or whose CLI path does not exist — so a future tool cannot
+/// ship without a CLI. Paths are `toron` subcommand words (`mail send`).
+pub const TOOL_CLI_PARITY: &[(&str, &str)] = &[
+    ("register_agent", "agent bootstrap"),
+    ("create_agent_identity", "agent bootstrap"),
+    ("whois", "mail whois"),
+    ("resolve_pane_identity", "pane resolve"),
+    ("cleanup_pane_identities", "pane cleanup"),
+    ("list_agents", "agent list"),
+    ("send_message", "mail send"),
+    ("reply_message", "mail reply"),
+    ("fetch_inbox", "mail inbox"),
+    ("acknowledge_message", "mail ack"),
+    ("mark_message_read", "mail read"),
+    ("request_contact", "contact request"),
+    ("respond_contact", "contact respond"),
+    ("list_contacts", "contact list"),
+    ("set_contact_policy", "contact policy"),
+    ("check_file_reservation_conflicts", "reserve conflicts"),
+    ("file_reservation_paths", "reserve acquire"),
+    ("renew_file_reservations", "reserve renew"),
+    ("release_file_reservations", "reserve release"),
+    ("force_release_file_reservation", "reserve force-release"),
+    ("list_file_reservations", "reserve list"),
+    (
+        "release_file_reservations_by_reason",
+        "reserve release-by-reason",
+    ),
+    ("search_messages", "mail search"),
+    ("summarize_thread", "mail thread-summarize"),
+    ("macro_start_session", "agent bootstrap"),
+    ("macro_prepare_thread", "mail prepare-thread"),
+    ("macro_contact_handshake", "contact handshake"),
+    ("macro_file_reservation_cycle", "reserve cycle"),
+    ("ensure_product", "product ensure"),
+    ("products_link", "product link"),
+    ("search_messages_product", "product search"),
+    ("fetch_inbox_product", "product inbox"),
+    ("summarize_thread_product", "product summarize"),
+    ("acquire_build_slot", "slot acquire"),
+    ("renew_build_slot", "slot renew"),
+    ("release_build_slot", "slot release"),
+    ("health_check", "status"),
+    ("ensure_project", "project ensure"),
+    ("install_precommit_guard", "guard install"),
+    ("uninstall_precommit_guard", "guard uninstall"),
+    ("ask_judgment", "judgment ask"),
+];
+
+/// The live additive tools as catalog entries (bd-5jeyj): same shape as
+/// the parity rows, plus the CLI command that covers each one. The frozen
+/// 38-tool table stays byte-identical (ADR-0007 C3); this section is how
+/// the catalog lists ALL live tools.
+pub fn additive_tool_catalog() -> anyhow::Result<Vec<Value>> {
+    let tools = ToolServer::tool_router().list_all();
+    let mut out = Vec::with_capacity(ADDITIVE_TOOLS.len());
+    for name in ADDITIVE_TOOLS {
+        let tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == *name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "catalog drift: additive tool `{name}` missing from the MCP surface"
+                )
+            })?;
+        let cli = TOOL_CLI_PARITY
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| *c)
+            .ok_or_else(|| {
+                anyhow::anyhow!("catalog drift: additive tool `{name}` has no CLI mapping")
+            })?;
+        let mut entry = tool_entry(tool, "Additive");
+        entry["cli"] = Value::String(cli.to_string());
+        out.push(entry);
+    }
+    Ok(out)
+}
+
 fn tool_entry(tool: &Tool, group: &str) -> Value {
     let input_schema = Value::Object((*tool.input_schema).clone());
     let output_schema = tool

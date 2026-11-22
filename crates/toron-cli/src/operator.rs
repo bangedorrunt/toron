@@ -17,8 +17,9 @@ use serde_json::json;
 
 use crate::cli::{
     AgentCommand, BackendCommand, Command, ContactCommand, DoctorArgs, DoctorCmd,
-    DoctorReconstructArgs, GuardCommand, KeyCommand, KeyGenerateArgs, KeyInspectArgs, MailCommand,
-    ProjectCommand, ProjectEnsureArgs, RelayCommand, RelayUrlArg, ReserveCommand, SlotCommand,
+    DoctorReconstructArgs, GuardCommand, JudgmentCommand, KeyCommand, KeyGenerateArgs,
+    KeyInspectArgs, MailCommand, PaneCommand, ProductCommand, ProjectCommand, ProjectEnsureArgs,
+    RelayCommand, RelayUrlArg, ReserveCommand, SlotCommand,
 };
 use crate::config::Config;
 use crate::output::{OutputFormat, render_json};
@@ -1274,6 +1275,7 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Mail(MailCommand::Read(_)) => "mail.read",
         Command::Mail(MailCommand::Search(_)) => "mail.search",
         Command::Mail(MailCommand::ThreadSummarize(_)) => "mail.thread_summarize",
+        Command::Mail(MailCommand::PrepareThread(_)) => "mail.prepare_thread",
         Command::Mail(MailCommand::Whois(_)) => "mail.whois",
         Command::AckSla(_) => "mail.ack_sla",
         Command::Reserve(ReserveCommand::Acquire(_)) => "reserve.acquire",
@@ -1282,6 +1284,7 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Reserve(ReserveCommand::Renew(_)) => "reserve.renew",
         Command::Reserve(ReserveCommand::Release(_)) => "reserve.release",
         Command::Reserve(ReserveCommand::ReleaseByReason(_)) => "reserve.release_by_reason",
+        Command::Reserve(ReserveCommand::Cycle(_)) => "reserve.cycle",
         Command::Reserve(ReserveCommand::Sweep(_)) => "reserve.sweep",
         Command::Reserve(ReserveCommand::Yield(_)) => "reserve.yield",
         Command::Reserve(ReserveCommand::Yields(_)) => "reserve.yields",
@@ -1297,11 +1300,23 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Contact(ContactCommand::Respond(_)) => "contact.respond",
         Command::Contact(ContactCommand::List(_)) => "contact.list",
         Command::Contact(ContactCommand::Policy(_)) => "contact.policy",
+        Command::Contact(ContactCommand::Handshake(_)) => "contact.handshake",
         Command::Contact(ContactCommand::Captain(_)) => "contact.captain",
         Command::Guard(GuardCommand::Install(_)) => "guard.install",
         Command::Guard(GuardCommand::Uninstall(_)) => "guard.uninstall",
         Command::Agent(AgentCommand::Bootstrap(_)) => "agent.bootstrap",
         Command::Agent(AgentCommand::Prune(_)) => "agent.prune",
+        Command::Agent(AgentCommand::Rename(_)) => "agent.rename",
+        Command::Agent(AgentCommand::List(_)) => "agent.list",
+        Command::Agent(AgentCommand::Mint(_)) => "agent.mint",
+        Command::Pane(PaneCommand::Resolve(_)) => "pane.resolve",
+        Command::Pane(PaneCommand::Cleanup(_)) => "pane.cleanup",
+        Command::Product(ProductCommand::Ensure(_)) => "product.ensure",
+        Command::Product(ProductCommand::Link(_)) => "product.link",
+        Command::Product(ProductCommand::Search(_)) => "product.search",
+        Command::Product(ProductCommand::Inbox(_)) => "product.inbox",
+        Command::Product(ProductCommand::Summarize(_)) => "product.summarize",
+        Command::Judgment(JudgmentCommand::Ask(_)) => "judgment.ask",
         _ => "unknown",
     }
 }

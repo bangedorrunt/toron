@@ -20,6 +20,7 @@ pub fn build_catalog(generated_at: &str) -> anyhow::Result<Value> {
         "generated_at": generated_at,
         "toron_version": env!("CARGO_PKG_VERSION"),
         "tools": toron_mcp::catalog::tool_catalog()?,
+        "additive_tools": toron_mcp::catalog::additive_tool_catalog()?,
         "resources": toron_mcp::catalog::resource_catalog(),
         "cli_commands": cli_commands(),
     }))
@@ -271,6 +272,25 @@ mod tests {
         assert_eq!(groups, expected, "tool order follows TOOL_GROUPS");
         let resources = fresh["resources"].as_array().expect("resources array");
         assert_eq!(resources.len(), 25, "AM-Rust parity requires 25 resources");
+        let additive = fresh["additive_tools"]
+            .as_array()
+            .expect("additive_tools array");
+        assert_eq!(
+            additive.len(),
+            toron_mcp::catalog::ADDITIVE_TOOLS.len(),
+            "the catalog lists every live additive tool"
+        );
+        for tool in additive {
+            let name = tool["name"].as_str().unwrap_or("");
+            assert!(
+                toron_mcp::catalog::ADDITIVE_TOOLS.contains(&name),
+                "unexpected additive row: {name}"
+            );
+            assert!(
+                tool["cli"].as_str().is_some_and(|c| !c.is_empty()),
+                "additive tool {name} names its CLI command"
+            );
+        }
     }
 
     #[test]

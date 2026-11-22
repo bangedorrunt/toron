@@ -309,3 +309,15 @@ inferred `required` lists; no input field moved.
 
 The fixture is the reviewed contract for this revision; S5's tamper witness
 still fails on a one-field change.
+
+---
+
+## Amendment A2 (2026-11-22) — stale-holder flag on the lease board (bd-kyute)
+
+`list_file_reservations` output gains `holder_live: boolean` on each lease row:
+false when the holder has no signed agent-profile activity within
+`STALE_AFTER_SECS` (30 min). This is an additive output-only field; the frozen
+method-shape fixture was regenerated after review. No tool name, count, input
+schema, or resource shape changed. The companion TTL cap (one hour, renew to
+hold longer) and the `BoundedHold` invariant live in code and
+`ToronLeaseResolution.tla` respectively; neither changes the MCP wire surface.
