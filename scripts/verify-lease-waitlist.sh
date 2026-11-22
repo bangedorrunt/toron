@@ -65,6 +65,7 @@ TRACES="$REPO/.agents/skills/verify-lease-resolution/traces"
 cp "$TRACES"/ToronLeaseResolution.*.jsonl "$WORK/"
 conform ToronLeaseResolution.recorded.jsonl 0 ""
 conform ToronLeaseResolution.no-holder-release.jsonl 20 "HandoffRelease"
+conform ToronLeaseResolution.pre-edit.jsonl 0 ""
 
 [ "$fail" -eq 0 ] || { echo "verify-lease-waitlist: $fail failed" >&2; exit 1; }
 echo "verify-lease-waitlist: all checks passed"

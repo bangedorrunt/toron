@@ -1,0 +1,3 @@
+{"edits_leased":[],"edits_blocked":[],"edits_waiters":{},"edits_writes":[]}
+{"action":"PreEditGranted","edits_leased":["A"],"edits_blocked":[],"edits_waiters":{},"edits_writes":[]}
+{"action":"WriteEdit","edits_leased":["A"],"edits_blocked":[],"edits_waiters":{},"edits_writes":["A"]}

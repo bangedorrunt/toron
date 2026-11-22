@@ -3,7 +3,8 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS MaxEpoch, FixSplitBrainAndEpoch, Bug, CapEnabled, MaxHold
 \* bd-ll7bs: Bug \in {"none", "double-holder", "lifo", "drop-waiter", "no-ttl"}.
-\* Each non-"none" value removes exactly one waitlist fence.
+\* bd-lk0kt: also "no-edit-lease", "no-edit-queue", "double-acquire".
+\* Each non-"none" value removes exactly one fence.
 
 VARIABLES
     bus_holder,
@@ -28,7 +29,11 @@ VARIABLES
     hold_ticks,
     dirty,
     stolen,
-    clean_stalled
+    clean_stalled,
+    edits_leased,
+    edits_blocked,
+    edits_waiters,
+    edits_writes
 
 vars == <<
     bus_holder,
@@ -53,11 +58,22 @@ vars == <<
     hold_ticks,
     dirty,
     stolen,
-    clean_stalled
+    clean_stalled,
+    edits_leased,
+    edits_blocked,
+    edits_waiters,
+    edits_writes
 >>
 
 \* bd-ll7bs: the waitlist half of the lease board. Kept in the SAME model so
 \* the existing split-brain/epoch invariants still constrain a handoff.
+LeaseVars == <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+    mirror_expired_active, mirror_epoch, durable_live, waitq, waitqLen,
+    arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease,
+    ghost, hold_ticks, dirty, stolen, clean_stalled>>
+
+EditVars == <<edits_leased, edits_blocked, edits_waiters, edits_writes>>
+
 Agents == {"A", "B", "C"}
 Sources == {"commit", "ship", "release", "ttl", "retire"}
 MaxQ == 2
@@ -118,8 +134,13 @@ Init ==
     /\ dirty = {}
     /\ stolen = FALSE
     /\ clean_stalled = FALSE
+    /\ edits_leased = {}
+    /\ edits_blocked = {}
+    /\ edits_waiters = [a \in Agents |-> 0]
+    /\ edits_writes = {}
 
 AcquireA ==
+    /\ UNCHANGED EditVars
     /\ next_epoch <= MaxEpoch
     /\ ActiveOwners = {}
     /\ bus_holder' = "A"
@@ -135,6 +156,7 @@ AcquireA ==
     /\ hold_ticks' = 0
 
 AcquireB ==
+    /\ UNCHANGED EditVars
     /\ next_epoch >= 1
     /\ next_epoch <= MaxEpoch
     /\ ActiveOwners = {}
@@ -151,6 +173,7 @@ AcquireB ==
     /\ hold_ticks' = 0
 
 AcquireC ==
+    /\ UNCHANGED EditVars
     /\ next_epoch >= 2
     /\ next_epoch <= MaxEpoch
     /\ ActiveOwners = {}
@@ -166,6 +189,7 @@ AcquireC ==
     /\ hold_ticks' = 0
 
 HoldTick ==
+    /\ UNCHANGED EditVars
     /\ (IF CapEnabled THEN hold_ticks < MaxHold ELSE hold_ticks < MaxHold + 1)
     /\ hold_ticks' = hold_ticks + 1
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
@@ -175,6 +199,7 @@ HoldTick ==
 \* uncommitted changes in the path. Commit clears the dirty flag; after the
 \* grace window (modelled by CleanCommit) the lease is no longer extended.
 EditDirty(a) ==
+    /\ UNCHANGED EditVars
     /\ a \in Agents
     /\ dirty' = dirty \cup {a}
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
@@ -184,6 +209,7 @@ EditDirty(a) ==
                    stolen, clean_stalled>>
 
 CleanCommit(a) ==
+    /\ UNCHANGED EditVars
     /\ a \in Agents
     /\ a \in dirty
     /\ dirty' = dirty \ {a}
@@ -195,6 +221,7 @@ CleanCommit(a) ==
 
 \* Negative fixture: handing a dirty path away while its holder is live.
 StealDirty(a, b) ==
+    /\ UNCHANGED EditVars
     /\ Bug = "steal-dirty"
     /\ a \in Agents /\ b \in Agents /\ a /= b
     /\ a \in dirty /\ a \in durable_live
@@ -209,6 +236,7 @@ StealDirty(a, b) ==
 
 \* A clean holder's expired lease must hand off to the head waiter.
 HandoffClean ==
+    /\ UNCHANGED EditVars
     /\ bus_status = "Held"
     /\ bus_expired
     /\ bus_holder \notin dirty
@@ -235,6 +263,7 @@ HandoffClean ==
                            badRelease, ghost, dirty, hold_ticks, stolen>>
 
 ReleaseHolder ==
+    /\ UNCHANGED EditVars
     /\ bus_status = "Held"
     /\ bus_holder \in ActiveOwners
     /\ bus_status' = "Released"
@@ -244,6 +273,7 @@ ReleaseHolder ==
     /\ UNCHANGED newVars
 
 ForceRevokeHolder ==
+    /\ UNCHANGED EditVars
     /\ bus_status = "Held"
     /\ bus_holder \in ActiveOwners
     /\ bus_status' = "Revoked"
@@ -253,6 +283,7 @@ ForceRevokeHolder ==
     /\ UNCHANGED newVars
 
 ExpireBusLease ==
+    /\ UNCHANGED EditVars
     /\ bus_status = "Held"
     /\ ~bus_expired
     /\ bus_holder \in Agents
@@ -262,12 +293,14 @@ ExpireBusLease ==
     /\ UNCHANGED newVars
 
 LapseActivityA ==
+    /\ UNCHANGED EditVars
     /\ "A" \in durable_live
     /\ durable_live' = durable_live \ {"A"}
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired, mirror_expired_active, mirror_epoch>>
     /\ UNCHANGED newVars
 
 RecordInboxPollA ==
+    /\ UNCHANGED EditVars
     /\ ~("A" \in durable_live)
     /\ "A" \in mirror_expired_active
     /\ durable_live' = durable_live \cup {"A"}
@@ -275,11 +308,13 @@ RecordInboxPollA ==
     /\ UNCHANGED newVars
 
 Done ==
+    /\ UNCHANGED EditVars
     /\ next_epoch > MaxEpoch
     /\ UNCHANGED vars
 
 \* bd-ll7bs: a blocked acquire joins ONE FIFO queue and asks the holder once.
 QueueHold(a) ==
+    /\ UNCHANGED EditVars
     /\ a \in Agents
     /\ ActiveOwners /= {}
     /\ a \notin ActiveOwners
@@ -297,6 +332,7 @@ QueueHold(a) ==
 \* The one handoff helper: every release source transfers to the head waiter,
 \* through the existing epoch-safe grant, never a second grant path.
 HandoffRelease(src) ==
+    /\ UNCHANGED EditVars
     /\ src \in Sources
     /\ bus_status = "Held"
     /\ bus_holder \in ActiveOwners
@@ -334,7 +370,50 @@ HandoffRelease(src) ==
                            ELSE badRelease
     /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks, dirty, stolen, clean_stalled>>
 
+\* bd-lk0kt: pre-edit hook. A free path is leased on first edit; a path held
+\* by another pin blocks the edit and enqueues exactly one waiter; a repeat
+\* pre-edit by the holder is a no-op.
+PreEditGranted ==
+    \E a \in Agents:
+        /\ a \notin edits_leased
+        /\ a \notin edits_blocked
+        /\ ActiveOwners = {} \/ a \in ActiveOwners
+        /\ edits_leased' = edits_leased \cup {a}
+        /\ UNCHANGED LeaseVars
+        /\ UNCHANGED <<edits_blocked, edits_waiters, edits_writes>>
+
+PreEditBlocked ==
+    \E a, b \in Agents:
+        /\ a /= b
+        /\ b \in ActiveOwners
+        /\ a \notin edits_leased
+        /\ a \notin edits_blocked
+        /\ edits_blocked' = edits_blocked \cup {a}
+        /\ edits_waiters' = IF Bug = "no-edit-queue" THEN edits_waiters
+                            ELSE [edits_waiters EXCEPT ![a] = @ + 1]
+        /\ UNCHANGED LeaseVars
+        /\ UNCHANGED <<edits_leased, edits_writes>>
+
+PreEditRepeat ==
+    \E a \in edits_leased:
+        /\ edits_waiters' = IF Bug = "double-acquire"
+                            THEN [edits_waiters EXCEPT ![a] = @ + 1]
+                            ELSE edits_waiters
+        /\ UNCHANGED LeaseVars
+        /\ UNCHANGED <<edits_leased, edits_blocked, edits_writes>>
+
+WriteEdit ==
+    \E a \in Agents:
+        /\ a \in edits_leased \/ Bug = "no-edit-lease"
+        /\ edits_writes' = edits_writes \cup {a}
+        /\ UNCHANGED LeaseVars
+        /\ UNCHANGED <<edits_leased, edits_blocked, edits_waiters>>
+
 Next ==
+    \/ PreEditGranted
+    \/ PreEditBlocked
+    \/ PreEditRepeat
+    \/ WriteEdit
     \/ AcquireA
     \/ AcquireC
     \/ AcquireB
@@ -377,5 +456,11 @@ BoundedHold == hold_ticks <= MaxHold
 LeaseOnlyWhileDirty == \A a \in LivenessExtendedOwners : a \in dirty
 DirtyNeverStolen == stolen = FALSE
 HandoffOnClean == clean_stalled = FALSE
+
+\* bd-lk0kt: every edit happens under its writer's lease; every blocked edit
+\* has exactly one waiter; re-acquiring a held path adds no waiter.
+NoEditWithoutLease == edits_writes \subseteq edits_leased
+BlockedEditQueued == \A a \in edits_blocked : edits_waiters[a] = 1
+IdempotentAcquire == \A a \in Agents : edits_waiters[a] <= 1
 
 ====
