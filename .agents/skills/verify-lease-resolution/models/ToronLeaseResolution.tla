@@ -25,7 +25,10 @@ VARIABLES
     asked,
     badRelease,
     ghost,
-    hold_ticks
+    hold_ticks,
+    dirty,
+    stolen,
+    clean_stalled
 
 vars == <<
     bus_holder,
@@ -47,7 +50,10 @@ vars == <<
     asked,
     badRelease,
     ghost,
-    hold_ticks
+    hold_ticks,
+    dirty,
+    stolen,
+    clean_stalled
 >>
 
 \* bd-ll7bs: the waitlist half of the lease board. Kept in the SAME model so
@@ -56,7 +62,7 @@ Agents == {"A", "B", "C"}
 Sources == {"commit", "ship", "release", "ttl", "retire"}
 MaxQ == 2
 QIdx == 1..MaxQ
-baseNew == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost>>
+baseNew == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost, dirty, stolen, clean_stalled>>
 newVars == <<baseNew, hold_ticks>>
 
 BusActiveOwners ==
@@ -72,12 +78,14 @@ LivenessExtendedOwners ==
             /\ bus_status = "Held"
             /\ bus_expired
             /\ bus_holder = a
-            /\ BusActiveOwners = {}}
+            /\ BusActiveOwners = {}
+            /\ (Bug = "clean-idle-extends" \/ a \in dirty)}
     ELSE
         {a \in Agents :
             /\ a \in mirror_expired_active
             /\ a \in durable_live
-            /\ ~(a \in BusActiveOwners)}
+            /\ ~(a \in BusActiveOwners)
+            /\ (Bug = "clean-idle-extends" \/ a \in dirty)}
 
 ActiveOwners == BusActiveOwners \cup LivenessExtendedOwners
 
@@ -107,6 +115,9 @@ Init ==
     /\ badRelease = {}
     /\ ghost = {}
     /\ hold_ticks = 0
+    /\ dirty = {}
+    /\ stolen = FALSE
+    /\ clean_stalled = FALSE
 
 AcquireA ==
     /\ next_epoch <= MaxEpoch
@@ -159,6 +170,69 @@ HoldTick ==
     /\ hold_ticks' = hold_ticks + 1
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
                    mirror_expired_active, mirror_epoch, durable_live, baseNew>>
+
+\* bd-nmilo: a live hold survives its TTL only while the holder still has
+\* uncommitted changes in the path. Commit clears the dirty flag; after the
+\* grace window (modelled by CleanCommit) the lease is no longer extended.
+EditDirty(a) ==
+    /\ a \in Agents
+    /\ dirty' = dirty \cup {a}
+    /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+                   mirror_expired_active, mirror_epoch, durable_live,
+                   waitq, waitqLen, arrq, arrLen, servedq, servedLen,
+                   arrived, served, asked, badRelease, ghost, hold_ticks,
+                   stolen, clean_stalled>>
+
+CleanCommit(a) ==
+    /\ a \in Agents
+    /\ a \in dirty
+    /\ dirty' = dirty \ {a}
+    /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+                   mirror_expired_active, mirror_epoch, durable_live,
+                   waitq, waitqLen, arrq, arrLen, servedq, servedLen,
+                   arrived, served, asked, badRelease, ghost, hold_ticks,
+                   stolen, clean_stalled>>
+
+\* Negative fixture: handing a dirty path away while its holder is live.
+StealDirty(a, b) ==
+    /\ Bug = "steal-dirty"
+    /\ a \in Agents /\ b \in Agents /\ a /= b
+    /\ a \in dirty /\ a \in durable_live
+    /\ bus_holder = a
+    /\ bus_holder' = b
+    /\ stolen' = TRUE
+    /\ UNCHANGED <<bus_status, bus_epoch, next_epoch, bus_expired,
+                   mirror_expired_active, mirror_epoch, durable_live,
+                   waitq, waitqLen, arrq, arrLen, servedq, servedLen,
+                   arrived, served, asked, badRelease, ghost, hold_ticks,
+                   dirty, clean_stalled>>
+
+\* A clean holder's expired lease must hand off to the head waiter.
+HandoffClean ==
+    /\ bus_status = "Held"
+    /\ bus_expired
+    /\ bus_holder \notin dirty
+    /\ waitqLen > 0
+    /\ IF Bug = "no-clean-handoff"
+       THEN /\ clean_stalled' = TRUE
+            /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+                           mirror_expired_active, mirror_epoch, durable_live,
+                           waitq, waitqLen, arrq, arrLen, servedq, servedLen,
+                           arrived, served, asked, badRelease, ghost, dirty, hold_ticks, stolen>>
+       ELSE /\ bus_holder' = waitq[1]
+            /\ bus_status' = "Held"
+            /\ bus_expired' = FALSE
+            /\ bus_epoch' = next_epoch
+            /\ next_epoch' = next_epoch + 1
+            /\ waitq' = [i \in QIdx |-> IF i < waitqLen THEN waitq[i + 1] ELSE "None"]
+            /\ waitqLen' = waitqLen - 1
+            /\ served' = served \cup {waitq[1]}
+            /\ mirror_epoch' =
+                 [mirror_epoch EXCEPT ![bus_holder] = bus_epoch, ![waitq[1]] = next_epoch]
+            /\ clean_stalled' = FALSE
+            /\ UNCHANGED <<mirror_expired_active, durable_live,
+                           arrq, arrLen, servedq, servedLen, arrived, asked,
+                           badRelease, ghost, dirty, hold_ticks, stolen>>
 
 ReleaseHolder ==
     /\ bus_status = "Held"
@@ -218,7 +292,7 @@ QueueHold(a) ==
     /\ arrived' = arrived \cup {a}
     /\ asked' = asked \cup {a}
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
-                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost, hold_ticks>>
+                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost, hold_ticks, dirty, stolen, clean_stalled>>
 
 \* The one handoff helper: every release source transfers to the head waiter,
 \* through the existing epoch-safe grant, never a second grant path.
@@ -258,7 +332,7 @@ HandoffRelease(src) ==
           /\ badRelease' = IF waitqLen > 0 /\ ~grant
                            THEN badRelease \cup {src}
                            ELSE badRelease
-    /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks>>
+    /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks, dirty, stolen, clean_stalled>>
 
 Next ==
     \/ AcquireA
@@ -270,6 +344,10 @@ Next ==
     \/ LapseActivityA
     \/ RecordInboxPollA
     \/ HoldTick
+    \/ \E a \in Agents : EditDirty(a)
+    \/ \E a \in Agents : CleanCommit(a)
+    \/ \E a, b \in Agents : StealDirty(a, b)
+    \/ HandoffClean
     \/ \E a \in Agents : QueueHold(a)
     \/ \E s \in Sources : HandoffRelease(s)
     \/ Done
@@ -294,5 +372,10 @@ HandoffOnEveryRelease == badRelease = {}
 \* bd-kyute: a hold is a heartbeat, not a deed. One tick maps to the 15-minute
 \* MAX_RESERVATION_TTL_SECS; MaxHold is the operator's bounded-hold cap.
 BoundedHold == hold_ticks <= MaxHold
+
+\* bd-nmilo: a hold ends when the edit ends, not when the agent dies.
+LeaseOnlyWhileDirty == \A a \in LivenessExtendedOwners : a \in dirty
+DirtyNeverStolen == stolen = FALSE
+HandoffOnClean == clean_stalled = FALSE
 
 ====

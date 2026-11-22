@@ -40,11 +40,14 @@ run() { # cfg expected-status expected-invariant
 
 run ToronLeaseResolution.fixed ok
 run ToronLeaseResolution.waitlist ok
-run ToronLeaseResolution.waitlist.broken-double-holder invariant OneHolder
-run ToronLeaseResolution.waitlist.broken-lifo invariant FifoHandoff
-run ToronLeaseResolution.waitlist.broken-drop-waiter invariant NoLostWaiter
-run ToronLeaseResolution.waitlist.broken-no-ttl invariant HandoffOnEveryRelease
-run ToronLeaseResolution.broken-unbounded-hold invariant BoundedHold
+# Every broken fixture is discovered by file name; its FIRST line names the
+# invariant it must violate. No registry to edit when a new invariant lands.
+for cfg_file in "$MODELS"/ToronLeaseResolution*.broken*.cfg; do
+  [ -f "$cfg_file" ] || continue
+  name="$(command head -1 "$cfg_file" | sed -n 's/^\\\* \([A-Za-z0-9]*\) broken:.*/\1/p')"
+  [ -n "$name" ] || { echo "FAIL $cfg_file: first line must name its invariant" >&2; fail=$((fail + 1)); continue; }
+  run "$(basename "$cfg_file" .cfg)" invariant "$name"
+done
 
 conform() { # trace expected-rc step
   local trace="$1" expected="$2" step="$3" out rc
