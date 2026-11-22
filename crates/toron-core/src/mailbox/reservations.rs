@@ -1038,6 +1038,11 @@ impl Mailbox {
         let project_slug = &self.canonical_project(project_slug).await;
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let now_secs = Timestamp::now().as_secs() as i64;
+        // bd-kyute: renew must not undo the acquire cap. Clamp both the
+        // extension and the resulting absolute expiry to the same ceiling.
+        let cap_secs = MAX_RESERVATION_TTL_SECS;
+        let extend_secs = extend_secs.min(cap_secs);
+        let cap_abs_secs = (now_secs as u64).saturating_add(cap_secs);
         let mine = self
             .active_reservations(project_slug)
             .await?
@@ -1074,7 +1079,8 @@ impl Mailbox {
             // and produced a 2x expiry (parity bug bd-XXX).
             let new_expiry_secs = old_expiry_secs
                 .map(|abs| (abs as u64).saturating_add(extend_secs))
-                .unwrap_or_else(|| created.as_secs().saturating_add(extend_secs));
+                .unwrap_or_else(|| created.as_secs().saturating_add(extend_secs))
+                .min(cap_abs_secs);
             let ttl = EnvelopeTtl {
                 secs: Some(new_expiry_secs.saturating_sub(created.as_secs())),
             };
@@ -5109,16 +5115,16 @@ mod tests {
                 "demo",
                 "BlueLake",
                 &["src/**".into()],
-                Some(7200),
+                Some(900),
                 true,
                 None,
             )
             .await
-            .expect("acquire long");
+            .expect("acquire capped");
         assert_eq!(acq.granted.len(), 1);
 
         let renew = mailbox
-            .renew_file_reservations("demo", "BlueLake", &[], 3600)
+            .renew_file_reservations("demo", "BlueLake", &[], 300)
             .await
             .expect("renew");
         assert_eq!(
@@ -5144,10 +5150,11 @@ mod tests {
             .expect("acquire short");
         let old_short = short.granted[0].expires_ts_us.expect("short expiry");
 
+        let now = chrono::Utc::now().timestamp();
         let renew2 = mailbox
             .renew_file_reservations("demo", "BlueLake", &[], 3600)
             .await
-            .expect("renew 2");
+            .expect("renew 2 over the cap");
         assert_eq!(
             renew2.renewed, 2,
             "renewed equals the live lease set (both paths)"
@@ -5161,9 +5168,9 @@ mod tests {
         let new_exp = moved.expires_ts_us.expect("moved expiry");
         assert!(new_exp > old_short, "near-lapse expiry moved forward");
         assert!(
-            (new_exp - old_short) / 1_000_000 >= 3600,
-            "absolute extension: new = old + extend (got +{}s)",
-            (new_exp - old_short) / 1_000_000
+            new_exp / 1_000_000 <= now + MAX_RESERVATION_TTL_SECS as i64,
+            "renew over the cap must not exceed now+900 (got {})",
+            new_exp / 1_000_000
         );
 
         let _ = std::fs::remove_file(&db_path);
@@ -5177,14 +5184,7 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
 
         let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
+            .file_reservation_paths("demo", "BlueLake", &["src/**".into()], Some(60), true, None)
             .await
             .expect("acquire");
         let old_expiry_us = acq.granted[0]
@@ -5192,12 +5192,12 @@ mod tests {
             .expect("acquired lease has expiry");
 
         let renew = mailbox
-            .renew_file_reservations("demo", "BlueLake", &["src/**".into()], 7200)
+            .renew_file_reservations("demo", "BlueLake", &["src/**".into()], 300)
             .await
             .expect("renew");
         assert_eq!(renew.renewed, 1);
         assert_eq!(renew.reservations.len(), 1);
-        let expected_us = old_expiry_us + 7_200_000_000;
+        let expected_us = old_expiry_us + 300_000_000;
         assert_eq!(
             renew.reservations[0].expires_ts_us,
             Some(expected_us),
