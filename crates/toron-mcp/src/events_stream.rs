@@ -221,17 +221,13 @@ pub async fn stream_intercept(
         // bd-958by: pi's auto probe sends server/discover with no _meta. rmcp
         // requires metadata on every discover request, so answer it here with
         // the same version list the server advertises.
-        let result = json!({
-            "resultType": "complete",
-            "supportedVersions": crate::server::SUPPORTED_PROTOCOL_VERSIONS
-                .iter()
-                .map(|v| v.as_str())
-                .collect::<Vec<_>>(),
-            "capabilities": serde_json::to_value(crate::server::ToronServer::capabilities())
-                .unwrap_or_default(),
-            "ttlMs": 60_000,
-            "cacheScope": "public",
-        });
+        let server = crate::server::ToronServer::new();
+        let config = <crate::server::ToronServer as rmcp::ServerHandler>::get_info(&server);
+        let result = rmcp::model::DiscoverResult::from_server_info(
+            crate::server::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+            config,
+        );
+        let result = serde_json::to_value(result).unwrap_or_default();
         return (
             StatusCode::OK,
             axum::Json(json!({

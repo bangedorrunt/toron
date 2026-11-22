@@ -159,6 +159,10 @@ async fn bare_server_discover_needs_no_metadata() -> anyhow::Result<()> {
         text.contains("2024-11-05"),
         "discover advertises old versions: {text}"
     );
+    assert!(
+        text.contains("io.modelcontextprotocol/serverInfo") && text.contains("toron"),
+        "discover keeps server identity for older clients: {text}"
+    );
     Ok(())
 }
 
