@@ -1,3 +1,5 @@
 {"edits_leased":[],"edits_blocked":[],"edits_waiters":{},"edits_writes":[]}
 {"action":"PreEditGranted","edits_leased":["A"],"edits_blocked":[],"edits_waiters":{},"edits_writes":[]}
-{"action":"WriteEdit","edits_leased":["A"],"edits_blocked":[],"edits_waiters":{},"edits_writes":["A"]}
+{"action":"AcquireA","edits_leased":["A"],"edits_blocked":[],"edits_waiters":{},"edits_writes":[]}
+{"action":"PreEditBlocked","edits_leased":["A"],"edits_blocked":["B"],"edits_waiters":{"B":1},"edits_writes":[]}
+{"action":"WriteEdit","edits_leased":["A"],"edits_blocked":["B"],"edits_waiters":{"B":1},"edits_writes":["A"]}
