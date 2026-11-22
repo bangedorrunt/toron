@@ -44,6 +44,7 @@ run ToronLeaseResolution.waitlist.broken-double-holder invariant OneHolder
 run ToronLeaseResolution.waitlist.broken-lifo invariant FifoHandoff
 run ToronLeaseResolution.waitlist.broken-drop-waiter invariant NoLostWaiter
 run ToronLeaseResolution.waitlist.broken-no-ttl invariant HandoffOnEveryRelease
+run ToronLeaseResolution.broken-unbounded-hold invariant BoundedHold
 
 conform() { # trace expected-rc step
   local trace="$1" expected="$2" step="$3" out rc

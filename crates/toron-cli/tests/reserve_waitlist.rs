@@ -159,6 +159,12 @@ fn queue_acquire_through_daemon_end_to_end() {
         queues.iter().any(|q| q["waiters"][0] == "DawnWaiter"),
         "the daemon MCP path recorded the waiter: {body}"
     );
+    assert!(
+        body["reservations"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().all(|r| r["holder_live"] == true)),
+        "a freshly bootstrapped holder is live: {body}"
+    );
 
     let release = toron()
         .args([
@@ -194,6 +200,42 @@ fn queue_acquire_through_daemon_end_to_end() {
         "the daemon path handed the lease over: {body}"
     );
     drop(daemon);
+}
+
+#[tokio::test]
+async fn ttl_above_the_cap_is_clamped() {
+    let (mailbox, _db, _data) = test_mailbox("ttl-cap").await;
+    mailbox
+        .register_agent(PROJECT, &AgentProfile::new("LongHold"))
+        .await
+        .expect("register");
+    let before = chrono::Utc::now().timestamp_micros();
+    let out = mailbox
+        .file_reservation_paths(
+            PROJECT,
+            "LongHold",
+            &["src/capped.rs".to_string()],
+            Some(60 * 60 * 24 * 30),
+            true,
+            None,
+        )
+        .await
+        .expect("acquire");
+    assert_eq!(out.granted.len(), 1);
+    let rows = mailbox
+        .list_file_reservations(PROJECT, None, None)
+        .await
+        .expect("board");
+    let lease = rows
+        .iter()
+        .find(|r| r.path_pattern == "src/capped.rs")
+        .expect("lease");
+    let expires = lease.expires_ts_us.expect("expiry");
+    let cap_us = 60 * 60 * 1_000_000;
+    assert!(
+        expires <= before + cap_us + 5_000_000 && expires > before,
+        "TTL must be clamped to one hour, got {expires} (now {before})"
+    );
 }
 
 #[tokio::test]

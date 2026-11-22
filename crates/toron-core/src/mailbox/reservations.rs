@@ -83,6 +83,8 @@ pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
 /// while its command runs, so a live worker never loses a hold. A dead one
 /// frees the path inside three minutes.
 pub const DEFAULT_RESERVATION_TTL_SECS: u64 = 3 * 60;
+/// bd-kyute: a hold is a heartbeat, not a deed. Longer holds use renew.
+pub const MAX_RESERVATION_TTL_SECS: u64 = 60 * 60;
 
 /// The 30031 status state machine (ADR-0011 Spec 2). Status-less 30031s are
 /// `Held` (backward compat — existing reservations are byte-identical).
@@ -637,6 +639,15 @@ impl Mailbox {
                 });
             }
             let ttl_secs = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
+            let ttl_secs = if ttl_secs > MAX_RESERVATION_TTL_SECS {
+                eprintln!(
+                    "toron: ttl {ttl_secs}s exceeds the {}s cap; clamped (renew to hold longer)",
+                    MAX_RESERVATION_TTL_SECS
+                );
+                MAX_RESERVATION_TTL_SECS
+            } else {
+                ttl_secs
+            };
             let ttl_us = ttl_secs;
             let blockers = Self::kernel_blockers_for(
                 &model,
@@ -2379,14 +2390,13 @@ impl Mailbox {
 
     /// Staleness heuristic: holder has no signed profile activity within
     /// `STALE_AFTER_SECS`.
-    async fn is_holder_stale(&self, project_slug: &str, res: &Reservation) -> bool {
+    async fn pubkey_stale(&self, project_slug: &str, holder_pubkey: &str) -> bool {
         let filter =
             kind_project_filter(toron_kind(crate::nostr::kinds::AGENT_PROFILE), project_slug);
         collect_replay(self.bus.as_ref(), filter)
             .await
             .is_ok_and(|events| {
                 let now = Timestamp::now().as_secs() as i64;
-                let holder_pubkey = res.agent_pubkey.clone();
                 let last_active = events
                     .iter()
                     .filter(|e| e.pubkey.to_hex() == holder_pubkey)
@@ -2394,6 +2404,16 @@ impl Mailbox {
                     .max();
                 last_active.is_none_or(|ts| now - ts > STALE_AFTER_SECS as i64)
             })
+    }
+
+    async fn is_holder_stale(&self, project_slug: &str, res: &Reservation) -> bool {
+        self.pubkey_stale(project_slug, &res.agent_pubkey).await
+    }
+
+    /// bd-kyute: whether a lease holder still has live signed presence. The
+    /// reserve-list surfaces use this to flag dead-pin holds.
+    pub async fn holder_live(&self, project_slug: &str, holder_pubkey: &str) -> bool {
+        !self.pubkey_stale(project_slug, holder_pubkey).await
     }
 
     /// Best-effort pubkey → agent-name map from kind-30013 profiles, with the

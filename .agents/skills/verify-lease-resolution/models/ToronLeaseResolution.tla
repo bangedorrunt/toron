@@ -1,7 +1,7 @@
 ---- MODULE ToronLeaseResolution ----
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS MaxEpoch, FixSplitBrainAndEpoch, Bug
+CONSTANTS MaxEpoch, FixSplitBrainAndEpoch, Bug, CapEnabled, MaxHold
 \* bd-ll7bs: Bug \in {"none", "double-holder", "lifo", "drop-waiter", "no-ttl"}.
 \* Each non-"none" value removes exactly one waitlist fence.
 
@@ -24,7 +24,8 @@ VARIABLES
     served,
     asked,
     badRelease,
-    ghost
+    ghost,
+    hold_ticks
 
 vars == <<
     bus_holder,
@@ -45,7 +46,8 @@ vars == <<
     served,
     asked,
     badRelease,
-    ghost
+    ghost,
+    hold_ticks
 >>
 
 \* bd-ll7bs: the waitlist half of the lease board. Kept in the SAME model so
@@ -54,7 +56,8 @@ Agents == {"A", "B", "C"}
 Sources == {"commit", "ship", "release", "ttl", "retire"}
 MaxQ == 2
 QIdx == 1..MaxQ
-newVars == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost>>
+baseNew == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost>>
+newVars == <<baseNew, hold_ticks>>
 
 BusActiveOwners ==
     IF bus_status = "Held" /\ ~bus_expired /\ bus_holder \in Agents
@@ -103,6 +106,7 @@ Init ==
     /\ asked = {}
     /\ badRelease = {}
     /\ ghost = {}
+    /\ hold_ticks = 0
 
 AcquireA ==
     /\ next_epoch <= MaxEpoch
@@ -116,7 +120,8 @@ AcquireA ==
         IF FixSplitBrainAndEpoch THEN {} ELSE mirror_expired_active \ {"A"}
     /\ mirror_epoch' = [mirror_epoch EXCEPT !["A"] = next_epoch]
     /\ durable_live' = durable_live \cup {"A"}
-    /\ UNCHANGED newVars
+    /\ UNCHANGED baseNew
+    /\ hold_ticks' = 0
 
 AcquireB ==
     /\ next_epoch >= 1
@@ -131,7 +136,8 @@ AcquireB ==
         IF FixSplitBrainAndEpoch THEN {} ELSE mirror_expired_active \ {"B"}
     /\ mirror_epoch' = [mirror_epoch EXCEPT !["B"] = next_epoch]
     /\ durable_live' = durable_live \cup {"B"}
-    /\ UNCHANGED newVars
+    /\ UNCHANGED baseNew
+    /\ hold_ticks' = 0
 
 AcquireC ==
     /\ next_epoch >= 2
@@ -145,7 +151,14 @@ AcquireC ==
     /\ mirror_expired_active' = IF FixSplitBrainAndEpoch THEN {} ELSE mirror_expired_active \ {"C"}
     /\ mirror_epoch' = [mirror_epoch EXCEPT !["C"] = next_epoch]
     /\ durable_live' = durable_live \cup {"C"}
-    /\ UNCHANGED newVars
+    /\ UNCHANGED baseNew
+    /\ hold_ticks' = 0
+
+HoldTick ==
+    /\ (IF CapEnabled THEN hold_ticks < MaxHold ELSE hold_ticks < MaxHold + 1)
+    /\ hold_ticks' = hold_ticks + 1
+    /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+                   mirror_expired_active, mirror_epoch, durable_live, baseNew>>
 
 ReleaseHolder ==
     /\ bus_status = "Held"
@@ -205,7 +218,7 @@ QueueHold(a) ==
     /\ arrived' = arrived \cup {a}
     /\ asked' = asked \cup {a}
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
-                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost>>
+                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost, hold_ticks>>
 
 \* The one handoff helper: every release source transfers to the head waiter,
 \* through the existing epoch-safe grant, never a second grant path.
@@ -245,7 +258,7 @@ HandoffRelease(src) ==
           /\ badRelease' = IF waitqLen > 0 /\ ~grant
                            THEN badRelease \cup {src}
                            ELSE badRelease
-    /\ UNCHANGED <<arrq, arrLen, arrived, asked>>
+    /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks>>
 
 Next ==
     \/ AcquireA
@@ -256,6 +269,7 @@ Next ==
     \/ ExpireBusLease
     \/ LapseActivityA
     \/ RecordInboxPollA
+    \/ HoldTick
     \/ \E a \in Agents : QueueHold(a)
     \/ \E s \in Sources : HandoffRelease(s)
     \/ Done
@@ -276,5 +290,8 @@ Queued == {waitq[i] : i \in 1..waitqLen}
 FifoHandoff == \A i \in 1..servedLen : servedq[i] = arrq[i]
 NoLostWaiter == arrived \subseteq Queued \cup ActiveOwners \cup served
 HandoffOnEveryRelease == badRelease = {}
+
+\* bd-kyute: a hold is a heartbeat, not a deed — it cannot grow past the cap.
+BoundedHold == hold_ticks <= MaxHold
 
 ====
