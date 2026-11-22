@@ -231,7 +231,7 @@ async fn ttl_above_the_cap_is_clamped() {
         .find(|r| r.path_pattern == "src/capped.rs")
         .expect("lease");
     let expires = lease.expires_ts_us.expect("expiry");
-    let cap_us = 60 * 60 * 1_000_000;
+    let cap_us = toron_core::mailbox::reservations::MAX_RESERVATION_TTL_SECS as i64 * 1_000_000;
     assert!(
         expires <= before + cap_us + 5_000_000 && expires > before,
         "TTL must be clamped to one hour, got {expires} (now {before})"

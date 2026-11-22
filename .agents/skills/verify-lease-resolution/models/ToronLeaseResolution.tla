@@ -291,7 +291,8 @@ FifoHandoff == \A i \in 1..servedLen : servedq[i] = arrq[i]
 NoLostWaiter == arrived \subseteq Queued \cup ActiveOwners \cup served
 HandoffOnEveryRelease == badRelease = {}
 
-\* bd-kyute: a hold is a heartbeat, not a deed — it cannot grow past the cap.
+\* bd-kyute: a hold is a heartbeat, not a deed. One tick maps to the 15-minute
+\* MAX_RESERVATION_TTL_SECS; MaxHold is the operator's bounded-hold cap.
 BoundedHold == hold_ticks <= MaxHold
 
 ====

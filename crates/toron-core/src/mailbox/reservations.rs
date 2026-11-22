@@ -84,7 +84,7 @@ pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
 /// frees the path inside three minutes.
 pub const DEFAULT_RESERVATION_TTL_SECS: u64 = 3 * 60;
 /// bd-kyute: a hold is a heartbeat, not a deed. Longer holds use renew.
-pub const MAX_RESERVATION_TTL_SECS: u64 = 60 * 60;
+pub const MAX_RESERVATION_TTL_SECS: u64 = 15 * 60;
 
 /// The 30031 status state machine (ADR-0011 Spec 2). Status-less 30031s are
 /// `Held` (backward compat — existing reservations are byte-identical).
