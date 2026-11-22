@@ -173,6 +173,7 @@
         "required": [
           "message_id",
           "acknowledged",
+          "acknowledged_at_us",
           "read"
         ],
         "type": "object"
@@ -234,7 +235,8 @@
             },
             "required": [
               "slot",
-              "exclusive"
+              "exclusive",
+              "expires_ts_us"
             ],
             "type": "object"
           },
@@ -452,7 +454,8 @@
             "required": [
               "slot",
               "agent_name",
-              "exclusive"
+              "exclusive",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -577,6 +580,11 @@
             ]
           }
         },
+        "required": [
+          "removed",
+          "released",
+          "note"
+        ],
         "type": "object"
       }
     },
@@ -930,7 +938,16 @@
               "body_md",
               "importance",
               "ack_required",
-              "created_ts_us"
+              "thread_id",
+              "created_ts_us",
+              "read_ts_us",
+              "duplicate_of",
+              "corr",
+              "wake",
+              "priority",
+              "audience",
+              "result_path",
+              "verdict"
             ],
             "type": "object"
           }
@@ -1075,7 +1092,14 @@
               "body_md",
               "importance",
               "ack_required",
-              "created_ts_us"
+              "thread_id",
+              "created_ts_us",
+              "corr",
+              "wake",
+              "priority",
+              "audience",
+              "result_path",
+              "verdict"
             ],
             "type": "object"
           }
@@ -1117,6 +1141,11 @@
           },
           "project_key": {
             "type": "string"
+          },
+          "queue": {
+            "default": false,
+            "description": "On a hard conflict, join the FIFO waitlist and ask the holder once.",
+            "type": "boolean"
           },
           "reason": {
             "type": [
@@ -1175,7 +1204,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           },
@@ -1469,8 +1499,15 @@
             "required": [
               "name",
               "npub",
+              "program",
+              "model",
+              "task_description",
               "last_active_ts_us",
               "stale",
+              "pane_id",
+              "workspace_id",
+              "tab_id",
+              "pane_npub",
               "identity_divergent"
             ],
             "type": "object"
@@ -1550,6 +1587,7 @@
               "from_pubkey",
               "to_name",
               "to_pubkey",
+              "to_project",
               "status",
               "created_ts_us"
             ],
@@ -1632,7 +1670,27 @@
               "path",
               "holder",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
+            ],
+            "type": "object"
+          },
+          "ReservationWaitlistOut": {
+            "description": "One path's FIFO waiters.",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "waiters": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "path",
+              "waiters"
             ],
             "type": "object"
           }
@@ -1651,12 +1709,21 @@
               "$ref": "#/$defs/LeaseRowOut"
             },
             "type": "array"
+          },
+          "waitlists": {
+            "default": [],
+            "description": "bd-ll7bs: FIFO waiters by path, shown by `reserve list`.",
+            "items": {
+              "$ref": "#/$defs/ReservationWaitlistOut"
+            },
+            "type": "array"
           }
         },
         "required": [
           "project_key",
           "count",
-          "reservations"
+          "reservations",
+          "waitlists"
         ],
         "type": "object"
       }
@@ -1807,6 +1874,7 @@
               "from_pubkey",
               "to_name",
               "to_pubkey",
+              "to_project",
               "status",
               "created_ts_us"
             ],
@@ -1838,6 +1906,7 @@
         "required": [
           "requester",
           "target",
+          "link",
           "welcome_sent"
         ],
         "type": "object"
@@ -1922,7 +1991,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -2220,7 +2290,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -2303,6 +2374,7 @@
         "required": [
           "message_id",
           "acknowledged",
+          "acknowledged_at_us",
           "read"
         ],
         "type": "object"
@@ -2698,7 +2770,8 @@
               "agent_name",
               "agent_pubkey",
               "exclusive",
-              "status"
+              "status",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -2716,6 +2789,9 @@
             ]
           }
         },
+        "required": [
+          "slot"
+        ],
         "type": "object"
       }
     },
@@ -2782,7 +2858,8 @@
               "id",
               "path_pattern",
               "exclusive",
-              "reason"
+              "reason",
+              "expires_ts_us"
             ],
             "type": "object"
           }
@@ -3133,6 +3210,7 @@
           "from_pubkey",
           "to_name",
           "to_pubkey",
+          "to_project",
           "status",
           "created_ts_us"
         ],
@@ -3179,7 +3257,9 @@
           }
         },
         "required": [
-          "pane_id"
+          "agent_name",
+          "pane_id",
+          "note"
         ],
         "type": "object"
       }
@@ -3262,6 +3342,7 @@
           "from_pubkey",
           "to_name",
           "to_pubkey",
+          "to_project",
           "status",
           "created_ts_us"
         ],
@@ -3397,7 +3478,9 @@
               "from",
               "created_ts_us",
               "importance",
-              "ack_required"
+              "ack_required",
+              "thread_id",
+              "body_md"
             ],
             "type": "object"
           }
@@ -3418,7 +3501,8 @@
           }
         },
         "required": [
-          "result"
+          "result",
+          "next_cursor"
         ],
         "type": "object"
       }
@@ -3537,7 +3621,9 @@
               "from",
               "created_ts_us",
               "importance",
-              "ack_required"
+              "ack_required",
+              "thread_id",
+              "body_md"
             ],
             "type": "object"
           }
@@ -4102,8 +4188,15 @@
         "required": [
           "name",
           "npub",
+          "program",
+          "model",
+          "task_description",
           "last_active_ts_us",
           "stale",
+          "pane_id",
+          "workspace_id",
+          "tab_id",
+          "pane_npub",
           "identity_divergent"
         ],
         "type": "object"

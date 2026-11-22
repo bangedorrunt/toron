@@ -272,3 +272,40 @@ not = [{ contains = ["esc to cancel"] }]
 - **Interchangeable backends (A1, S1, §8).** Opaque IDs plus status normalization quarantine every backend dialect at the adapter edge, so a future backend changes method bodies, never reducers. The swap is proven by replay tests, not by a staging weekend.
 - **Coverage no human writes (A5, S3).** Model-based path generation turns the dispatch core's own transition table into its test suite: illegal transitions are caught by generated paths instead of production incidents, and "same log, same effects" becomes a CI fact alongside the envelope conformance test (S5).
 - **Immediate, zero-risk half (A6, A7).** The AGENTS.md conventions block and VERIFY honesty already landed: every future bead inherits them, and report beads can no longer borrow test gates. That half pays rent from today with no implementation risk.
+
+---
+
+## Amendment A1 (2026-11-22) — MCP method-shape regen (bd-reqp4)
+
+`mbx test -p toron-mcp --test catalog_shapes` was red on HEAD with 22 drifted
+shapes. Frozen fixture `crates/toron-mcp/tests/fixtures/tool-method-shapes-v2.json`
+was regenerated with `TORON_REGEN_SHAPES=1` after this classification.
+
+**Evidence.** Tool count stays 41 (38 parity + 3 additive), resource shapes are
+byte-identical, and the ONLY input-schema change across all 41 tools is the
+`queue` boolean on `file_reservation_paths`. Every other drift is an
+`output_schema` delta: either a regenerated `$defs` body or a `required` list
+now naming fields already present in the response type. No parity tool's call
+contract (name, params, types, required-ness of inputs) changed meaning.
+
+**Generator-only (rmcp 3.11 unification, bd-6zo01; no wire meaning change):**
+`acquire_build_slot`, `check_file_reservation_conflicts`, `fetch_inbox`,
+`fetch_inbox_product`, `file_reservation_paths` (output `$defs` half only),
+`list_agents`, `list_contacts`, `macro_file_reservation_cycle`,
+`macro_start_session`, `renew_build_slot` (shape), `renew_file_reservations`,
+`search_messages_product`. These differ only in generated `$defs` bodies and
+inferred `required` lists; no input field moved.
+
+**Intentional, named:**
+| Tool | Change | Bead |
+|---|---|---|
+| `file_reservation_paths` | `queue: boolean` input; FIFO waitlist acquire | bd-ll7bs |
+| `list_file_reservations` | `waitlists: [{path, waiters}]` output | bd-ll7bs |
+| `acknowledge_message`, `mark_message_read` | `acknowledged_at_us` now required in output | bd-fhf0 / bd-wave5-tojson-core-x7kj |
+| `request_contact`, `respond_contact`, `macro_contact_handshake` | `to_project` / `link` now required in output | bd-fhf0 |
+| `whois`, `list_agents` (WhoIsOut def) | pane identity/program/model fields now required in output | bd-fhf0 |
+| `resolve_pane_identity`, `cleanup_pane_identities` | resolution/cleanup result fields now required in output | bd-fhf0 |
+| `search_messages` | `next_cursor` now required in output | 627f5a4a (SEP-2106 outputSchema) |
+
+The fixture is the reviewed contract for this revision; S5's tamper witness
+still fails on a one-field change.
