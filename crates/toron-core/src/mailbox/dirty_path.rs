@@ -25,6 +25,11 @@ pub enum PathEvidence {
 /// The seam. Production uses `GitDirtyPathSource`; tests inject a fake.
 pub trait DirtyPathSource: Send + Sync {
     fn evidence(&self, repo_root: &Path, path: &str) -> PathEvidence;
+
+    /// One bounded call for a whole lease batch, not one fork per path.
+    fn evidence_batch(&self, repo_root: &Path, paths: &[String]) -> Vec<PathEvidence> {
+        paths.iter().map(|p| self.evidence(repo_root, p)).collect()
+    }
 }
 
 /// Pure decision: the reducer half. No clock, process or filesystem here.
@@ -59,38 +64,68 @@ impl Default for GitDirtyPathSource {
     }
 }
 
-impl DirtyPathSource for GitDirtyPathSource {
-    fn evidence(&self, repo_root: &Path, path: &str) -> PathEvidence {
-        let last_edit_ts_us = std::fs::metadata(repo_root.join(path))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| (d.as_secs() as i64).saturating_mul(1_000_000))
-            .unwrap_or(0);
+impl GitDirtyPathSource {
+    fn run_git(&self, repo_root: &Path, paths: &[String]) -> Option<Vec<u8>> {
         let child = match Command::new("git")
             .current_dir(repo_root)
-            .args(["status", "--porcelain=v2", "-z", "--", path])
+            .args(["status", "--porcelain=v2", "-z", "--"])
+            .args(paths)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => return PathEvidence::Unknown,
+            Err(_) => return None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(child.wait_with_output());
         });
         match rx.recv_timeout(self.timeout) {
-            Ok(Ok(out)) if out.status.success() => {
-                if out.stdout.is_empty() {
-                    PathEvidence::Clean { last_edit_ts_us }
-                } else {
+            Ok(Ok(out)) if out.status.success() => Some(out.stdout),
+            _ => None,
+        }
+    }
+
+    fn for_path(&self, repo_root: &Path, path: &str, out: Option<&[u8]>) -> PathEvidence {
+        let last_edit_ts_us = std::fs::metadata(repo_root.join(path))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64).saturating_mul(1_000_000))
+            .unwrap_or(0);
+        match out {
+            None => PathEvidence::Unknown,
+            Some(bytes) => {
+                let needle = path.as_bytes();
+                let dirty = bytes
+                    .split(|b| *b == 0)
+                    .any(|field| field == needle || field.ends_with(needle));
+                if dirty {
                     PathEvidence::Dirty { last_edit_ts_us }
+                } else {
+                    PathEvidence::Clean { last_edit_ts_us }
                 }
             }
-            _ => PathEvidence::Unknown,
         }
+    }
+}
+
+impl DirtyPathSource for GitDirtyPathSource {
+    fn evidence(&self, repo_root: &Path, path: &str) -> PathEvidence {
+        let out = self.run_git(repo_root, &[path.to_string()]);
+        self.for_path(repo_root, path, out.as_deref())
+    }
+
+    fn evidence_batch(&self, repo_root: &Path, paths: &[String]) -> Vec<PathEvidence> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let out = self.run_git(repo_root, paths);
+        paths
+            .iter()
+            .map(|p| self.for_path(repo_root, p, out.as_deref()))
+            .collect()
     }
 }
 

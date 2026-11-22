@@ -192,6 +192,9 @@ pub struct Mailbox {
     /// tests use a fake; production reads git status plus file mtime.
     pub(crate) dirty_source: Arc<dyn dirty_path::DirtyPathSource>,
     pub(crate) unknown_logged: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    pub(crate) dirty_cache:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, (i64, dirty_path::PathEvidence)>>>,
+    pub(crate) repo_roots: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
 }
 
 /// A memoized alternate-root resolution (see `Mailbox::alt_key_paths`).
@@ -259,6 +262,8 @@ impl Mailbox {
             handoff_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             dirty_source: Arc::new(dirty_path::GitDirtyPathSource::default()),
             unknown_logged: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            dirty_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            repo_roots: Arc::new(std::collections::HashMap::new()),
         }
     }
 
@@ -266,6 +271,64 @@ impl Mailbox {
     #[must_use]
     pub fn with_dirty_source(mut self, source: Arc<dyn dirty_path::DirtyPathSource>) -> Self {
         self.dirty_source = source;
+        self
+    }
+
+    /// One bounded git call per resolve batch, with a short cache. The cache
+    /// lock is never held across the source call.
+    pub(crate) fn evidence_batch_cached(
+        &self,
+        repo_root: &std::path::Path,
+        paths: &[String],
+        now_us: i64,
+    ) -> Vec<dirty_path::PathEvidence> {
+        const TTL_US: i64 = 5_000_000;
+        let mut out: Vec<Option<dirty_path::PathEvidence>> = vec![None; paths.len()];
+        {
+            let cache = self.dirty_cache.lock();
+            for (i, path) in paths.iter().enumerate() {
+                let key = format!("{}:{}", repo_root.display(), path);
+                if let Some((stamp, ev)) = cache.get(&key)
+                    && now_us.saturating_sub(*stamp) <= TTL_US
+                {
+                    out[i] = Some(ev.clone());
+                }
+            }
+        }
+        let missing: Vec<String> = paths
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out[*i].is_none())
+            .map(|(_, p)| p.clone())
+            .collect();
+        let fresh = self.dirty_source.evidence_batch(repo_root, &missing);
+        let mut by_path = std::collections::HashMap::new();
+        {
+            let mut cache = self.dirty_cache.lock();
+            for (path, ev) in missing.iter().zip(fresh) {
+                let key = format!("{}:{}", repo_root.display(), path);
+                cache.insert(key, (now_us, ev.clone()));
+                by_path.insert(path.clone(), ev);
+            }
+        }
+        for (i, path) in paths.iter().enumerate() {
+            if out[i].is_none() {
+                out[i] = by_path.get(path).cloned();
+            }
+        }
+        out.into_iter()
+            .map(|ev| ev.unwrap_or(dirty_path::PathEvidence::Unknown))
+            .collect()
+    }
+
+    /// Register a project's git repo root. Until toron persists one, the
+    /// embedder supplies it; without one the evidence source reports Unknown.
+    #[must_use]
+    pub fn with_repo_roots(
+        mut self,
+        roots: std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> Self {
+        self.repo_roots = Arc::new(roots);
         self
     }
 

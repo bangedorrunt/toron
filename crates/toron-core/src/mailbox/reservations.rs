@@ -1825,7 +1825,17 @@ impl Mailbox {
             .fetch_all(pool)
             .await
             .unwrap_or_default();
-            for (pubkey, path, reason, excl, exp_us, event_id, row_epoch) in expired_mirrors {
+            let paths = expired_mirrors
+                .iter()
+                .map(|m| m.1.clone())
+                .collect::<Vec<_>>();
+            let evidences = match self.repo_roots.get(project_slug) {
+                Some(root) => self.evidence_batch_cached(root, &paths, now_us),
+                None => vec![super::dirty_path::PathEvidence::Unknown; paths.len()],
+            };
+            for ((pubkey, path, reason, excl, exp_us, event_id, row_epoch), evidence) in
+                expired_mirrors.into_iter().zip(evidences)
+            {
                 let dup_self = out
                     .iter()
                     .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path);
@@ -1835,11 +1845,6 @@ impl Mailbox {
                 let live_presence = durable_live
                     .as_ref()
                     .is_some_and(|m| m.contains_key(&pubkey));
-                // bd-nmilo: liveness extends only while the path is dirty or
-                // recently edited. Unknown evidence falls back to the old
-                // liveness rule; a missing git repo never steals a lease.
-                let repo_root = self.data_dir.join(project_slug);
-                let evidence = self.dirty_source.evidence(&repo_root, &path);
                 if evidence == super::dirty_path::PathEvidence::Unknown {
                     let key = format!("{project_slug}:{path}");
                     if self.unknown_logged.lock().insert(key) {
@@ -7491,6 +7496,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    #[tokio::test]
+    async fn registered_repo_root_drops_a_clean_path_past_grace() {
+        let (mailbox, db_path, data_dir) = test_mailbox("registered-root").await;
+        let repo = std::env::temp_dir().join(format!("toron-nmilo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).expect("repo");
+        let _ = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["init", "-q"])
+            .status();
+        std::fs::write(repo.join("tracked.txt"), "one\n").expect("write");
+        let _ = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "tracked.txt"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "base",
+            ])
+            .status();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(400);
+        std::fs::File::open(repo.join("tracked.txt"))
+            .expect("file")
+            .set_modified(old)
+            .expect("old mtime");
+        let mut roots = std::collections::HashMap::new();
+        roots.insert("demo".to_string(), repo.clone());
+        let mailbox = mailbox.with_repo_roots(roots);
+        let holder = register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["tracked.txt".to_string()],
+                Some(1),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire");
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
+        let resolved = mailbox.resolved_leases("demo").await.expect("resolve");
+        assert!(
+            !resolved.iter().any(|r| r.agent_pubkey == holder.to_hex()),
+            "clean past grace must NOT be liveness-extended"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     struct FixedEvidence(super::super::dirty_path::PathEvidence);
     impl super::super::dirty_path::DirtyPathSource for FixedEvidence {
         fn evidence(
@@ -7505,8 +7569,6 @@ mod tests {
     #[tokio::test]
     async fn liveness_extended_lease_preserves_fencing_epoch() {
         let (mailbox, db_path, data_dir) = test_mailbox("liveness_epoch").await;
-        // bd-nmilo: a clean path past the grace would now expire; this test
-        // pins the epoch of a DIRTY live holder.
         let mailbox = mailbox.with_dirty_source(std::sync::Arc::new(FixedEvidence(
             super::super::dirty_path::PathEvidence::Dirty { last_edit_ts_us: 0 },
         )));
