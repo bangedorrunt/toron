@@ -1,7 +1,7 @@
 ---- MODULE ToronLeaseResolution ----
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS MaxEpoch, FixSplitBrainAndEpoch, Bug, CapEnabled, MaxHold
+CONSTANTS MaxEpoch, FixSplitBrainAndEpoch, Bug, CapEnabled, MaxHold, GraceSecs
 \* bd-ll7bs: Bug \in {"none", "double-holder", "lifo", "drop-waiter", "no-ttl"}.
 \* bd-lk0kt: also "no-edit-lease", "no-edit-queue", "double-acquire".
 \* Each non-"none" value removes exactly one fence.
@@ -30,6 +30,7 @@ VARIABLES
     dirty,
     stolen,
     clean_stalled,
+    unknown,
     edits_leased,
     edits_blocked,
     edits_waiters,
@@ -59,6 +60,7 @@ vars == <<
     dirty,
     stolen,
     clean_stalled,
+    unknown,
     edits_leased,
     edits_blocked,
     edits_waiters,
@@ -70,7 +72,7 @@ vars == <<
 LeaseVars == <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
     mirror_expired_active, mirror_epoch, durable_live, waitq, waitqLen,
     arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease,
-    ghost, hold_ticks, dirty, stolen, clean_stalled>>
+    ghost, hold_ticks, dirty, stolen, clean_stalled, unknown>>
 
 EditVars == <<edits_leased, edits_blocked, edits_waiters, edits_writes>>
 
@@ -78,7 +80,7 @@ Agents == {"A", "B", "C"}
 Sources == {"commit", "ship", "release", "ttl", "retire"}
 MaxQ == 2
 QIdx == 1..MaxQ
-baseNew == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost, dirty, stolen, clean_stalled>>
+baseNew == <<waitq, waitqLen, arrq, arrLen, servedq, servedLen, arrived, served, asked, badRelease, ghost, dirty, stolen, clean_stalled, unknown>>
 newVars == <<baseNew, hold_ticks>>
 
 BusActiveOwners ==
@@ -95,13 +97,13 @@ LivenessExtendedOwners ==
             /\ bus_expired
             /\ bus_holder = a
             /\ BusActiveOwners = {}
-            /\ (Bug = "clean-idle-extends" \/ a \in dirty)}
+            /\ (Bug = "clean-idle-extends" \/ a \in dirty \/ a \in unknown)}
     ELSE
         {a \in Agents :
             /\ a \in mirror_expired_active
             /\ a \in durable_live
             /\ ~(a \in BusActiveOwners)
-            /\ (Bug = "clean-idle-extends" \/ a \in dirty)}
+            /\ (Bug = "clean-idle-extends" \/ a \in dirty \/ a \in unknown)}
 
 ActiveOwners == BusActiveOwners \cup LivenessExtendedOwners
 
@@ -134,6 +136,7 @@ Init ==
     /\ dirty = {}
     /\ stolen = FALSE
     /\ clean_stalled = FALSE
+    /\ unknown = {}
     /\ edits_leased = {}
     /\ edits_blocked = {}
     /\ edits_waiters = [a \in Agents |-> 0]
@@ -206,7 +209,7 @@ EditDirty(a) ==
                    mirror_expired_active, mirror_epoch, durable_live,
                    waitq, waitqLen, arrq, arrLen, servedq, servedLen,
                    arrived, served, asked, badRelease, ghost, hold_ticks,
-                   stolen, clean_stalled>>
+                   stolen, clean_stalled, unknown>>
 
 CleanCommit(a) ==
     /\ UNCHANGED EditVars
@@ -217,7 +220,20 @@ CleanCommit(a) ==
                    mirror_expired_active, mirror_epoch, durable_live,
                    waitq, waitqLen, arrq, arrLen, servedq, servedLen,
                    arrived, served, asked, badRelease, ghost, hold_ticks,
-                   stolen, clean_stalled>>
+                   stolen, clean_stalled, unknown>>
+
+\* bd-nmilo ruling: missing evidence (no repo, git failure, timeout) falls back
+\* to the liveness rule; it is NEVER treated as clean, so no steal.
+EvidenceUnknown(a) ==
+    /\ a \in Agents
+    /\ a \notin dirty
+    /\ Cardinality(unknown) < 1
+    /\ unknown' = unknown \cup {a}
+    /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
+                   mirror_expired_active, mirror_epoch, durable_live,
+                   waitq, waitqLen, arrq, arrLen, servedq, servedLen,
+                   arrived, served, asked, badRelease, ghost, dirty, hold_ticks,
+                   stolen, clean_stalled, unknown>>
 
 \* Negative fixture: handing a dirty path away while its holder is live.
 StealDirty(a, b) ==
@@ -232,7 +248,7 @@ StealDirty(a, b) ==
                    mirror_expired_active, mirror_epoch, durable_live,
                    waitq, waitqLen, arrq, arrLen, servedq, servedLen,
                    arrived, served, asked, badRelease, ghost, hold_ticks,
-                   dirty, clean_stalled>>
+                   dirty, clean_stalled, unknown>>
 
 \* A clean holder's expired lease must hand off to the head waiter.
 HandoffClean ==
@@ -246,7 +262,7 @@ HandoffClean ==
             /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
                            mirror_expired_active, mirror_epoch, durable_live,
                            waitq, waitqLen, arrq, arrLen, servedq, servedLen,
-                           arrived, served, asked, badRelease, ghost, dirty, hold_ticks, stolen>>
+                           arrived, served, asked, badRelease, ghost, dirty, hold_ticks, stolen, unknown>>
        ELSE /\ bus_holder' = waitq[1]
             /\ bus_status' = "Held"
             /\ bus_expired' = FALSE
@@ -260,7 +276,7 @@ HandoffClean ==
             /\ clean_stalled' = FALSE
             /\ UNCHANGED <<mirror_expired_active, durable_live,
                            arrq, arrLen, servedq, servedLen, arrived, asked,
-                           badRelease, ghost, dirty, hold_ticks, stolen>>
+                           badRelease, ghost, dirty, hold_ticks, stolen, unknown>>
 
 ReleaseHolder ==
     /\ UNCHANGED EditVars
@@ -327,7 +343,7 @@ QueueHold(a) ==
     /\ arrived' = arrived \cup {a}
     /\ asked' = asked \cup {a}
     /\ UNCHANGED <<bus_holder, bus_status, bus_epoch, next_epoch, bus_expired,
-                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost, hold_ticks, dirty, stolen, clean_stalled>>
+                   mirror_expired_active, mirror_epoch, durable_live, served, servedq, servedLen, badRelease, ghost, hold_ticks, dirty, stolen, clean_stalled, unknown>>
 
 \* The one handoff helper: every release source transfers to the head waiter,
 \* through the existing epoch-safe grant, never a second grant path.
@@ -368,7 +384,7 @@ HandoffRelease(src) ==
           /\ badRelease' = IF waitqLen > 0 /\ ~grant
                            THEN badRelease \cup {src}
                            ELSE badRelease
-    /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks, dirty, stolen, clean_stalled>>
+    /\ UNCHANGED <<arrq, arrLen, arrived, asked, hold_ticks, dirty, stolen, clean_stalled, unknown>>
 
 \* bd-lk0kt: pre-edit hook. A free path is leased on first edit; a path held
 \* by another pin blocks the edit and enqueues exactly one waiter; a repeat
@@ -427,6 +443,7 @@ Next ==
     \/ \E a \in Agents : CleanCommit(a)
     \/ \E a, b \in Agents : StealDirty(a, b)
     \/ HandoffClean
+    \/ \E a \in Agents : EvidenceUnknown(a)
     \/ \E a \in Agents : QueueHold(a)
     \/ \E s \in Sources : HandoffRelease(s)
     \/ Done
@@ -453,7 +470,7 @@ HandoffOnEveryRelease == badRelease = {}
 BoundedHold == hold_ticks <= MaxHold
 
 \* bd-nmilo: a hold ends when the edit ends, not when the agent dies.
-LeaseOnlyWhileDirty == \A a \in LivenessExtendedOwners : a \in dirty
+LeaseOnlyWhileDirty == \A a \in LivenessExtendedOwners : a \in dirty \/ a \in unknown
 DirtyNeverStolen == stolen = FALSE
 HandoffOnClean == clean_stalled = FALSE
 
