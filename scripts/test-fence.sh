@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# bd-u6o2l: the commit fence in a temp toron clone. Two commits: one with a
-# dead_code field must be refused at commit time; the fixed one must pass, and
-# --sha must then prove that clean commit. No live repo or daemon is touched.
+# bd-u6o2l: the commit fence in a throwaway repo built from SOURCE FILES, so it
+# also runs from a git-archive export (no .git), as in clean-proof. Two commits:
+# one with a dead_code field must be refused at commit time; the fixed one must
+# pass, and --sha must then prove that clean commit. No live repo is touched.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,7 +10,24 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/toron-fence-test.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
-git clone -q --shared "$ROOT" "$TMP/toron"
+# Build a real git repo at DEST from SRC. Where SRC has git objects we archive
+# HEAD — the committed tree, never another lane's dirty WIP. An archive export
+# has no .git, so there we copy its files. Either way DEST gets a fresh HEAD.
+make_repo() {
+    local src="$1" dest="$2"
+    mkdir -p "$dest"
+    if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+        git -C "$src" archive HEAD | tar -x -C "$dest"
+    else
+        tar -C "$src" --exclude=.git --exclude=target --exclude=.lavish -cf - . |
+            tar -C "$dest" -xf -
+    fi
+    git -C "$dest" init -q
+    git -C "$dest" config user.name FenceTest
+    git -C "$dest" config user.email fence-test@localhost
+}
+
+make_repo "$ROOT" "$TMP/toron"
 cd "$TMP/toron"
 # Overlay the fence under test so this script also works before it is committed.
 mkdir -p scripts/hooks
@@ -18,10 +36,31 @@ cp "$ROOT/scripts/hooks/pre-commit" scripts/hooks/pre-commit
 cp "$ROOT/scripts/hooks/install.sh" scripts/hooks/install.sh
 cp "$ROOT/fence.toml" fence.toml
 chmod +x scripts/fence.sh scripts/hooks/pre-commit scripts/hooks/install.sh
-# The clone's ../elm-effect-rs path dep must exist at the pinned revision.
-git clone -q --shared "$ROOT/../elm-effect-rs" "$TMP/elm-effect-rs"
-git config user.name FenceTest
-git config user.email fence-test@localhost
+
+# The fence exports ../elm-effect-rs from git at the pin in fence.toml. An
+# archive export has no git objects for that sibling either, so build it from
+# its files and repoint the pin at the fresh commit.
+SIB_SRC="$ROOT/../elm-effect-rs"
+[ -d "$SIB_SRC" ] || { echo "test-fence: $SIB_SRC missing" >&2; exit 1; }
+if git -C "$SIB_SRC" rev-parse --git-dir >/dev/null 2>&1; then
+    git clone -q --shared "$SIB_SRC" "$TMP/elm-effect-rs"
+else
+    make_repo "$SIB_SRC" "$TMP/elm-effect-rs"
+    (cd "$TMP/elm-effect-rs" && git add -A && git commit -qm 'sibling fixture')
+    sib_pin="$(git -C "$TMP/elm-effect-rs" rev-parse HEAD)"
+    python3 - "$TMP/toron/fence.toml" "$sib_pin" <<'PY'
+import re, sys
+path, pin = sys.argv[1], sys.argv[2]
+text = open(path).read()
+text, n = re.subn(r'(?m)^rev\s*=\s*"[^"]*"', f'rev = "{pin}"', text, count=1)
+if n != 1:
+    raise SystemExit("test-fence: no sibling rev in fence.toml")
+open(path, "w").write(text)
+PY
+fi
+
+git add -A
+git commit -qm 'base'
 bash scripts/hooks/install.sh
 hp="$(git config --get core.hooksPath)"
 [ "$hp" = "scripts/hooks" ] || { echo "test-fence: hooksPath=$hp" >&2; exit 1; }
