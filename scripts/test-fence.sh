@@ -36,7 +36,7 @@ EOF
 printf 'pub mod fence_probe;\n' >>crates/toron-core/src/lib.rs
 git add "$probe" crates/toron-core/src/lib.rs
 head_before="$(git rev-parse HEAD)"
-if git commit -m 'probe: unused field must be refused' >"$TMP/bad.log" 2>&1; then
+if FLYWHEEL_COMMIT_OPERATOR=1 git commit -m 'probe: unused field must be refused' >"$TMP/bad.log" 2>&1; then
     echo "test-fence: commit with an unused field passed the fence" >&2
     cat "$TMP/bad.log" >&2
     exit 1
@@ -56,7 +56,7 @@ pub fn probe() -> Probe {
 }
 EOF
 git add "$probe" crates/toron-core/src/lib.rs
-git commit -m 'probe: named field is clean' >"$TMP/good.log" 2>&1 || {
+FLYWHEEL_COMMIT_OPERATOR=1 git commit -m 'probe: named field is clean' >"$TMP/good.log" 2>&1 || {
     echo "test-fence: clean commit was refused" >&2
     cat "$TMP/good.log" >&2
     exit 1
@@ -78,6 +78,7 @@ if command -v flywheel >/dev/null 2>&1 && flywheel commit --help 2>/dev/null | g
     git add foreign.txt
     printf 'named\n' >named.txt
     flywheel commit named.txt -m 'flywheel commit private index' --repo "$TMP/toron" \
+        --no-reservation-check \
         >"$TMP/fwcommit.log" 2>&1 || {
         echo "test-fence: flywheel commit --repo failed" >&2
         cat "$TMP/fwcommit.log" >&2
