@@ -110,25 +110,22 @@ bash scripts/fence.sh --sha HEAD >"$TMP/sha.log" 2>&1 || {
 }
 echo "test-fence: --sha GREEN on the clean commit"
 
-# flywheel commit --repo must drive the same hook on its private index, never
-# sweeping another lane's staged file (bd-aberm + bd-u6o2l).
-if command -v flywheel >/dev/null 2>&1 && flywheel commit --help 2>/dev/null | grep -q -- '--repo'; then
-    printf 'foreign\n' >foreign.txt
-    git add foreign.txt
-    printf 'named\n' >named.txt
-    flywheel commit named.txt -m 'flywheel commit private index' --repo "$TMP/toron" \
-        --no-reservation-check \
-        >"$TMP/fwcommit.log" 2>&1 || {
-        echo "test-fence: flywheel commit --repo failed" >&2
-        cat "$TMP/fwcommit.log" >&2
-        exit 1
-    }
-    tree_files="$(git ls-tree -r --name-only HEAD)"
-    printf '%s\n' "$tree_files" | grep -qx named.txt \
-        || { echo "test-fence: named path missing from commit" >&2; exit 1; }
-    printf '%s\n' "$tree_files" | grep -qx foreign.txt \
-        && { echo "test-fence: flywheel commit swept the foreign staged file" >&2; exit 1; }
-    git diff --cached --name-only | grep -qx foreign.txt \
-        || { echo "test-fence: foreign staged file was stripped" >&2; exit 1; }
-    echo "test-fence: flywheel commit --repo fenced the private tree"
-fi
+# A private-index commit must still run the hook and must not sweep another
+# lane's staged file (bd-aberm + bd-u6o2l). Drive it with git + the nonce the
+# hook accepts: no ambient `flywheel` — the proof's PATH resolves one from
+# ~/.cargo/bin, which is neither this tree's code nor pinned by the proof.
+printf 'foreign\n' >foreign.txt
+git add foreign.txt
+printf 'named\n' >named.txt
+private_index="$TMP/toron/private-index"
+GIT_INDEX_FILE="$private_index" git read-tree HEAD
+GIT_INDEX_FILE="$private_index" git add named.txt
+GIT_INDEX_FILE="$private_index" FLYWHEEL_COMMIT_TOKEN=fwc-test \
+    git commit -qm 'flywheel commit private index'
+[ -n "$(git ls-tree -r --name-only HEAD -- named.txt)" ] \
+    || { echo "test-fence: named path missing from commit" >&2; exit 1; }
+[ -z "$(git ls-tree -r --name-only HEAD -- foreign.txt)" ] \
+    || { echo "test-fence: flywheel commit swept the foreign staged file" >&2; exit 1; }
+[ -n "$(git diff --cached --name-only -- foreign.txt)" ] \
+    || { echo "test-fence: foreign staged file was stripped" >&2; exit 1; }
+echo "test-fence: private-index commit fenced the tree"
