@@ -7634,6 +7634,80 @@ mod tests {
         }
     }
 
+    /// bd-nmilo: a repo_root on the lease makes the fake dirty source authoritative.
+    /// Dirty → the live holder keeps the path and the waiter stays queued
+    /// (DirtyNeverStolen). Clean and idle past grace → the lease drops and the
+    /// waiter is handed the path (HandoffOnClean, with a wake).
+    #[tokio::test]
+    async fn dirty_path_stays_with_live_holder_clean_path_hands_to_waiter() {
+        use super::super::dirty_path::PathEvidence;
+
+        async fn scenario(tag: &str, evidence: PathEvidence) -> (bool, bool, bool) {
+            let (mailbox, db_path, data_dir) = test_mailbox(tag).await;
+            let mailbox = mailbox.with_dirty_source(std::sync::Arc::new(FixedEvidence(evidence)));
+            let root =
+                std::env::temp_dir().join(format!("toron-nmilo-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("root");
+            let holder = register(&mailbox, "demo", "BlueLake").await;
+            register(&mailbox, "demo", "RoseDune").await;
+            mailbox
+                .file_reservation_paths_with_root(
+                    "demo",
+                    "BlueLake",
+                    &["src/lease.rs".into()],
+                    Some(1),
+                    true,
+                    None,
+                    Some(root.to_str().expect("utf8 root")),
+                )
+                .await
+                .expect("acquire with root");
+            assert!(
+                mailbox
+                    .enqueue_waiter("demo", "src/lease.rs", "RoseDune", Some("bd-nmilo"))
+                    .await
+                    .expect("enqueue waiter")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+            mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
+
+            let resolved = mailbox.resolved_leases("demo").await.expect("resolve");
+            let holder_keeps = resolved
+                .iter()
+                .any(|r| r.path_pattern == "src/lease.rs" && r.agent_pubkey == holder.to_hex());
+            let waiter_queued = mailbox
+                .list_project_waiters("demo")
+                .await
+                .expect("waiters")
+                .iter()
+                .any(|w| w.agent_name == "RoseDune");
+            let waiter_holds = mailbox
+                .active_reservations("demo")
+                .await
+                .expect("active")
+                .iter()
+                .any(|r| r.path_pattern == "src/lease.rs" && r.agent_name == "RoseDune");
+
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_dir_all(&data_dir);
+            let _ = std::fs::remove_dir_all(&root);
+            (holder_keeps, waiter_queued, waiter_holds)
+        }
+
+        let (keeps, queued, handed) =
+            scenario("dirty", PathEvidence::Dirty { last_edit_ts_us: 0 }).await;
+        assert!(keeps, "a live dirty holder keeps the lease past TTL");
+        assert!(queued, "the waiter stays queued while the path is dirty");
+        assert!(!handed, "a dirty path is never handed to a waiter");
+
+        let (keeps, queued, handed) =
+            scenario("clean", PathEvidence::Clean { last_edit_ts_us: 0 }).await;
+        assert!(!keeps, "a clean idle path drops after the grace window");
+        assert!(!queued, "the clean path's waiter leaves the queue");
+        assert!(handed, "the clean path is handed to the waiter with a wake");
+    }
+
     #[tokio::test]
     async fn liveness_extended_lease_preserves_fencing_epoch() {
         let (mailbox, db_path, data_dir) = test_mailbox("liveness_epoch").await;
