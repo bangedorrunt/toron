@@ -966,54 +966,24 @@ impl InboxStore {
         Ok((next as u64, 0))
     }
 
-    /// bd-gj5vn: recover an ingest scope whose (epoch, seq) went stale because
-    /// a second seat advanced the producer epoch. Adopt the CURRENT fence
-    /// and the highest seq already landed under it, so the next append uses
-    /// a live triple instead of degrading. No log reading by the caller.
+    /// bd-gj5vn / bd-bn0ko: recover an ingest scope whose (epoch, seq) went
+    /// stale because a second seat advanced the producer epoch. Allocate a
+    /// FRESH scope epoch above every epoch the producer has used — never
+    /// adopt the bare fence epoch, which is shared by every scope and
+    /// collides under `inbox_log`'s UNIQUE(producer, epoch, seq).
     pub async fn resync_ingest_seq(
         &self,
         producer: &str,
         recipient: &str,
     ) -> Result<(u64, u64), InboxError> {
         let scope = scope_key(producer, INBOX_STREAM, recipient);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let global: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM inbox_producer_state WHERE producer = ?1")
-                .bind(producer)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let scoped: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM inbox_producer_state WHERE producer = ?1")
-                .bind(&scope)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let claimed: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
-                .bind(producer)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let epoch = global.max(scoped).max(claimed).unwrap_or(0).max(0) as u64;
-        let max_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) FROM inbox_log \
-             WHERE stream = ?1 AND recipient = ?2 AND producer = ?3 AND epoch = ?4",
-        )
-        .bind(INBOX_STREAM)
-        .bind(recipient)
-        .bind(producer)
-        .bind(epoch as i64)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO inbox_producer_state (producer, epoch, last_seq) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (producer) DO UPDATE SET epoch = excluded.epoch, last_seq = excluded.last_seq",
-        )
-        .bind(&scope)
-        .bind(epoch as i64)
-        .bind(max_seq)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok((epoch, max_seq as u64 + 1))
+        // Drop the stale scope row; ingest_seq_for's fresh-scope allocator
+        // then hands this scope a distinct epoch via the sequencer.
+        sqlx::query("DELETE FROM inbox_producer_state WHERE producer = ?1")
+            .bind(&scope)
+            .execute(&self.pool)
+            .await?;
+        self.ingest_seq_for(producer, recipient).await
     }
 
     /// Would [`Self::append_envelope`] pass the authority check for `env`

@@ -828,10 +828,11 @@ impl Mailbox {
                 continue;
             }
             let mut done = false;
+            // Per-scope sequence: one sender into many readers never shares a
+            // row. Resolve it ONCE: a retry must adopt the fresh triple from
+            // resync, not recompute a stale one at the loop top (bd-bn0ko).
+            let (mut epoch, mut seq) = store.ingest_seq_for(&sender, &reader).await?;
             for _ in 0..8 {
-                // Per-scope sequence: one sender into many readers never
-                // shares a row, so cross-reader ingest never contends.
-                let (epoch, seq) = store.ingest_seq_for(&sender, &reader).await?;
                 env.msg.epoch = epoch;
                 env.msg.seq = seq;
                 let k = env.msg.key();
@@ -852,18 +853,15 @@ impl Mailbox {
                         done = true;
                         break;
                     }
-                    // Our triple moved under us (concurrent ingester) or is
-                    // foreign-occupied: recompute and retry.
+                    // A retryable fence: a concurrent ingester moved our
+                    // triple, a foreign payload occupies it, or a second seat
+                    // advanced the epoch. In every case adopt a FRESH unique
+                    // scope triple — retrying the same one is how a collision
+                    // becomes a permanent "8 tries lost the race" bail.
                     Err(InboxError::Append(AppendError::SeqGap { .. }))
-                    | Err(InboxError::PayloadConflict { .. }) => continue,
-                    // bd-gj5vn: a second seat advanced the producer epoch;
-                    // adopt the current fence instead of degrading the pull.
-                    Err(InboxError::Append(AppendError::StaleEpoch { .. })) => {
-                        let (fresh_epoch, fresh_seq) =
-                            store.resync_ingest_seq(&sender, &reader).await?;
-                        env.msg.epoch = fresh_epoch;
-                        env.msg.seq = fresh_seq;
-                        continue;
+                    | Err(InboxError::PayloadConflict { .. })
+                    | Err(InboxError::Append(AppendError::StaleEpoch { .. })) => {
+                        (epoch, seq) = store.resync_ingest_seq(&sender, &reader).await?;
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -3756,6 +3754,147 @@ mod tests {
             batch.items.len(),
             2,
             "both mails are visible to the live pin"
+        );
+    }
+
+    /// bd-bn0ko: after a second seat advances a sender's epoch, resyncing two
+    /// readers must not pin both to the SAME bare-claim epoch. `inbox_log` is
+    /// UNIQUE(producer, epoch, seq), so a shared epoch makes the second
+    /// reader's pending rumor collide at (sender, E, 1) with the first one's
+    /// payload. Every retry then hits PayloadConflict on the same triple and
+    /// the loop bails with "8 tries lost the producer race" — the live
+    /// SlateHarbor stuck state.
+    #[tokio::test]
+    async fn mail_ingest_stale_epoch_resync_lands_the_pending_rumor() {
+        let (mailbox, pool, _db, _dir) = test_mailbox_with_pool("nmilo-ingest-resync").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        let store = mailbox.inbox_store().expect("store");
+        let sender_hex = mailbox
+            .comms_npub("demo", "GreenCastle")
+            .await
+            .expect("sender npub");
+
+        // Both readers ingest once under their OWN distinct scope epochs.
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake", "RoseDune"]))
+            .await
+            .expect("first broadcast");
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "BlueLake", &store)
+                .await
+                .expect("first BlueLake ingest"),
+            1
+        );
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "RoseDune", &store)
+                .await
+                .expect("first RoseDune ingest"),
+            1
+        );
+
+        // A second seat advances the bare producer epoch. Resyncing both
+        // readers to that shared fence is the bug: they now claim the same
+        // (producer, epoch) pair.
+        store
+            .claim_epoch(&sender_hex, "second-seat")
+            .await
+            .expect("second seat claims epoch");
+        let (blue_epoch, _) = store
+            .resync_ingest_seq(
+                &sender_hex,
+                &mailbox
+                    .comms_npub("demo", "BlueLake")
+                    .await
+                    .expect("blue npub"),
+            )
+            .await
+            .expect("resync BlueLake");
+        let (rose_epoch, _) = store
+            .resync_ingest_seq(
+                &sender_hex,
+                &mailbox
+                    .comms_npub("demo", "RoseDune")
+                    .await
+                    .expect("rose npub"),
+            )
+            .await
+            .expect("resync RoseDune");
+        assert_ne!(
+            blue_epoch, rose_epoch,
+            "resync must give each scope a distinct epoch"
+        );
+
+        // A new broadcast must be ingested by both readers, not stuck on a
+        // cross-reader payload collision.
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake", "RoseDune"]))
+            .await
+            .expect("second broadcast");
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "BlueLake", &store)
+                .await
+                .expect("BlueLake pending mail lands"),
+            1
+        );
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "RoseDune", &store)
+                .await
+                .expect("RoseDune pending mail lands"),
+            1
+        );
+
+        // The exact live stuck state: both scopes pinned to the SAME epoch
+        // (what the old resync produced). The second reader's rumor then
+        // collides at (sender, E, 1) with the first reader's payload — a
+        // PayloadConflict, not a StaleEpoch — and must still recover by
+        // adopting a fresh triple instead of bailing after 8 identical tries.
+        let blue_reader = mailbox
+            .comms_npub("demo", "BlueLake")
+            .await
+            .expect("blue npub");
+        let rose_reader = mailbox
+            .comms_npub("demo", "RoseDune")
+            .await
+            .expect("rose npub");
+        for scope in [
+            format!("{sender_hex}\u{1f}{blue_reader}"),
+            format!("{sender_hex}\u{1f}{rose_reader}"),
+        ] {
+            sqlx::query(
+                "UPDATE inbox_producer_state SET epoch = 900, last_seq = 0 WHERE producer = ?1",
+            )
+            .bind(&scope)
+            .execute(&pool)
+            .await
+            .expect("pin both scopes to the same epoch");
+        }
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake", "RoseDune"]))
+            .await
+            .expect("third broadcast");
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "BlueLake", &store)
+                .await
+                .expect("BlueLake lands under the shared epoch"),
+            1
+        );
+        assert_eq!(
+            mailbox
+                .ingest_delivered_mail("demo", "RoseDune", &store)
+                .await
+                .expect("RoseDune recovers from the cross-reader payload collision"),
+            1
         );
     }
 
