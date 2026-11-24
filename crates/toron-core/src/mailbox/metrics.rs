@@ -57,6 +57,8 @@ impl ToolMetrics {
 pub struct MailboxMetrics {
     /// Per-tool metrics keyed by tool name.
     pub per_tool: Mutex<std::collections::HashMap<String, ToolMetrics>>,
+    /// Count of local wake-shadow `bus.publish` failures (`D11`).
+    pub wake_publish_failures: AtomicU64,
 }
 
 /// A serializable snapshot of the counters.
@@ -65,6 +67,8 @@ pub struct MetricsSnapshot {
     pub tools: std::collections::BTreeMap<String, ToolCounters>,
     pub total_calls: u64,
     pub total_errors: u64,
+    #[serde(default)]
+    pub wake_publish_failures: u64,
 }
 
 /// Per-tool counters in the snapshot.
@@ -79,6 +83,11 @@ impl MailboxMetrics {
     /// New empty metrics.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record one local wake-shadow publish failure.
+    pub fn record_wake_publish_failure(&self) {
+        self.wake_publish_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a tool call outcome.
@@ -109,6 +118,7 @@ impl MailboxMetrics {
         let mut out = MetricsSnapshot {
             total_calls: 0,
             total_errors: 0,
+            wake_publish_failures: self.wake_publish_failures.load(Ordering::Relaxed),
             tools: std::collections::BTreeMap::new(),
         };
         {
@@ -133,10 +143,11 @@ impl MailboxMetrics {
     pub fn robot_status(&self) -> serde_json::Value {
         let snap = self.snapshot();
         serde_json::json!({
-            "ok": snap.total_errors == 0,
+            "ok": snap.total_errors == 0 && snap.wake_publish_failures == 0,
             "tools": snap.tools.len(),
             "calls": snap.total_calls,
             "errors": snap.total_errors,
+            "wake_publish_failures": snap.wake_publish_failures,
         })
     }
 
@@ -354,5 +365,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         worker.join().expect("metrics stress thread no panic");
+    }
+
+    #[test]
+    fn wake_publish_failure_counter_increments_snapshot_and_robot_status() {
+        let m = MailboxMetrics::new();
+        assert_eq!(m.snapshot().wake_publish_failures, 0);
+        m.record_wake_publish_failure();
+        m.record_wake_publish_failure();
+        let snap = m.snapshot();
+        assert_eq!(snap.wake_publish_failures, 2);
+        let robot = m.robot_status();
+        assert_eq!(robot["wake_publish_failures"], 2);
+        assert_eq!(robot["ok"], false);
     }
 }

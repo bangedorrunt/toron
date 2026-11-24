@@ -156,6 +156,8 @@ pub struct Mailbox {
     /// Total argon2 KDF invocations this process has performed (test
     /// observable; the many-keys gate asserts the warm-rebuild bound).
     kdf_loads: Arc<AtomicU64>,
+    /// Count of local wake-shadow `bus.publish` failures (`D11`).
+    wake_publish_failures: Arc<AtomicU64>,
     /// ADR-0007 R3: optional side-channel for post-unwrap mail (workflow
     /// `message_posted` triggers). When set, [`TriggerNotifySink`] wraps the
     /// projection sink.
@@ -249,6 +251,7 @@ impl Mailbox {
                 .get_or_init(|| Arc::new(papaya::HashMap::new()))
                 .clone(),
             kdf_loads: Arc::new(AtomicU64::new(0)),
+            wake_publish_failures: Arc::new(AtomicU64::new(0)),
             trigger_tx: None,
             unwrap_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             judge_model: Arc::new(parking_lot::Mutex::new(

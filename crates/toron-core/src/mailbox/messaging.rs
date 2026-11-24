@@ -609,14 +609,25 @@ impl Mailbox {
                 Tag::parse(["from", &args.sender_name]).expect("from"),
                 Tag::parse(["mid", &visible_id]).expect("mid"),
             ];
-            if let Ok(ev) = build_event(
+            match build_event(
                 &sender_keys,
                 toron_kind(9),
                 wake_content,
                 tags,
                 Timestamp::now(),
             ) {
-                let _ = self.bus.publish(ev).await;
+                Ok(ev) => {
+                    if let Err(e) = self.bus.publish(ev).await {
+                        eprintln!("toron: wake publish failed: {e}");
+                        self.wake_publish_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("toron: wake build_event failed: {e}");
+                    self.wake_publish_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
 
