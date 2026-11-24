@@ -515,9 +515,14 @@
       "args": "append, send, task, msg, cursor",
       "description": "Inbox plumbing: `append` (fixture door, one envelope straight to the log), `send` (journal first through the outbox loop, with recovery) and `task` (every envelope of a task you sent or received)",
       "name": "inbox"
+    },
+    {
+      "args": "post, read, wait",
+      "description": "Room-class `#seq` board facade (`post` | `read` | `wait`)",
+      "name": "board"
     }
   ],
-  "generated_at": "2026-11-22T20:42:21Z",
+  "generated_at": "2026-11-24T22:11:33Z",
   "resources": [
     {
       "description": "List projects known to toron.",
