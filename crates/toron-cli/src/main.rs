@@ -131,9 +131,11 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             run_role(cmd, format)?;
             ExitCode::SUCCESS
         }
-        Command::Next(_) | Command::Ack(_) | Command::Done(_) | Command::Inbox(_) => {
-            comms::run_comms(command, format, &cfg)?
-        }
+        Command::Next(_)
+        | Command::Ack(_)
+        | Command::Done(_)
+        | Command::Inbox(_)
+        | Command::Board(_) => comms::run_comms(command, format, &cfg)?,
         Command::RunState(cmd) => {
             run_run_state(cmd, &cfg, format)?;
             ExitCode::SUCCESS

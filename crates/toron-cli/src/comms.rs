@@ -13,8 +13,65 @@ use std::process::ExitCode;
 use serde_json::json;
 use toron_core::inbox::InboxError;
 
-use crate::cli::{Command, InboxCommand};
+use crate::cli::{BoardCommand, Command, InboxCommand};
 use crate::output::{OutputFormat, render_json};
+
+/// Derive the daemon's `/v1/*` base URL from `TORON_MCP_URL` / `FLYWHEEL_TORON_URL`
+/// unless `TORON_CLI_DIRECT=1` is set.
+pub fn daemon_v1_base_url(
+    env_url: Option<&str>,
+    fallback_url: Option<&str>,
+    direct: bool,
+) -> Option<String> {
+    if direct {
+        return None;
+    }
+    let raw = env_url
+        .or(fallback_url)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let trimmed = raw.trim_end_matches('/');
+    let base = trimmed.strip_suffix("/mcp").unwrap_or(trimmed);
+    Some(base.to_string())
+}
+
+fn live_daemon_v1_base() -> Option<String> {
+    let direct = std::env::var("TORON_CLI_DIRECT")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let toron_mcp = std::env::var("TORON_MCP_URL").ok();
+    let fw_url = std::env::var("FLYWHEEL_TORON_URL").ok();
+    daemon_v1_base_url(toron_mcp.as_deref(), fw_url.as_deref(), direct)
+}
+
+async fn try_daemon_v1_post(
+    path: &str,
+    payload: serde_json::Value,
+) -> Option<(u16, serde_json::Value)> {
+    let base = live_daemon_v1_base()?;
+    let url = format!("{base}{path}");
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_millis(500)))
+            .timeout_global(Some(std::time::Duration::from_secs(3)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let body_str = serde_json::to_string(&payload).ok()?;
+        let mut resp = agent
+            .post(&url)
+            .header("content-type", "application/json")
+            .send(body_str)
+            .ok()?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().ok()?;
+        let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some((status, body))
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 #[tokio::main]
 pub async fn run_comms(
@@ -22,9 +79,63 @@ pub async fn run_comms(
     format: OutputFormat,
     cfg: &crate::config::Config,
 ) -> anyhow::Result<ExitCode> {
-    if !toron_core::inbox::try_enabled_with(cfg.comms_inbox_log())? {
+    let command_is_board = matches!(command, Command::Board(_));
+    if !command_is_board && !toron_core::inbox::try_enabled_with(cfg.comms_inbox_log())? {
         eprintln!("toron: error: {}", InboxError::Disabled);
         return Ok(ExitCode::from(2));
+    }
+    if let Command::Next(a) = command {
+        if a.urgent && !a.peek {
+            eprintln!("toron: error: --urgent requires --peek");
+            return Ok(ExitCode::from(2));
+        }
+        if let Some((200, v)) = try_daemon_v1_post(
+            "/v1/next",
+            json!({
+                "project": a.project,
+                "who": a.who,
+                "stream": a.stream,
+                "peek": a.peek,
+                "urgent": a.urgent,
+            }),
+        )
+        .await
+            && v.get("batch").is_some_and(serde_json::Value::is_object)
+        {
+            let degraded = v["degraded"].as_str();
+            if a.urgent {
+                if let Some(err) = degraded {
+                    println!("degraded: mail ingest failed ({err})");
+                    return Ok(ExitCode::from(4));
+                }
+                if v["urgent_pending"].as_bool().unwrap_or(false) {
+                    println!("urgent");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return Ok(ExitCode::from(1));
+            }
+            if format == OutputFormat::Human {
+                print_next_human_json(&v["batch"], a.peek);
+                if let Some(err) = degraded {
+                    println!("degraded: mail ingest failed ({err})");
+                    return Ok(ExitCode::from(4));
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let out_val = match degraded {
+                Some(err) => with_degraded(v["batch"].clone(), err),
+                None => v["batch"].clone(),
+            };
+            render_json(&out_val, format);
+            return Ok(if degraded.is_some() {
+                ExitCode::from(4)
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+    }
+    if let Command::Board(board_cmd) = command {
+        return run_board(board_cmd, format).await;
     }
     let mailbox = toron_mcp::demo_mailbox().await?;
     let store = mailbox.inbox_store_with(cfg.comms_inbox_log())?;
@@ -234,6 +345,42 @@ pub async fn run_comms(
     }
 }
 
+fn print_next_human_json(b: &serde_json::Value, peek: bool) {
+    let mode = if peek {
+        " (peek: nothing committed)"
+    } else {
+        ""
+    };
+    let items = b["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    println!(
+        "inbox {} cursor {} -> {}{mode}, {} message(s)",
+        b["reader"].as_str().unwrap_or(""),
+        b["cursor_before"],
+        b["cursor_after"],
+        items.len()
+    );
+    for it in items {
+        let env = &it["envelope"];
+        let title = env["body"]["title"]
+            .as_str()
+            .or_else(|| env["body"]["text"].as_str())
+            .unwrap_or("");
+        println!();
+        println!(
+            "#{} {} {} {} from {}",
+            it["offset"],
+            it["msg_key"].as_str().unwrap_or(""),
+            env["class"].as_str().unwrap_or(""),
+            env["contract"].as_str().unwrap_or(""),
+            env["from"].as_str().unwrap_or(""),
+        );
+        if !title.is_empty() {
+            println!("  {title}");
+        }
+        println!("  phase: {}", it["phase"].as_str().unwrap_or(""));
+    }
+}
+
 /// Human view of `toron next`: one block per message, ending in the verbs
 /// the reader may run now (redesign §6.2 "Allowed now").
 fn print_next_human(b: &toron_core::inbox::NextBatch, peek: bool) {
@@ -284,6 +431,116 @@ fn read_input(file: &str) -> std::io::Result<String> {
     }
 }
 
+async fn run_board(cmd: &BoardCommand, format: OutputFormat) -> anyhow::Result<ExitCode> {
+    match cmd {
+        BoardCommand::Post(a) => {
+            if let Some((status, body)) = try_daemon_v1_post(
+                "/v1/board/post",
+                json!({
+                    "project": a.project,
+                    "channel": a.channel,
+                    "author": a.who,
+                    "body": a.body,
+                    "mentions": a.mentions,
+                    "sensitivity": a.sensitivity,
+                }),
+            )
+            .await
+            {
+                if status == 200 {
+                    render_json(&body, format);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if status == 400 {
+                    eprintln!(
+                        "toron: {}",
+                        body["error"].as_str().unwrap_or("board_post refused")
+                    );
+                    return Ok(ExitCode::from(3));
+                }
+            }
+            let mb = toron_mcp::demo_mailbox().await?;
+            match mb
+                .board_post(
+                    &a.project,
+                    &a.channel,
+                    &a.who,
+                    &a.body,
+                    &a.mentions,
+                    a.sensitivity.as_deref(),
+                )
+                .await
+            {
+                Ok(msg) => {
+                    render_json(&serde_json::to_value(msg)?, format);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(e)
+                    if e.downcast_ref::<toron_core::mailbox::board::BoardRefusal>()
+                        .is_some() =>
+                {
+                    eprintln!("toron: {e:#}");
+                    Ok(ExitCode::from(3))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        BoardCommand::Read(a) => {
+            if let Some((200, body)) = try_daemon_v1_post(
+                "/v1/board/read",
+                json!({
+                    "project": a.project,
+                    "channel": a.channel,
+                    "since_seq": a.since_seq,
+                    "limit": a.limit,
+                }),
+            )
+            .await
+            {
+                render_json(&body, format);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mb = toron_mcp::demo_mailbox().await?;
+            let res = mb
+                .board_read(&a.project, &a.channel, a.since_seq, a.limit)
+                .await?;
+            render_json(&serde_json::to_value(res)?, format);
+            Ok(ExitCode::SUCCESS)
+        }
+        BoardCommand::Wait(a) => {
+            if let Some((200, body)) = try_daemon_v1_post(
+                "/v1/board/wait",
+                json!({
+                    "project": a.project,
+                    "channel": a.channel,
+                    "since_seq": a.since_seq,
+                    "mentions_only": a.mentions_only,
+                    "recipient": a.who,
+                    "timeout_ms": a.timeout_ms,
+                }),
+            )
+            .await
+            {
+                render_json(&body, format);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mb = toron_mcp::demo_mailbox().await?;
+            let res = mb
+                .board_wait(
+                    &a.project,
+                    &a.channel,
+                    a.since_seq,
+                    a.mentions_only,
+                    a.who.as_deref(),
+                    a.timeout_ms,
+                )
+                .await?;
+            render_json(&serde_json::to_value(res)?, format);
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 /// Attach the ingest-degradation signal to a `next` JSON result. Healthy
 /// results carry no such field; degraded ones name the failure so a quiet
 /// read is never mistaken for an empty one.
@@ -318,5 +575,21 @@ mod tests {
         assert_ne!(ExitCode::from(4), ExitCode::SUCCESS);
         assert_ne!(ExitCode::from(4), ExitCode::from(1));
         assert_ne!(ExitCode::from(4), ExitCode::from(3));
+    }
+
+    #[test]
+    fn daemon_v1_base_url_strips_mcp_suffix_and_honors_direct_bypass() {
+        assert_eq!(
+            daemon_v1_base_url(Some("http://127.0.0.1:18080/mcp/"), None, false).as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        assert_eq!(
+            daemon_v1_base_url(None, Some("http://127.0.0.1:18080"), false).as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        assert_eq!(
+            daemon_v1_base_url(Some("http://127.0.0.1:18080/mcp"), None, true),
+            None
+        );
     }
 }

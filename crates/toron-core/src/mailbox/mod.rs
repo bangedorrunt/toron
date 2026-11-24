@@ -54,6 +54,7 @@ where
 
 pub mod agent_bindings;
 pub mod aliases;
+pub mod board;
 pub mod build_slots;
 pub mod comms;
 pub mod contacts;

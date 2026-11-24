@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use super::Mailbox;
 
+/// 1-release deprecation notice for waitlist/yield negotiation (`ADR-0047`, `D3/R6`).
+pub const DEPRECATED_MAIL_HOLDER_NOTICE: &str = "removed: mail the holder";
+
 /// One stand-down marker: "bead `bead_id` is being worked by `holder`".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YieldMarker {

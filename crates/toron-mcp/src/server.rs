@@ -981,6 +981,215 @@ pub fn resolve_allowed_hosts(extra: &[String]) -> Vec<String> {
     hosts
 }
 
+#[derive(serde::Deserialize)]
+struct V1NextRequest {
+    project: String,
+    who: String,
+    stream: Option<String>,
+    #[serde(default)]
+    peek: bool,
+    #[serde(default)]
+    urgent: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct V1BoardPostRequest {
+    project: String,
+    #[serde(default = "default_board_channel")]
+    channel: String,
+    author: String,
+    body: String,
+    #[serde(default)]
+    mentions: Vec<String>,
+    sensitivity: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1BoardReadRequest {
+    project: String,
+    #[serde(default = "default_board_channel")]
+    channel: String,
+    #[serde(default)]
+    since_seq: u64,
+    #[serde(default = "default_board_limit")]
+    limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct V1BoardWaitRequest {
+    project: String,
+    #[serde(default = "default_board_channel")]
+    channel: String,
+    #[serde(default)]
+    since_seq: u64,
+    #[serde(default)]
+    mentions_only: bool,
+    recipient: Option<String>,
+    #[serde(default = "default_board_wait_ms")]
+    timeout_ms: u64,
+}
+
+fn default_board_channel() -> String {
+    "main".to_string()
+}
+
+fn default_board_limit() -> usize {
+    50
+}
+
+fn default_board_wait_ms() -> u64 {
+    5_000
+}
+
+async fn v1_next_handler(
+    axum::extract::State(mailbox): axum::extract::State<toron_core::mailbox::Mailbox>,
+    axum::Json(req): axum::Json<V1NextRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    let store = match mailbox.inbox_store_with(None) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+            );
+        }
+    };
+    let reader = match mailbox.comms_npub(&req.project, &req.who).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+            );
+        }
+    };
+    let degraded = match mailbox
+        .ingest_delivered_mail(&req.project, &req.who, &store)
+        .await
+    {
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let batch = match store.next(&reader, req.stream.as_deref(), req.peek).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+            );
+        }
+    };
+    let now_us = toron_core::mailbox::lease_liveness::host_now_us();
+    mailbox
+        .record_inbox_poll(&req.project, &req.who, now_us)
+        .await;
+    if !req.peek {
+        let _ = mailbox.note_committed_read(&req.project, &req.who).await;
+    }
+    let urgent_pending = if req.urgent {
+        toron_core::inbox::urgent_pending(&batch.items)
+    } else {
+        false
+    };
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "batch": batch,
+            "degraded": degraded,
+            "urgent_pending": urgent_pending,
+        })),
+    )
+}
+
+async fn v1_board_post_handler(
+    axum::extract::State(mailbox): axum::extract::State<toron_core::mailbox::Mailbox>,
+    axum::Json(req): axum::Json<V1BoardPostRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match mailbox
+        .board_post(
+            &req.project,
+            &req.channel,
+            &req.author,
+            &req.body,
+            &req.mentions,
+            req.sensitivity.as_deref(),
+        )
+        .await
+    {
+        Ok(msg) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!(msg)),
+        ),
+        Err(e)
+            if e.downcast_ref::<toron_core::mailbox::board::BoardRefusal>()
+                .is_some() =>
+        {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+async fn v1_board_read_handler(
+    axum::extract::State(mailbox): axum::extract::State<toron_core::mailbox::Mailbox>,
+    axum::Json(req): axum::Json<V1BoardReadRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match mailbox
+        .board_read(&req.project, &req.channel, req.since_seq, req.limit)
+        .await
+    {
+        Ok(res) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!(res)),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+async fn v1_board_wait_handler(
+    axum::extract::State(mailbox): axum::extract::State<toron_core::mailbox::Mailbox>,
+    axum::Json(req): axum::Json<V1BoardWaitRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match mailbox
+        .board_wait(
+            &req.project,
+            &req.channel,
+            req.since_seq,
+            req.mentions_only,
+            req.recipient.as_deref(),
+            req.timeout_ms,
+        )
+        .await
+    {
+        Ok(res) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!(res)),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+pub fn v1_http_router(mailbox: toron_core::mailbox::Mailbox) -> axum::Router {
+    axum::Router::new()
+        .route("/v1/next", axum::routing::post(v1_next_handler))
+        .route("/v1/board/post", axum::routing::post(v1_board_post_handler))
+        .route("/v1/board/read", axum::routing::post(v1_board_read_handler))
+        .route("/v1/board/wait", axum::routing::post(v1_board_wait_handler))
+        .with_state(mailbox)
+}
+
 async fn router_with_mailbox(
     mailbox: toron_core::mailbox::Mailbox,
     trigger_rx: tokio::sync::mpsc::UnboundedReceiver<toron_core::mailbox::unwrap::UnwrappedMail>,
@@ -988,6 +1197,7 @@ async fn router_with_mailbox(
 ) -> anyhow::Result<(axum::Router, Vec<WorkflowHost>)> {
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let index_pool = mailbox.index_pool().cloned().expect("mailbox index pool");
+    let v1 = v1_http_router(mailbox.clone());
     let server = ToronServer::new().with_mailbox(mailbox);
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
@@ -1038,6 +1248,7 @@ async fn router_with_mailbox(
         .with_state(signal_state);
     let router = axum::Router::new()
         .merge(mcp_router)
+        .merge(v1)
         .merge(blossom)
         .merge(signal_router);
     Ok((router, hosts))
@@ -1464,5 +1675,90 @@ steps:
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[tokio::test]
+    async fn v1_board_and_next_http_routes_work_in_process() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt as _;
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::nostr::identity::AgentProfile;
+        use tower::ServiceExt as _;
+
+        let dir = std::env::temp_dir().join(format!("toron-v1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v1.sqlite");
+        let pool = schema::connect(db.to_str().unwrap()).await.unwrap();
+        schema::migrate(&pool).await.unwrap();
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .unwrap(),
+        );
+        let mb = Mailbox::new(bus, dir.clone(), Some(toron_core::keys::generate()))
+            .with_agent_passphrase("v1-test")
+            .with_index_pool(pool);
+        mb.register_agent("proj", &AgentProfile::new("AmberFalcon"))
+            .await
+            .unwrap();
+
+        let app = v1_http_router(mb);
+
+        let ok_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/board/post")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project":"proj","channel":"main","author":"AmberFalcon","body":"hello board"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_post.status(), StatusCode::OK);
+        let body_bytes = ok_post.into_body().collect().await.unwrap().to_bytes();
+        let posted: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(posted["seq"], 1);
+
+        let refused_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/board/post")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project":"proj","channel":"main","author":"AmberFalcon","body":"ok","sensitivity":"secret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused_post.status(), StatusCode::BAD_REQUEST);
+
+        let read_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/board/read")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project":"proj","channel":"main","since_seq":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_res.status(), StatusCode::OK);
+        let read_bytes = read_res.into_body().collect().await.unwrap().to_bytes();
+        let read_json: serde_json::Value = serde_json::from_slice(&read_bytes).unwrap();
+        assert_eq!(read_json["head_seq"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

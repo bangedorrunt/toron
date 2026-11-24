@@ -229,6 +229,63 @@ pub enum Command {
     /// `task` (every envelope of a task you sent or received).
     #[command(subcommand)]
     Inbox(InboxCommand),
+
+    /// Room-class `#seq` board facade (`post` | `read` | `wait`).
+    #[command(subcommand)]
+    Board(BoardCommand),
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum BoardCommand {
+    /// Post a plaintext room message (refuses secret-class bodies).
+    Post(BoardPostArgs),
+    /// Read room messages after `--since-seq`.
+    Read(BoardReadArgs),
+    /// Wait for new room messages after `--since-seq`.
+    Wait(BoardWaitArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BoardPostArgs {
+    #[arg(long)]
+    pub project: String,
+    #[arg(long, default_value = "main")]
+    pub channel: String,
+    #[arg(long = "as")]
+    pub who: String,
+    #[arg(long = "mention")]
+    pub mentions: Vec<String>,
+    #[arg(long)]
+    pub sensitivity: Option<String>,
+    pub body: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BoardReadArgs {
+    #[arg(long)]
+    pub project: String,
+    #[arg(long, default_value = "main")]
+    pub channel: String,
+    #[arg(long, default_value_t = 0)]
+    pub since_seq: u64,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BoardWaitArgs {
+    #[arg(long)]
+    pub project: String,
+    #[arg(long, default_value = "main")]
+    pub channel: String,
+    #[arg(long, default_value_t = 0)]
+    pub since_seq: u64,
+    #[arg(long)]
+    pub mentions_only: bool,
+    #[arg(long = "as")]
+    pub who: Option<String>,
+    #[arg(long, default_value_t = 5000)]
+    pub timeout_ms: u64,
 }
 
 /// `toron next` (ADR-0041).

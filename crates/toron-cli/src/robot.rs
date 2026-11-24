@@ -1398,17 +1398,23 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             "nothing was released; the preview reads no board or tracker — run without -n \
              to discover the closed-reason leases and release them",
         ),
-        ReserveCommand::Yield(a) => (
-            "reserve_yield",
-            json!({
-                "project_key": a.project,
-                "agent_name": a.agent,
-                "bead_id": a.bead_id,
-                "holder": a.holder,
-                "note": a.note,
-            }),
-            "nothing was yielded",
-        ),
+        ReserveCommand::Yield(a) => {
+            eprintln!(
+                "toron: deprecated (ADR-0047): {}",
+                toron_core::mailbox::yields::DEPRECATED_MAIL_HOLDER_NOTICE
+            );
+            (
+                "reserve_yield",
+                json!({
+                    "project_key": a.project,
+                    "agent_name": a.agent,
+                    "bead_id": a.bead_id,
+                    "holder": a.holder,
+                    "note": a.note,
+                }),
+                "nothing was yielded",
+            )
+        }
         ReserveCommand::ForceRelease(a) => (
             "force_release_file_reservation",
             json!({
