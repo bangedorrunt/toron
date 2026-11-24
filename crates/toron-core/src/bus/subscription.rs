@@ -85,7 +85,10 @@ impl Subscription {
     }
 
     /// Attach the publisher-side lag counter (in-process bus only).
-    pub(crate) fn with_lag(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub(crate) fn with_lag(
+        mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         self.lagged = Some(counter);
         self
     }

@@ -4,14 +4,12 @@
 //! CLI-only `toron events token mint|list|revoke` (bd-6bgrd).
 //! Minting requires the ADR-0038 operator key; no key material is ever printed.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde_json::json;
 
 use crate::cli::{EventsCommand, TokenCommand, TokenMintArgs, TokenRevokeArgs};
 use toron_core::config;
-use toron_core::events::principal::{
-    self, FileTokenStore, Principal, Scope, TokenStore,
-};
+use toron_core::events::principal::{self, FileTokenStore, Principal, Scope, TokenStore};
 
 /// Resolve and load the operator key to prove mint authority (ADR-0038). The
 /// key is never printed, logged or put in a response.
@@ -45,8 +43,14 @@ fn mint(args: &TokenMintArgs) -> anyhow::Result<()> {
         }
         (Principal::Operator, Scope::operator())
     } else {
-        let pin = args.pin.as_deref().context("--pin is required (or use --operator)")?;
-        let project = args.project.as_deref().context("--project is required for a pin token")?;
+        let pin = args
+            .pin
+            .as_deref()
+            .context("--pin is required (or use --operator)")?;
+        let project = args
+            .project
+            .as_deref()
+            .context("--project is required for a pin token")?;
         let mut scope = Scope::for_pin(pin, project);
         if let Some(secs) = args.ttl_secs {
             if secs <= 0 || secs > principal::MAX_PIN_TTL_US / 1_000_000 {

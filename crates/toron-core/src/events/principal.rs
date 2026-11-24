@@ -274,7 +274,13 @@ mod tests {
             Ok(())
         }
         fn get(&self, hash: &str) -> anyhow::Result<Option<TokenRecord>> {
-            Ok(self.0.lock().unwrap().iter().find(|r| r.hash == hash).cloned())
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.hash == hash)
+                .cloned())
         }
         fn list(&self) -> anyhow::Result<Vec<TokenRecord>> {
             Ok(self.0.lock().unwrap().clone())
@@ -340,7 +346,10 @@ mod tests {
         assert_eq!(resolve(Some("Basic abc"), 1000, &store), None);
         let hash = hash_token(&plaintext);
         store.revoke(&hash).unwrap();
-        assert_eq!(resolve(Some(&format!("Bearer {plaintext}")), 1000, &store), None);
+        assert_eq!(
+            resolve(Some(&format!("Bearer {plaintext}")), 1000, &store),
+            None
+        );
     }
 
     #[test]
@@ -359,7 +368,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve(Some(&format!("Bearer {plaintext}")), 1000 + MAX_PIN_TTL_US * 400, &store),
+            resolve(
+                Some(&format!("Bearer {plaintext}")),
+                1000 + MAX_PIN_TTL_US * 400,
+                &store
+            ),
             Some(Principal::Pin {
                 pin: "P".into(),
                 project: "f".into()

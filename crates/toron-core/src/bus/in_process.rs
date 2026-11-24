@@ -276,7 +276,8 @@ impl InProcessBus {
     fn note_full_drop(&self, sub: &Subscriber, event: &Event) {
         self.full_drops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        sub.lagged.fetch_add(1, std::sync::atomic::Ordering::Release);
+        sub.lagged
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         if !sub.note_full() {
             return;
         }
@@ -436,9 +437,11 @@ impl InProcessBus {
 
         let registry = self.subs.clone();
         let release_id = id.clone();
-        Ok(Subscription::new(id, rx).with_lag(lagged).with_release(Box::new(move || {
-            registry.write().remove(&release_id);
-        })))
+        Ok(Subscription::new(id, rx)
+            .with_lag(lagged)
+            .with_release(Box::new(move || {
+                registry.write().remove(&release_id);
+            })))
     }
 }
 
