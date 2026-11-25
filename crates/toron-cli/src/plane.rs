@@ -243,6 +243,7 @@ pub(crate) async fn collect_channel_events(
 /// Post count + newest post time per channel id, from one project-wide
 /// replay. The Channels sidebar needs "is this room alive?" without paying a
 /// replay per room; the TUI is the only caller today.
+#[allow(dead_code)]
 pub(crate) async fn channel_activity(
     mailbox: &Mailbox,
     project: &str,

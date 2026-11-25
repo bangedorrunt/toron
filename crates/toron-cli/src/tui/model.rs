@@ -1,778 +1,297 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0031
-//! TUI model — the pure half of the Elm fold (ADR-0031 §7, "Elm-everywhere").
+//! Pure Swarm Board model (Elm-everywhere).
 //!
-//! Everything here is data. No clock, no environment, no I/O: wall time enters
-//! as a `Msg::Tick { now_unix }` payload and is stored in [`Model::now_unix`],
-//! and the view turns it into text. Lists are *derived* from the fetched rows
-//! ([`MailState::rows`]), so the same model always renders the same rows.
-//!
-//! Gmail-shaped reading order: tabs across the top, then sidebar → list →
-//! reader. The sidebar is the folder (or channel) axis, the list is the
-//! current selection, the reader is the open conversation. Tabs that do not
-//! need a reader (dashboard, settings) use the full width.
+//! No I/O, no clock, no environment reads: wall time arrives via `Msg::Tick`,
+//! and [`Model::projection`] produces the exact `toron-board.v1` JSON contract
+//! and screen state. Sealed NIP-17 bodies are never stored here (counts only).
 
-use toron_core::nostr::presence::PresenceState;
+use serde::{Deserialize, Serialize};
 
-use super::compose::ComposeState;
-
-/// Minimum usable terminal width. The floor is a phone-width PTY — an iPhone
-/// SSH client reports ~40-50 columns — so the console keeps working there in
-/// one-pane mode instead of refusing. Below this the resize card shows (§2).
 pub const MIN_W: u16 = 40;
-/// Minimum usable terminal height (five rows of chrome, seven of content).
 pub const MIN_H: u16 = 12;
+pub const WIDE_W: u16 = 100;
 
-/// Width at which the reader pane gets its own column (three-pane Gmail).
-pub const TRI_PANE_W: u16 = 108;
-/// Width at which the sidebar, list and reader share the frame (two-pane).
-pub const DUAL_PANE_W: u16 = 80;
+pub const TORON_PROBE_INTERVAL_SECS: u64 = 10;
+pub const FLYWHEEL_PROBE_INTERVAL_SECS: u64 = 30;
+pub const IDLE_PAUSE_SECS: u64 = 300;
+pub const BOARD_SCHEMA: &str = "toron-board.v1";
 
-/// Top-level tabs. Order is the display order and the `1..5` key order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tab {
-    Mail,
-    Channels,
-    Agents,
-    Dashboard,
-    Settings,
+/// Responsive layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Wide,
+    Compact,
+    TooSmall,
 }
 
-impl Tab {
-    /// Every tab, in display order.
-    pub const ALL: [Tab; 5] = [
-        Tab::Mail,
-        Tab::Channels,
-        Tab::Agents,
-        Tab::Dashboard,
-        Tab::Settings,
+/// Pick the layout mode for a frame size.
+pub const fn layout_mode(width: u16, height: u16) -> LayoutMode {
+    if width < MIN_W || height < MIN_H {
+        LayoutMode::TooSmall
+    } else if width >= WIDE_W {
+        LayoutMode::Wide
+    } else {
+        LayoutMode::Compact
+    }
+}
+
+/// Bottom inspector mode (`1`..`4` / `d` / `l` / `s`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Inspector {
+    #[default]
+    Message,
+    Diagnostics,
+    Leases,
+    Charts,
+}
+
+impl Inspector {
+    pub const ALL: [Inspector; 4] = [
+        Inspector::Message,
+        Inspector::Diagnostics,
+        Inspector::Leases,
+        Inspector::Charts,
     ];
 
-    /// Position in [`Tab::ALL`] (`1..=5` in the tab bar).
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
-    }
-
-    /// Tab-bar label.
     pub const fn title(self) -> &'static str {
         match self {
-            Tab::Mail => "Mail",
-            Tab::Channels => "Channels",
-            Tab::Agents => "Agents",
-            Tab::Dashboard => "Dashboard",
-            Tab::Settings => "Settings",
+            Inspector::Message => "Message",
+            Inspector::Diagnostics => "Diagnostics",
+            Inspector::Leases => "Leases",
+            Inspector::Charts => "Charts",
         }
     }
 
-    /// Keyboard mnemonic: the digits 1..5 select tabs directly.
-    pub fn from_digit(c: char) -> Option<Tab> {
-        let idx = c.to_digit(10)? as usize;
-        (1..=Tab::ALL.len())
-            .contains(&idx)
-            .then(|| Tab::ALL[idx - 1])
-    }
-
-    /// Parse the `--tab` flag value.
-    pub fn parse(s: &str) -> Option<Tab> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "mail" | "inbox" => Some(Tab::Mail),
-            "channels" | "channel" => Some(Tab::Channels),
-            "agents" | "agent" => Some(Tab::Agents),
-            "dashboard" | "stats" => Some(Tab::Dashboard),
-            "settings" | "config" => Some(Tab::Settings),
-            _ => None,
-        }
-    }
-
-    /// Tab cycling (Tab / Shift-Tab).
-    pub fn step(self, delta: isize) -> Tab {
-        let n = Self::ALL.len() as isize;
-        let i = (self.index() as isize + delta).rem_euclid(n);
-        Self::ALL[i as usize]
-    }
-
-    /// True when the tab renders sidebar + list + reader.
-    pub const fn has_reader(self) -> bool {
-        matches!(self, Tab::Mail | Tab::Channels | Tab::Agents)
-    }
-
-    /// True when the tab renders a filter box (`/` opens insert mode).
-    pub const fn filters(self) -> bool {
-        matches!(self, Tab::Mail | Tab::Channels | Tab::Agents)
+    pub fn step(self, delta: isize) -> Inspector {
+        let i = Self::ALL.iter().position(|x| *x == self).unwrap_or(0) as isize;
+        let next = (i + delta).rem_euclid(Self::ALL.len() as isize);
+        Self::ALL[next as usize]
     }
 }
 
-/// Input mode. `Insert` is the in-place filter/search box; `Help` is the
-/// modal keybinding overlay; `Compose` is the send form. `Help` and `Compose`
-/// are focus traps — background keys are ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Input mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
+    #[default]
     Normal,
-    Insert,
+    Filter,
     Help,
     Compose,
 }
 
-/// Which pane owns the keyboard. `Tab` moves focus forward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
-    Sidebar,
-    List,
-    Reader,
+/// Diagnostic severity (`P0` and `P1` fail `--check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DiagnosticSeverity {
+    P0,
+    P1,
+    P2,
+    P3,
 }
 
-impl Pane {
-    /// Panes visible on a tab, left to right. Truthful per tab: the Agents tab
-    /// draws no sidebar, so it must not offer one as a focus target (`h` would
-    /// land on a pane nothing renders).
-    pub const fn order(tab: Tab) -> &'static [Pane] {
-        match tab {
-            Tab::Mail | Tab::Channels => &[Pane::Sidebar, Pane::List, Pane::Reader],
-            Tab::Agents => &[Pane::List, Pane::Reader],
-            _ => &[Pane::List],
-        }
+impl DiagnosticSeverity {
+    pub const fn is_blocking(self) -> bool {
+        matches!(self, Self::P0 | Self::P1)
     }
 
-    /// Move focus within a tab's visible panes, clamped at both ends (the
-    /// leftmost pane is `h`, not a wrap into the reader).
-    pub fn step(self, tab: Tab, delta: isize) -> Pane {
-        let order = Pane::order(tab);
-        let i = order.iter().position(|p| *p == self).unwrap_or(0) as isize;
-        let next = (i + delta).clamp(0, order.len() as isize - 1);
-        order[next as usize]
-    }
-}
-
-/// Responsive breakpoint (§2 "Breakpoint modes" + "Minimum size gate").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutMode {
-    /// Three columns: sidebar, list, reader — from [`TRI_PANE_W`].
-    Tri,
-    /// Two columns: the sidebar, plus list and reader sharing the frame —
-    /// from [`DUAL_PANE_W`].
-    Dual,
-    /// One pane at a time, switched with `h`/`l`: phone-width terminals
-    /// ([`MIN_W`]..[`DUAL_PANE_W`] columns) where three columns cannot fit.
-    /// The rows narrow with it (one line per message, no stamp).
-    Stacked,
-    /// Below [`MIN_W`]×[`MIN_H`]: resize card, no data panes.
-    TooSmall,
-}
-
-impl LayoutMode {
-    /// True in the one-pane (phone-width) mode: chrome and rows compact.
-    pub const fn single(self) -> bool {
-        matches!(self, LayoutMode::Stacked)
-    }
-}
-
-/// Pick the layout for a frame size. Pure — the view calls it every frame.
-pub const fn layout_mode(width: u16, height: u16) -> LayoutMode {
-    if width < MIN_W || height < MIN_H {
-        return LayoutMode::TooSmall;
-    }
-    if width >= TRI_PANE_W {
-        LayoutMode::Tri
-    } else if width >= DUAL_PANE_W {
-        LayoutMode::Dual
-    } else {
-        LayoutMode::Stacked
-    }
-}
-
-/// Mail folder axis (the sidebar of the Mail tab).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Folder {
-    #[default]
-    Inbox,
-    Unread,
-    Threads,
-    NeedsAck,
-    Important,
-}
-
-impl Folder {
-    /// Every folder, in sidebar order.
-    pub const ALL: [Folder; 5] = [
-        Folder::Inbox,
-        Folder::Unread,
-        Folder::Threads,
-        Folder::NeedsAck,
-        Folder::Important,
-    ];
-
-    /// Sidebar label.
-    pub const fn title(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Folder::Inbox => "Inbox",
-            Folder::Unread => "Unread",
-            Folder::Threads => "Threads",
-            Folder::NeedsAck => "Needs ack",
-            Folder::Important => "Important",
+            Self::P0 => "P0",
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
         }
     }
+}
 
-    /// Parse the `--folder` flag value.
-    pub fn parse(s: &str) -> Option<Folder> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "inbox" | "all" => Some(Folder::Inbox),
-            "unread" | "new" => Some(Folder::Unread),
-            "threads" | "thread" => Some(Folder::Threads),
-            "ack" | "needs-ack" | "needsack" => Some(Folder::NeedsAck),
-            "important" | "high" => Some(Folder::Important),
-            _ => None,
+/// One diagnostic finding from either `toron` or `flywheel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub id: String,
+    pub severity: DiagnosticSeverity,
+    #[serde(default = "default_source")]
+    pub source: String,
+    pub summary: String,
+    pub evidence: String,
+    pub remedy_cmd: String,
+}
+
+fn default_source() -> String {
+    "flywheel".to_string()
+}
+
+/// Signals probed for `toron` health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToronHealthSignals {
+    pub daemon_reachable: bool,
+    pub daemon_latency_ms: Option<u64>,
+    pub wake_liveness_ok: bool,
+    pub wake_never_stamped: bool,
+    pub wake_publish_failures: u64,
+    pub stuck_queued_sends: usize,
+}
+
+impl Default for ToronHealthSignals {
+    fn default() -> Self {
+        Self {
+            daemon_reachable: false,
+            daemon_latency_ms: None,
+            wake_liveness_ok: true,
+            wake_never_stamped: false,
+            wake_publish_failures: 0,
+            stuck_queued_sends: 0,
         }
     }
+}
 
-    /// `j`/`k` movement within the sidebar.
-    pub const fn step(self, delta: isize) -> Folder {
-        let i = (self as isize + delta).rem_euclid(Self::ALL.len() as isize);
-        Self::ALL[i as usize]
+/// Pure `toron` v1 diagnostic rules over [`ToronHealthSignals`].
+pub fn diagnose_toron(signals: &ToronHealthSignals) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if signals.wake_never_stamped {
+        out.push(Diagnostic {
+            id: "WAKE_NEVER_STAMPED".to_string(),
+            severity: DiagnosticSeverity::P1,
+            source: "toron".to_string(),
+            summary: "Wake liveness has never been stamped".to_string(),
+            evidence: "wake_never_stamped=true".to_string(),
+            remedy_cmd: "toron daemon status --json".to_string(),
+        });
+    } else if !signals.wake_liveness_ok {
+        out.push(Diagnostic {
+            id: "WAKE_DEAF".to_string(),
+            severity: DiagnosticSeverity::P0,
+            source: "toron".to_string(),
+            summary: "Wake listener is deaf or expired".to_string(),
+            evidence: "wake_liveness_ok=false".to_string(),
+            remedy_cmd: "toron daemon status --json".to_string(),
+        });
     }
-}
-
-/// One mail message as the index returns it. `thread_id` is always the
-/// message's own id when it is not part of a thread (the mailbox contract).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MailRow {
-    /// Message id (hex).
-    pub id: String,
-    /// Thread id (`corr`-adjacent, never the sender's corr).
-    pub thread_id: String,
-    /// Sender pin.
-    pub sender: String,
-    /// Subject (NIP-14).
-    pub subject: String,
-    /// Importance tag as stored (`normal`/`high`/`urgent`).
-    pub importance: String,
-    /// Receiver asked for an acknowledgement.
-    pub ack_required: bool,
-    /// The acknowledgement already landed (`acked` receipt exists).
-    pub acked: bool,
-    /// The recipient opened it (`read_ts_us` in the projection).
-    pub read: bool,
-    /// Created-at, unix seconds (µs precision is not needed in the UI).
-    pub at: u64,
-    /// Body, when the reader fetched it.
-    pub body: Option<String>,
-    /// The projection carried this row's read/ack state. A search hit does
-    /// not (its result carries no corr and no read stamp), so it must say
-    /// "unknown" instead of inventing an unread dot or an owed ack.
-    pub state_known: bool,
-}
-
-impl MailRow {
-    /// High or urgent importance (the `Important` folder + the row badge).
-    pub fn important(&self) -> bool {
-        matches!(
-            self.importance.trim().to_ascii_lowercase().as_str(),
-            "high" | "urgent"
-        )
+    if signals.wake_publish_failures > 0 {
+        out.push(Diagnostic {
+            id: "WAKE_PUBLISH_FAILURES".to_string(),
+            severity: DiagnosticSeverity::P1,
+            source: "toron".to_string(),
+            summary: "Wake event publish failures detected".to_string(),
+            evidence: format!("wake_publish_failures={}", signals.wake_publish_failures),
+            remedy_cmd: "toron daemon status --json".to_string(),
+        });
     }
-
-    /// Still owes an acknowledgement. Unknown state is never owed.
-    pub const fn ack_pending(&self) -> bool {
-        self.state_known && self.ack_required && !self.acked
+    if signals.stuck_queued_sends > 0 {
+        out.push(Diagnostic {
+            id: "STUCK_QUEUED_SEND".to_string(),
+            severity: DiagnosticSeverity::P1,
+            source: "toron".to_string(),
+            summary: "Queued sends are waiting in queued-sends.jsonl".to_string(),
+            evidence: format!("stuck_queued_sends={}", signals.stuck_queued_sends),
+            remedy_cmd: "toron mail flush".to_string(),
+        });
     }
-
-    /// Never opened. Unknown state is never claimed as unread.
-    pub const fn unread(&self) -> bool {
-        self.state_known && !self.read
-    }
+    out
 }
 
-/// One thread: the derived grouping of the mail rows (`Folder::Threads`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadRow {
-    /// Thread id.
-    pub id: String,
-    /// Newest message's subject.
-    pub subject: String,
-    /// Message count.
-    pub count: usize,
-    /// Newest `at` in the thread.
-    pub at: u64,
-    /// Distinct senders, newest first.
-    pub participants: Vec<String>,
-    /// How many messages still owe an ack.
-    pub ack_pending: usize,
+/// Optional `flywheel snapshot` panel parsed from subprocess stdout.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FlywheelPanel {
+    pub project: String,
+    pub dispatcher: String,
+    pub degraded: Vec<String>,
+    pub pin_count: usize,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
-/// One display row of the list pane. Threads and messages share it so the
-/// view, the selection clamp, and the reader-open decision all read one shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListRow {
-    /// Stable key: message id, or thread id when the row is a thread.
-    pub key: String,
-    /// Thread to open in the reader.
-    pub thread_id: String,
-    /// Subject.
-    pub subject: String,
-    /// Sender (message row) or participants (thread row).
-    pub from: String,
-    /// Metadata line: message count / age / flags.
-    pub meta: String,
-    /// Newest `at` on the row.
-    pub at: u64,
-    /// Row is a thread aggregate.
-    pub thread: bool,
-    /// Owes an acknowledgement.
-    pub ack_pending: bool,
-    /// High/urgent importance.
-    pub important: bool,
-    /// Never opened (`●` in the list).
-    pub unread: bool,
-}
-
-/// The open conversation in the reader pane.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct OpenThread {
-    /// Thread id.
-    pub thread_id: String,
-    /// Subject line of the conversation.
-    pub subject: String,
-    /// Messages oldest-first (reading order).
-    pub messages: Vec<MailRow>,
-}
-
-/// Mail tab state. `messages` is the fetched index; every list is derived.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MailState {
-    /// Sidebar folder.
-    pub folder: Folder,
-    /// Rows from the last successful inbox fetch, newest first.
-    pub messages: Vec<MailRow>,
-    /// Cursor in the visible list.
-    pub selected: usize,
-    /// Open conversation, when the reader has content.
-    pub open: Option<OpenThread>,
-    /// Server-side search hits (`Enter` in the filter box). `None` = the
-    /// folder list is showing; `Some` = search results replace it.
-    pub search: Option<Vec<MailRow>>,
-    /// The last fetch landed at least once (drives the empty-state text).
-    pub loaded: bool,
-    /// The last inbox fetch failed. A failure is a settled outcome, not a
-    /// fetch still in flight: without this the list would say "loading"
-    /// forever, which is how an unregistered pin used to greet a fresh
-    /// console. Cleared by the next successful fetch.
-    pub error: Option<String>,
-    /// Reader scroll offset (the view clamps it to the rendered content).
-    pub scroll: usize,
-}
-
-impl MailState {
-    /// The rows the list pane shows, derived from the folder + filter +
-    /// search state. Newest first.
-    pub fn rows(&self) -> Vec<ListRow> {
-        let source: Vec<MailRow> = match &self.search {
-            Some(hits) => hits.clone(),
-            None => match self.folder {
-                Folder::Unread => self.messages.iter().filter(|m| !m.read).cloned().collect(),
-                Folder::NeedsAck => self
-                    .messages
-                    .iter()
-                    .filter(|m| m.ack_pending())
-                    .cloned()
-                    .collect(),
-                Folder::Important => self
-                    .messages
-                    .iter()
-                    .filter(|m| m.important())
-                    .cloned()
-                    .collect(),
-                Folder::Inbox => self.messages.clone(),
-                Folder::Threads => return thread_rows(&self.messages),
-            },
-        };
-        let mut rows: Vec<ListRow> = source
-            .iter()
-            .map(|m| ListRow {
-                key: m.id.clone(),
-                thread_id: thread_id_of(m),
-                subject: m.subject.clone(),
-                from: m.sender.clone(),
-                meta: String::new(),
-                at: m.at,
-                thread: false,
-                ack_pending: m.ack_pending(),
-                important: m.important(),
-                unread: m.unread(),
-            })
-            .collect();
-        rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.key.cmp(&b.key)));
-        rows
-    }
-
-    /// Apply a local (client-side) filter to the derived rows. Pure; the
-    /// filter text is the model's input box.
-    pub fn filtered_rows(&self, filter: &str) -> Vec<ListRow> {
-        let mut rows = self.rows();
-        filter_rows(&mut rows, filter);
-        rows
-    }
-}
-
-/// Group messages into thread rows, newest thread first.
-pub fn thread_rows(messages: &[MailRow]) -> Vec<ListRow> {
-    let mut threads: Vec<ThreadRow> = Vec::new();
-    for m in messages {
-        let tid = thread_id_of(m);
-        match threads.iter_mut().find(|t| t.id == tid) {
-            Some(t) => {
-                t.count += 1;
-                if m.at >= t.at {
-                    t.at = m.at;
-                    if !m.subject.is_empty() {
-                        t.subject.clone_from(&m.subject);
-                    }
-                }
-                if !t.participants.contains(&m.sender) {
-                    t.participants.push(m.sender.clone());
-                }
-                if m.ack_pending() {
-                    t.ack_pending += 1;
-                }
-            }
-            None => threads.push(ThreadRow {
-                id: tid,
-                subject: m.subject.clone(),
-                count: 1,
-                at: m.at,
-                participants: vec![m.sender.clone()],
-                ack_pending: usize::from(m.ack_pending()),
-            }),
-        }
-    }
-    threads.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
-    threads
-        .into_iter()
-        .map(|t| {
-            let others = t.participants.len().saturating_sub(1);
-            let unread = messages
-                .iter()
-                .any(|m| thread_id_of(m) == t.id && m.unread());
-            ListRow {
-                key: t.id.clone(),
-                thread_id: t.id,
-                subject: t.subject,
-                from: t.participants.first().cloned().unwrap_or_default(),
-                meta: if others == 0 {
-                    format!("{} msg", t.count)
-                } else {
-                    format!("{} msgs · +{others}", t.count)
-                },
-                at: t.at,
-                thread: true,
-                ack_pending: t.ack_pending > 0,
-                important: false,
-                unread,
-            }
-        })
-        .collect()
-}
-
-/// A message's thread: its own id when it is not threaded (never empty, so
-/// the reader always has a key to fetch by).
-pub fn thread_id_of(m: &MailRow) -> String {
-    if m.thread_id.trim().is_empty() {
-        m.id.clone()
-    } else {
-        m.thread_id.clone()
-    }
-}
-
-/// Case-insensitive substring filter over subject/from/meta. Pure.
-pub fn filter_rows(rows: &mut Vec<ListRow>, filter: &str) {
-    let needle = filter.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        return;
-    }
-    rows.retain(|r| {
-        r.subject.to_ascii_lowercase().contains(&needle)
-            || r.from.to_ascii_lowercase().contains(&needle)
-            || r.meta.to_ascii_lowercase().contains(&needle)
-    });
-}
-
-/// One channel row (kind 39000/39002 lifecycle projection).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ChannelRow {
-    /// Channel id (the `h`/`d` tag).
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Private channels are members-only.
-    pub private: bool,
-    /// Retired channel (posts refused, history until purge).
-    pub closed: bool,
-    /// Member count.
-    pub members: usize,
-    /// The caller is a member.
-    pub joined: bool,
-    /// Posts observed on the local bus.
-    pub posts: usize,
-    /// Newest post `at`, when any.
-    pub last_at: Option<u64>,
-}
-
-/// One channel post (kind 9; kind 7 reactions carry `react_to`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PostRow {
-    /// Event id.
+/// One `#seq` board post.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardPost {
+    pub seq: u64,
     pub event_id: String,
-    /// Author npub hex. The view resolves the pin from the loaded roster —
-    /// the host never guesses a second name mapping.
     pub author: String,
-    /// Body.
-    pub content: String,
-    /// Created-at, unix seconds.
-    pub at: u64,
-    /// Event kind (9 post, 7 reaction).
-    pub kind: u16,
-    /// Reaction target, when kind 7.
-    pub react_to: Option<String>,
-    /// `@mention` targets (p tags).
+    pub body: String,
     pub mentions: Vec<String>,
+    pub created_at: u64,
 }
 
-impl PostRow {
-    /// True for a reaction rather than a post.
-    pub const fn is_reaction(&self) -> bool {
-        self.kind == 7
+impl BoardPost {
+    pub fn preview(&self) -> String {
+        self.body
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string()
     }
 }
 
-/// Channels tab state.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ChannelsState {
-    /// Channels visible to the caller, name-sorted.
-    pub channels: Vec<ChannelRow>,
-    /// Sidebar cursor.
-    pub selected: usize,
-    /// Cursor in the post list.
-    pub selected_post: usize,
-    /// Posts of the selected channel, newest first.
-    pub posts: Vec<PostRow>,
-    /// The selected channel's id the posts belong to (guards stale reads).
-    pub posts_for: Option<String>,
-    /// A fetch has landed (drives empty-state text).
-    pub loaded: bool,
-    /// Reader scroll offset (the view clamps it).
-    pub scroll: usize,
-}
-
-impl ChannelsState {
-    /// The channel the sidebar cursor points at.
-    pub fn current(&self) -> Option<&ChannelRow> {
-        self.channels.get(self.selected)
-    }
-
-    /// Posts for the selected channel, local-filtered, newest first.
-    pub fn visible_posts(&self, filter: &str) -> Vec<PostRow> {
-        let mut rows = self.posts.clone();
-        rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.event_id.cmp(&b.event_id)));
-        let needle = filter.trim().to_ascii_lowercase();
-        if !needle.is_empty() {
-            rows.retain(|p| {
-                p.content.to_ascii_lowercase().contains(&needle)
-                    || p.author.to_ascii_lowercase().contains(&needle)
-            });
-        }
-        rows
-    }
-}
-
-/// One agent row: the registered roster joined with the presence projection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AgentRow {
-    /// Canonical pin.
+/// One agent seat on the roster.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RosterRow {
     pub name: String,
-    /// npub hex.
     pub npub: String,
-    /// Harness/program from the 30013 profile.
     pub program: Option<String>,
-    /// Model from the 30013 profile.
     pub model: Option<String>,
-    /// Task from the 30013 profile.
-    pub task: Option<String>,
-    /// Live pane (advisory, from whois when a backend is reachable).
-    pub pane_id: Option<String>,
-    /// Heartbeat inside the TTL: online.
+    pub status: String,
     pub online: bool,
-    /// Last heartbeat state (Unknown when never seen).
-    pub state: PresenceState,
-    /// Seconds since the last heartbeat, when one exists.
+    pub retired: bool,
     pub age_secs: Option<u64>,
-    /// Heartbeat status line.
-    pub status: Option<String>,
-    /// The local tour of duty: this row is the TUI's own identity.
-    pub is_self: bool,
+    pub lease_count: usize,
 }
 
-impl AgentRow {
-    /// `online` marker with a shape, never color alone (§4): `●` vs `○`.
-    pub const fn marker(&self) -> &'static str {
-        if self.online { "●" } else { "○" }
-    }
-
-    /// Human presence word for the detail pane and the dashboard buckets.
-    pub const fn state_label(&self) -> &'static str {
-        presence_label(self.online, self.state)
-    }
-}
-
-/// Canonical presence word: offline wins, then the five hc-vocabulary
-/// states (never a sixth spelling — ADR-0031 A4).
-pub const fn presence_label(online: bool, state: PresenceState) -> &'static str {
-    if !online {
-        return "offline";
-    }
-    match state {
-        PresenceState::Idle => "idle",
-        PresenceState::Working => "working",
-        PresenceState::Blocked => "blocked",
-        PresenceState::Done => "done",
-        PresenceState::Unknown => "unknown",
-    }
-}
-
-/// Agents tab state.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AgentsState {
-    /// Roster joined with presence, name-sorted.
-    pub rows: Vec<AgentRow>,
-    /// Cursor.
-    pub selected: usize,
-    /// Detail-card scroll offset (the view clamps it to the rendered card;
-    /// a long task or status line has to be readable somewhere).
-    pub scroll: usize,
-    /// A fetch has landed.
-    pub loaded: bool,
-}
-
-impl AgentsState {
-    /// Rows matching the local filter (pin / npub / program / model / task).
-    pub fn visible_rows(&self, filter: &str) -> Vec<AgentRow> {
-        let mut rows = self.rows.clone();
-        let needle = filter.trim().to_ascii_lowercase();
-        if !needle.is_empty() {
-            let matches = |v: &Option<String>| {
-                v.as_deref()
-                    .is_some_and(|s| s.to_ascii_lowercase().contains(&needle))
-            };
-            rows.retain(|a| {
-                a.name.to_ascii_lowercase().contains(&needle)
-                    || a.npub.to_ascii_lowercase().contains(&needle)
-                    || matches(&a.program)
-                    || matches(&a.model)
-                    || matches(&a.task)
-            });
+impl RosterRow {
+    pub fn marker(&self) -> &'static str {
+        if self.retired {
+            "•"
+        } else if self.online {
+            "●"
+        } else {
+            "○"
         }
-        rows
-    }
-
-    /// Online count (dashboard).
-    pub fn online(&self) -> usize {
-        self.rows.iter().filter(|a| a.online).count()
     }
 }
 
-/// Receipt transition counts (durable store).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// One active file reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRow {
+    pub id: String,
+    pub holder: String,
+    pub path: String,
+    pub exclusive: bool,
+    pub expires_at: u64,
+}
+
+/// Durable receipt transition counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptCounts {
-    /// Owed.
     pub owed: usize,
-    /// Acked.
     pub acked: usize,
-    /// Resulted.
     pub resulted: usize,
-    /// Bookkeeping failed after a durable enqueue (ADR-0010 D8) — surfaced on
-    /// purpose: a degraded receipt is a fact the operator has to see.
     pub degraded: usize,
 }
 
-/// One dashboard health line (`label: value`, plus a pass/warn shape).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthRow {
-    /// Line label.
-    pub label: String,
-    /// Line value.
-    pub value: String,
-    /// False renders the warn shape (`!`) instead of the ok shape (`✓`).
-    pub ok: bool,
+/// Sealed NIP-17 inbox counts only — bodies are excluded from v1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedInboxCounts {
+    pub total: usize,
+    pub unread: usize,
 }
 
-/// Dashboard tab state. Every number other than receipts/health is derived
-/// from the other tabs' loaded data, so the dashboard never disagrees with
-/// what the operator can see.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DashboardState {
-    /// Receipt counts from the durable store.
-    pub receipts: ReceiptCounts,
-    /// Receipts (or health) have been fetched at least once.
-    pub loaded: bool,
-    /// Health lines from the host (source, data dir, daemon, keys).
-    pub health: Vec<HealthRow>,
-    /// Window of the arrival chart, in hours (live-tunable).
-    pub window_hours: u64,
-}
-
-impl Default for DashboardState {
-    fn default() -> Self {
-        Self {
-            receipts: ReceiptCounts::default(),
-            loaded: false,
-            health: Vec::new(),
-            window_hours: 24,
-        }
-    }
-}
-
-impl DashboardState {
-    /// Cycle the chart window (6 → 12 → 24 → 48 → 6).
-    pub fn step_window(&self, delta: isize) -> u64 {
-        const WINDOWS: [u64; 4] = [6, 12, 24, 48];
-        let i = WINDOWS
-            .iter()
-            .position(|w| *w == self.window_hours)
-            .unwrap_or(2) as isize;
-        WINDOWS[(i + delta).rem_euclid(WINDOWS.len() as isize) as usize]
-    }
-}
-
-/// Where the data came from (the mailbox selector's verdict).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Source connection info.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SourceInfo {
-    /// `daemon` / `embedded` / `pinned`.
     pub kind: String,
-    /// Endpoint or root path, in one line.
     pub detail: String,
-    /// The durable data dir the store lives in.
     pub data_dir: String,
-    /// True when a daemon on this machine owns the same store.
     pub daemon_loopback: bool,
 }
 
-/// Settings tab state. Identity and source are read-only facts (they come
-/// from the flags/env at start); the tunables are live model edits.
+/// Seeded identity and display settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsState {
-    /// Project slug.
     pub project: String,
-    /// Acting pin, when the operator has one.
     pub agent: Option<String>,
-    /// Resolved npub of the acting pin.
     pub npub: Option<String>,
-    /// Data source.
     pub source: SourceInfo,
-    /// Refresh cadence in ms (live-tunable; the runtime rebuilds its timer).
     pub refresh_ms: u64,
-    /// Compact rows (one line per row) vs the two-line default.
-    pub dense: bool,
-    /// Timestamps rendered as age (`2m`) vs clock time (`14:03`).
     pub relative_time: bool,
-    /// Show closed (retired) channels in the Channels tab (`--all`).
-    pub show_closed_channels: bool,
+    pub chart_window_hours: u64,
 }
 
 impl Default for SettingsState {
@@ -783,377 +302,198 @@ impl Default for SettingsState {
             npub: None,
             source: SourceInfo::default(),
             refresh_ms: 1000,
-            dense: false,
             relative_time: true,
-            show_closed_channels: false,
+            chart_window_hours: 24,
         }
     }
 }
 
 impl SettingsState {
-    /// Refresh cadence bounds: 250ms .. 10s (an unbounded cadence either
-    /// hammers the store or stops being a live view).
     pub const MIN_REFRESH_MS: u64 = 250;
-    /// Upper bound.
     pub const MAX_REFRESH_MS: u64 = 10_000;
 
-    /// Step the refresh cadence by ±`step` ms, clamped.
     pub fn step_refresh(&self, step: i64) -> u64 {
-        let next = self.refresh_ms as i64 + step;
-        next.clamp(Self::MIN_REFRESH_MS as i64, Self::MAX_REFRESH_MS as i64) as u64
+        (self.refresh_ms as i64 + step)
+            .clamp(Self::MIN_REFRESH_MS as i64, Self::MAX_REFRESH_MS as i64) as u64
     }
 }
 
-/// Status-line severity (vim one-liner feedback).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Status-line severity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StatusKind {
-    /// Plain information.
+    #[default]
     Info,
-    /// The action succeeded.
     Ok,
-    /// The action failed (typed failure, never a panic).
     Error,
 }
 
-/// The one-line status message under the footer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Footer status banner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
-    /// Message text.
     pub text: String,
-    /// Severity (rendered with a shape prefix, never color alone).
     pub kind: StatusKind,
 }
 
-impl Default for Status {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            kind: StatusKind::Info,
-        }
-    }
+/// Single pure JSON projection shared with `--json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardProjection {
+    pub schema: String,
+    pub project: String,
+    pub viewer: Option<String>,
+    pub follow: bool,
+    pub toron_health: ToronHealthSignals,
+    pub flywheel: Option<FlywheelPanel>,
+    pub roster: Vec<RosterRow>,
+    pub posts: Vec<BoardPost>,
+    pub leases: Vec<LeaseRow>,
+    pub receipts: ReceiptCounts,
+    pub sealed_inbox: SealedInboxCounts,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
-/// The commands an empty pane names, built for THIS project and pin so the
-/// operator can paste them without editing. A placeholder stays a placeholder:
-/// an unknown pin is never guessed.
-///
-/// Every line is parsed by the real clap surface in
-/// `tests::onboarding_commands_parse_as_real_cli_invocations`, so a renamed
-/// flag or a new required argument fails the suite instead of leaving a dead
-/// command in a pane nobody exercises.
+/// Complete Swarm Board UI state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Onboarding {
-    /// Send the first message (the recipient is the operator's decision).
-    pub mail: String,
-    /// Create the first room.
-    pub channel: String,
-    /// Register this pin in the roster.
-    pub agent: String,
-}
-
-/// The whole UI state. One model, one fold (`update::tick`).
-#[derive(Debug, Clone, PartialEq)]
 pub struct Model {
-    /// Active tab.
-    pub tab: Tab,
-    /// Input mode.
     pub mode: Mode,
-    /// Focused pane.
-    pub pane: Pane,
-    /// Mail tab.
-    pub mail: MailState,
-    /// Channels tab.
-    pub channels: ChannelsState,
-    /// Agents tab.
-    pub agents: AgentsState,
-    /// Dashboard tab.
-    pub dashboard: DashboardState,
-    /// Settings tab.
+    pub inspector: Inspector,
     pub settings: SettingsState,
-    /// Live filter box (shared vocabulary: `/` opens it on any list tab).
-    pub input: String,
-    /// Wall-clock payload from the last tick, unix seconds.
+    pub posts: Vec<BoardPost>,
+    pub roster: Vec<RosterRow>,
+    pub leases: Vec<LeaseRow>,
+    pub receipts: ReceiptCounts,
+    pub sealed_inbox: SealedInboxCounts,
+    pub toron_health: ToronHealthSignals,
+    pub flywheel: Option<FlywheelPanel>,
+    pub follow: bool,
+    pub show_retired: bool,
+    pub selected_post: usize,
+    pub msg_scroll: usize,
+    pub selected_diag: usize,
+    pub filter: String,
+    pub compose_draft: Option<String>,
     pub now_unix: u64,
-    /// Tick counter (spinner + the slower-cadence gate).
     pub tick: u64,
-    /// Effects in flight (bounded: a slow store never queues a second wave).
     pub inflight: usize,
-    /// Status line.
+    pub focused: bool,
+    pub last_input_unix: u64,
+    pub last_toron_probe_unix: Option<u64>,
+    pub last_flywheel_probe_unix: Option<u64>,
+    pub toron_probe_inflight: bool,
+    pub flywheel_probe_inflight: bool,
     pub status: Status,
-    /// The compose form, while one is open. `None` in every other mode; the
-    /// draft lives here so a failed send never loses what was typed.
-    pub compose: Option<ComposeState>,
-    /// Set by the quit path; the runtime draws one last frame and exits.
     pub should_quit: bool,
 }
 
 impl Model {
-    /// Seed a model from resolved identity + source facts. Starts on
-    /// `folder`/`tab` as asked by the flags, with an empty understood state.
-    pub fn seed(tab: Tab, folder: Folder, settings: SettingsState) -> Self {
+    pub fn seed(settings: SettingsState) -> Self {
         Self {
-            tab,
             mode: Mode::Normal,
-            pane: Pane::List,
-            mail: MailState {
-                folder,
-                ..Default::default()
-            },
-            channels: ChannelsState::default(),
-            agents: AgentsState::default(),
-            dashboard: DashboardState::default(),
+            inspector: Inspector::Message,
             settings,
-            input: String::new(),
+            posts: Vec::new(),
+            roster: Vec::new(),
+            leases: Vec::new(),
+            receipts: ReceiptCounts::default(),
+            sealed_inbox: SealedInboxCounts::default(),
+            toron_health: ToronHealthSignals::default(),
+            flywheel: None,
+            follow: true,
+            show_retired: false,
+            selected_post: 0,
+            msg_scroll: 0,
+            selected_diag: 0,
+            filter: String::new(),
+            compose_draft: None,
             now_unix: 0,
             tick: 0,
             inflight: 0,
+            focused: true,
+            last_input_unix: 0,
+            last_toron_probe_unix: None,
+            last_flywheel_probe_unix: None,
+            toron_probe_inflight: false,
+            flywheel_probe_inflight: false,
             status: Status::default(),
-            compose: None,
             should_quit: false,
         }
     }
 
-    /// The roster row for one recipient spelling, matched on pin or npub (or
-    /// the `role:` / alias fold is the mailbox's job, not the console's).
-    pub fn roster_row(&self, name: &str) -> Option<&AgentRow> {
-        let name = name.trim();
-        self.agents
-            .rows
+    pub fn visible_posts(&self) -> Vec<&BoardPost> {
+        let needle = self.filter.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return self.posts.iter().collect();
+        }
+        self.posts
             .iter()
-            .find(|a| a.name == name || a.npub == name)
+            .filter(|p| {
+                p.author.to_ascii_lowercase().contains(&needle)
+                    || p.body.to_ascii_lowercase().contains(&needle)
+                    || p.mentions
+                        .iter()
+                        .any(|m| m.to_ascii_lowercase().contains(&needle))
+            })
+            .collect()
     }
 
-    /// The first named recipient the loaded roster knows has NO live pane.
-    ///
-    /// A peer message is durable either way, but the doorbell can only PROMPT
-    /// a pane; without one the wake lands in that pin's digest. The console has
-    /// to say which it is instead of implying the recipient was notified. An
-    /// unloaded or silent roster answers `None` (we cannot know), never a guess.
-    pub fn recipient_without_a_pane(&self, to: &str) -> Option<String> {
-        for name in to.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if let Some(row) = self.roster_row(name)
-                && row.pane_id.is_none()
-            {
-                return Some(row.name.clone());
-            }
-        }
-        None
+    pub fn selected_board_post(&self) -> Option<&BoardPost> {
+        let visible = self.visible_posts();
+        visible.get(self.selected_post).copied()
     }
 
-    /// The commands a quiet console should name. Pure: project and pin come
-    /// from the seeded settings, and a missing pin stays a `<pin>` placeholder
-    /// rather than a guess about who the operator is.
-    pub fn onboarding(&self) -> Onboarding {
-        let project = match self.settings.project.trim() {
-            "" => "<project>".to_string(),
-            p => p.to_string(),
+    pub fn clamp_selection(&mut self) {
+        let post_len = self.visible_posts().len();
+        self.selected_post = if post_len == 0 {
+            0
+        } else {
+            self.selected_post.min(post_len - 1)
         };
-        let pin = self
-            .settings
-            .agent
-            .clone()
-            .unwrap_or_else(|| "<pin>".to_string());
-        Onboarding {
-            mail: format!(
-                "toron mail send --project {project} --as {pin} --to <pin> --subject <subject> --body <body>"
-            ),
-            channel: format!(
-                "toron channel create <id> --name <name> --project {project} --as {pin}"
-            ),
-            agent: format!("toron agent bootstrap --project {project} --as {pin}"),
+        let diag_len = self.diagnostics().len();
+        self.selected_diag = if diag_len == 0 {
+            0
+        } else {
+            self.selected_diag.min(diag_len - 1)
+        };
+    }
+
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        let mut all = diagnose_toron(&self.toron_health);
+        if let Some(fw) = &self.flywheel {
+            all.extend(fw.diagnostics.iter().cloned());
+        }
+        all.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.id.cmp(&b.id)));
+        all
+    }
+
+    pub fn has_blocking_diagnostics(&self) -> bool {
+        self.diagnostics().iter().any(|d| d.severity.is_blocking())
+    }
+
+    pub fn projection(&self) -> BoardProjection {
+        BoardProjection {
+            schema: BOARD_SCHEMA.to_string(),
+            project: self.settings.project.clone(),
+            viewer: self.settings.agent.clone(),
+            follow: self.follow,
+            toron_health: self.toron_health.clone(),
+            flywheel: self.flywheel.clone(),
+            roster: self.roster.clone(),
+            posts: self.posts.clone(),
+            leases: self.leases.clone(),
+            receipts: self.receipts,
+            sealed_inbox: self.sealed_inbox,
+            diagnostics: self.diagnostics(),
         }
     }
 
-    /// Rows the list pane currently shows (mail tab). A server search IS the
-    /// filter: re-running the local predicate over its hits would hide every
-    /// hit that matched in the body (which the local pass cannot see) while
-    /// the title still counted it.
-    pub fn mail_rows(&self) -> Vec<ListRow> {
-        if self.mail.search.is_some() {
-            return self.mail.rows();
-        }
-        self.mail.filtered_rows(&self.input)
+    pub fn arrivals(&self) -> Vec<u64> {
+        let ts: Vec<u64> = self.posts.iter().map(|p| p.created_at).collect();
+        super::charts::hour_buckets(&ts, self.now_unix, self.settings.chart_window_hours)
     }
 
-    /// Cursor length for the focused pane of the active tab. The Mail sidebar
-    /// holds the folder enum (four fixed rows) and is moved through
-    /// `SelectFolder` semantics, not a numeric cursor.
-    pub fn cursor_len(&self) -> usize {
-        match self.tab {
-            Tab::Mail => self.mail_rows().len(),
-            Tab::Channels => match self.pane {
-                Pane::Sidebar => self.channels.channels.len(),
-                _ => self.channels.visible_posts(&self.input).len(),
-            },
-            Tab::Agents => self.agents.visible_rows(&self.input).len(),
-            _ => 0,
-        }
-    }
-
-    /// Cursor position for the focused pane.
-    pub const fn cursor(&self) -> usize {
-        match self.tab {
-            Tab::Mail => self.mail.selected,
-            Tab::Channels => match self.pane {
-                Pane::Sidebar => self.channels.selected,
-                _ => self.channels.selected_post,
-            },
-            Tab::Agents => self.agents.selected,
-            _ => 0,
-        }
-    }
-
-    /// Clamp the focused cursor into `[0, len)`; empty lists sit at 0.
-    pub fn clamp_cursor(&mut self) {
-        let len = self.cursor_len();
-        let cur = self.cursor();
-        let next = if len == 0 { 0 } else { cur.min(len - 1) };
-        self.set_cursor(next);
-    }
-
-    /// Move the focused cursor by `delta`, clamped.
-    pub fn move_cursor(&mut self, delta: isize) {
-        let len = self.cursor_len();
-        if len == 0 {
-            self.set_cursor(0);
-            return;
-        }
-        let next = (self.cursor() as isize + delta).clamp(0, len as isize - 1);
-        self.set_cursor(next as usize);
-    }
-
-    /// Jump the focused cursor to `target` (clamped to the last row).
-    pub fn goto_cursor(&mut self, target: usize) {
-        let len = self.cursor_len();
-        let next = if len == 0 { 0 } else { target.min(len - 1) };
-        self.set_cursor(next);
-    }
-
-    /// Write the focused cursor back into its owning state.
-    pub const fn set_cursor(&mut self, value: usize) {
-        match self.tab {
-            Tab::Mail => self.mail.selected = value,
-            Tab::Channels => match self.pane {
-                Pane::Sidebar => self.channels.selected = value,
-                _ => self.channels.selected_post = value,
-            },
-            Tab::Agents => self.agents.selected = value,
-            _ => {}
-        }
-    }
-
-    /// Change the mail folder with the same reset semantics as clicking it:
-    /// the list cursor resets, the reader closes, and any search drops.
-    pub fn set_folder(&mut self, folder: Folder) -> bool {
-        if folder == self.mail.folder {
-            return false;
-        }
-        self.mail.folder = folder;
-        self.mail.selected = 0;
-        self.mail.open = None;
-        self.mail.search = None;
-        self.mail.scroll = 0;
-        self.clamp_cursor();
-        true
-    }
-
-    /// Switch tabs, resetting focus to a pane that exists on the new tab.
-    pub fn goto_tab(&mut self, tab: Tab) {
-        self.tab = tab;
-        self.mode = Mode::Normal;
-        self.pane = Pane::List;
-        self.input.clear();
-        self.clamp_cursor();
-    }
-
-    /// Set the status line (one-liner feedback). It stays until the next
-    /// action replaces it — no timer, so nothing here reads a clock.
     pub fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
         self.status = Status {
             text: text.into(),
             kind,
         };
     }
-
-    /// Pin for an npub, from the loaded roster. Pure join: the host never
-    /// keeps a second npub→name map.
-    pub fn agent_name_for(&self, npub: &str) -> Option<&str> {
-        self.agents
-            .rows
-            .iter()
-            .find(|a| a.npub == npub)
-            .map(|a| a.name.as_str())
-    }
-
-    /// Sidebar badge counts, one per folder, derived from the index.
-    pub fn folder_counts(&self) -> Vec<(Folder, usize)> {
-        Folder::ALL
-            .iter()
-            .map(|f| {
-                let n = match f {
-                    Folder::Inbox => self.mail.messages.len(),
-                    Folder::Unread => self.mail.messages.iter().filter(|m| !m.read).count(),
-                    Folder::Threads => thread_rows(&self.mail.messages).len(),
-                    Folder::NeedsAck => self
-                        .mail
-                        .messages
-                        .iter()
-                        .filter(|m| m.ack_pending())
-                        .count(),
-                    Folder::Important => {
-                        self.mail.messages.iter().filter(|m| m.important()).count()
-                    }
-                };
-                (*f, n)
-            })
-            .collect()
-    }
-
-    /// Mail arrivals per hour over the dashboard window, oldest first.
-    pub fn arrivals(&self) -> Vec<u64> {
-        let ts: Vec<u64> = self.mail.messages.iter().map(|m| m.at).collect();
-        crate::tui::charts::hour_buckets(&ts, self.now_unix, self.dashboard.window_hours)
-    }
-
-    /// Posts per channel, largest first (the dashboard's activity bars).
-    pub fn channel_bars(&self) -> Vec<(String, u64)> {
-        let mut bars: Vec<(String, u64)> = self
-            .channels
-            .channels
-            .iter()
-            .map(|c| (channel_label(c), c.posts as u64))
-            .collect();
-        bars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        bars.truncate(8);
-        bars
-    }
-
-    /// Roster split by presence (offline counted once, by `online`).
-    pub fn agent_state_counts(&self) -> Vec<(String, u64)> {
-        let mut counts: Vec<(String, u64)> = Vec::new();
-        for row in &self.agents.rows {
-            let label = row.state_label().to_string();
-            match counts.iter_mut().find(|(l, _)| *l == label) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((label, 1)),
-            }
-        }
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        counts
-    }
-
-    /// Threads in the mail index (dashboard stat).
-    pub fn thread_count(&self) -> usize {
-        thread_rows(&self.mail.messages).len()
-    }
-}
-
-/// Short channel label for charts and titles (`#general`).
-pub fn channel_label(c: &ChannelRow) -> String {
-    let name = if c.name.trim().is_empty() {
-        c.id.as_str()
-    } else {
-        c.name.as_str()
-    };
-    format!("#{name}")
 }

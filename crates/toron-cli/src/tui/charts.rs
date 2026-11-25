@@ -25,6 +25,7 @@ pub fn hour_buckets(timestamps: &[u64], now: u64, window_hours: u64) -> Vec<u64>
 
 /// Scale a series to bar widths in `[0, max_width]`, keeping the largest bar
 /// full. A zero series stays zero (no fake baseline).
+#[cfg(test)]
 pub fn bar_widths(values: &[u64], max_width: u16) -> Vec<u16> {
     let max = values.iter().copied().max().unwrap_or(0);
     if max == 0 || max_width == 0 {
@@ -37,6 +38,7 @@ pub fn bar_widths(values: &[u64], max_width: u16) -> Vec<u16> {
 }
 
 /// Compact count for stat cards: `999` / `1.2k` / `3.4M`.
+#[cfg(test)]
 pub fn compact(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();

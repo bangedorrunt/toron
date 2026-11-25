@@ -1,20 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0031
-//! `toron tui` — the operator console: mail, channels, agents, dashboard,
-//! settings in one Gmail-shaped frame.
-//!
-//! Shape (ADR-0031 §7, "Elm-everywhere"): `model` is pure data, `update::tick`
-//! is the only reducer, `msg::Effect` values are the only way work leaves it,
-//! and this module is the interpreter that runs them and feeds the results
-//! back. No I/O in the fold; no decision in this file.
-//!
-//! ```text
-//!   keyboard ──keymap──▶ Msg ─┐
-//!                             ├─▶ tick(&Model, Msg) ─▶ (Model, Vec<Effect>)
-//!   host results ────────────▶┘                              │
-//!                                                            ▼
-//!                                        dispatch: bounded host.run(effect) ─▶ Msg
-//! ```
+//! `toron tui` (`dashboard` / `ui`) — Swarm Board console and `--json`/`--check` AX door.
 
 pub mod charts;
 pub mod compose;
@@ -31,54 +17,88 @@ mod tests;
 use std::io::IsTerminal;
 use std::time::Duration;
 
+use crossterm::event::{DisableFocusChange, EnableFocusChange, Event};
+use crossterm::execute;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use toron_core::bus::{Filter, SubscriptionEvent};
+use toron_core::nostr::kinds::toron_kind;
 
 use crate::cli::TuiArgs;
 
 pub use host::{LiveHost, TuiHost};
-pub use model::{Folder, Model, Tab};
+pub use model::Model;
 pub use msg::{Effect, Msg};
 
-/// Run the console. Refuses a non-TTY outright (a raw-mode dashboard on a
-/// pipe would hang a script), then resolves identity + the one store before
-/// taking the screen.
+/// Run the Swarm Board console, or emit `--json` / `--check` in non-TTY pipes.
 #[tokio::main]
 pub async fn run_tui(args: &TuiArgs) -> anyhow::Result<()> {
-    let tab = Tab::parse(&args.tab).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown --tab {:?} (mail|channels|agents|dashboard|settings)",
-            args.tab
-        )
-    })?;
-    let folder = Folder::parse(&args.folder).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown --folder {:?} (inbox|unread|threads|ack|important)",
-            args.folder
-        )
-    })?;
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        anyhow::bail!("toron tui requires a TTY (refusing to run on a pipe)");
+    let ax_mode = args.json || args.check;
+    if !ax_mode && (!std::io::stdout().is_terminal() || !std::io::stdin().is_terminal()) {
+        anyhow::bail!("toron tui requires a TTY (pass --json or --check for non-TTY output)");
     }
 
     let host = LiveHost::connect(args).await?;
-    let model = Model::seed(tab, folder, host.settings());
+    let model = Model::seed(host.settings());
 
+    if ax_mode {
+        let final_model = run_oneshot(&host, model).await;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&final_model.projection())?
+            );
+        }
+        if args.check && final_model.has_blocking_diagnostics() {
+            let ids: Vec<String> = final_model
+                .diagnostics()
+                .into_iter()
+                .filter(|d| d.severity.is_blocking())
+                .map(|d| format!("{}: {}", d.severity.label(), d.id))
+                .collect();
+            anyhow::bail!("blocking diagnostics detected: {}", ids.join(", "));
+        }
+        return Ok(());
+    }
+
+    let _ = execute!(std::io::stdout(), EnableFocusChange);
     let mut terminal = ratatui::init();
     let result = run_loop(&mut terminal, host, model).await;
     ratatui::restore();
+    let _ = execute!(std::io::stdout(), DisableFocusChange);
     result
 }
 
-/// The interpreter loop: draw, then wait for a key, a result, or the tick.
-async fn run_loop<H: TuiHost>(
+async fn run_oneshot<H: TuiHost>(host: &H, model: Model) -> Model {
+    let (mut current, effects) = update::tick(&model, Msg::Init);
+    let mut handles = Vec::new();
+    for effect in effects {
+        if effect == Effect::Quit {
+            continue;
+        }
+        let h = host.clone();
+        handles.push(tokio::spawn(async move {
+            bounded(&h, effect, host::effect_timeout()).await
+        }));
+    }
+    for handle in handles {
+        if let Ok(message) = handle.await {
+            let (next, _) = update::tick(&current, message);
+            current = next;
+        }
+    }
+    current
+}
+
+async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    host: H,
+    host: LiveHost,
     model: Model,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Msg>(128);
-    let (event_tx, mut event_rx) = mpsc::channel::<crossterm::event::Event>(128);
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(128);
     spawn_input(event_tx);
+    spawn_bus_watcher(&host, tx.clone());
 
     let mut model = model;
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -103,9 +123,13 @@ async fn run_loop<H: TuiHost>(
             }
             maybe = event_rx.recv() => {
                 let Some(event) = maybe else { break };
-                if let crossterm::event::Event::Key(key) = event
-                    && let Some(message) = keymap::translate(&model, key)
-                {
+                let maybe_msg = match event {
+                    Event::Key(key) => keymap::translate(&model, key),
+                    Event::FocusGained => Some(Msg::FocusChanged(true)),
+                    Event::FocusLost => Some(Msg::FocusChanged(false)),
+                    _ => None,
+                };
+                if let Some(message) = maybe_msg {
                     let (next, effects) = update::tick(&model, message);
                     model = next;
                     dispatch(&host, &tx, &mut handles, effects);
@@ -126,9 +150,22 @@ async fn run_loop<H: TuiHost>(
     Ok(())
 }
 
-/// Spawn the effects. Every fetch is bounded by [`host::effect_timeout`] and
-/// its outcome comes back as a message, so a wedged store cannot wedge the
-/// dashboard.
+fn spawn_bus_watcher(host: &LiveHost, tx: mpsc::Sender<Msg>) {
+    let mailbox = host.mailbox().clone();
+    tokio::spawn(async move {
+        let filter = Filter::new().kinds([toron_kind(9)]);
+        let Ok(mut sub) = mailbox.bus().subscribe_trusted(filter).await else {
+            return;
+        };
+        while let Some(ev) = sub.next().await {
+            if matches!(ev, SubscriptionEvent::Event(_)) && tx.send(Msg::BusChanged).await.is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 fn dispatch<H: TuiHost>(
     host: &H,
     tx: &mpsc::Sender<Msg>,
@@ -148,28 +185,16 @@ fn dispatch<H: TuiHost>(
     }
 }
 
-/// Drop finished tasks and report how many effects are still owed an answer.
-///
-/// The count is DERIVED, never accumulated: a task that panics inside the host
-/// never posts a result, so an accumulator would stay above zero forever and
-/// the fold (`tick_refresh`) would refuse to dispatch again — a frozen console
-/// with no typed failure anywhere.
 pub(crate) fn live_handles(handles: &mut Vec<JoinHandle<()>>) -> usize {
     handles.retain(|h| !h.is_finished());
     handles.len()
 }
 
-/// Fold the derived in-flight count back into the model.
 fn note_inflight(model: &mut Model, inflight: usize) {
     let (next, _) = update::tick(model, Msg::Inflight(inflight));
     *model = next;
 }
 
-/// One effect, with its ceiling attached at the edge (effect law: bound every
-/// wait; journal the attempt before the provider runs — the host records the
-/// call before it answers, which is what the interpreter tests assert).
-/// `timeout` is a parameter so the tests can bound a scripted hang without
-/// touching the process environment.
 pub(crate) async fn bounded<H: TuiHost>(host: &H, effect: Effect, timeout: Duration) -> Msg {
     let op = host::effect_op(&effect);
     match tokio::time::timeout(timeout, host.run(effect)).await {
@@ -177,18 +202,14 @@ pub(crate) async fn bounded<H: TuiHost>(host: &H, effect: Effect, timeout: Durat
         Err(_) => Msg::Failed {
             op,
             message: format!(
-                "no answer after {}ms — the store is not responding (TORON_TUI_TIMEOUT_MS raises this)",
+                "no answer after {}ms — store not responding (TORON_TUI_TIMEOUT_MS raises this)",
                 timeout.as_millis()
             ),
         },
     }
 }
 
-/// Key input on a blocking thread (crossterm has no async reader without the
-/// `event-stream` feature; a dedicated thread keeps the dependency set as-is).
-/// The thread ends when the receiver drops, and a 200ms poll keeps it
-/// responsive to that.
-fn spawn_input(tx: mpsc::Sender<crossterm::event::Event>) {
+fn spawn_input(tx: mpsc::Sender<Event>) {
     std::thread::spawn(move || {
         loop {
             match crossterm::event::poll(Duration::from_millis(200)) {

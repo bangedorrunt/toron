@@ -190,8 +190,9 @@ pub enum Command {
     /// latency percentiles over an in-process bus, not a parity check.
     Bench(BenchArgs),
 
-    /// Operator console (ratatui): mail, channels, agents, dashboard,
-    /// settings — live against the project's one local store.
+    /// Swarm Board console (ratatui): live #seq posts, roster, leases,
+    /// health pills, and pure diagnostics (`--json` / `--check` for agents).
+    #[command(visible_aliases = ["dashboard", "ui"])]
     Tui(TuiArgs),
 
     /// Workflow (ADR-0005 Spec 5): lint/validate/run/invoke/dry-run a single
@@ -2332,27 +2333,25 @@ pub struct BenchArgs {
 
 #[derive(Debug, Args)]
 pub struct TuiArgs {
-    /// Poll/refresh interval in milliseconds (live-tunable in the Settings tab).
+    /// Poll/refresh interval in milliseconds (live-tunable in Charts & Settings).
     #[arg(long, default_value_t = 1000)]
     pub refresh_ms: u64,
     /// Project slug to open. Falls back to $TORON_PROJECT; with neither the
     /// TUI fails loud (no silent `demo` default — same rule as presence).
     #[arg(long)]
     pub project: Option<String>,
-    /// Acting agent pin whose inbox the Mail tab projects. Falls back to
-    /// $AGENT_NAME; without either the Mail tab reports a missing identity
-    /// instead of guessing one.
+    /// Acting agent pin. Falls back to $AGENT_NAME; optional for read-only
+    /// board/roster/lease inspection.
     #[arg(long = "as")]
     pub agent: Option<String>,
-    /// Open on this tab (mail|channels|agents|dashboard|settings).
-    #[arg(long, default_value = "mail")]
-    pub tab: String,
-    /// Open on this mail folder (inbox|threads|ack|important).
-    #[arg(long, default_value = "inbox")]
-    pub folder: String,
-    /// Include closed (retired) channels in the Channels tab.
+    /// Emit the Swarm Board JSON projection (`toron-board.v1`) and exit.
+    /// Bypasses the TTY gate so agents and scripts can run it in pipes.
     #[arg(long)]
-    pub all: bool,
+    pub json: bool,
+    /// Run pure diagnostic checks and exit non-zero on P0/P1 findings.
+    /// Bypasses the TTY gate.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
