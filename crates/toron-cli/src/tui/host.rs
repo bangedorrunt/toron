@@ -374,11 +374,15 @@ impl LiveHost {
     }
 
     async fn probe_flywheel_snapshot(&self) -> Option<FlywheelPanel> {
-        if std::env::var("TORON_TUI_NO_FLYWHEEL").ok().as_deref() == Some("1") {
+        if std::env::var("TORON_TUI_NO_FLYWHEEL").ok().as_deref() == Some("1")
+            || std::env::var("TORON_UNDER_TEST").is_ok()
+        {
             return None;
         }
         let project = self.project.clone();
-        let fut = tokio::process::Command::new("flywheel")
+        let flywheel_bin =
+            std::env::var("TORON_FLYWHEEL_BIN").unwrap_or_else(|_| "flywheel".to_string());
+        let fut = tokio::process::Command::new(flywheel_bin)
             .args(["snapshot", &project])
             .output();
         let out = tokio::time::timeout(FLYWHEEL_SNAPSHOT_TIMEOUT, fut)

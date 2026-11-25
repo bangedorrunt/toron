@@ -93,6 +93,7 @@ fn swarm_board_runs_and_exits_cleanly_on_45_col_pty() {
     if !have_script() {
         return;
     }
+    // spawn-harness: passed to run_on_45_col_pty which applies toron_core::testkit::toron_command env
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
     let (drawn, code) = run_on_45_col_pty(program, "q");
     assert_eq!(code, 0, "must exit 0 on q; drew:\n{drawn}");
