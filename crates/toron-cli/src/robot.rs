@@ -122,35 +122,6 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// bd-reserve-yield-taqf: the yield board. CLI-only noun (no MCP tool, same
-/// discipline as `ack-sla`), so this shape is hand-built and shared by both
-/// arms — the markers plus the beads a resume must skip right now.
-fn yield_board_json(
-    project_key: &str,
-    views: Vec<toron_core::mailbox::yields::YieldView>,
-    suppressed: Vec<String>,
-) -> Value {
-    let yields: Vec<Value> = views
-        .into_iter()
-        .map(|v| {
-            json!({
-                "bead_id": v.bead_id,
-                "holder": v.holder,
-                "yielder": v.yielder,
-                "note": v.note,
-                "created_ts_us": v.created_ts_us,
-                "holder_live": v.holder_live,
-            })
-        })
-        .collect();
-    json!({
-        "project": project_key,
-        "count": yields.len(),
-        "yields": yields,
-        "suppressed": suppressed,
-    })
-}
-
 /// bd-close-releases-leases-qkbo: mark board rows whose reason bead is CLOSED
 /// (CLI-only additive fields; the MCP `LeaseBoardOut` shape is untouched).
 /// Best-effort: no tracker file means no annotation, never an error —
@@ -1398,23 +1369,6 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             "nothing was released; the preview reads no board or tracker — run without -n \
              to discover the closed-reason leases and release them",
         ),
-        ReserveCommand::Yield(a) => {
-            eprintln!(
-                "toron: deprecated (ADR-0047): {}",
-                toron_core::mailbox::yields::DEPRECATED_MAIL_HOLDER_NOTICE
-            );
-            (
-                "reserve_yield",
-                json!({
-                    "project_key": a.project,
-                    "agent_name": a.agent,
-                    "bead_id": a.bead_id,
-                    "holder": a.holder,
-                    "note": a.note,
-                }),
-                "nothing was yielded",
-            )
-        }
         ReserveCommand::ForceRelease(a) => (
             "force_release_file_reservation",
             json!({
@@ -1463,10 +1417,7 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             }),
             "nothing was transferred",
         ),
-        ReserveCommand::Conflicts(_)
-        | ReserveCommand::List(_)
-        | ReserveCommand::WithLease(_)
-        | ReserveCommand::Yields(_) => {
+        ReserveCommand::Conflicts(_) | ReserveCommand::List(_) | ReserveCommand::WithLease(_) => {
             return None;
         }
     };
@@ -1502,31 +1453,20 @@ pub async fn run_reserve(
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             warn_acquire_paths(&paths).await;
             let root = acquire_repo_root();
-            let out = if args.queue {
-                mailbox
-                    .file_reservation_paths_queued(
-                        &args.project,
-                        &args.agent,
-                        &paths,
-                        args.ttl_secs,
-                        args.exclusive,
-                        args.reason.as_deref(),
-                        root.as_deref(),
-                    )
-                    .await?
-            } else {
-                mailbox
-                    .file_reservation_paths_with_root(
-                        &args.project,
-                        &args.agent,
-                        &paths,
-                        args.ttl_secs,
-                        args.exclusive,
-                        args.reason.as_deref(),
-                        root.as_deref(),
-                    )
-                    .await?
-            };
+            if args.queue {
+                anyhow::bail!("removed: mail the holder");
+            }
+            let out = mailbox
+                .file_reservation_paths_with_root(
+                    &args.project,
+                    &args.agent,
+                    &paths,
+                    args.ttl_secs,
+                    args.exclusive,
+                    args.reason.as_deref(),
+                    root.as_deref(),
+                )
+                .await?;
             emit(out)
         }
         ReserveCommand::Conflicts(args) => {
@@ -1558,9 +1498,7 @@ pub async fn run_reserve(
                 project_key: args.project.clone(),
                 count: reservations.len() as i64,
                 reservations,
-                waitlists: toron_mcp::tools::reservation::waitlist_rows(
-                    &mailbox.list_project_waiters(&args.project).await?,
-                ),
+                waitlists: Vec::new(),
             }
             .to_json();
             let closed =
@@ -1626,27 +1564,6 @@ pub async fn run_reserve(
                 released += result.released as u64;
             }
             print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
-        }
-        ReserveCommand::Yield(args) => {
-            mailbox
-                .record_reservation_yield(
-                    &args.project,
-                    &args.agent,
-                    &args.bead_id,
-                    &args.holder,
-                    args.note.as_deref().unwrap_or(""),
-                )
-                .await?;
-            print_json(&json!({
-                "ok": true,
-                "project": args.project,
-                "bead_id": args.bead_id,
-                "holder": args.holder,
-            }))
-        }
-        ReserveCommand::Yields(args) => {
-            let (views, suppressed) = mailbox.reservation_yield_board(&args.project).await?;
-            print_json(&yield_board_json(&args.project, views, suppressed))
         }
         ReserveCommand::ForceRelease(args) => {
             mailbox
@@ -2262,13 +2179,6 @@ pub async fn run_reserve_daemon(
                 released += result.get("released").and_then(Value::as_u64).unwrap_or(0);
             }
             print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
-        }
-        ReserveCommand::Yield(_) | ReserveCommand::Yields(_) => {
-            eprintln!(
-                "toron reserve yield/yields: no daemon tool; scanning the shared durable root directly"
-            );
-            let mb = embedded_mailbox().await?;
-            run_reserve(&mb, cmd, dry_run).await
         }
         ReserveCommand::ForceRelease(args) => {
             daemon_tool(

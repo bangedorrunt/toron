@@ -1208,12 +1208,6 @@ impl Mailbox {
         let mut released = 0usize;
         let mut leases = Vec::new();
         for res in mine {
-            // bd-ll7bs: a waiter gets the path through the same atomic transfer
-            // every other release uses; the transfer publishes its own events.
-            if self.handoff_waiter(project_slug, &res).await {
-                released += 1;
-                continue;
-            }
             let (_, effects) = self
                 .kernel_tick(project_slug, &KernelMsg::Release { id: res.id.clone() })
                 .await;
@@ -1965,18 +1959,6 @@ impl Mailbox {
         // bd-ll7bs: an expired lease with waiters must hand over on the READ,
         // not on some unrelated later release. The inflight guard stops the
         // sweep's own board read from recursing into another sweep.
-        if self
-            .list_project_waiters(project_slug)
-            .await
-            .is_ok_and(|w| !w.is_empty())
-            && self
-                .handoff_inflight
-                .lock()
-                .insert(project_slug.to_string())
-        {
-            let _ = Box::pin(self.sweep_expired_waitlists(project_slug)).await;
-            self.handoff_inflight.lock().remove(project_slug);
-        }
         Ok(out)
     }
 
@@ -3137,45 +3119,7 @@ impl Mailbox {
         (next, effects)
     }
 
-    /// bd-ll7bs: one handoff choke point. A freed path with a waiter moves to
-    /// it through the existing epoch-safe transfer — never a second grant path.
-    /// A failed transfer leaves the lease alone so an ordinary release can run.
-    pub(crate) async fn handoff_waiter(&self, project_slug: &str, lease: &Reservation) -> bool {
-        let mut releasing = lease.clone();
-        self.fill_agent_names(project_slug, std::slice::from_mut(&mut releasing))
-            .await;
-        if releasing.agent_name.is_empty() {
-            return false;
-        }
-        let Ok(Some(next)) = self
-            .next_waiter(project_slug, &releasing.path_pattern)
-            .await
-        else {
-            return false;
-        };
-        if next.agent_name == releasing.agent_name {
-            return false;
-        }
-        let moved = self
-            .transfer_reservation(
-                project_slug,
-                &releasing.agent_name,
-                &next.agent_name,
-                &releasing.path_pattern,
-                next.reason.as_deref(),
-            )
-            .await
-            .is_ok();
-        if moved {
-            let _ = self.remove_waiter(next.seq).await;
-        }
-        moved
-    }
-
     async fn kernel_release_lease(&self, project_slug: &str, lease: &Reservation) -> bool {
-        if self.handoff_waiter(project_slug, lease).await {
-            return true;
-        }
         let (_, effects) = self
             .kernel_tick(
                 project_slug,
@@ -3889,46 +3833,6 @@ mod tests {
             vec![""],
             "roster miss stays empty, no invented prefix: {holders:?}"
         );
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    /// bd-ow6c: ONE project key on both halves of the yield join. The marker
-    /// table was written and read RAW while the lease board was canonicalized,
-    /// so a marker written under a path-form spelling was invisible to the
-    /// join — and the loop resumed a bead a live peer held.
-    #[tokio::test]
-    async fn yield_markers_join_the_lease_board_under_one_canonical_project_key() {
-        let (mailbox, db_path, data_dir) = test_mailbox("yield-canonical").await;
-        mailbox
-            .ensure_project("demo")
-            .await
-            .expect("ensure project");
-        let pool = mailbox.index_pool.as_ref().expect("pool").clone();
-        sqlx::query(
-            "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
-             VALUES (?1, ?2, ?3)",
-        )
-        .bind("/w/demo")
-        .bind("demo")
-        .bind(1_i64)
-        .execute(&pool)
-        .await
-        .expect("seed the alias");
-        mailbox
-            .record_reservation_yield("/w/demo", "Yielder", "yield-bead-1", "Holder", "note")
-            .await
-            .expect("record the yield");
-        let (views, _) = mailbox
-            .reservation_yield_board("demo")
-            .await
-            .expect("the yield board");
-        assert_eq!(
-            views.len(),
-            1,
-            "the marker joins the canonical board: {views:?}"
-        );
-        assert_eq!(views[0].bead_id, "yield-bead-1");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -7632,80 +7536,6 @@ mod tests {
         ) -> super::super::dirty_path::PathEvidence {
             self.0.clone()
         }
-    }
-
-    /// bd-nmilo: a repo_root on the lease makes the fake dirty source authoritative.
-    /// Dirty → the live holder keeps the path and the waiter stays queued
-    /// (DirtyNeverStolen). Clean and idle past grace → the lease drops and the
-    /// waiter is handed the path (HandoffOnClean, with a wake).
-    #[tokio::test]
-    async fn dirty_path_stays_with_live_holder_clean_path_hands_to_waiter() {
-        use super::super::dirty_path::PathEvidence;
-
-        async fn scenario(tag: &str, evidence: PathEvidence) -> (bool, bool, bool) {
-            let (mailbox, db_path, data_dir) = test_mailbox(tag).await;
-            let mailbox = mailbox.with_dirty_source(std::sync::Arc::new(FixedEvidence(evidence)));
-            let root =
-                std::env::temp_dir().join(format!("toron-nmilo-{tag}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&root).expect("root");
-            let holder = register(&mailbox, "demo", "BlueLake").await;
-            register(&mailbox, "demo", "RoseDune").await;
-            mailbox
-                .file_reservation_paths_with_root(
-                    "demo",
-                    "BlueLake",
-                    &["src/lease.rs".into()],
-                    Some(1),
-                    true,
-                    None,
-                    Some(root.to_str().expect("utf8 root")),
-                )
-                .await
-                .expect("acquire with root");
-            assert!(
-                mailbox
-                    .enqueue_waiter("demo", "src/lease.rs", "RoseDune", Some("bd-nmilo"))
-                    .await
-                    .expect("enqueue waiter")
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-            let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
-            mailbox.record_inbox_poll("demo", "BlueLake", now_us).await;
-
-            let resolved = mailbox.resolved_leases("demo").await.expect("resolve");
-            let holder_keeps = resolved
-                .iter()
-                .any(|r| r.path_pattern == "src/lease.rs" && r.agent_pubkey == holder.to_hex());
-            let waiter_queued = mailbox
-                .list_project_waiters("demo")
-                .await
-                .expect("waiters")
-                .iter()
-                .any(|w| w.agent_name == "RoseDune");
-            let waiter_holds = mailbox
-                .active_reservations("demo")
-                .await
-                .expect("active")
-                .iter()
-                .any(|r| r.path_pattern == "src/lease.rs" && r.agent_name == "RoseDune");
-
-            let _ = std::fs::remove_file(&db_path);
-            let _ = std::fs::remove_dir_all(&data_dir);
-            let _ = std::fs::remove_dir_all(&root);
-            (holder_keeps, waiter_queued, waiter_holds)
-        }
-
-        let (keeps, queued, handed) =
-            scenario("dirty", PathEvidence::Dirty { last_edit_ts_us: 0 }).await;
-        assert!(keeps, "a live dirty holder keeps the lease past TTL");
-        assert!(queued, "the waiter stays queued while the path is dirty");
-        assert!(!handed, "a dirty path is never handed to a waiter");
-
-        let (keeps, queued, handed) =
-            scenario("clean", PathEvidence::Clean { last_edit_ts_us: 0 }).await;
-        assert!(!keeps, "a clean idle path drops after the grace window");
-        assert!(!queued, "the clean path's waiter leaves the queue");
-        assert!(handed, "the clean path is handed to the waiter with a wake");
     }
 
     #[tokio::test]

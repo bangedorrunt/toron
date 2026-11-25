@@ -367,7 +367,7 @@
       "name": "events"
     },
     {
-      "args": "acquire, conflicts, list, renew, release, release-by-reason, cycle, sweep, yield, yields, force-release, request-release, respond, transfer, with-lease",
+      "args": "acquire, conflicts, list, renew, release, release-by-reason, cycle, sweep, force-release, request-release, respond, transfer, with-lease",
       "description": "File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release",
       "name": "reserve"
     },
@@ -522,7 +522,7 @@
       "name": "board"
     }
   ],
-  "generated_at": "2026-11-25T04:47:36Z",
+  "generated_at": "2026-11-25T05:13:54Z",
   "resources": [
     {
       "description": "List projects known to toron.",

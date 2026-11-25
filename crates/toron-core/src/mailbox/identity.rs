@@ -995,8 +995,9 @@ impl Mailbox {
                     &profile,
                     &roles,
                     crate::nostr::Timestamp::now(),
-                ) {
-                    let _ = self.bus.publish(new_event).await;
+                ) && let Err(e) = self.bus.publish(new_event).await
+                {
+                    tracing::warn!("role profile publish failed: {e}");
                 }
             }
         }

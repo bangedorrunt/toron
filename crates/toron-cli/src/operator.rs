@@ -1286,8 +1286,6 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Reserve(ReserveCommand::ReleaseByReason(_)) => "reserve.release_by_reason",
         Command::Reserve(ReserveCommand::Cycle(_)) => "reserve.cycle",
         Command::Reserve(ReserveCommand::Sweep(_)) => "reserve.sweep",
-        Command::Reserve(ReserveCommand::Yield(_)) => "reserve.yield",
-        Command::Reserve(ReserveCommand::Yields(_)) => "reserve.yields",
         Command::Reserve(ReserveCommand::ForceRelease(_)) => "reserve.force_release",
         Command::Reserve(ReserveCommand::RequestRelease(_)) => "reserve.request_release",
         Command::Reserve(ReserveCommand::Respond(_)) => "reserve.respond",

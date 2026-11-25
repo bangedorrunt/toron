@@ -65,17 +65,7 @@ impl ToolServer {
             );
         }
         ToolOutput::result(if args.queue {
-            self.mailbox
-                .file_reservation_paths_queued(
-                    &args.project_key,
-                    &args.agent_name,
-                    &args.paths,
-                    nonneg_secs(args.ttl_seconds),
-                    args.exclusive.unwrap_or(false),
-                    args.reason.as_deref(),
-                    args.repo_root.as_deref(),
-                )
-                .await
+            Err(anyhow::anyhow!("removed: mail the holder"))
         } else {
             self.mailbox
                 .file_reservation_paths_with_root(
@@ -234,16 +224,11 @@ impl ToolServer {
                 holder_live,
             });
         }
-        let waiters = self
-            .mailbox
-            .list_project_waiters(&args.project_key)
-            .await
-            .unwrap_or_default();
         ToolOutput::result(Ok(LeaseBoardOut {
             project_key: args.project_key,
             count: reservations.len() as i64,
             reservations,
-            waitlists: waitlist_rows(&waiters),
+            waitlists: Vec::new(),
         }))
     }
 }
@@ -351,26 +336,6 @@ pub struct LeaseBoardOut {
 pub struct ReservationWaitlistOut {
     pub path: String,
     pub waiters: Vec<String>,
-}
-
-/// Group the project's waiters by path, preserving arrival order within each.
-#[must_use]
-pub fn waitlist_rows(
-    waiters: &[toron_core::mailbox::reservation_waitlist::Waiter],
-) -> Vec<ReservationWaitlistOut> {
-    use std::collections::BTreeMap;
-    let mut rows: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for w in waiters {
-        rows.entry(&w.path_pattern)
-            .or_default()
-            .push(w.agent_name.clone());
-    }
-    rows.into_iter()
-        .map(|(path, waiters)| ReservationWaitlistOut {
-            path: path.to_string(),
-            waiters,
-        })
-        .collect()
 }
 
 impl crate::tools::ToJson for LeaseBoardOut {

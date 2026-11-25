@@ -1244,8 +1244,11 @@ impl Mailbox {
             content,
             tags,
             Timestamp::now(),
-        ) {
-            let _ = self.bus.publish(ev).await;
+        ) && let Err(e) = self.bus.publish(ev).await
+        {
+            self.wake_publish_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("ack-sla wake publish failed: {e}");
         }
         Ok(())
     }

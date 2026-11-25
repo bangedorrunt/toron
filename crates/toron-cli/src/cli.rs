@@ -974,14 +974,6 @@ pub enum ReserveCommand {
     /// Release every lease whose reason bead is CLOSED (batch of
     /// release-by-reason; the closed set is read from the repo tracker).
     Sweep(ReserveSweepArgs),
-    /// Record ONE structured stand-down marker for (bead, holder): "bead
-    /// <id> is being worked by <holder>, stop resuming it". Idempotent per
-    /// (bead, holder); the loop reads `reserve yields` and skips the bead
-    /// while the holder's lease is live.
-    Yield(ReserveYieldArgs),
-    /// Show the project's yield markers, each flagged with whether its holder
-    /// is live right now, plus the beads a resume must currently skip.
-    Yields(ReserveYieldsArgs),
     /// Operator force-release of a stale reservation.
     ForceRelease(ReserveForceReleaseArgs),
     /// Ask the holder to release or defer a held reservation (ADR-0011
@@ -1118,32 +1110,6 @@ pub struct ReserveSweepArgs {
     /// Skip the NIP-17 notification to the previous holders (default: notify).
     #[arg(long)]
     pub no_notify: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ReserveYieldArgs {
-    /// Project slug.
-    #[arg(long, required = true)]
-    pub project: String,
-    /// The pin yielding the bead (the pane that was resumed and declined).
-    #[arg(long = "as", required = true)]
-    pub agent: String,
-    /// Bead id being yielded.
-    #[arg(long = "bead", required = true)]
-    pub bead_id: String,
-    /// The pin already working the bead (whose live lease keeps it suppressed).
-    #[arg(long, required = true)]
-    pub holder: String,
-    /// Why the bead is being yielded (free text, stored verbatim).
-    #[arg(long)]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct ReserveYieldsArgs {
-    /// Project slug.
-    #[arg(long, required = true)]
-    pub project: String,
 }
 
 #[derive(Debug, Args)]

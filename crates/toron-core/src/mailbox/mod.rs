@@ -77,14 +77,12 @@ pub mod pin_reuse;
 pub mod product;
 pub mod receipts;
 pub mod receipts_core;
-pub mod reservation_waitlist;
 pub mod reservations;
 pub mod reservations_core;
 pub mod search;
 pub mod send_tags;
 pub mod surface;
 pub mod unwrap;
-pub mod yields;
 
 pub use crate::nostr::identity::AgentProfile;
 pub use build_slots::AcquireBuildSlotResult;
@@ -188,9 +186,6 @@ pub struct Mailbox {
     alt_key_paths: Arc<papaya::HashMap<(String, String), AltKeyMemo>>,
     /// Test/metrics observable: alternate-root walks performed.
     alt_key_walks: Arc<AtomicU64>,
-    /// bd-ll7bs: per-project guard so an expiry-triggered handoff cannot
-    /// recurse through the lease board read that triggered it.
-    pub(crate) handoff_inflight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// bd-nmilo: dirty-path evidence for liveness extension. Injectable so
     /// tests use a fake; production reads git status plus file mtime.
     pub(crate) dirty_source: Arc<dyn dirty_path::DirtyPathSource>,
@@ -262,7 +257,6 @@ impl Mailbox {
             unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
             alt_key_paths: Arc::new(papaya::HashMap::new()),
             alt_key_walks: Arc::new(AtomicU64::new(0)),
-            handoff_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             dirty_source: Arc::new(dirty_path::GitDirtyPathSource::default()),
             unknown_logged: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             dirty_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
