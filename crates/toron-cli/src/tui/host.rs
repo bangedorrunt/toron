@@ -142,6 +142,54 @@ impl LiveHost {
         let mut seen: std::collections::HashSet<String> =
             posts.iter().map(|p| p.event_id.clone()).collect();
 
+        let canonical = self.mailbox.canonical_project(&self.project).await;
+        if let Ok(mut sub) = self
+            .mailbox
+            .bus()
+            .subscribe_trusted(
+                toron_core::bus::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(9)]),
+            )
+            .await
+        {
+            while let Some(toron_core::bus::SubscriptionEvent::Event(ev)) = sub.next().await {
+                let tag = |name: &str| -> Option<String> {
+                    ev.tags
+                        .iter()
+                        .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
+                        .and_then(|t| t.as_slice().get(1).cloned())
+                };
+                if tag("toron-kind").as_deref() != Some("board-post")
+                    || tag("t").as_deref() != Some(canonical.as_str())
+                {
+                    continue;
+                }
+                let event_id = ev.id.to_hex();
+                if !seen.insert(event_id.clone()) {
+                    continue;
+                }
+                let ch = tag("h").unwrap_or_else(|| "main".to_string());
+                let body = if ch == "main" {
+                    ev.content.clone()
+                } else {
+                    format!("[#{ch}] {}", ev.content)
+                };
+                let mentions: Vec<String> = ev
+                    .tags
+                    .iter()
+                    .filter(|t| t.as_slice().first().map(String::as_str) == Some("mention"))
+                    .filter_map(|t| t.as_slice().get(1).cloned())
+                    .collect();
+                posts.push(BoardPost {
+                    seq: tag("seq").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                    event_id,
+                    author: tag("from").unwrap_or_else(|| "unknown".to_string()),
+                    body,
+                    mentions,
+                    created_at: ev.created_at.as_secs(),
+                });
+            }
+        }
+
         if let Ok(store) = crate::plane::rebuild_store(&self.mailbox, &self.project).await {
             let agents = self
                 .mailbox
@@ -293,22 +341,33 @@ impl LiveHost {
         let stuck_queued_sends = toron_core::queued_send::pending()
             .map(|v| v.len())
             .unwrap_or(0);
-        let wake_publish_failures = 0;
-        let (daemon_reachable, daemon_latency_ms) = if self.settings.source.daemon_loopback
-            && std::env::var("TORON_TUI_NO_HTTP_PROBE").ok().as_deref() != Some("1")
-        {
-            let endpoint = self.settings.source.detail.clone();
-            tokio::task::spawn_blocking(move || probe_http_endpoint(&endpoint))
-                .await
-                .unwrap_or((false, None))
-        } else {
-            (!self.settings.source.daemon_loopback, None)
-        };
+        let wake_publish_failures = self.mailbox.wake_publish_failures();
+        let skip_http = std::env::var("TORON_TUI_NO_HTTP_PROBE").ok().as_deref() == Some("1");
+        let (daemon_reachable, daemon_latency_ms) =
+            if self.settings.source.daemon_loopback && !skip_http {
+                let endpoint = self.settings.source.detail.clone();
+                tokio::task::spawn_blocking(move || probe_http_endpoint(&endpoint))
+                    .await
+                    .unwrap_or((false, None))
+            } else {
+                (!self.settings.source.daemon_loopback, None)
+            };
+        let (wake_liveness_ok, wake_never_stamped) =
+            if self.settings.source.daemon_loopback && !skip_http {
+                let root = toron_core::config::mailbox_root(self.mailbox.data_dir());
+                let wake_sock_exists = toron_core::bus::wake::wake_sock_path(&root).exists();
+                (
+                    daemon_reachable && wake_sock_exists,
+                    daemon_reachable && !wake_sock_exists,
+                )
+            } else {
+                (true, false)
+            };
         ToronHealthSignals {
             daemon_reachable,
             daemon_latency_ms,
-            wake_liveness_ok: daemon_reachable || !self.settings.source.daemon_loopback,
-            wake_never_stamped: false,
+            wake_liveness_ok,
+            wake_never_stamped,
             wake_publish_failures,
             stuck_queued_sends,
         }

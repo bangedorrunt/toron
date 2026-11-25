@@ -435,6 +435,12 @@ impl Mailbox {
         &self.bus
     }
 
+    /// Count of local wake-shadow `bus.publish` failures (`D11`).
+    pub fn wake_publish_failures(&self) -> u64 {
+        self.wake_publish_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The on-disk directory under which project roots live.
     pub const fn data_dir(&self) -> &PathBuf {
         &self.data_dir

@@ -42,7 +42,7 @@ workflows/              product YAML
 | Effect journal / durable engine | core index migrations, `RunStateStore`, `crates/toron-core/src/index/durable_engine.rs` |
 | MCP tools / resources | `crates/toron-mcp/src/{tools,resources}.rs`, `catalog.rs` |
 | MCP Events (SEP-3415) | `crates/toron-core/src/events/`, `crates/toron-mcp/src/events/`, `events_stream.rs` |
-| TUI (Elm core) | `crates/toron-cli/src/tui/` (pure `tick`) |
+| TUI (Elm core) | `crates/toron-cli/src/tui/` (`toron tui` / `dashboard` / `ui` Swarm Board, `--json`/`--check`, pure `tick` + `diagnose_toron`) |
 | Daemon / CLI / build identity | `crates/toron-cli/src/{cli,daemon,main}.rs`, `crates/toron-core/src/serve_build.rs` |
 
 ## Crate rules
