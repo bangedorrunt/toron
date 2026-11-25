@@ -97,11 +97,22 @@ impl Mailbox {
         classify_board_body(body, sensitivity)?;
         let canonical = self.canonical_project(project).await;
         let author_keys = self.agent_keys_for_resolved(&canonical, author).await?;
+        let next_seq = self
+            .board_read(&canonical, channel, 0, usize::MAX)
+            .await?
+            .head_seq
+            + 1;
+        let posted_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
         let mut tags = vec![
             Tag::parse(["t", &canonical]).expect("t tag"),
             Tag::parse(["h", channel]).expect("h tag"),
             Tag::parse(["toron-kind", "board-post"]).expect("toron-kind"),
             Tag::parse(["from", author]).expect("from tag"),
+            Tag::parse(["seq", &next_seq.to_string()]).expect("seq tag"),
+            Tag::parse(["posted_us", &posted_us.to_string()]).expect("posted_us tag"),
         ];
         for mention in mentions {
             tags.push(Tag::parse(["mention", mention]).expect("mention tag"));
@@ -150,6 +161,21 @@ impl Mailbox {
                 events.push(ev);
             }
         }
+        events.sort_by(|a, b| {
+            let key = |ev: &Event| {
+                (
+                    event_tag(ev, "seq")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(u64::MAX),
+                    event_tag(ev, "posted_us")
+                        .and_then(|s| s.parse::<u128>().ok())
+                        .unwrap_or(0),
+                    ev.created_at.as_secs(),
+                    ev.id.to_hex(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
         let head_seq = events.len() as u64;
         let messages = events
             .into_iter()
@@ -322,13 +348,28 @@ mod tests {
             .board_post("proj", "main", "AmberFalcon", "third", &[], None)
             .await
             .unwrap();
-        assert_eq!((m1.seq, m2.seq, m3.seq), (1, 2, 3));
+        let mut seqs = vec![m1.seq, m2.seq, m3.seq];
+        for i in 4..=10 {
+            let m = mb
+                .board_post(
+                    "proj",
+                    "main",
+                    "AmberFalcon",
+                    &format!("msg-{i}"),
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+            seqs.push(m.seq);
+        }
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
 
-        let tail = mb.board_read("proj", "main", 1, 10).await.unwrap();
-        assert_eq!(tail.head_seq, 3);
+        let tail = mb.board_read("proj", "main", 8, 10).await.unwrap();
+        assert_eq!(tail.head_seq, 10);
         assert_eq!(tail.messages.len(), 2);
-        assert_eq!(tail.messages[0].seq, 2);
-        assert_eq!(tail.messages[1].seq, 3);
+        assert_eq!(tail.messages[0].seq, 9);
+        assert_eq!(tail.messages[1].seq, 10);
 
         let wraps = crate::mailbox::collect_replay(&*mb.bus, Filter::new().kinds([Kind::GiftWrap]))
             .await
