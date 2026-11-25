@@ -40,14 +40,14 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
 
     match msg {
         Msg::Init => {
-            effects.extend(event_driven_loads());
+            effects.extend(single_flight_loads(&mut m));
             m.toron_probe_inflight = true;
             m.flywheel_probe_inflight = true;
             effects.push(Effect::ProbeToronHealth);
             effects.push(Effect::ProbeFlywheelSnapshot);
         }
         Msg::BusChanged => {
-            effects.extend(event_driven_loads());
+            effects.extend(single_flight_loads(&mut m));
         }
         Msg::Tick { now_unix } => {
             m.now_unix = now_unix;
@@ -80,6 +80,7 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             }
         }
         Msg::BoardLoaded(posts) => {
+            m.board_inflight = false;
             m.posts = posts;
             if m.follow {
                 let len = m.visible_posts().len();
@@ -88,8 +89,14 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             }
             m.clamp_selection();
         }
-        Msg::RosterLoaded(roster) => m.roster = roster,
-        Msg::LeasesLoaded(leases) => m.leases = leases,
+        Msg::RosterLoaded(roster) => {
+            m.roster_inflight = false;
+            m.roster = roster;
+        }
+        Msg::LeasesLoaded(leases) => {
+            m.leases_inflight = false;
+            m.leases = leases;
+        }
         Msg::ReceiptsLoaded(receipts) => m.receipts = receipts,
         Msg::SealedCountsLoaded(counts) => m.sealed_inbox = counts,
         Msg::ToronHealthLoaded { signals, now_unix } => {
@@ -117,6 +124,9 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         Msg::Inflight(n) => m.inflight = n,
         Msg::Failed { op, message } => {
             match op {
+                Op::Board => m.board_inflight = false,
+                Op::Roster => m.roster_inflight = false,
+                Op::Leases => m.leases_inflight = false,
                 Op::Health => m.toron_probe_inflight = false,
                 Op::Flywheel => m.flywheel_probe_inflight = false,
                 _ => {}
@@ -232,7 +242,7 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         Msg::CommitFilter => m.mode = Mode::Normal,
         Msg::Refresh => {
             m.set_status(StatusKind::Info, "refreshing");
-            effects.extend(event_driven_loads());
+            effects.extend(single_flight_loads(&mut m));
             if !m.toron_probe_inflight {
                 m.toron_probe_inflight = true;
                 effects.push(Effect::ProbeToronHealth);
@@ -307,14 +317,23 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
     (m, effects)
 }
 
-fn event_driven_loads() -> Vec<Effect> {
-    vec![
-        Effect::LoadBoard,
-        Effect::LoadRoster,
-        Effect::LoadLeases,
-        Effect::LoadReceipts,
-        Effect::LoadSealedCounts,
-    ]
+fn single_flight_loads(m: &mut Model) -> Vec<Effect> {
+    let mut out = Vec::new();
+    if !m.board_inflight {
+        m.board_inflight = true;
+        out.push(Effect::LoadBoard);
+    }
+    if !m.roster_inflight {
+        m.roster_inflight = true;
+        out.push(Effect::LoadRoster);
+    }
+    if !m.leases_inflight {
+        m.leases_inflight = true;
+        out.push(Effect::LoadLeases);
+    }
+    out.push(Effect::LoadReceipts);
+    out.push(Effect::LoadSealedCounts);
+    out
 }
 
 const fn is_user_input(msg: &Msg) -> bool {

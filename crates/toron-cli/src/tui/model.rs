@@ -380,6 +380,9 @@ pub struct Model {
     pub last_flywheel_probe_unix: Option<u64>,
     pub toron_probe_inflight: bool,
     pub flywheel_probe_inflight: bool,
+    pub board_inflight: bool,
+    pub roster_inflight: bool,
+    pub leases_inflight: bool,
     pub status: Status,
     pub should_quit: bool,
 }
@@ -413,9 +416,16 @@ impl Model {
             last_flywheel_probe_unix: None,
             toron_probe_inflight: false,
             flywheel_probe_inflight: false,
+            board_inflight: false,
+            roster_inflight: false,
+            leases_inflight: false,
             status: Status::default(),
             should_quit: false,
         }
+    }
+
+    pub fn lease_count_for(&self, holder: &str) -> usize {
+        self.leases.iter().filter(|l| l.holder == holder).count()
     }
 
     pub fn visible_posts(&self) -> Vec<&BoardPost> {

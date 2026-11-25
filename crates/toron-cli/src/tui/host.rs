@@ -123,11 +123,10 @@ impl LiveHost {
     }
 
     async fn fetch_board(&self) -> anyhow::Result<Vec<BoardPost>> {
-        let res = self
+        let mut posts: Vec<BoardPost> = self
             .mailbox
             .board_read(&self.project, "main", 0, BOARD_LIMIT)
-            .await?;
-        Ok(res
+            .await?
             .messages
             .into_iter()
             .map(|m| BoardPost {
@@ -138,7 +137,61 @@ impl LiveHost {
                 mentions: m.mentions,
                 created_at: m.created_at.max(0) as u64,
             })
-            .collect())
+            .collect();
+
+        let mut seen: std::collections::HashSet<String> =
+            posts.iter().map(|p| p.event_id.clone()).collect();
+
+        if let Ok(store) = crate::plane::rebuild_store(&self.mailbox, &self.project).await {
+            let agents = self
+                .mailbox
+                .list_agents(&self.project, ListAgentsOptions::default())
+                .await
+                .unwrap_or_default();
+            let by_pubkey: HashMap<String, String> =
+                agents.into_iter().map(|a| (a.npub, a.name)).collect();
+
+            for ch in store.list().into_iter().filter(|c| !c.private) {
+                let Ok(events) =
+                    crate::plane::collect_channel_events(&self.mailbox, &self.project, &ch.id, 0)
+                        .await
+                else {
+                    continue;
+                };
+                for ev in events {
+                    let event_id = ev.id.to_hex();
+                    if !seen.insert(event_id.clone()) {
+                        continue;
+                    }
+                    let author_hex = ev.pubkey.to_hex();
+                    let author = by_pubkey
+                        .get(&author_hex)
+                        .cloned()
+                        .unwrap_or_else(|| author_hex.chars().take(12).collect());
+                    let label = if ch.name.is_empty() { &ch.id } else { &ch.name };
+                    posts.push(BoardPost {
+                        seq: 0,
+                        event_id,
+                        author,
+                        body: format!("[#{label}] {}", ev.content),
+                        mentions: Vec::new(),
+                        created_at: ev.created_at.as_secs(),
+                    });
+                }
+            }
+        }
+
+        posts.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        for (idx, post) in posts.iter_mut().enumerate() {
+            if post.seq == 0 {
+                post.seq = idx as u64 + 1;
+            }
+        }
+        Ok(posts)
     }
 
     async fn fetch_roster(&self) -> anyhow::Result<Vec<RosterRow>> {
@@ -146,15 +199,6 @@ impl LiveHost {
             .mailbox
             .list_agents(&self.project, ListAgentsOptions::default())
             .await?;
-        let leases = self
-            .mailbox
-            .list_file_reservations(&self.project, None, None)
-            .await
-            .unwrap_or_default();
-        let mut lease_counts: HashMap<String, usize> = HashMap::new();
-        for l in leases {
-            *lease_counts.entry(l.agent_name).or_insert(0) += 1;
-        }
         let now = now_unix();
         let presence = crate::plane::read_presence(&self.mailbox, &self.project, now);
         let mut by_npub: HashMap<String, (String, u64)> = HashMap::new();
@@ -171,7 +215,7 @@ impl LiveHost {
                     .unwrap_or_else(|| "offline".to_string());
                 let retired = status == "done" || w.pane_id.as_deref() == Some("retired");
                 RosterRow {
-                    lease_count: lease_counts.get(&w.name).copied().unwrap_or(0),
+                    lease_count: 0,
                     name: w.name,
                     npub: w.npub,
                     program: w.program,
@@ -276,7 +320,7 @@ impl LiveHost {
         }
         let project = self.project.clone();
         let fut = tokio::process::Command::new("flywheel")
-            .args(["snapshot", "--project", &project])
+            .args(["snapshot", &project])
             .output();
         let out = tokio::time::timeout(FLYWHEEL_SNAPSHOT_TIMEOUT, fut)
             .await

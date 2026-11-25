@@ -314,3 +314,27 @@ async fn interpreter_bounds_hang_and_surfaces_typed_failure() {
         other => panic!("expected typed failure on timeout, got {other:?}"),
     }
 }
+
+#[test]
+fn bus_changed_storm_is_single_flight_and_never_overlaps_loads() {
+    let (mut m, init_fx) = update::tick(&model(), Msg::Init);
+    assert!(init_fx.contains(&Effect::LoadLeases));
+    assert!(m.board_inflight && m.roster_inflight && m.leases_inflight);
+
+    for _ in 0..20 {
+        let (next, fx) = update::tick(&m, Msg::BusChanged);
+        m = next;
+        assert!(!fx.contains(&Effect::LoadBoard));
+        assert!(!fx.contains(&Effect::LoadRoster));
+        assert!(!fx.contains(&Effect::LoadLeases));
+    }
+
+    (m, _) = update::tick(&m, Msg::BoardLoaded(Vec::new()));
+    (m, _) = update::tick(&m, Msg::RosterLoaded(Vec::new()));
+    (m, _) = update::tick(&m, Msg::LeasesLoaded(Vec::new()));
+
+    let (_, after_fx) = update::tick(&m, Msg::BusChanged);
+    assert!(after_fx.contains(&Effect::LoadBoard));
+    assert!(after_fx.contains(&Effect::LoadRoster));
+    assert!(after_fx.contains(&Effect::LoadLeases));
+}

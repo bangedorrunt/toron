@@ -102,6 +102,7 @@ async fn run_loop(
 
     let mut model = model;
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut cleared_stderr = false;
 
     let (next, effects) = update::tick(&model, Msg::Init);
     model = next;
@@ -116,6 +117,10 @@ async fn run_loop(
         tokio::select! {
             maybe = rx.recv() => {
                 let Some(message) = maybe else { break };
+                if !cleared_stderr && matches!(message, Msg::LeasesLoaded(_)) {
+                    cleared_stderr = true;
+                    let _ = terminal.clear();
+                }
                 let (next, effects) = update::tick(&model, message);
                 model = next;
                 dispatch(&host, &tx, &mut handles, effects);
@@ -157,10 +162,16 @@ fn spawn_bus_watcher(host: &LiveHost, tx: mpsc::Sender<Msg>) {
         let Ok(mut sub) = mailbox.bus().subscribe_trusted(filter).await else {
             return;
         };
+        let mut live = false;
         while let Some(ev) = sub.next().await {
-            if matches!(ev, SubscriptionEvent::Event(_)) && tx.send(Msg::BusChanged).await.is_err()
-            {
-                break;
+            match ev {
+                SubscriptionEvent::Eose => live = true,
+                SubscriptionEvent::Event(_)
+                    if live && tx.try_send(Msg::BusChanged).is_err() && tx.is_closed() =>
+                {
+                    break;
+                }
+                _ => {}
             }
         }
     });
