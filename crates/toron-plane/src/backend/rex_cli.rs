@@ -655,7 +655,7 @@ const REQUIRED_API_GROUPS: &[&[&str]] = &[
     &["send-key", "client.key"],
     &["events", "block.event"],
     &["session.list"],
-    &["session.kill"],
+    &["session.kill", "session.destroy"],
     &["target.resolve"],
     &["com.superlogical.terminal.format"],
     &["com.superlogical.terminal.blob_read"],
@@ -2329,5 +2329,18 @@ mod wire_contract_tests {
             }
             other => panic!("expected a structured program status event, got {other:?}"),
         }
+    }
+    /// Rex 0.1.0-snapshot.2558 (api_revision 20) renamed `session.kill` to
+    /// `session.destroy`. The probe runs on every failure, so a stale name
+    /// relabelled each ordinary rex error as skew and hid the real one.
+    #[test]
+    fn skew_probe_accepts_the_session_destroy_rename() {
+        let current = "run\nsession.new_split\nsession.set_block_label\nblock.close\n\
+            com.superlogical.terminal.write\nclient.key\nblock.event\nsession.list\n\
+            session.destroy\ntarget.resolve\ncom.superlogical.terminal.format\n\
+            com.superlogical.terminal.blob_read\n";
+        assert_eq!(missing_api_method(current), None);
+        let without_close = current.replace("session.destroy\n", "");
+        assert_eq!(missing_api_method(&without_close), Some("session.kill"));
     }
 }
